@@ -424,3 +424,25 @@ test("stopping waits for a running turn, then deletes; a failed deletion is repo
   assert.equal(problems.length, 1);
   assert.match(problems[0], /disk says no.*~\/\.claude\/projects/);
 });
+
+test("changing an existing file without base is refused with how to do it; the page isn't asked", async () => {
+  const { server, port, code } = await start();
+  const p = page(port);
+  await p.open;
+  await p.hello({ code });
+  p.notify("grant.changed", GRANT);
+  p.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "first" });
+  await until(() => p.events.filter((e) => e.event.type === "turn_finished").length === 1);
+  p.notify("chat.message", { conversation: "c1", id: "u2", author: "person", text: "second" });
+  await until(() => p.events.filter((e) => e.event.type === "turn_finished").length === 2);
+  const second = p.events.filter((e) => e.turn_id === p.events.at(-1).turn_id);
+  const write = second.find((e) => e.event.type === "tool_call_finished").event;
+  assert.equal(write.status, "error");
+  assert.match(write.body, /already exists\. Read it with workspace_read, then call workspace_write again with base/);
+  assert.ok(!p.requests.includes("workspace.write"));
+  assert.match(p.files.get("/notes/fake-note.md"), /first/);
+  assert.ok(!second.some((e) => e.event.type === "artifact"));
+
+  p.ws.close();
+  await server.close();
+});

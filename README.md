@@ -1,0 +1,29 @@
+# sagebrush-agent
+
+Chat with Claude in [Sagebrush](https://sagebrush.space), with Claude running on your own computer.
+
+```
+npx -y <the tarball's URL>
+```
+
+It prints a link. Open it in Chrome or Firefox, and allow the folders Claude may use. Then chat.
+
+## What it does
+
+- It starts Claude through Anthropic's [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk), with **your own Claude login**. It uses the same login as Claude Code: if you have used Claude Code on this computer, you are logged in. Otherwise run `claude` once and log in.
+- It listens **only on 127.0.0.1** (the loopback address). It accepts a connection only:
+  - from the Sagebrush page's origin;
+  - with the one-time code it prints, valid once, for 5 minutes;
+  - and only one page at a time. Before the hello, a connection may send at most 16 KiB in total and must say hello within 10 seconds; at most 4 wait at once.
+- **One page, one grant:** everything Claude does belongs to the page that is paired and the access it granted. If the page disconnects or the grant changes, the running turn stops, queued messages are dropped (the page is told), and open questions count as "no". Nothing started under one grant runs under another. A page that comes back with its session (a reload) keeps the conversation, but not the stopped work.
+- **Files:** Claude's only file tools are the Sagebrush workspace's (`workspace_list`, `workspace_read`, `workspace_write`, …). Each call goes to the page, which checks it against the folders and permissions you granted, and does it in the workspace in your browser.
+  - Claude gets no shell, no files of this computer and no settings: the SDK runs with no setting sources, in an empty temporary folder.
+- **What asks you first, in the chat:** each web search or fetch (`WebSearch`, `WebFetch`), and each move, rename or removal of a workspace file. The question shows the address, query or path, and all of the call's arguments; your answer covers exactly those. Claude never decides on its own: the SDK runs in its manual permission mode (no auto mode, no bypass), only our MCP server is loaded, and any other tool is refused.
+- **What leaves your computer:** the conversation goes to Anthropic, through the SDK, as with any Claude session. A web search or fetch you allow goes to that search or address (Anthropic runs the search; a fetch may go from this computer).
+- **What is kept on disk:** like Claude Code, the SDK saves each conversation's transcript (your messages, Claude's replies, and the tools' results, including file contents Claude read) under `~/.claude/projects/`, in a folder named after the daemon's empty working folder. That is how a conversation goes on from one message to the next. When you stop sagebrush-agent with Ctrl+C, it waits (up to 10 seconds) for running turns to stop, then deletes this run's transcripts and the working folder, and says so; if it can't delete something, it says what and where it is. If it is killed or crashes, they stay there until you delete them. The SDK may also keep its usual logs under `~/.claude/`.
+
+Options: `--port N` (default: a free port) and `--origin ORIGIN` (another allowed page origin, exact: like `https://example.org`, no path or wildcard). The environment variable `SAGEBRUSH_AGENT_PAGE` changes only the printed link, never which pages may connect.
+
+Press Ctrl+C to stop.
+
+Release: the tarball is published at an immutable, versioned URL with its SHA-256; a change means a new version and a new review.

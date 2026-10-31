@@ -97,6 +97,25 @@ test("shortNotebookRead: 8000 empty outputs are charged by their serialized byte
   assert.equal(r.rev, 3);
 });
 
+test("shortNotebookRead: 200 cells of one 2000-byte output each: wrappers and commas charged, the cap held exactly", () => {
+  const read = readOf(Array.from({ length: 200 }, (_, i) => ({ id: `c${i}`, code: "", outputs: [{ output_type: "stream", name: "stdout", text: "z".repeat(2000) }] })), { autorun: "always" });
+  const r = shortNotebookRead(read);
+  const charged = chargedBytes(r);
+  assert.ok(charged <= NOTEBOOK_LIMITS.readBytes, `charged ${charged}`);
+  // (and it fills the cap: one more cell's output would not have fit)
+  assert.ok(charged > NOTEBOOK_LIMITS.readBytes - 2100, `charged only ${charged}`);
+  assert.match(r.content.json.note, /reached at cell \d+/);
+  assert.match(r.content.json.metadata, /^\[the notebook's metadata, \d+ bytes omitted\]$/);
+});
+
+test("shortNotebookRead: at the exact cap, over many cell and output shapes", () => {
+  for (const n of [1, 7, 33, 150, 400]) for (const len of [0, 1, 500, 2000, 9000]) for (const per of [1, 3]) {
+    const read = readOf(Array.from({ length: n }, (_, i) => ({ id: `c${i}`, code: "x", ...(i % 5 === 0 ? { metadata: { k: "v".repeat(50) } } : {}), outputs: Array.from({ length: per }, () => ({ output_type: "stream", name: "stdout", text: "é".repeat(len) })) })), { seed: "s" });
+    const charged = chargedBytes(shortNotebookRead(read));
+    assert.ok(charged <= NOTEBOOK_LIMITS.readBytes, `n=${n} len=${len} per=${per}: charged ${charged}`);
+  }
+});
+
 test("shortNotebookRead: one output's text alternatives share one allowance", () => {
   const t = "y".repeat(NOTEBOOK_LIMITS.outputBytes);
   const r = shortNotebookRead(readOf([{ id: "a", code: "x", outputs: [{ output_type: "execute_result", data: { "text/plain": t, "text/markdown": t, "text/latex": t } }] }]));

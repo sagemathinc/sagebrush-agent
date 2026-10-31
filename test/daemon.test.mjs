@@ -186,7 +186,17 @@ test("the SDK options: ask, never decide alone; only our MCP server; no settings
   assert.deepEqual(options.settings.permissions.ask, ["WebSearch", "WebFetch", "mcp__sagebrush__workspace_rename", "mcp__sagebrush__workspace_remove"]);
   assert.equal(options.settings.permissions.disableAutoMode, "disable");
   assert.equal(options.settings.permissions.disableBypassPermissionsMode, "disable");
-  assert.ok(!options.allowedTools.some((t) => /remove|rename|Web/.test(t)));
+  // no bare allowedTools: every call reaches canUseTool (no SDK "shadowed" warning)
+  assert.equal(options.allowedTools, undefined);
+  for (const t of ["list", "read", "write", "mkdir"]) {
+    const n = p.events.length;
+    assert.deepEqual(await options.canUseTool(`mcp__sagebrush__workspace_${t}`, { path: "/a" }, {}), { behavior: "allow", updatedInput: { path: "/a" } });
+    assert.equal(p.events.length, n); // (no question for these)
+  }
+  // under a later binding (the grant changed), the old turn's workspace calls are refused here too
+  p.notify("grant.changed", { folders: ["/notes"], write: false, expires: null });
+  await until(() => server.binding?.grant?.folders?.[0] === "/notes");
+  assert.equal((await options.canUseTool("mcp__sagebrush__workspace_read", { path: "/a" }, {})).behavior, "deny");
   // a tool outside the ask list is refused without asking the person
   const before = p.events.length;
   const v = await options.canUseTool("Bash", { command: "ls" }, {});

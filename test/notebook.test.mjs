@@ -224,7 +224,7 @@ test("workspace_write_notebook: a stale base is refused by the page; a path that
   const p = await paired();
   p.say("u1", "make a notebook");
   await finished(p, 1);
-  const tools = p.server.workspaceTools({}, p.server.binding, undefined);
+  const tools = p.server.workspaceTools("c1", {}, p.server.binding, undefined);
   const call = (name, a) => tools.handlers[name](a);
   const stale = await call("workspace_write_notebook", { path: "/notes/plot.ipynb", mode: "python", cells: [], base: 99 });
   assert.equal(stale.isError, true);

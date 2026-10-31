@@ -1,6 +1,6 @@
 {
   "name": "sagebrush-agent",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Chat with Claude in Sagebrush: a small daemon on your computer that runs Claude (with your own Claude login) and talks to the Sagebrush page over the loopback address.",
   "type": "module",
   "bin": {
@@ -10,6 +10,7 @@
     "bin/",
     "lib/server.mjs",
     "lib/turns.mjs",
+    "lib/notebook.mjs",
     "README.md",
     "npm-shrinkwrap.json"
   ],

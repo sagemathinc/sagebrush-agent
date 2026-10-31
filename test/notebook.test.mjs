@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import WebSocket from "ws";
 import { fakeCreateServer, fakeQuery } from "../lib/fake.mjs";
-import { NOTEBOOK_LIMITS, notebookDoc, shortNotebookRead } from "../lib/notebook.mjs";
+import { NOTEBOOK_LIMITS, notebookDoc, shortNotebookRead, chargedBytes } from "../lib/notebook.mjs";
 import { AgentServer } from "../lib/server.mjs";
 
 const ORIGIN = "https://agents.sagebrush.cloud";
@@ -77,8 +77,52 @@ test("shortNotebookRead: the whole read is bounded; later cells' outputs are omi
   const n = Math.ceil(NOTEBOOK_LIMITS.readBytes / NOTEBOOK_LIMITS.outputBytes) + 5;
   const read = { entry: {}, rev: 1, content: { json: { cells: Array.from({ length: n }, (_, i) => ({ id: `c${i}`, code: "", outputs: [{ output_type: "stream", text: big }] })) } } };
   const r = shortNotebookRead(read);
-  assert.match(r.content.json.note, /outputs of \d+ more cells omitted/);
-  assert.ok(Buffer.byteLength(JSON.stringify(r)) < NOTEBOOK_LIMITS.readBytes + 64 * 1024);
+  assert.match(r.content.json.note, /limit of 262144 bytes for outputs was reached at cell \d+/);
+  assert.ok(chargedBytes(r) <= NOTEBOOK_LIMITS.readBytes, `charged ${chargedBytes(r)}`);
+});
+
+// ART-C7: the cap is on what is returned (wrappers, labels, notes and metadata summaries included), not on text alone.
+const bytes = (v) => Buffer.byteLength(JSON.stringify(v));
+const readOf = (cells, extra = {}) => ({ entry: { path: "/n.ipynb" }, rev: 3, content: { json: { mode: "python", ...extra, cells } } });
+const allSources = (r) => r.content.json.cells.map((c) => c.code).join("");
+
+test("shortNotebookRead: 8000 empty outputs are charged by their serialized bytes and stop at the cap", () => {
+  const read = readOf(Array.from({ length: 40 }, (_, i) => ({ id: `c${i}`, code: "pass", outputs: Array.from({ length: 200 }, () => ({ output_type: "stream", name: "stdout", text: "" })) })));
+  assert.ok(bytes(read.content.json.cells.map((c) => c.outputs)) > NOTEBOOK_LIMITS.readBytes); // (the counterexample: over the cap with no text at all)
+  const r = shortNotebookRead(read);
+  assert.ok(chargedBytes(r) <= NOTEBOOK_LIMITS.readBytes, `charged ${chargedBytes(r)}`);
+  assert.match(r.content.json.note, /limit of 262144 bytes for outputs was reached at cell \d+/);
+  assert.equal(r.content.json.cells.length, 40); // (every cell's source is still there)
+  assert.equal(allSources(r), "pass".repeat(40));
+  assert.equal(r.rev, 3);
+});
+
+test("shortNotebookRead: one output's text alternatives share one allowance", () => {
+  const t = "y".repeat(NOTEBOOK_LIMITS.outputBytes);
+  const r = shortNotebookRead(readOf([{ id: "a", code: "x", outputs: [{ output_type: "execute_result", data: { "text/plain": t, "text/markdown": t, "text/latex": t } }] }]));
+  const d = r.content.json.cells[0].outputs[0].data;
+  const kept = ["text/plain", "text/markdown", "text/latex"].map((m) => d[m].replace(/…\[\d+ more bytes\]$/, "")).join("");
+  assert.equal(Buffer.byteLength(kept), NOTEBOOK_LIMITS.outputBytes, "8 KiB in all, not 8 KiB each");
+  assert.equal(d["text/latex"], `…[${NOTEBOOK_LIMITS.outputBytes} more bytes]`);
+});
+
+test("shortNotebookRead: multibyte text and JSON escapes are charged as returned", () => {
+  const nasty = "\u0001".repeat(40000) + "é".repeat(40000); // (each \u0001 is 6 bytes once serialized)
+  const read = readOf(Array.from({ length: 60 }, (_, i) => ({ id: `c${i}`, code: "", outputs: [{ output_type: "stream", name: "stdout", text: nasty }] })));
+  const r = shortNotebookRead(read);
+  assert.ok(chargedBytes(r) <= NOTEBOOK_LIMITS.readBytes, `charged ${chargedBytes(r)}`);
+  for (const c of r.content.json.cells) for (const o of c.outputs ?? []) assert.ok(!/\uFFFD/.test(o.text)); // (never cut inside a character)
+});
+
+test("shortNotebookRead: cell and notebook metadata are summarized, not returned", () => {
+  const meta = { tags: ["t".repeat(300000)] };
+  const r = shortNotebookRead(readOf([{ id: "a", code: "1", metadata: meta, attachments: { "x.png": { "image/png": "A".repeat(100000) } }, outputs: [{ output_type: "execute_result", metadata: meta, data: { "text/plain": "1" } }] }], { autorun: "always", seed: "s".repeat(500000) }));
+  const json = r.content.json;
+  assert.match(json.metadata, /^\[the notebook's metadata, \d+ bytes omitted\]$/);
+  assert.match(json.cells[0].other, /^\[other fields of this cell, \d+ bytes omitted\]$/);
+  assert.match(json.cells[0].outputs[0].metadata, /^\[metadata, \d+ bytes omitted\]$/);
+  assert.equal(json.cells[0].outputs[0].data["text/plain"], "1");
+  assert.ok(bytes(r) < 4096, `returned ${bytes(r)}`);
 });
 
 // A fake page that keeps documents ({json}) and texts, and records every request.

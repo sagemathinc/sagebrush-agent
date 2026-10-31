@@ -15,7 +15,7 @@ const GRANT = { folders: ["/"], write: true, expires: null };
 const NB = { mode: "python", cells: [{ id: "a", code: "1+1", outputs: [{ output_type: "execute_result", data: { "text/plain": "2" }, execution_count: 1 }], n: 1 }, { id: "b", type: "markdown", code: "# t" }] };
 
 // A fake page: one notebook at /n.ipynb (ref R1), and whether it offers notebook.edit.
-async function paired({ features = true } = {}) {
+async function paired({ features = true, editFails = 0 } = {}) {
   const server = new AgentServer({ query: fakeQuery, log: () => {} });
   server.createServer = fakeCreateServer;
   const port = await server.listen();
@@ -35,7 +35,7 @@ async function paired({ features = true } = {}) {
     if (m.method === "workspace.read") return f ? reply({ entry: { path: p.path, kind: "notebook" }, rev: f.rev, content: f.content, ...(features ? { ref: f.ref } : {}) }) : fail("missing", "missing");
     if (m.method === "workspace.create") return f ? fail("exists", `${p.path} is there already`) : (files.set(p.path, { content: p.content, rev: 1, ref: "R2" }), reply({ entry: { path: p.path } }));
     if (m.method === "workspace.stat") return reply({ entry: f ? { path: p.path } : null });
-    if (m.method === "notebook.edit") return reply({ ok: true, inserted: [] });
+    if (m.method === "notebook.edit") return editFails-- > 0 ? fail("busy", "applied here but not saved: the store refused it") : reply({ ok: true, inserted: [] });
     reply({});
   });
   await new Promise((r, j) => { ws.on("open", r); ws.on("error", j); });
@@ -134,5 +134,19 @@ test("E12 (helper): with such a page, write_notebook only creates: an existing p
   assert.equal(p.files.get("/n.ipynb").content.json.cells[0].code, "1+1");
   const made = await p.tools().handlers.workspace_write_notebook({ path: "/m.ipynb", mode: "python", cells: [{ type: "code", source: "x" }] });
   assert.equal(made.isError, undefined);
+  } finally { await p.close(); }
+});
+
+test("E22h: an edit the page refuses leaves the held read in place: the same base edits again", async () => {
+  const p = await paired({ editFails: 1 });
+  try {
+    const t = p.tools();
+    await t.handlers.workspace_read({ path: "/n.ipynb" });
+    const first = await t.handlers.workspace_edit_notebook({ path: "/n.ipynb", base: 1, set: [{ id: "a", source: "2+2" }] });
+    assert.equal(first.isError, true);
+    assert.match(first.content[0].text, /not saved/);
+    const again = await t.handlers.workspace_edit_notebook({ path: "/n.ipynb", base: 1, set: [{ id: "a", source: "2+2" }] });
+    assert.equal(again.isError, undefined);
+    assert.equal(p.asked.filter((a) => a.method === "notebook.edit").length, 2);
   } finally { await p.close(); }
 });

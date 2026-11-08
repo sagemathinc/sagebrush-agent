@@ -394,6 +394,24 @@ test("the command line: --origin must be an exact http(s) origin", async () => {
   }
 });
 
+test("the command line: the printed link opens sagebrush.space/agents unless SAGEBRUSH_AGENT_PAGE says otherwise", async () => {
+  const { spawn } = await import("node:child_process");
+  const link = (env) => new Promise((resolve, reject) => {
+    const e = { ...process.env, SAGEBRUSH_AGENT_FAKE: "1", ...env };
+    if (env.SAGEBRUSH_AGENT_PAGE === undefined) delete e.SAGEBRUSH_AGENT_PAGE;
+    const c = spawn(process.execPath, ["bin/sagebrush-agent.mjs"], { env: e, stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    const t = setTimeout(() => { c.kill("SIGKILL"); reject(new Error(`no link: ${out}`)); }, 10000);
+    c.stdout.on("data", (d) => {
+      out += d;
+      const m = /Open: +(\S+)/.exec(out);
+      if (m) { clearTimeout(t); c.kill("SIGKILL"); resolve(m[1]); }
+    });
+  });
+  assert.match(await link({}), /^https:\/\/sagebrush\.space\/agents\/\?pair=[^&]+&port=\d+$/);
+  assert.match(await link({ SAGEBRUSH_AGENT_PAGE: "https://dev.sagebrush.space/agents" }), /^https:\/\/dev\.sagebrush\.space\/agents\/\?pair=/);
+});
+
 test("a malformed frame before the hello closes only that socket", async () => {
   const net = await import("node:net");
   const { server, port, code } = await start();

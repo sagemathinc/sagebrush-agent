@@ -394,6 +394,12 @@ test("the command line: --origin must be an exact http(s) origin", async () => {
   }
 });
 
+test("the version the agent says (hello, status, its tool server) is the package's version", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { VERSION } = await import("../lib/server.mjs");
+  assert.equal(VERSION, JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version);
+});
+
 test("the command line: the printed link opens sagebrush.space/agents unless SAGEBRUSH_AGENT_PAGE says otherwise", async () => {
   const { spawn } = await import("node:child_process");
   const link = (env) => new Promise((resolve, reject) => {

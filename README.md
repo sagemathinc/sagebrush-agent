@@ -34,6 +34,6 @@ Press Ctrl+C to stop.
 - No message is over the runner's limit, about 4 MB. A bigger file write fails as an ordinary error that Claude sees.
 - An Allow counts only when the page's answer carries the hash of exactly the action that was asked about.
 
-In both modes, at most 4 chats run at once and 16 messages wait; one more is refused, and the page says so. `SAGEBRUSH_AGENT_FAKE=1`, set where you start it, runs a scripted fake model instead of Claude, for tests.
+In both modes, at most 4 chats run at once (a fifth waits its turn) and at most 16 messages wait; a seventeenth is refused, and the page says so. `SAGEBRUSH_AGENT_FAKE=1`, set where you start it, runs a scripted fake model instead of Claude, for tests.
 
 Release: the tarball is published at an immutable, versioned URL with its SHA-256; a change means a new version and a new review.

@@ -170,10 +170,15 @@ test("row 3: a timeout_s or seconds past the page's bound is sent as given (the 
     let r3 = null, r4 = null;
     s.tools.workspace_run_file({ path: "/a.py", timeout_s: 9007199254740991 }).then((r) => (r3 = r));
     s.tools.workspace_git_wait({ name: "b", seconds: 1_000_000_000 }).then((r) => (r4 = r));
-    await c.at(80_000);
+    // (both sides: an uncapped timer would overflow setTimeout's 2^31 - 1 ms and end the call at once)
+    await c.at(79_900);
+    assert.ok(r4 === null && r3 === null, "both still waiting at 79.9 s");
+    await c.at(100);
     await tick();
     assert.ok(r4 && r3 === null, "the wait ended at 80 s, the run not yet");
-    await c.at(550_000);
+    await c.at(549_900);
+    assert.equal(r3, null, "the run still waiting at 629.9 s");
+    await c.at(100);
     await tick();
     assert.ok(r3, "the run ended at 630 s");
   } finally { c.off(); }

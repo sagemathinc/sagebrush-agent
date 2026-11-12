@@ -40,7 +40,7 @@ test("writer: with a real Writable, the count never passes 2F (data) or 2F + 4 K
   w.release(); await tick(); await tick(); check("drained");
   for (let i = 0; i < 20 && lw.counters().queued + lw.counters().inFlight; i++) { w.release(); await tick(); }
   const c = lw.counters();
-  assert.deepEqual([c.held, c.reserveHeld, c.inFlight, c.inFlightWritten], [0, 0, 0, 0]);
+  assert.deepEqual([c.held, c.reserveHeld, c.inFlight, c.live, c.liveBytes], [0, 0, 0, 0, 0]);
 });
 
 test("writer: many backpressure cycles leave no listeners behind", async () => {
@@ -168,4 +168,36 @@ test("emit checks the writer's room from the count, before the line is built", (
     assert.equal(server.emit(ws, big), "full");
   } finally { JSON.stringify = orig; }
   assert.deepEqual([built, stringified], [0, 0], "nothing serialized or sent");
+});
+
+test("writer: a line counts whole until stdout's callback for its last chunk, even when only a small tail is outstanding", async () => {
+  const F = 65536, w = heldWritable(1 << 20);
+  const lw = new LineWriter(w, { budget: 2 * F });
+  assert.equal(lw.send("a".repeat(F + 9)), "ok"); // (F + 10 bytes: a 64 KiB chunk and a 10-byte tail)
+  await tick();
+  assert.equal(w.pendingWrites(), 1, "the first chunk is being written; the stream buffers the tail");
+  w.release(1); // (stdout is done with the first chunk; now the tail is written, and its callback is held)
+  await tick();
+  assert.equal(w.pendingWrites(), 1);
+  const c = lw.counters();
+  assert.equal(c.held, F + 10, "the whole line still counts: stdout's view of the tail keeps its buffer");
+  assert.equal(c.liveBytes, c.held, "the count is the buffers that exist");
+  // (so less room is left for the next lines: one that would pass 2F with the whole line counted is refused)
+  assert.equal(lw.send("b".repeat(F - 20)), "ok");
+  assert.equal(lw.send("c".repeat(30)), "full");
+  w.release(); await tick(); w.release(); await tick();
+  assert.deepEqual([lw.counters().held, lw.counters().live], [0, 0]);
+});
+
+test("writer: when every count is zero, no line buffer is left reachable from the writer", async () => {
+  const w = heldWritable(1 << 20);
+  const lw = new LineWriter(w, { budget: 1 << 20 });
+  lw.send("x".repeat(32767)); lw.send("y".repeat(65535)); lw.send("z", { reserve: true });
+  for (let i = 0; i < 10; i++) { w.release(); await tick(); }
+  const c = lw.counters();
+  assert.deepEqual([c.held, c.reserveHeld, c.queued, c.live], [0, 0, 0, 0]);
+  const reachable = Object.values(lw).filter((v) => Buffer.isBuffer(v) || (v && typeof v === "object" && Buffer.isBuffer(v.buf)));
+  assert.deepEqual(reachable, [], "no completed line kept");
+  assert.equal(lw.live.size, 0);
+  assert.equal(lw.queue.length, 0);
 });

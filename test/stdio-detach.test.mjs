@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { fakeCreateServer, fakeQuery } from "../lib/fake.mjs";
-import { AgentServer } from "../lib/server.mjs";
+import { AgentServer, TEXT } from "../lib/server.mjs";
 
 const F = 64 * 1024;
 
@@ -100,4 +100,63 @@ test("at a detach, nothing is written for the old page: its queued chat messages
     assert.deepEqual(after.map((m) => m.method), [], "no line for a page that is gone");
     assert.equal(h.server.counters().queued, 0);
   } finally { await h.close(); }
+});
+
+test("sessions retire with their conversations: real turns past 64 conversations keep at most 64 ids, delete the rest, log a failure, and an old chat starts anew", async () => {
+  const deleted = [], logs = [];
+  const server = new AgentServer({ query: fakeQuery, log: (m) => logs.push(m), stdio: true,
+    deleteSession: async (id) => { deleted.push(id); if (deleted.length === 1) throw new Error("disk says no"); } });
+  server.createServer = fakeCreateServer;
+  const input = new EventEmitter(), out = new Out();
+  server.serveStdio({ input, output: out, fatal: () => {} });
+  const send = (o) => input.emit("data", Buffer.from(JSON.stringify(o) + "\n"));
+  send({ relay: { start: { frame: F, protocol: 1, epoch: 0 } } });
+  const seen = new Set();
+  const iv = setInterval(() => { for (const m of out.lines()) if (typeof m.id === "string" && m.method && !seen.has(m.id)) { seen.add(m.id); send({ jsonrpc: "2.0", id: m.id, result: m.method === "workspace.stat" ? { entry: null } : { entries: [], rev: 1 } }); } }, 2);
+  try {
+    send({ jsonrpc: "2.0", method: "grant.changed", params: { folders: ["/"], write: true } });
+    const done = (conv) => out.lines().filter((m) => m.method === "turn.event" && m.params.conversation === conv && m.params.event.type === "turn_finished").length;
+    const firstSession = new Map();
+    for (let i = 0; i < 66; i++) {
+      say({ send }, `c${i}`, "big 1");
+      await until(() => done(`c${i}`) === 1, `turn ${i}`);
+      firstSession.set(`c${i}`, server.conversations.get(`c${i}`)?.sessionId);
+      assert.ok(server.counters().sessions <= 64, `sessions ${server.counters().sessions} after ${i + 1} conversations`);
+    }
+    await until(() => server.counters().retiring === 0, "the retirements done");
+    assert.deepEqual([server.counters().conversations, server.counters().sessions], [64, 64]);
+    assert.deepEqual(deleted, [firstSession.get("c0"), firstSession.get("c1")], "the two evicted chats' sessions deleted, in order");
+    assert.ok(logs.some((l) => l === TEXT.transcriptLeft(server.transcriptPath(firstSession.get("c0")))), "the failed deletion logged with its path");
+    // (c0 comes back: a new conversation and a new session; the oldest idle one, c2, goes)
+    say({ send }, "c0", "big 1");
+    await until(() => done("c0") === 2, "c0 again");
+    const again = server.conversations.get("c0").sessionId;
+    assert.ok(again && again !== firstSession.get("c0"), "a new session, not a resume of the deleted one");
+    await until(() => server.counters().retiring === 0, "c2 retired");
+    assert.equal(deleted.at(-1), firstSession.get("c2"));
+    assert.ok(server.counters().sessions <= 64);
+  } finally { clearInterval(iv); await server.close(); }
+});
+
+test("a session a conversation replaces (the SDK gave a new id) is retired at once; the current one is kept", async () => {
+  const deleted = [];
+  let n = 0;
+  // (a query that hands back a new session id on every turn, as the SDK may)
+  const query = () => (async function* () { yield { type: "system", subtype: "init", session_id: `s${++n}` }; yield { type: "result", subtype: "success", is_error: false, result: "ok", usage: {} }; })();
+  const server = new AgentServer({ query, log: () => {}, stdio: true, deleteSession: async (id) => { deleted.push(id); } });
+  server.createServer = fakeCreateServer;
+  const input = new EventEmitter(), out = new Out();
+  server.serveStdio({ input, output: out, fatal: () => {} });
+  const send = (o) => input.emit("data", Buffer.from(JSON.stringify(o) + "\n"));
+  send({ relay: { start: { frame: F, protocol: 1, epoch: 0 } } });
+  send({ jsonrpc: "2.0", method: "grant.changed", params: { folders: ["/"], write: true } });
+  const done = () => out.lines().filter((m) => m.method === "turn.event" && m.params.event.type === "turn_finished").length;
+  try {
+    for (let i = 1; i <= 3; i++) { say({ send }, "c1", `turn ${i}`); await until(() => done() === i, `turn ${i}`); }
+    await until(() => server.counters().retiring === 0, "retired");
+    assert.deepEqual(deleted, ["s1", "s2"]);
+    assert.deepEqual([...server.sessions], ["s3"]);
+    assert.equal(server.conversations.get("c1").sessionId, "s3");
+  } finally { await server.close(); }
+  assert.deepEqual(deleted, ["s1", "s2", "s3"], "and the current one at close");
 });

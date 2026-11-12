@@ -72,11 +72,12 @@ test("parseStart: the one valid form, F at each edge and just outside, protocol,
   assert.equal(parseStart({ jsonrpc: "2.0" }), null);
 });
 
-// A stdout stand-in whose reads the test controls: write() returns false once its buffer passes the high-water mark.
+// A stdout stand-in whose reads the test controls: write() returns false once its buffer passes the high-water mark;
+// a write's callback is called when its bytes are taken (drainAll), as a real stream calls it once they are flushed.
 class Pipe extends EventEmitter {
-  constructor(highWater = 16 * 1024) { super(); this.writableHighWaterMark = highWater; this.writableLength = 0; this.out = []; this.paused = false; }
-  write(b) { this.out.push(Buffer.from(b)); this.writableLength += b.length; if (!this.paused) queueMicrotask(() => this.drainAll()); return this.writableLength < this.writableHighWaterMark; }
-  drainAll() { if (this.writableLength === 0) return; this.writableLength = 0; this.emit("drain"); }
+  constructor(highWater = 16 * 1024) { super(); this.writableHighWaterMark = highWater; this.writableLength = 0; this.out = []; this.cbs = []; this.paused = false; }
+  write(b, cb) { this.out.push(Buffer.from(b)); this.writableLength += b.length; if (cb) this.cbs.push(cb); if (!this.paused) queueMicrotask(() => this.drainAll()); return this.writableLength < this.writableHighWaterMark; }
+  drainAll() { if (this.writableLength === 0) return; this.writableLength = 0; for (const cb of this.cbs.splice(0)) cb(); this.emit("drain"); }
   text() { return Buffer.concat(this.out).toString("utf8"); }
 }
 const tick = () => new Promise((r) => setImmediate(r));

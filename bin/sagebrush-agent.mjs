@@ -52,11 +52,9 @@ if (stdio && loopbackFlags) {
 
 let query, createServer, deleteSession;
 if (process.env.SAGEBRUSH_AGENT_FAKE === "1") {
-  // The fake model is only in the source checkout, not in the published package.
-  const fake = await import("../lib/fake.mjs").catch(() => {
-    console.error("SAGEBRUSH_AGENT_FAKE needs the source checkout (lib/fake.mjs isn't published)");
-    process.exit(2);
-  });
+  // The fake model, for tests: chosen only by this variable, set where the agent is started; nothing the page or
+  // the runner sends can choose it.
+  const fake = await import("../lib/fake.mjs");
   ({ fakeQuery: query, fakeCreateServer: createServer } = fake);
   console.error("FAKE model: no Claude, for testing");
 } else {

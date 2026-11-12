@@ -100,3 +100,23 @@ test("a timed-out deletion still counts until it settles: the SDK's call isn't c
     await until(() => h.server.counters().retiring === 0, "all settled");
   } finally { for (const r of settle) r(); await h.server.close(); }
 });
+
+test("one place freed starts one waiting turn, not every waiting one: the place is checked per turn", async () => {
+  const settle = new Map();
+  const h = harness({ deleteSession: (id) => new Promise((r) => settle.set(id, r)) });
+  try {
+    for (const c of ["a", "b", "c", "d"]) { h.say(c); await until(() => h.finished(c) === 1, `first turn of ${c}`); }
+    // (retirement full: 8 held)
+    for (let i = 0; i < 8; i++) { h.server.sessions.add(`x${i}`); h.server.retire(`x${i}`); }
+    for (const c of ["a", "b", "c", "d"]) h.say(c);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(["a", "b", "c", "d"].reduce((k, c) => k + h.started(c), 0), 4, "none of the four started");
+    // (exactly one place frees: one deletion settles)
+    await until(() => settle.has("x0"), "the first deletion under way");
+    settle.get("x0")();
+    await until(() => h.server.counters().retiring <= 8 && ["a", "b", "c", "d"].reduce((k, c) => k + h.started(c), 0) >= 5, "one turn started");
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(["a", "b", "c", "d"].reduce((k, c) => k + h.started(c), 0), 5, "exactly one");
+    assert.ok(h.server.counters().retiring <= 8);
+  } finally { for (const r of settle.values()) r(); await h.server.close(); }
+});

@@ -139,7 +139,9 @@ test("stdio: detach ends the binding: the running turn stops, its open question 
     a.grant(); a.say("c1", "hello again");
     await a.until(() => a.lines.slice(before).some((l) => l.msg.method === "turn.event" && l.msg.params.event.type === "turn_finished"), "the new turn's end");
     const after = a.lines.slice(before).filter((l) => l.msg.method === "turn.event").map((l) => l.msg.params.event);
-    assert.ok(!after.some((e) => e.type === "text_delta" && /allowed the search/.test(e.text)), "the late Allow did nothing");
+    const said = after.filter((e) => e.type === "text_delta").map((e) => e.text).join("");
+    assert.doesNotMatch(said, /allowed the search/, "the late Allow did nothing");
+    assert.match(said, /said: "hello again"/, "the text is joined before matching (the fake sends a word per event)");
     assert.equal(after.at(-1).outcome, "completed");
   } finally { a.stopAnswering?.(); a.kill(); }
 });

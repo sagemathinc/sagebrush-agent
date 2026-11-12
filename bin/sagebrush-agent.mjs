@@ -56,7 +56,7 @@ server.createServer = createServer;
 const p = await server.listen();
 const code = server.newCode();
 // SAGEBRUSH_AGENT_PAGE changes only the printed link, never the allowed origins.
-const page = (process.env.SAGEBRUSH_AGENT_PAGE ?? "https://agents.sagebrush.cloud/agents/").replace(/\/?$/, "/");
+const page = (process.env.SAGEBRUSH_AGENT_PAGE ?? "https://sagebrush.space/agents/").replace(/\/?$/, "/");
 if (!/^https?:$/.test(new URL(page, "x:/").protocol)) {
   console.error("SAGEBRUSH_AGENT_PAGE must be an http(s) URL");
   process.exit(2);

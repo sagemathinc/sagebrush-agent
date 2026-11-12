@@ -64,7 +64,8 @@ test("a question with no abort signal is still denied at the detach (the binding
     const verdict = h.server.askPerson(binding, () => {}, "WebSearch", { query: "x" }, {}, "c1");
     assert.equal(h.server.permissions.size, 1);
     h.send({ relay: { page: "detached", epoch: 1 } });
-    assert.deepEqual(await verdict, { behavior: "deny", message: "The person said no." });
+    const settled = await Promise.race([verdict, new Promise((r) => setTimeout(() => r("still open 2 s after the detach"), 2000))]);
+    assert.deepEqual(settled, { behavior: "deny", message: "The person said no." });
   } finally { await h.close(); }
 });
 

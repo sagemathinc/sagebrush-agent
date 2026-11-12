@@ -14,6 +14,7 @@ import { BUSY_LINE, PAGE_TEXT, PAGE_TOOL_VERBS, PAGE_VERBS, RUN_VERBS, isPng } f
 //  this same file against its schema.json; a change to either side is a change to review)
 const PAGE_VERBS_SHA = "431a67a7c594944d2b024b3e1a734f360253f4f7c2e75925ed6c3e18826bf8ce";
 const tick = () => new Promise((r) => setImmediate(r));
+const until = async (f) => { for (let i = 0; i < 200 && !f(); i++) await tick(); assert.ok(f(), "waited for it"); };
 
 /** A server bound to a fake page that records what it's sent and answers when told. */
 function setup({ requestsTaken = 0 } = {}) {
@@ -54,13 +55,13 @@ test("row 1 + 9: the 8 tools as the SDK advertises them: the page's description 
     assert.ok(t, verb);
     assert.equal(t.description, RUN_VERBS.includes(verb) ? `${page.description} ${BUSY_LINE}` : page.description, verb);
     assert.equal(t.description.includes(BUSY_LINE), RUN_VERBS.includes(verb), `${verb}: the busy line on the run tools only`);
-    // (the page's schema, closed; zod writes its own $schema, an integer's safe-integer bound (2^53 - 1), which the page
-    //  leaves out, and no "required" when it is empty (the page writes []): the only differences, said here)
+    // (the page's schema, closed; zod writes its own $schema, and no "required" when it is empty (the page writes []):
+    //  the only differences, said here. Integers have no upper bound, as on the page.)
     const { $schema: _a, ...want } = page.params;
     const { $schema: _b, ...got } = t.inputSchema;
-    const strip = (o) => JSON.parse(JSON.stringify(o, (k, v) => (v && typeof v === "object" && v.type === "integer" && v.maximum === Number.MAX_SAFE_INTEGER ? (({ maximum, ...r }) => r)(v) : v)));
     const req = (o) => (Array.isArray(o.required) && o.required.length === 0 ? (({ required, ...r }) => r)(o) : o);
-    assert.deepEqual(req(strip(got)), req(want), verb);
+    assert.deepEqual(req(got), req(want), verb);
+    assert.equal(JSON.stringify(got).includes("maximum"), false, `${verb}: no upper bound the page doesn't have`);
     assert.equal(got.additionalProperties, false, verb);
   }
   await done(s);
@@ -100,6 +101,26 @@ test("row 2: an unknown key, or a required one missing, is refused by the schema
     assert.match(r.content[0].text, /Input validation error/);
   }
   assert.equal(s.ws.sent.length, 0, "nothing sent");
+  await done(s);
+});
+
+test("row 3: through the SDK's own call path, timeout_s 10^20 and seconds 10^9 reach the page as given and get its refusal; 1.5 and 0 are refused by the schema", async () => {
+  const s = setup();
+  const spec = s.spec();
+  const server = sdk.createSdkMcpServer({ name: spec.name, version: spec.version, tools: spec.tools.map(([n, d, sh, h]) => sdk.tool(n, d, sh, h)) });
+  const call = (name, a) => server.instance.server._requestHandlers.get("tools/call")({ method: "tools/call", params: { name, arguments: a } }, { signal: new AbortController().signal, requestId: 1, sendNotification: async () => {}, sendRequest: async () => {} });
+  for (const [name, a, refusal] of [["workspace_run_file", { path: "/a.py", timeout_s: 1e20 }, "timeout_s is 1 to 600"], ["workspace_git_wait", { name: "b", seconds: 1e9 }, "git_wait's seconds are 1 to 50"]]) {
+    const n = s.ws.sent.length;
+    const p = call(name, a);
+    await until(() => s.ws.sent.length === n + 1);
+    const m = s.ws.sent.at(-1);
+    assert.equal(JSON.stringify(m.params), JSON.stringify(a), `${name}: sent as given`);
+    s.fail(m, refusal);
+    assert.equal(text(await p), "refused: " + refusal);
+  }
+  const n = s.ws.sent.length;
+  for (const t of [1.5, 0]) assert.equal((await call("workspace_run_file", { path: "/a.py", timeout_s: t })).isError, true, String(t));
+  assert.equal(s.ws.sent.length, n, "nothing sent for 1.5 or 0");
   await done(s);
 });
 

@@ -162,8 +162,13 @@ test("stdio: attached(n) with no detached(n) before it still ends the old bindin
     a.send({ relay: { page: "detached", epoch: 0 } });
     await a.until(() => a.err.includes(TEXT.stale), "the stale line logged");
     a.send({ relay: { page: "something-new", epoch: 9 } }); // (an unknown relay line: ignored)
-    a.send({ jsonrpc: "2.0", method: "page.features", params: { features: [] } });
+    a.send({ relay: { future: { anything: true } } });
+    // (a round trip after them: the agent read both and answers the next control line)
+    a.send({ relay: { page: "detached", epoch: 2 } });
+    a.send({ relay: { page: "attached", epoch: 2 } });
+    await a.until(() => ready(a, 3), "agent.ready after the unknown relay lines");
     assert.equal(a.exit, null);
+    assert.equal(a.err.includes(TEXT.badStart), false);
   } finally { a.stopAnswering?.(); a.kill(); }
 });
 
@@ -248,6 +253,11 @@ test("stdio: a page that stops reading: the turn is stopped at the 2F bound and 
     const ev = a.events((p) => p.conversation === "c1");
     const err = ev.find((e) => e.type === "turn_error");
     assert.equal(err?.message, TEXT.notReading);
+    // (after the notice, the turn's only event is its end; nothing of the stopped turn follows it)
+    const at = ev.indexOf(err);
+    assert.deepEqual(ev.slice(at + 1).map((e) => [e.type, e.outcome]), [["turn_finished", "error"]]);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(a.events((p) => p.conversation === "c1").length, ev.length, "nothing more for that turn");
     assert.ok(ev.filter((e) => e.type === "text_delta").length < 200, "the flood was cut short");
     a.say("c2", "hello");
     await a.until(() => finished(a, "c2"), "a turn afterwards");

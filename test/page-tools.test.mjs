@@ -287,6 +287,24 @@ test("row 4: rebound before the stop: no run_stop on the old binding or the new 
   await done(s);
 });
 
+test("row 4: rebound with the run's turn running: the rebind cancels the turn before it rejects the call, so the stop comes while the new binding is current; no run_stop on the old binding or the new one", async () => {
+  const c = clock(), s = setup();
+  try {
+    // (the conversation's running turn, as runTurn sets it: the rebind cancels it, which aborts the turn's signal)
+    s.server.conversations.get("c1").running = { binding: s.binding, cancel: () => s.ac.abort() };
+    const p = s.tools.workspace_run_notebook({ path: "/n.ipynb" });
+    await tick();
+    const ws2 = { readyState: 1, sent: [], send(x) { this.sent.push(JSON.parse(x)); return "ok"; } };
+    s.server.rebind({ ws: ws2, grant: { folders: ["/"], write: true }, gen: 99 }, "the grant changed");
+    assert.equal(text(await p), "refused: the turn was stopped");
+    await c.at(200_000);
+    assert.equal(s.msg("workspace.run_stop").length, 0, "none on the old binding");
+    assert.equal(ws2.sent.filter((m) => m.method === "workspace.run_stop").length, 0, "none on the new one");
+    s.server.conversations.get("c1").running = null;
+  } finally { c.off(); }
+  await done(s);
+});
+
 test("row 4: run_stop takes a request place like any call: sent when one is free, never queued when all are taken", async () => {
   const c = clock(), s = setup({ requestsTaken: 31 });
   try {
@@ -348,6 +366,25 @@ test("row 5: a JPEG, a 4-byte prefix of the signature, and invalid base64: each 
   assert.deepEqual(r.content.slice(1).map((c) => c.type === "text" ? c.text : c.type), [PAGE_TEXT.notPng(1), PAGE_TEXT.notPng(2), PAGE_TEXT.notPng(3), "image"]);
   assert.equal(PAGE_TEXT.notPng(2), "Page 2: the page sent an image that isn't a PNG, so it was left out.");
   assert.equal(isPng(PNG_B64), true);
+});
+
+test("row 5: base64url ('-' or '_') in an otherwise valid PNG: left out with its line", async () => {
+  const long = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(24, 0xff)]).toString("base64");
+  for (const ch of ["-", "_"]) {
+    const bad = long.slice(0, 16) + ch + long.slice(17);
+    const r = await latex({ pages: [{ n: 1, w: 1, h: 1, png: bad }] });
+    assert.deepEqual(r.content.slice(1), [{ type: "text", text: PAGE_TEXT.notPng(1) }], ch);
+  }
+});
+
+test("row 5: the 256 KiB edge: an answer of exactly 262,144 bytes as JSON is used; 262,145 is refused whole", async () => {
+  const sized = (bytes) => { const base = { report: "", pages: [{ n: 1, w: 1, h: 1, png: PNG_B64 }] }; base.report = "x".repeat(bytes - Buffer.byteLength(JSON.stringify(base))); assert.equal(Buffer.byteLength(JSON.stringify(base)), bytes); return base; };
+  const at = await latex(sized(262_144));
+  assert.equal(at.isError, undefined);
+  assert.equal(at.content.filter((c) => c.type === "image").length, 1);
+  const over = await latex(sized(262_145));
+  assert.equal(over.isError, true);
+  assert.deepEqual(over.content, [{ type: "text", text: PAGE_TEXT.tooLarge }]);
 });
 
 test("row 5: an answer over 256 KiB, or with 5 pages, is refused whole with its exact line, nothing converted", async () => {

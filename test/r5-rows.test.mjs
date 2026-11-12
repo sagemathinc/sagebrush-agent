@@ -120,3 +120,23 @@ test("one place freed starts one waiting turn, not every waiting one: the place 
     assert.ok(h.server.counters().retiring <= 8);
   } finally { for (const r of settle.values()) r(); await h.server.close(); }
 });
+
+test("a kept read's index keys count against the reads budget: a long conversation id or path uses it up like anything else", async () => {
+  const server = new AgentServer({ query: () => (async function* () {})(), log: () => {}, stdio: true });
+  server.createServer = fakeCreateServer;
+  const hashes = new Map([["a", "h"]]);
+  const short = AgentServer.readBytes("r", hashes, JSON.stringify(["c", "/p", 1]), "/p");
+  const longPath = "/" + "p".repeat(100000);
+  const longConv = "c".repeat(100000);
+  const long = AgentServer.readBytes("r", hashes, JSON.stringify([longConv, longPath, 1]), longPath);
+  // (the conversation once, the path twice: in the index key and as the conversation's own key, at 2 bytes a unit)
+  assert.ok(long - short >= 2 * (100000 + 2 * 100000) - 64, `the keys count: ${long - short}`);
+  // (through keepRead: the counted total includes them, and one whose keys alone pass the budget isn't kept)
+  const c = server.conversation(longConv);
+  assert.equal(server.keepRead(c, longConv, longPath, 1, { ref: "r", hashes }), true);
+  assert.equal(server.counters().readsBytes, long);
+  const huge = "/" + "q".repeat(3 * 1024 * 1024);
+  assert.equal(server.keepRead(c, longConv, huge, 1, { ref: "r", hashes }), false, "keys over 8 MiB as counted: not kept");
+  assert.equal(server.counters().readsBytes, long);
+  await server.close();
+});

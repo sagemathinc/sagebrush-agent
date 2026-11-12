@@ -11,6 +11,9 @@
     "lib/server.mjs",
     "lib/turns.mjs",
     "lib/notebook.mjs",
+    "lib/canon.mjs",
+    "lib/stdio.mjs",
+    "lib/fake.mjs",
     "README.md",
     "npm-shrinkwrap.json"
   ],

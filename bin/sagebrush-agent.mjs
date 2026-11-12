@@ -6,8 +6,16 @@
 //   npx sagebrush-agent [--port N] [--origin https://...]
 //
 // Then open the link it prints (or enter the code and port in the page).
+//
+//   sagebrush-agent --stdio
+//
+// is how `sagebrush remote --serve-agents --agent-cmd ...` runs it: the page is
+// reached through the runner, one JSON message per line on stdin and stdout
+// (stdout carries nothing else). SIGINT stops the running turns; SIGTERM, or
+// the end of stdin, stops the agent.
 
-import { AgentServer, DEFAULT_ORIGINS } from "../lib/server.mjs";
+import { AgentServer, DEFAULT_ORIGINS, TEXT } from "../lib/server.mjs";
+import { stdinChunks } from "../lib/stdio.mjs";
 
 // An exact http(s) origin, like https://example.org or http://127.0.0.1:8000: no path, no wildcard.
 function exactOrigin(s) {
@@ -22,17 +30,24 @@ function exactOrigin(s) {
 
 const args = process.argv.slice(2);
 let port = 0;
+let stdio = false;
+let loopbackFlags = false;
 const origins = [...DEFAULT_ORIGINS];
 for (let i = 0; i < args.length; i++) {
-  if (args[i] === "--port") port = Number(args[++i]);
-  else if (args[i] === "--origin") origins.push(exactOrigin(String(args[++i])));
+  if (args[i] === "--port") { port = Number(args[++i]); loopbackFlags = true; }
+  else if (args[i] === "--origin") { origins.push(exactOrigin(String(args[++i]))); loopbackFlags = true; }
+  else if (args[i] === "--stdio") stdio = true;
   else if (args[i] === "--help" || args[i] === "-h") {
-    console.log("usage: sagebrush-agent [--port N] [--origin https://...]");
+    console.log("usage: sagebrush-agent [--port N] [--origin https://...]\n       sagebrush-agent --stdio   (run by sagebrush remote --serve-agents)");
     process.exit(0);
   } else {
     console.error(`unknown argument: ${args[i]}`);
     process.exit(2);
   }
+}
+if (stdio && loopbackFlags) {
+  console.error("--stdio can't be used with --port or --origin: the runner is the only peer");
+  process.exit(2);
 }
 
 let query, createServer, deleteSession;
@@ -51,6 +66,31 @@ if (process.env.SAGEBRUSH_AGENT_FAKE === "1") {
   createServer = (spec) => sdk.createSdkMcpServer({ name: spec.name, version: spec.version, tools: spec.tools.map(([name, description, shape, handler]) => sdk.tool(name, description, shape, handler)) });
 }
 
+if (stdio) {
+  const server = new AgentServer({ query, deleteSession, stdio: true });
+  server.createServer = createServer;
+  let stopping = false;
+  const stop = async (code = 0) => {
+    if (stopping) return;
+    stopping = true;
+    let problems;
+    try { problems = await server.close(); } catch (e) { problems = [String(e?.message ?? e)]; }
+    for (const p of problems) console.error(p);
+    process.exit(problems.length ? 1 : code);
+  };
+  const fatal = (text) => { console.error(text); stop(1); };
+  // (a runner that went away: nothing more can be written)
+  process.stdout.on("error", () => stop(0));
+  process.on("SIGINT", () => server.stopTurns());
+  process.once("SIGTERM", () => stop(0));
+  await server.serveStdio({ input: stdinChunks(), output: process.stdout, fatal });
+  if (!server.stdioStarted) fatal(TEXT.badStart);
+  else stop(0);
+} else {
+await listenLoopback();
+}
+
+async function listenLoopback() {
 const server = new AgentServer({ port, origins, query, deleteSession });
 server.createServer = createServer;
 const p = await server.listen();
@@ -81,3 +121,4 @@ const stop = async () => {
 };
 process.once("SIGINT", stop);
 process.once("SIGTERM", stop);
+}

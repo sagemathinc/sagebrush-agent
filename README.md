@@ -27,4 +27,13 @@ Options: `--port N` (default: a free port) and `--origin ORIGIN` (another allowe
 
 Press Ctrl+C to stop.
 
+## With `sagebrush remote`
+
+`sagebrush remote --serve-agents --agent-cmd "npx -y <the tarball's URL> --stdio"` runs it as the runner's child. The page reaches it through the runner, one message per line on stdin and stdout, so it listens on no port and prints no link.
+- The runner's Stop stops the running turns. Stopping the runner stops the agent: it waits up to 1 second for turns to stop, then deletes this run's transcripts, as above.
+- No message is over the runner's limit, about 4 MB. A bigger file write fails as an ordinary error that Claude sees.
+- An Allow counts only when the page's answer carries the hash of exactly the action that was asked about.
+
+In both modes, at most 4 chats run at once and 16 messages wait; one more is refused, and the page says so. `SAGEBRUSH_AGENT_FAKE=1`, set where you start it, runs a scripted fake model instead of Claude, for tests.
+
 Release: the tarball is published at an immutable, versioned URL with its SHA-256; a change means a new version and a new review.

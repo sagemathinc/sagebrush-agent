@@ -68,3 +68,31 @@ test("permissionDigest: each field of the identity changes it; a refused input h
   assert.notEqual(permissionDigest({ ...base, input: { url: "https://y.example" } }), d);
   assert.equal(permissionDigest({ ...base, input: 1.5 }), null);
 });
+
+test("jsonBytes: equals JSON.stringify's UTF-8 length, refuses one byte under it, and never copies a huge string", async () => {
+  const { jsonBytes } = await import("../lib/canon.mjs");
+  let rnd = 999;
+  const r = (n) => (rnd = (rnd * 1103515245 + 12345) % 2147483648) % n;
+  const chars = ["a", '"', "\\", "\n", "\u0001", "é", "€", "😀", "\ud800", "\udc00"];
+  const str = () => Array.from({ length: r(8) }, () => chars[r(chars.length)]).join("");
+  const gen = (d) => {
+    const k = r(d > 3 ? 5 : 8);
+    if (k === 0) return null;
+    if (k === 1) return r(2) === 0;
+    if (k === 2) return [1.5, -0, NaN, Infinity, 3e21, 7][r(6)];
+    if (k === 3) return str();
+    if (k === 4) return undefined;
+    if (k === 5) return Array.from({ length: r(4) }, () => gen(d + 1));
+    const o = {};
+    for (let i = r(4); i > 0; i--) o[str()] = gen(d + 1);
+    return o;
+  };
+  for (let i = 0; i < 5000; i++) {
+    const v = { jsonrpc: "2.0", params: gen(0) };
+    const want = Buffer.byteLength(JSON.stringify(v));
+    assert.equal(jsonBytes(v, 1 << 20), want);
+    assert.equal(jsonBytes(v, want), want, "exactly at the limit");
+    assert.equal(jsonBytes(v, want - 1), -1, "one byte under it");
+  }
+  assert.equal(jsonBytes({ text: '"'.repeat(7 << 20) }, 4 << 20), -1);
+});

@@ -145,7 +145,7 @@ test("a change update for another turn doesn't touch the card", async () => {
 });
 
 test("an Allow and the turn's end in the same tick: the Allow lands first but the request is cancelled, not accepted", async () => {
-  for (const end of ["completed", "resolved", "exited"]) {
+  for (const end of ["completed", "gone", "exited"]) {
     const t = setup();
     try {
       const answer = t.backend.request(t.app, "item/commandExecution/requestApproval", command(), 11);
@@ -154,7 +154,7 @@ test("an Allow and the turn's end in the same tick: the Allow lands first but th
       q.done(true); // (the Allow settles the card first ...)
       // (... and before the request's answer is decided, the turn ends, in the same tick)
       if (end === "completed") t.backend.notification(t.app, "turn/completed", { threadId: "th", turn: { id: "turn1", status: "completed" } });
-      if (end === "resolved") { t.active.turn.finished = true; t.backend.turns.delete("th"); }
+      if (end === "gone") { t.active.turn.finished = true; t.backend.turns.delete("th"); }
       if (end === "exited") t.backend.notification(t.app, "sagebrush/exited", { message: "exit 3" });
       assert.deepEqual(await answer, { decision: "cancel" }, end);
     } finally { await t.done(); }

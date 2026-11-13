@@ -7,6 +7,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { mkdtempSync, existsSync, readFileSync, rmSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import WebSocket from "ws";
 import { TEXT, AgentServer, parseGrant } from "../lib/server.mjs";
 import { fakeCreateServer, fakeQuery } from "../lib/fake.mjs";
@@ -16,8 +19,11 @@ const BIN = fileURLToPath(new URL("../bin/sagebrush-agent.mjs", import.meta.url)
 const F = 64 * 1024;
 
 function agent() {
-  const p = spawn(process.execPath, [BIN, "--stdio"], { env: { ...process.env, SAGEBRUSH_AGENT_FAKE: "1" }, stdio: ["pipe", "pipe", "pipe"] });
-  const a = { p, lines: [], err: "", waiters: [] };
+  // (the runner's working folder: where it started the agent; native mode works there)
+  const runnerCwd = realpathSync(mkdtempSync(join(tmpdir(), "runner-cwd-")));
+  const p = spawn(process.execPath, [BIN, "--stdio"], { cwd: runnerCwd, env: { ...process.env, SAGEBRUSH_AGENT_FAKE: "1" }, stdio: ["pipe", "pipe", "pipe"] });
+  const a = { p, runnerCwd, lines: [], err: "", waiters: [] };
+  a.exited = new Promise((r) => p.on("exit", (code) => r(code)));
   let buf = "";
   p.stdout.on("data", (d) => {
     buf += d.toString("utf8");
@@ -38,7 +44,7 @@ function agent() {
   a.text = (conversation) => a.events(conversation).filter((e) => e.type === "text_delta").map((e) => e.text).join("");
   a.finished = (conversation, n = 1) => a.events(conversation).filter((e) => e.type === "turn_finished").length >= n;
   a.mode = () => a.lines.filter((m) => m.method === "agent.mode").map((m) => m.params.native);
-  a.kill = () => { try { p.kill("SIGKILL"); } catch {} };
+  a.kill = () => { try { p.kill("SIGKILL"); } catch {} rmSync(runnerCwd, { recursive: true, force: true }); };
   a.send({ relay: { start: { frame: F, protocol: 1, epoch: 0 } } });
   return a;
 }
@@ -47,7 +53,14 @@ const digest = (c) => permissionDigest({ child: c.child, conversation: c.convers
 const options = async (a, conversation) => {
   a.say(conversation, "options?");
   await a.until(() => a.finished(conversation), "the options turn");
-  return JSON.parse(/OPTIONS (\{.*\})/.exec(a.text(conversation))[1]);
+  return strip(JSON.parse(/OPTIONS (\{.*\})/.exec(a.text(conversation))[1]));
+};
+// (the options without where and whether it resumed, which rows check on their own)
+const strip = ({ cwd, resumed, ...o }) => o;
+const optionsFull = async (a, conversation, n) => {
+  a.say(conversation, "options?");
+  await a.until(() => a.finished(conversation, n), "the options turn");
+  return [...a.text(conversation).matchAll(/OPTIONS (\{.*?\})(?=OPTIONS|$)/g)].map((m) => JSON.parse(m[1])).at(-1);
 };
 const NATIVE = { tools: { type: "preset", preset: "claude_code" }, settingSources: ["user", "project", "local"], permissionMode: "default", strictMcpConfig: null, systemPrompt: "claude_code", settings: null };
 const TOOLS_ONLY = { tools: ["WebSearch", "WebFetch"], settingSources: [], permissionMode: "default", strictMcpConfig: true, systemPrompt: "sagebrush", settings: "set" };
@@ -99,7 +112,7 @@ test("the mode is decided per turn: native, then off, in the same conversation",
     a.grant({ native: false });
     a.say("c1", "options?");
     await a.until(() => a.finished("c1", 2), "the second turn");
-    const second = [...a.text("c1").matchAll(/OPTIONS (\{.*?\})(?=OPTIONS|$)/g)].map((m) => JSON.parse(m[1]));
+    const second = [...a.text("c1").matchAll(/OPTIONS (\{.*?\})(?=OPTIONS|$)/g)].map((m) => strip(JSON.parse(m[1])));
     assert.deepEqual(second.at(-1), TOOLS_ONLY);
     assert.deepEqual(a.mode(), [true, false]);
   } finally { a.kill(); }
@@ -234,9 +247,67 @@ test("over the loopback address, native true is not taken: tools-only, logged, a
     assert.deepEqual(msgs.filter((m) => m.method === "agent.mode").map((m) => m.params.native), [false]);
     send({ jsonrpc: "2.0", method: "chat.message", params: { conversation: "c1", id: "m1", text: "options?", author: "person" } });
     await until(() => done("c1"), "the options turn");
-    assert.deepEqual(JSON.parse(/OPTIONS (\{.*\})/.exec(text("c1"))[1]), TOOLS_ONLY);
+    assert.deepEqual(strip(JSON.parse(/OPTIONS (\{.*\})/.exec(text("c1"))[1])), TOOLS_ONLY);
     send({ jsonrpc: "2.0", method: "chat.message", params: { conversation: "c2", id: "m2", text: "tool Bash ls", author: "person" } });
     await until(() => done("c2"), "the Bash turn");
     assert.ok(text("c2").includes("VERDICT Bash deny: Bash isn't available here."), text("c2"));
   } finally { ws.close(); await server.close(); }
+});
+
+test("native works in the runner's own folder; tools-only in the agent's own empty one", async () => {
+  const a = agent();
+  try {
+    a.grant({ native: true });
+    const n = await optionsFull(a, "c1", 1);
+    assert.equal(n.cwd, a.runnerCwd);
+    a.grant({ native: false });
+    const t = await optionsFull(a, "c2", 1);
+    assert.notEqual(t.cwd, a.runnerCwd);
+    assert.match(t.cwd, /sagebrush-agent-/);
+  } finally { a.kill(); rmSync(a.runnerCwd, { recursive: true, force: true }); }
+});
+
+test("a native file by a relative name stays in the runner's folder after the agent stops; the runner's folder stays too", async () => {
+  const a = agent();
+  try {
+    a.grant({ native: true });
+    a.say("c1", "touch made-natively.txt");
+    await a.until(() => a.finished("c1"), "the touch turn");
+    const file = join(a.runnerCwd, "made-natively.txt");
+    assert.equal(readFileSync(file, "utf8"), "made by the fake model\n");
+    a.p.stdin.end(); // (the runner closes the pipe: the agent stops, deleting what is its own)
+    assert.equal(await a.exited, 0);
+    assert.ok(existsSync(a.runnerCwd), "the runner's folder is still there");
+    assert.equal(readFileSync(file, "utf8"), "made by the fake model\n");
+  } finally { a.kill(); rmSync(a.runnerCwd, { recursive: true, force: true }); }
+});
+
+test("tools-only: a file in the agent's own folder goes with it when the agent stops", async () => {
+  const a = agent();
+  try {
+    a.grant({ native: false });
+    a.say("c1", "options?");
+    await a.until(() => a.finished("c1"), "the options turn");
+    const own = JSON.parse(/OPTIONS (\{.*\})/.exec(a.text("c1"))[1]).cwd;
+    a.say("c2", "touch scratch.txt");
+    await a.until(() => a.finished("c2"), "the touch turn");
+    assert.ok(existsSync(join(own, "scratch.txt")));
+    a.p.stdin.end();
+    assert.equal(await a.exited, 0);
+    assert.ok(!existsSync(own), "the agent's own folder is removed");
+    assert.ok(!existsSync(join(a.runnerCwd, "scratch.txt")));
+  } finally { a.kill(); rmSync(a.runnerCwd, { recursive: true, force: true }); }
+});
+
+test("a conversation goes on in its own folder only: after the mode changes, a new session starts", async () => {
+  const a = agent();
+  try {
+    a.grant({ native: true });
+    assert.equal((await optionsFull(a, "c1", 1)).resumed, false);
+    assert.equal((await optionsFull(a, "c1", 2)).resumed, true, "native again: resumed");
+    a.grant({ native: false });
+    const t = await optionsFull(a, "c1", 3);
+    assert.equal(t.resumed, false, "tools-only after native: a new session, not the other folder's");
+    assert.equal((await optionsFull(a, "c1", 4)).resumed, true, "tools-only again: resumed");
+  } finally { a.kill(); rmSync(a.runnerCwd, { recursive: true, force: true }); }
 });

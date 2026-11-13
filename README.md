@@ -40,10 +40,10 @@ Press Ctrl+C to stop.
 
 **Shell and files on that computer.** When the page's grant says so (the person's switch "Allow shell and files on <computer>", on by default for their own computer), Claude runs there as it does when they type `claude`:
 - its own tools (Bash, Read, Edit, Write, …) and system prompt, plus the Sagebrush workspace tools;
-- the person's own settings there (`~/.claude`, the project's `.claude` and `CLAUDE.md`): their allow, ask and deny rules and their MCP servers;
+- in the runner's working folder (where `sagebrush remote` was started), with the person's own settings: `~/.claude` and that folder's `.claude` and `CLAUDE.md` (their allow, ask and deny rules, their MCP servers). Files Claude writes there stay; only the empty folder of the tools-only mode is removed when the agent stops;
 - the default permission mode, as an interactive `claude` starts: anything Claude Code would ask about comes to the page as a card, with the exact command, path or edit, and an Allow counts only for that action. No mode from the settings that skips asking is taken up, and nothing is written to the settings.
 - With the switch off, it's the Sagebrush-tools-only mode above. Over the loopback address, it's always that mode, whatever the page asks.
-- The mode is decided once per reply: changing the switch takes effect from the next one.
+- The mode is decided once per reply. Turning the switch changes the grant, so, as with any grant change, a running reply stops and waiting messages are dropped; the next reply runs in the new mode.
 
 In both modes, at most 4 chats run at once (a fifth waits its turn) and at most 16 messages wait; a seventeenth is refused, and the page says so. `SAGEBRUSH_AGENT_FAKE=1`, set where you start it, runs a scripted fake model instead of Claude, for tests.
 

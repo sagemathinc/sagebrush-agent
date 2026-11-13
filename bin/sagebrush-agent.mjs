@@ -16,9 +16,9 @@
 //
 //   sagebrush-agent --codex --stdio
 //
-// runs the person's own Codex there instead (`codex app-server`, with that
-// computer's Codex login and settings): only over the runner, and only for a
-// connection with shell and files on.
+// runs Codex there instead: one pinned release, fetched and checked (never the
+// `codex` on PATH), as `codex app-server` with that computer's Codex login and
+// settings: only over the runner, and only for a connection with shell and files on.
 
 import { AgentServer, DEFAULT_ORIGINS, TEXT } from "../lib/server.mjs";
 import { stdinChunks } from "../lib/stdio.mjs";

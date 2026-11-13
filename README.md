@@ -38,10 +38,11 @@ Press Ctrl+C to stop.
 - No message is over the runner's limit, about 4 MB. A bigger file write fails as an ordinary error that Claude sees.
 - An Allow counts only when the page's answer carries the hash of exactly the action that was asked about.
 
-**Shell and files on that computer.** When the page's grant says so (the person's switch "Allow shell and files on <computer>", on by default for their own computer), Claude runs there as it does when they type `claude`:
+**Shell and files on that computer.** When the page's grant says so (the person's switch "Allow shell and files on <computer>", on by default for their own computer), Claude runs there much as it does when they type `claude`:
 - its own tools (Bash, Read, Edit, Write, …) and system prompt, plus the Sagebrush workspace tools;
 - in the runner's working folder (where `sagebrush remote` was started), with the person's own settings: `~/.claude` and that folder's `.claude` and `CLAUDE.md` (their allow, ask and deny rules, their MCP servers). Files Claude writes there stay; only the empty folder of the tools-only mode is removed when the agent stops;
-- the default permission mode, as an interactive `claude` starts: anything Claude Code would ask about comes to the page as a card, with the exact command, path or edit, and an Allow counts only for that action. No mode from the settings that skips asking is taken up, and nothing is written to the settings.
+- the permission mode their settings choose there (default, acceptEdits, plan, dontAsk or auto); with none set, the default mode, as an interactive `claude` starts. A bypassPermissions setting isn't taken up: it runs in the default mode, and the agent's log says so. Anything Claude Code asks about comes to the page as a card, with the exact command, path or edit, and an Allow counts only for that action. Nothing is written to the settings.
+- Moving or removing a file in the Sagebrush workspace is always asked, even when the person's own rules would allow it.
 - With the switch off, it's the Sagebrush-tools-only mode above. Over the loopback address, it's always that mode, whatever the page asks.
 - The mode is decided once per reply. Turning the switch changes the grant, so, as with any grant change, a running reply stops and waiting messages are dropped; the next reply runs in the new mode.
 

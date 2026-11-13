@@ -1,0 +1,56 @@
+{
+  "comment": "What sagebrush-agent uses of `codex app-server`, checked against that Codex's own generated schema before anything runs (lib/codex-selftest.mjs). Keep in step with lib/codex.mjs and lib/codex-turns.mjs: every field read or sent there is listed here.",
+  "clientRequests": {
+    "initialize": ["clientInfo", "capabilities"],
+    "account/read": [],
+    "config/read": ["includeLayers", "cwd"],
+    "thread/start": ["cwd", "ephemeral", "developerInstructions", "dynamicTools", "approvalPolicy"],
+    "turn/start": ["threadId", "input"],
+    "turn/interrupt": ["threadId", "turnId"]
+  },
+  "responses": {
+    "InitializeResponse": ["userAgent", "platformFamily"],
+    "GetAccountResponse": ["account", "requiresOpenaiAuth"],
+    "ConfigReadResponse": ["config"],
+    "ThreadStartResponse": ["thread.id", "thread.ephemeral", "approvalPolicy"],
+    "TurnStartResponse": ["turn.id"]
+  },
+  "notifications": {
+    "item/started": ["threadId", "turnId", "item"],
+    "item/completed": ["threadId", "turnId", "item"],
+    "item/agentMessage/delta": ["threadId", "turnId", "itemId", "delta"],
+    "item/reasoning/summaryTextDelta": ["threadId", "turnId", "delta"],
+    "item/fileChange/patchUpdated": ["threadId", "turnId", "itemId", "changes"],
+    "thread/tokenUsage/updated": ["threadId", "turnId", "tokenUsage.last.inputTokens", "tokenUsage.last.outputTokens"],
+    "error": ["threadId", "turnId", "error", "willRetry"],
+    "turn/completed": ["threadId", "turn.id", "turn.status", "turn.error"],
+    "serverRequest/resolved": ["threadId", "requestId"]
+  },
+  "serverRequests": {
+    "item/tool/call": ["threadId", "turnId", "tool", "arguments"],
+    "item/commandExecution/requestApproval": ["threadId", "turnId", "availableDecisions", "command", "cwd", "reason"],
+    "item/fileChange/requestApproval": ["threadId", "turnId", "itemId", "reason", "grantRoot"],
+    "item/permissions/requestApproval": ["threadId", "turnId", "permissions.network", "permissions.fileSystem", "cwd", "reason"],
+    "item/tool/requestUserInput": ["threadId", "turnId"]
+  },
+  "answers": {
+    "DynamicToolCallResponse": ["contentItems", "success"],
+    "CommandExecutionRequestApprovalResponse": ["decision"],
+    "FileChangeRequestApprovalResponse": ["decision"],
+    "PermissionsRequestApprovalResponse": ["permissions", "scope"]
+  },
+  "items": {
+    "agentMessage": ["id", "text"],
+    "dynamicToolCall": ["id", "tool", "arguments", "success", "contentItems", "durationMs"],
+    "commandExecution": ["id", "command", "status", "exitCode", "aggregatedOutput", "durationMs"],
+    "fileChange": ["id", "changes", "status"],
+    "webSearch": ["id", "query"],
+    "mcpToolCall": ["id", "server", "tool", "arguments", "error", "status"]
+  },
+  "values": [
+    { "type": "CommandExecutionApprovalDecision", "values": ["accept", "decline", "cancel"] },
+    { "type": "FileChangeApprovalDecision", "values": ["accept", "decline", "cancel"] },
+    { "type": "TurnStatus", "values": ["completed", "interrupted"] },
+    { "type": "AskForApproval", "values": ["on-request", "never"] }
+  ]
+}

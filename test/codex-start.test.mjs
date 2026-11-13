@@ -79,6 +79,8 @@ function harness({ children, spawnErr } = {}) {
   const spawned = [];
   server.backend = new CodexBackend(server, {
     command: ["codex", "app-server"],
+    // (these rows are about the app-server's lifetime; the self-test has its own: test/codex-selftest.test.mjs)
+    selfTest: async () => [],
     spawnFn: () => {
       // (a command that isn't there: the error, and nothing answered)
       if (spawnErr) { const c = scriptedChild({ answer: () => undefined }); setImmediate(() => c.emit("error", spawnErr)); spawned.push(c); return c; }

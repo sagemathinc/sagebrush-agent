@@ -85,7 +85,8 @@ if (stdio) {
   if (codex) {
     const { CodexBackend } = await import("../lib/codex.mjs");
     // (the fake app-server, for tests: chosen only by SAGEBRUSH_AGENT_FAKE=1, like the fake model)
-    const command = process.env.SAGEBRUSH_AGENT_FAKE === "1" ? [process.execPath, new URL("../lib/fake-codex.mjs", import.meta.url).pathname] : ["codex", "app-server"];
+    // (the real one: the pinned Codex, fetched and checked by the backend, never `codex` from PATH)
+    const command = process.env.SAGEBRUSH_AGENT_FAKE === "1" ? [process.execPath, new URL("../lib/fake-codex.mjs", import.meta.url).pathname] : null;
     server.backend = new CodexBackend(server, { command });
   }
   let stopping = false;

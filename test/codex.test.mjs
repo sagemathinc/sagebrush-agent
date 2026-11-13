@@ -11,16 +11,19 @@ import { mkdtempSync, existsSync, readFileSync, rmSync, realpathSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { permissionDigest } from "../lib/canon.mjs";
-import { CODEX_TEXT, CODEX_VERSIONS, codexVersion } from "../lib/codex.mjs";
+import { CODEX_TEXT, CODEX_VERSION, codexVersion } from "../lib/codex.mjs";
+import { PIN } from "../lib/codex-fetch.mjs";
 import { HINTS } from "../lib/codex-turns.mjs";
 
 const BIN = fileURLToPath(new URL("../bin/sagebrush-agent.mjs", import.meta.url));
+// (the schema the fake Codex gives the self-test: real Codex 0.163.0 output, test/fixtures)
+const SCHEMA = fileURLToPath(new URL("./fixtures/codex-schema-0.163.0.json", import.meta.url));
 const F = 64 * 1024;
 
 function agent(fakeEnv = {}) {
   const runnerCwd = realpathSync(mkdtempSync(join(tmpdir(), "runner-cwd-")));
   const record = join(runnerCwd, ".record.jsonl");
-  const env = { ...process.env, SAGEBRUSH_AGENT_FAKE: "1", FAKE_CODEX_RECORD: record, ...fakeEnv };
+  const env = { ...process.env, SAGEBRUSH_AGENT_FAKE: "1", FAKE_CODEX_RECORD: record, FAKE_CODEX_SCHEMA: SCHEMA, ...fakeEnv };
   const p = spawn(process.execPath, [BIN, "--codex", "--stdio"], { cwd: runnerCwd, env, stdio: ["pipe", "pipe", "pipe"] });
   const a = { p, runnerCwd, lines: [], err: "", waiters: [] };
   a.exited = new Promise((r) => p.on("exit", (code) => r(code)));
@@ -46,7 +49,12 @@ function agent(fakeEnv = {}) {
   a.finished = (conversation, n = 1) => a.events(conversation).filter((e) => e.type === "turn_finished").length >= n;
   a.cards = (conversation, state = "open") => a.events(conversation).filter((e) => e.type === "attention" && e.state === state);
   // (what the fake app-server got: its requests, and our answers to its requests)
-  a.rec = () => (existsSync(record) ? readFileSync(record, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
+  // (complete lines only: the fake may be appending one, and a read can land mid-line)
+  a.rec = () => {
+    if (!existsSync(record)) return [];
+    const t = readFileSync(record, "utf8");
+    return t.slice(0, t.lastIndexOf("\n") + 1).split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  };
   a.calls = (method) => a.rec().filter((m) => m.method === method);
   // (the page's side of a workspace verb: answered with `result`)
   a.answer = (method, result) => {
@@ -63,11 +71,12 @@ const digest = (c) => permissionDigest({ child: c.child, conversation: c.convers
 const finishedEvent = (a, c) => a.events(c).find((e) => e.type === "turn_finished");
 const errorEvent = (a, c) => a.events(c).find((e) => e.type === "turn_error");
 
-test("codexVersion reads the userAgent's version; the reviewed list is exact", () => {
+test("codexVersion reads the userAgent's version; the version run is the pinned one", () => {
   assert.equal(codexVersion("sagebrush-agent/0.159.2 (Ubuntu 26.4.0; x86_64) xterm (sagebrush-agent; 0.7.0)"), "0.159.2");
   assert.equal(codexVersion("codex_cli_rs/0.166.0"), "0.166.0");
   for (const s of ["", "no-version", "x/ (y)", null, undefined]) assert.equal(codexVersion(s), null, JSON.stringify(s));
-  assert.deepEqual(CODEX_VERSIONS, ["0.159.2"]);
+  assert.equal(CODEX_VERSION, PIN.version);
+  assert.equal(CODEX_VERSION, "0.159.2");
 });
 
 test("--codex without --stdio is refused at the start (exit 2), naming the runner", () => {
@@ -353,7 +362,7 @@ test("Codex exiting mid-turn fails the turn with why; the next message starts a 
   } finally { a.kill(); }
 });
 
-test("start-up refusals: another version, Windows, not logged in; each starts over at the next message", async () => {
+test("start-up refusals: not the pinned version, Windows, not logged in; each starts over at the next message", async () => {
   for (const [env, code, message] of [
     [{ FAKE_CODEX_VERSION: "0.160.0" }, "codex_version", CODEX_TEXT.version("0.160.0")],
     [{ FAKE_CODEX_PLATFORM: "windows" }, "codex_platform", CODEX_TEXT.windows],

@@ -20,7 +20,7 @@ import { permissionDigest } from "../lib/canon.mjs";
 const BIN = fileURLToPath(new URL("../bin/sagebrush-agent.mjs", import.meta.url));
 const F = 64 * 1024;
 
-function agent({ userMode, projectMode, configMode } = {}) {
+function agent({ userMode, projectMode, localMode, configMode } = {}) {
   // (the runner's working folder: where it started the agent; native mode works there. And a home of its own, so the
   //  person's settings are the row's, never this machine's)
   const runnerCwd = realpathSync(mkdtempSync(join(tmpdir(), "runner-cwd-")));
@@ -28,6 +28,7 @@ function agent({ userMode, projectMode, configMode } = {}) {
   mkdirSync(join(home, ".claude"), { recursive: true });
   if (userMode) writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ permissions: { defaultMode: userMode } }));
   if (projectMode) { mkdirSync(join(runnerCwd, ".claude")); writeFileSync(join(runnerCwd, ".claude", "settings.json"), JSON.stringify({ permissions: { defaultMode: projectMode } })); }
+  if (localMode) { mkdirSync(join(runnerCwd, ".claude"), { recursive: true }); writeFileSync(join(runnerCwd, ".claude", "settings.local.json"), JSON.stringify({ permissions: { defaultMode: localMode } })); }
   // (a configured folder of its own, as CLAUDE_CONFIG_DIR names one)
   const config = configMode ? join(runnerCwd, ".config-claude") : null;
   if (config) { mkdirSync(config); writeFileSync(join(config, "settings.json"), JSON.stringify({ permissions: { defaultMode: configMode } })); }
@@ -336,6 +337,7 @@ test("native over the runner: the mode the SDK's resolver and the CLI's filter g
     [{ projectMode: "bypassPermissions" }, "default"], // (filtered out)
     [{ userMode: "auto" }, "auto"], // (the person's own choice)
     [{ configMode: "dontAsk" }, "dontAsk"], // (CLAUDE_CONFIG_DIR is honoured)
+    [{ localMode: "plan" }, "plan"], // (the folder's own settings.local.json is read too)
   ]) {
     const a = agent(o);
     try {
@@ -541,4 +543,21 @@ test("a native session's transcript that can't be deleted is logged under the ru
     const line = logs.find((l) => l.includes("native-9"));
     assert.ok(line.includes(scratch.replace(/[^A-Za-z0-9]/g, "-")), line);
   } finally { await server.close(); rmSync(scratch, { recursive: true, force: true }); }
+});
+
+test("tools-only: a workspace remove is asked once (the permission callback), not again in its handler", async () => {
+  const a = agent();
+  const answering = setInterval(() => {
+    for (const m of a.lines) if (typeof m.id === "string" && m.method && !m.answered) { m.answered = true; a.send({ jsonrpc: "2.0", id: m.id, result: m.method === "workspace.stat" ? { entry: null } : m.method === "workspace.list" ? { entries: [] } : { ok: true, rev: 1 } }); }
+  }, 5);
+  try {
+    a.grant({ native: false });
+    a.say("c1", "please remove the note");
+    await a.until(() => card(a, "c1"), "the card");
+    const c = card(a, "c1");
+    a.send({ jsonrpc: "2.0", method: "chat.permission", params: { request_id: c.request_id, behavior: "allow", digest: digest(c) } });
+    await a.until(() => a.finished("c1"), "the turn (a second card would leave it waiting)");
+    assert.equal(a.events("c1").filter((e) => e.type === "attention" && e.state === "open").length, 1);
+    assert.equal(a.lines.filter((m) => m.method === "workspace.remove").length, 1);
+  } finally { clearInterval(answering); a.kill(); }
 });

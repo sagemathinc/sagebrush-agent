@@ -218,3 +218,22 @@ test("a request's record lasts as long as the request: resolved after its first 
     assert.equal(t.active.requests.size, 0);
   } finally { await t.done(); }
 });
+
+test("the turn's end marks every open request of it over, card or not", async () => {
+  for (const end of ["completed", "exited"]) {
+    const t = setup({ turnId: null });
+    try {
+      // (one request waiting for turn/start's answer, so with no card; its record is there from its arrival)
+      const answer = t.backend.request(t.app, "item/commandExecution/requestApproval", command("turn1"), 21);
+      const [req] = [...t.active.requests.values()];
+      assert.equal(req.over, false);
+      t.active.codexTurnId = "turn1";
+      if (end === "completed") t.backend.notification(t.app, "turn/completed", { threadId: "th", turn: { id: "turn1", status: "completed" } });
+      if (end === "exited") t.backend.notification(t.app, "sagebrush/exited", { message: "exit 3" });
+      assert.equal(req.over, true, end);
+      t.ready("turn1");
+      assert.notEqual((await answer).decision, "accept");
+      assert.equal(t.open().length, 0);
+    } finally { await t.done(); }
+  }
+});

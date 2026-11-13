@@ -11,6 +11,8 @@ import { AgentServer } from "../lib/server.mjs";
 import { CodexBackend } from "../lib/codex.mjs";
 import { CodexTurn } from "../lib/codex-turns.mjs";
 
+// (each row has a timeout: an answer that never comes fails the row by its name, not the run by hanging)
+
 function setup({ turnId = "turn1" } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "codex-lifetime-"));
   const server = new AgentServer({ stdio: true, runnerCwd: dir, log: () => {} });
@@ -32,7 +34,7 @@ function setup({ turnId = "turn1" } = {}) {
 }
 const command = (turnId = "turn1") => ({ threadId: "th", turnId, kind: "command", itemId: "cmd1", command: "echo benign", cwd: "/tmp", availableDecisions: ["accept", "decline"] });
 
-test("Codex resolves the request: the card is withdrawn, and an Allow after that accepts nothing", async () => {
+test("Codex resolves the request: the card is withdrawn, and an Allow after that accepts nothing", { timeout: 20000 }, async () => {
   const t = setup();
   try {
     const answer = t.backend.request(t.app, "item/commandExecution/requestApproval", command(), 17);
@@ -47,7 +49,7 @@ test("Codex resolves the request: the card is withdrawn, and an Allow after that
   } finally { await t.done(); }
 });
 
-test("a resolved notice for another request id, or another thread, leaves the card open", async () => {
+test("a resolved notice for another request id, or another thread, leaves the card open", { timeout: 20000 }, async () => {
   const t = setup();
   try {
     const answer = t.backend.request(t.app, "item/commandExecution/requestApproval", command(), "r-1");
@@ -60,7 +62,7 @@ test("a resolved notice for another request id, or another thread, leaves the ca
   } finally { await t.done(); }
 });
 
-test("the turn completes while a card is open: withdrawn, and a later Allow accepts nothing", async () => {
+test("the turn completes while a card is open: withdrawn, and a later Allow accepts nothing", { timeout: 20000 }, async () => {
   const t = setup();
   try {
     const answer = t.backend.request(t.app, "item/commandExecution/requestApproval", command(), 5);
@@ -74,7 +76,7 @@ test("the turn completes while a card is open: withdrawn, and a later Allow acce
   } finally { await t.done(); }
 });
 
-test("Codex exits while a card is open: withdrawn and cancelled", async () => {
+test("Codex exits while a card is open: withdrawn and cancelled", { timeout: 20000 }, async () => {
   const t = setup();
   try {
     const answer = t.backend.request(t.app, "item/permissions/requestApproval", { threadId: "th", turnId: "turn1", cwd: "/tmp", reason: "net", permissions: { network: { enabled: true }, fileSystem: null } }, 9);
@@ -86,7 +88,7 @@ test("Codex exits while a card is open: withdrawn and cancelled", async () => {
   } finally { await t.done(); }
 });
 
-test("before turn/start's answer: a request opens no card and can't pick the turn's id; after it, only one naming that id counts", async () => {
+test("before turn/start's answer: a request opens no card and can't pick the turn's id; after it, only one naming that id counts", { timeout: 20000 }, async () => {
   const t = setup({ turnId: null });
   try {
     const old = t.backend.request(t.app, "item/commandExecution/requestApproval", command("old-turn"), 1);
@@ -106,7 +108,7 @@ test("before turn/start's answer: a request opens no card and can't pick the tur
   } finally { await t.done(); }
 });
 
-test("a file change: the card shows the changes as last updated; an update while its card is open asks again, with the new diff", async () => {
+test("a file change: the card shows the changes as last updated; an update while its card is open asks again, with the new diff", { timeout: 20000 }, async () => {
   const t = setup();
   const base = { threadId: "th", turnId: "turn1" };
   const changes = (diff) => [{ path: "/tmp/benign.txt", kind: { type: "update", move_path: null }, diff }];
@@ -130,7 +132,7 @@ test("a file change: the card shows the changes as last updated; an update while
   } finally { await t.done(); }
 });
 
-test("a change update for another turn doesn't touch the card", async () => {
+test("a change update for another turn doesn't touch the card", { timeout: 20000 }, async () => {
   const t = setup();
   const changes = (diff) => [{ path: "/tmp/b.txt", kind: { type: "add" }, diff }];
   try {
@@ -145,7 +147,7 @@ test("a change update for another turn doesn't touch the card", async () => {
   } finally { await t.done(); }
 });
 
-test("an Allow and the turn's end in the same tick: the Allow lands first but the request is cancelled, not accepted", async () => {
+test("an Allow and the turn's end in the same tick: the Allow lands first but the request is cancelled, not accepted", { timeout: 20000 }, async () => {
   for (const end of ["completed", "gone", "exited"]) {
     const t = setup();
     try {
@@ -162,7 +164,7 @@ test("an Allow and the turn's end in the same tick: the Allow lands first but th
   }
 });
 
-test("a file change updated and, in the same batch, ended (resolved, completed, exited, Stop, rebind): no card opens again, and an Allow accepts nothing", async () => {
+test("a file change updated and, in the same batch, ended (resolved, completed, exited, Stop, rebind): no card opens again, and an Allow accepts nothing", { timeout: 20000 }, async () => {
   const changes = (diff) => [{ path: "/tmp/benign.txt", kind: { type: "update", move_path: null }, diff }];
   for (const end of ["resolved", "completed", "exited", "stop", "rebind"]) {
     const t = setup();
@@ -187,7 +189,7 @@ test("a file change updated and, in the same batch, ended (resolved, completed, 
   }
 });
 
-test("Codex resolves a request while it waits for turn/start's answer: no card opens for it after the answer", async () => {
+test("Codex resolves a request while it waits for turn/start's answer: no card opens for it after the answer", { timeout: 20000 }, async () => {
   const t = setup({ turnId: null });
   try {
     const answer = t.backend.request(t.app, "item/commandExecution/requestApproval", command("turn1"), 7);
@@ -202,7 +204,7 @@ test("Codex resolves a request while it waits for turn/start's answer: no card o
   } finally { await t.done(); }
 });
 
-test("a request's record lasts as long as the request: resolved after its first card, a patch update doesn't revive it", async () => {
+test("a request's record lasts as long as the request: resolved after its first card, a patch update doesn't revive it", { timeout: 20000 }, async () => {
   const changes = (diff) => [{ path: "/tmp/b.txt", kind: { type: "add" }, diff }];
   const t = setup();
   const base = { threadId: "th", turnId: "turn1" };
@@ -219,7 +221,7 @@ test("a request's record lasts as long as the request: resolved after its first 
   } finally { await t.done(); }
 });
 
-test("the turn's end marks every open request of it over, card or not", async () => {
+test("the turn's end marks every open request of it over, card or not", { timeout: 20000 }, async () => {
   for (const end of ["completed", "exited"]) {
     const t = setup({ turnId: null });
     try {

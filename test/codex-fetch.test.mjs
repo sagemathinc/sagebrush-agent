@@ -37,6 +37,8 @@ const pad = (n) => Buffer.alloc((512 - (n % 512)) % 512);
 const member = (name, data, opts) => Buffer.concat([header(name, data.length, opts), data, pad(data.length)]);
 const pax = (path) => { const rec = (k, v) => { let s = ` ${k}=${v}\n`; let n = s.length; n += String(n + String(n).length).length; return `${n}${s}`; }; const d = Buffer.from(rec("path", path)); return Buffer.concat([header("PaxHeader", d.length, { type: "x" }), d, pad(d.length)]); };
 const END = Buffer.alloc(1024);
+// (one extended-header record, its length counted as tar does: the digits include themselves)
+const paxRecord = (k, v) => { const body = ` ${k}=${v}\n`; let n = body.length + 1; while (String(n).length + body.length !== n) n = String(n).length + body.length; const d = Buffer.from(`${n}${body}`); return Buffer.concat([header("PaxHeader", d.length, { type: "x" }), d, pad(d.length)]); };
 
 const CODEX = Buffer.from("#!/bin/sh\necho codex-cli 9.9.9\n");
 const RG = Buffer.from("rg".repeat(700));
@@ -122,7 +124,7 @@ const BAD_ARCHIVES = [
   ["a missing file", () => goodMembers().slice(0, 4), /LICENSE is missing/],
   ["another size", () => [...goodMembers().slice(0, 4), member("package/LICENSE", Buffer.from("license text!!\n"))], /another size/],
   ["a global extension header", () => [member("pax_global_header", Buffer.from("20 comment=hello\n"), { type: "g" }), ...goodMembers()], /member type "g"/],
-  ["an unknown extension key", () => [Buffer.concat([header("PaxHeader", 23, { type: "x" }), Buffer.from("23 SCHILY.xattr.a=bcd\n").subarray(0, 23), pad(23)]), ...goodMembers()], /extension/],
+  ["an unknown extension key", () => [paxRecord("linkpath", "/etc/passwd"), ...goodMembers()], /extension linkpath/],
 ];
 for (const [what, members, re] of BAD_ARCHIVES) {
   test(`refused: ${what}`, async () => {
@@ -277,6 +279,26 @@ test("the cache directory is a symlink, or not a directory: refused, nothing fet
     const f = server({ [URL0]: GOOD });
     await refused(run(dir, pinFor(GOOD), f), "codex_cache");
     assert.equal(f.calls.length, 0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a fetch that loses the race to put its copy in place keeps the winner's (same inode), and removes its own", async () => {
+  const dir = scratch();
+  try {
+    let firstDone, n = 0;
+    const done = new Promise((r) => { firstDone = r; });
+    // (the start that asked first is answered only after the other's copy is in place, so it finds one there)
+    const f = server({ [URL0]: async () => (++n === 1 ? (await done, new Response(GOOD)) : new Response(GOOD)) });
+    const second = run(dir, pinFor(GOOD), f);
+    while (!f.calls.length) await new Promise((r) => setTimeout(r, 1));
+    const first = await run(dir, pinFor(GOOD), f);
+    const ino = lstatSync(join(rootIn(dir), "9.9.9-linux-x64")).ino;
+    firstDone();
+    const r2 = await second;
+    assert.ok(first);
+    assert.equal(lstatSync(r2.dir).ino, ino, "the copy in place wasn't replaced");
+    assert.equal(f.calls.length, 2);
+    assert.deepEqual(leftovers(dir), []);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

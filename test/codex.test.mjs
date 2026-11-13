@@ -425,3 +425,17 @@ test("a workspace tool call for a binding that isn't current is refused, even be
   assert.equal((await backend.toolCall(active, { tool: "workspace_list", arguments: {} })).success, true);
   assert.equal(listed, 1);
 });
+
+test("before Codex answers turn/start: a request for an earlier turn is declined without a card, its delta dropped; this turn's own early message is kept", async () => {
+  const a = agent();
+  try {
+    a.grant({ native: true });
+    a.say("c1", "early");
+    await a.until(() => a.finished("c1"), "the turn");
+    assert.match(a.text("c1"), /EARLY-OK /);
+    assert.doesNotMatch(a.text("c1"), /STALE/);
+    assert.match(a.text("c1"), /early decision: "decline"/);
+    assert.equal(a.events("c1").filter((e) => e.type === "attention").length, 0);
+    assert.equal(finishedEvent(a, "c1").outcome, "completed");
+  } finally { a.kill(); }
+});

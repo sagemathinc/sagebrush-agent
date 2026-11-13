@@ -44,7 +44,7 @@ Press Ctrl+C to stop.
 - the permission mode their settings choose there (default, acceptEdits, plan, dontAsk or auto); with none set, the default mode, as an interactive `claude` starts. A bypassPermissions setting isn't taken up: it runs in the default mode, and the agent's log says so. Anything Claude Code asks about comes to the page as a card, with the exact command, path or edit, and an Allow counts only for that action. Nothing is written to the settings.
 - Moving or removing a file in the Sagebrush workspace is always asked, even when the person's own rules would allow it.
 - With the switch off, it's the Sagebrush-tools-only mode above. Over the loopback address, it's always that mode, whatever the page asks.
-- The mode is decided once per reply. Turning the switch changes the grant, so, as with any grant change, a running reply stops and waiting messages are dropped; the next reply runs in the new mode.
+- The mode is decided once per reply. Turning the switch changes the grant, so, as with any grant change, a running reply stops and waiting messages are dropped. The next reply runs in the new mode, as a new Claude session: Claude hasn't seen that chat's earlier turns.
 
 In both modes, at most 4 chats run at once (a fifth waits its turn) and at most 16 messages wait; a seventeenth is refused, and the page says so. `SAGEBRUSH_AGENT_FAKE=1`, set where you start it, runs a scripted fake model instead of Claude, for tests.
 

@@ -71,7 +71,7 @@ function defaultAnswer(m) {
   }
 }
 
-function harness({ children, spawnErr } = {}) {
+function harness({ children, spawnErr, selfTest = async () => [] } = {}) {
   const scratch = mkdtempSync(join(tmpdir(), "runner-cwd-"));
   const logs = [];
   const server = new AgentServer({ log: (s) => logs.push(s), stdio: true, runnerCwd: scratch, name: "Codex", client: "codex-app-server" });
@@ -80,7 +80,7 @@ function harness({ children, spawnErr } = {}) {
   server.backend = new CodexBackend(server, {
     command: ["codex", "app-server"],
     // (these rows are about the app-server's lifetime; the self-test has its own: test/codex-selftest.test.mjs)
-    selfTest: async () => [],
+    selfTest,
     spawnFn: () => {
       // (a command that isn't there: the error, and nothing answered)
       if (spawnErr) { const c = scriptedChild({ answer: () => undefined }); setImmediate(() => c.emit("error", spawnErr)); spawned.push(c); return c; }
@@ -345,5 +345,17 @@ test("one read with an approval and then a later, unrelated notification: the ca
     q.done(true);
     await h.until(() => child.answers(504).length === 1, "the answer");
     assert.equal(child.answers(504)[0].result.decision, "accept", "a live request's Allow still accepts");
+  } finally { await h.close(); }
+});
+
+test("a self-test that fails with words of its own: the person sees fixed words only ('it failed'), never those", async () => {
+  const h = harness({ children: [scriptedChild()], selfTest: async () => { throw new Error("SECRET token=sk-x in /home/x/.codex/config.toml"); } });
+  try {
+    h.say("c1", "hello");
+    await h.until(() => h.finished("c1").length, "the refused turn");
+    const err = h.events("c1").find((e) => e.type === "turn_error");
+    assert.equal(err.code, "codex_incompatible");
+    assert.equal(err.message, CODEX_TEXT.noSchema("it failed"));
+    assert.ok(!h.logs.join("\n").includes("SECRET"), "nor in the log");
   } finally { await h.close(); }
 });

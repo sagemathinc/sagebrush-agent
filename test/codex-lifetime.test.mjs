@@ -22,12 +22,13 @@ function setup({ turnId = "turn1" } = {}) {
   let ready;
   const started = new Promise((r) => { ready = r; });
   const finished = [];
-  const active = { app, threadId: "th", codexTurnId: turnId, started: turnId ? Promise.resolve(turnId) : started, early: [], binding, signal: new AbortController().signal, turn: new CodexTurn("local"), conversation: "c1", c: {}, items: new Map(), asks: new Map(), send: (d) => events.push(...d), finish: (how) => finished.push(how), interrupted: false };
+  const turnAbort = new AbortController();
+  const active = { app, threadId: "th", codexTurnId: turnId, started: turnId ? Promise.resolve(turnId) : started, early: [], binding, signal: turnAbort.signal, turn: new CodexTurn("local"), conversation: "c1", c: {}, items: new Map(), requests: new Map(), send: (d) => events.push(...d), finish: (how) => finished.push(how), interrupted: false };
   backend.turns.set("th", active);
   const cards = (state) => events.filter((e) => e.type === "attention" && (!state || e.state === state));
   const open = () => [...server.permissions.values()];
   const tick = () => new Promise((r) => setImmediate(r));
-  return { server, backend, app, active, events, cards, open, tick, ready, finished, done: async () => { await server.close().catch(() => {}); rmSync(dir, { recursive: true, force: true }); } };
+  return { server, backend, app, active, events, cards, open, tick, ready, finished, turnAbort, done: async () => { await server.close().catch(() => {}); rmSync(dir, { recursive: true, force: true }); } };
 }
 const command = (turnId = "turn1") => ({ threadId: "th", turnId, kind: "command", itemId: "cmd1", command: "echo benign", cwd: "/tmp", availableDecisions: ["accept", "decline"] });
 
@@ -159,4 +160,61 @@ test("an Allow and the turn's end in the same tick: the Allow lands first but th
       assert.deepEqual(await answer, { decision: "cancel" }, end);
     } finally { await t.done(); }
   }
+});
+
+test("a file change updated and, in the same batch, ended (resolved, completed, exited, Stop, rebind): no card opens again, and an Allow accepts nothing", async () => {
+  const changes = (diff) => [{ path: "/tmp/benign.txt", kind: { type: "update", move_path: null }, diff }];
+  for (const end of ["resolved", "completed", "exited", "stop", "rebind"]) {
+    const t = setup();
+    const base = { threadId: "th", turnId: "turn1" };
+    try {
+      t.backend.notification(t.app, "item/started", { ...base, item: { id: "p1", type: "fileChange", status: "inProgress", changes: changes("old") } });
+      const answer = t.backend.request(t.app, "item/fileChange/requestApproval", { ...base, itemId: "p1" }, 3);
+      await t.tick();
+      assert.equal(t.open().length, 1, end);
+      t.backend.notification(t.app, "item/fileChange/patchUpdated", { ...base, itemId: "p1", changes: changes("new") });
+      if (end === "resolved") t.backend.notification(t.app, "serverRequest/resolved", { threadId: "th", requestId: 3 });
+      if (end === "completed") t.backend.notification(t.app, "turn/completed", { threadId: "th", turn: { id: "turn1", status: "completed" } });
+      if (end === "exited") t.backend.notification(t.app, "sagebrush/exited", { message: "exit 3" });
+      if (end === "stop") t.turnAbort.abort();
+      if (end === "rebind") t.server.binding = { grant: { native: true }, features: ["permission.digest"] };
+      await t.tick();
+      assert.equal(t.open().length, 0, `${end}: no card open again`);
+      for (const q of t.open()) q.done(true);
+      assert.deepEqual(await answer, { decision: "cancel" }, end);
+      assert.deepEqual(t.cards().map((c) => c.state), ["open", "denied"], end);
+    } finally { await t.done(); }
+  }
+});
+
+test("Codex resolves a request while it waits for turn/start's answer: no card opens for it after the answer", async () => {
+  const t = setup({ turnId: null });
+  try {
+    const answer = t.backend.request(t.app, "item/commandExecution/requestApproval", command("turn1"), 7);
+    t.backend.notification(t.app, "serverRequest/resolved", { threadId: "th", requestId: 7 });
+    t.active.codexTurnId = "turn1"; // (what runTurn does with turn/start's answer)
+    t.ready("turn1");
+    await t.tick();
+    assert.equal(t.open().length, 0);
+    assert.notEqual((await answer).decision, "accept");
+    assert.equal(t.cards().length, 0);
+    assert.equal(t.active.requests.size, 0, "the request's record goes with it");
+  } finally { await t.done(); }
+});
+
+test("a request's record lasts as long as the request: resolved after its first card, a patch update doesn't revive it", async () => {
+  const changes = (diff) => [{ path: "/tmp/b.txt", kind: { type: "add" }, diff }];
+  const t = setup();
+  const base = { threadId: "th", turnId: "turn1" };
+  try {
+    t.backend.notification(t.app, "item/started", { ...base, item: { id: "p1", type: "fileChange", status: "inProgress", changes: changes("a") } });
+    const answer = t.backend.request(t.app, "item/fileChange/requestApproval", { ...base, itemId: "p1" }, "x");
+    await t.tick();
+    t.backend.notification(t.app, "serverRequest/resolved", { threadId: "th", requestId: "x" });
+    t.backend.notification(t.app, "item/fileChange/patchUpdated", { ...base, itemId: "p1", changes: changes("b") });
+    await t.tick();
+    assert.equal(t.open().length, 0);
+    assert.deepEqual(await answer, { decision: "cancel" });
+    assert.equal(t.active.requests.size, 0);
+  } finally { await t.done(); }
 });

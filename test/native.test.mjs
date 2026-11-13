@@ -11,17 +11,23 @@ import { mkdtempSync, existsSync, readFileSync, rmSync, realpathSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
-import { TEXT, AgentServer, parseGrant } from "../lib/server.mjs";
+import { TEXT, AgentServer, parseGrant, settingsMode } from "../lib/server.mjs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { fakeCreateServer, fakeQuery } from "../lib/fake.mjs";
 import { permissionDigest } from "../lib/canon.mjs";
 
 const BIN = fileURLToPath(new URL("../bin/sagebrush-agent.mjs", import.meta.url));
 const F = 64 * 1024;
 
-function agent() {
-  // (the runner's working folder: where it started the agent; native mode works there)
+function agent({ userMode, projectMode } = {}) {
+  // (the runner's working folder: where it started the agent; native mode works there. And a home of its own, so the
+  //  person's settings are the row's, never this machine's)
   const runnerCwd = realpathSync(mkdtempSync(join(tmpdir(), "runner-cwd-")));
-  const p = spawn(process.execPath, [BIN, "--stdio"], { cwd: runnerCwd, env: { ...process.env, SAGEBRUSH_AGENT_FAKE: "1" }, stdio: ["pipe", "pipe", "pipe"] });
+  const home = join(runnerCwd, ".home");
+  mkdirSync(join(home, ".claude"), { recursive: true });
+  if (userMode) writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ permissions: { defaultMode: userMode } }));
+  if (projectMode) { mkdirSync(join(runnerCwd, ".claude")); writeFileSync(join(runnerCwd, ".claude", "settings.json"), JSON.stringify({ permissions: { defaultMode: projectMode } })); }
+  const p = spawn(process.execPath, [BIN, "--stdio"], { cwd: runnerCwd, env: { ...process.env, HOME: home, SAGEBRUSH_AGENT_FAKE: "1" }, stdio: ["pipe", "pipe", "pipe"] });
   const a = { p, runnerCwd, lines: [], err: "", waiters: [] };
   a.exited = new Promise((r) => p.on("exit", (code) => r(code)));
   let buf = "";
@@ -227,7 +233,8 @@ test("native: the Sagebrush workspace tools keep their own rules (removing a fil
 
 test("over the loopback address, native true is not taken: tools-only, logged, and Bash refused", async () => {
   const logs = [];
-  const server = new AgentServer({ query: fakeQuery, log: (m) => logs.push(m) });
+  const scratch = mkdtempSync(join(tmpdir(), "runner-cwd-"));
+  const server = new AgentServer({ query: fakeQuery, log: (m) => logs.push(m), runnerCwd: scratch });
   server.createServer = fakeCreateServer;
   const port = await server.listen();
   const code = server.newCode();
@@ -251,7 +258,7 @@ test("over the loopback address, native true is not taken: tools-only, logged, a
     send({ jsonrpc: "2.0", method: "chat.message", params: { conversation: "c2", id: "m2", text: "tool Bash ls", author: "person" } });
     await until(() => done("c2"), "the Bash turn");
     assert.ok(text("c2").includes("VERDICT Bash deny: Bash isn't available here."), text("c2"));
-  } finally { ws.close(); await server.close(); }
+  } finally { ws.close(); await server.close(); rmSync(scratch, { recursive: true, force: true }); }
 });
 
 test("native works in the runner's own folder; tools-only in the agent's own empty one", async () => {
@@ -310,4 +317,100 @@ test("a conversation goes on in its own folder only: after the mode changes, a n
     assert.equal(t.resumed, false, "tools-only after native: a new session, not the other folder's");
     assert.equal((await optionsFull(a, "c1", 4)).resumed, true, "tools-only again: resumed");
   } finally { a.kill(); rmSync(a.runnerCwd, { recursive: true, force: true }); }
+});
+
+test("settingsMode: the person's configured mode (user, then project, then local; the last wins); none is default; bypass never", () => {
+  const root = mkdtempSync(join(tmpdir(), "modes-"));
+  try {
+    const home = join(root, "home"), cwd = join(root, "cwd");
+    mkdirSync(join(home, ".claude"), { recursive: true }); mkdirSync(join(cwd, ".claude"), { recursive: true });
+    const put = (f, mode) => writeFileSync(f, typeof mode === "string" ? JSON.stringify({ permissions: { defaultMode: mode } }) : mode.raw);
+    const U = join(home, ".claude", "settings.json"), P = join(cwd, ".claude", "settings.json"), L = join(cwd, ".claude", "settings.local.json");
+    assert.deepEqual(settingsMode(cwd, home), { mode: "default", bypass: false }, "none set");
+    put(U, "acceptEdits");
+    assert.deepEqual(settingsMode(cwd, home), { mode: "acceptEdits", bypass: false }, "the user's");
+    put(P, "plan");
+    assert.deepEqual(settingsMode(cwd, home), { mode: "plan", bypass: false }, "the project's over the user's");
+    put(L, "dontAsk");
+    assert.deepEqual(settingsMode(cwd, home), { mode: "dontAsk", bypass: false }, "local over the project's");
+    put(L, "bypassPermissions");
+    assert.deepEqual(settingsMode(cwd, home), { mode: "default", bypass: true }, "bypass: default, said");
+    put(L, "made-up");
+    assert.deepEqual(settingsMode(cwd, home), { mode: "default", bypass: false }, "an unknown mode: default");
+    put(L, { raw: "{not json" });
+    assert.deepEqual(settingsMode(cwd, home), { mode: "plan", bypass: false }, "a file that can't be read is skipped");
+    put(U, "auto"); rmSync(P); rmSync(L);
+    assert.deepEqual(settingsMode(cwd, home), { mode: "auto", bypass: false }, "auto, when the person chose it");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("native over the runner: the mode the person's settings choose there is the one the turn runs in", async () => {
+  for (const [o, want] of [[{ userMode: "acceptEdits" }, "acceptEdits"], [{ userMode: "acceptEdits", projectMode: "plan" }, "plan"], [{ projectMode: "dontAsk" }, "dontAsk"]]) {
+    const a = agent(o);
+    try {
+      a.grant({ native: true });
+      assert.equal((await options(a, "c1")).permissionMode, want, JSON.stringify(o));
+    } finally { a.kill(); }
+  }
+});
+
+test("native over the runner: a bypassPermissions setting runs in the default mode, and says so once", async () => {
+  const a = agent({ userMode: "bypassPermissions" });
+  try {
+    a.grant({ native: true });
+    assert.equal((await options(a, "c1")).permissionMode, "default");
+    assert.equal(a.err.split(TEXT.noBypass).length - 1, 1);
+  } finally { a.kill(); }
+});
+
+test("tools-only ignores the person's settings: default mode, whatever they choose", async () => {
+  const a = agent({ userMode: "acceptEdits", projectMode: "plan" });
+  try {
+    a.grant({ native: false });
+    assert.deepEqual(await options(a, "c1"), TOOLS_ONLY);
+  } finally { a.kill(); }
+});
+
+test("native: removing a workspace file asks even when the person's rules let the call through (no callback): nothing reaches the page before Allow", async () => {
+  for (const answer of ["deny", "allow"]) {
+    const a = agent();
+    const removes = () => a.lines.filter((m) => m.method === "workspace.remove");
+    const answering = setInterval(() => {
+      for (const m of a.lines) if (typeof m.id === "string" && m.method && !m.answered) { m.answered = true; a.send({ jsonrpc: "2.0", id: m.id, result: { ok: true } }); }
+    }, 5);
+    try {
+      a.grant({ native: true });
+      a.say("c1", "direct remove /notes/a.md");
+      await a.until(() => card(a, "c1"), "the card");
+      const c = card(a, "c1");
+      assert.equal(c.title, "Allow workspace_remove?");
+      assert.deepEqual(c.action, { tool: "mcp__sagebrush__workspace_remove", input: { path: "/notes/a.md" } });
+      assert.equal(removes().length, 0, "nothing sent to the page while the card is open");
+      a.send({ jsonrpc: "2.0", method: "chat.permission", params: { request_id: c.request_id, behavior: answer, ...(answer === "allow" ? { digest: digest(c) } : {}) } });
+      await a.until(() => a.finished("c1"), "the turn");
+      if (answer === "deny") {
+        assert.equal(removes().length, 0, "denied: never sent");
+        assert.match(a.text("c1"), /DIRECT refused: refused: The person said no\./);
+      } else {
+        assert.deepEqual(removes().map((m) => m.params), [{ path: "/notes/a.md" }], "allowed: sent once, exactly as allowed");
+        assert.match(a.text("c1"), /DIRECT done/);
+      }
+    } finally { clearInterval(answering); a.kill(); }
+  }
+});
+
+test("each session's transcript is deleted where it ran: the runner's folder for a native one, the agent's own for the rest", async () => {
+  const deleted = [];
+  const scratch = mkdtempSync(join(tmpdir(), "runner-cwd-"));
+  const server = new AgentServer({ query: fakeQuery, log: () => {}, runnerCwd: scratch, deleteSession: async (id, o) => { deleted.push([id, o.dir]); } });
+  const own = server.cwd;
+  try {
+    server.sessions.add("native-1"); server.sessionDirs.set("native-1", scratch);
+    server.sessions.add("tools-1"); server.sessionDirs.set("tools-1", own);
+    server.sessions.add("older-1"); // (one with no folder recorded: the agent's own)
+    await server.close();
+    assert.deepEqual(deleted.sort(), [["native-1", scratch], ["older-1", own], ["tools-1", own]].sort());
+    assert.ok(!existsSync(own), "the agent's own folder is removed");
+    assert.ok(existsSync(scratch), "the runner's folder is not");
+  } finally { rmSync(scratch, { recursive: true, force: true }); }
 });

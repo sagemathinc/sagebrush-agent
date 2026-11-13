@@ -528,3 +528,17 @@ test("native without a resolver: the turn ends as an error; tools-only needs non
     assert.deepEqual(h.finished("c2"), ["completed"]);
   } finally { await h.close(); }
 });
+
+test("a native session's transcript that can't be deleted is logged under the runner's folder, where it is", async () => {
+  const logs = [];
+  const scratch = mkdtempSync(join(tmpdir(), "runner-cwd-"));
+  const server = new AgentServer({ query: fakeQuery, log: (m) => logs.push(m), runnerCwd: scratch, deleteSession: async () => { throw new Error("no"); } });
+  try {
+    server.sessions.add("native-9"); server.sessionDirs.set("native-9", scratch);
+    server.retire("native-9");
+    const t = Date.now();
+    while (!logs.some((l) => l.includes("native-9"))) { if (Date.now() - t > 5000) throw new Error("no log line"); await new Promise((r) => setTimeout(r, 5)); }
+    const line = logs.find((l) => l.includes("native-9"));
+    assert.ok(line.includes(scratch.replace(/[^A-Za-z0-9]/g, "-")), line);
+  } finally { await server.close(); rmSync(scratch, { recursive: true, force: true }); }
+});

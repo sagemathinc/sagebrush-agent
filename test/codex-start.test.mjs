@@ -44,6 +44,9 @@ function scriptedChild({ answer, ignoreTerm = false } = {}) {
   });
   child.reply = (id, result) => child.stdout.write(JSON.stringify({ id, result }) + "\n");
   child.notify = (method, params) => child.stdout.write(JSON.stringify({ method, params }) + "\n");
+  // (several messages in one write: one read for the agent, as a pipe may deliver them)
+  child.chunk = (...msgs) => child.stdout.write(msgs.map((m) => JSON.stringify(m) + "\n").join(""));
+  child.answers = (id) => child.got.filter((m) => m.id === id && !m.method);
   child.release = (method, result) => { for (const m of child.held.get(method) ?? []) child.reply(m.id, result ?? (answer ?? defaultAnswer)(m, child)); child.held.delete(method); child.hold.delete(method); };
   child.exit = (code, signal = null, stderr = "") => {
     if (child.exitCode !== null || child.signalCode !== null) return;
@@ -259,5 +262,86 @@ test("a thread start in an app-server that exits meanwhile sets nothing; the con
     h.say("c1", "third");
     await h.until(() => b.sent("turn/start").length === 2, "the third turn's start");
     assert.equal(b.sent("turn/start")[1].params.threadId, "thread-B");
+  } finally { await h.close(); }
+});
+
+// (a request from Codex and its serverRequest/resolved in one read: the request is taken first, so the resolution finds it)
+const cardsOf = (h, c) => h.events(c).filter((e) => e.type === "attention");
+// (the cards still open: each card's last state; one withdrawn at once shows "open" then "denied")
+const stillOpen = (h, c) => { const last = new Map(); for (const e of cardsOf(h, c)) last.set(e.id, e.state); return [...last.values()].filter((s) => s === "open").length; };
+async function runningTurn(h, child) {
+  h.say("c1", "hello");
+  await h.until(() => child.sent("turn/start").length === 1, "the turn's start");
+  await h.until(() => h.server.backend.turns.size === 1 && [...h.server.backend.turns.values()][0].codexTurnId, "the turn's id");
+  const [threadId, active] = [...h.server.backend.turns.entries()][0];
+  return { threadId, turnId: active.codexTurnId };
+}
+
+test("one read with a command approval and its serverRequest/resolved: no card stays open, and it's never accepted", { timeout: 20000 }, async () => {
+  const child = scriptedChild();
+  const h = harness({ children: [child] });
+  try {
+    const { threadId, turnId } = await runningTurn(h, child);
+    child.chunk(
+      { id: 501, method: "item/commandExecution/requestApproval", params: { threadId, turnId, kind: "command", itemId: "x", command: "echo benign", cwd: "/tmp" } },
+      { method: "serverRequest/resolved", params: { threadId, requestId: 501 } },
+    );
+    await h.until(() => child.answers(501).length === 1, "the answer");
+    assert.notEqual(child.answers(501)[0].result.decision, "accept");
+    assert.equal(stillOpen(h, "c1"), 0, "no card left open for a resolved request");
+    assert.equal(h.server.permissions.size, 0);
+  } finally { await h.close(); }
+});
+
+test("one read with a workspace rename call and its serverRequest/resolved: no card, no rename sent to the page", { timeout: 20000 }, async () => {
+  const child = scriptedChild();
+  const h = harness({ children: [child] });
+  try {
+    const { threadId, turnId } = await runningTurn(h, child);
+    child.chunk(
+      { id: 502, method: "item/tool/call", params: { threadId, turnId, callId: "k", namespace: null, tool: "workspace_rename", arguments: { from: "/a.md", to: "/b.md" } } },
+      { method: "serverRequest/resolved", params: { threadId, requestId: 502 } },
+    );
+    await h.until(() => child.answers(502).length === 1, "the answer");
+    assert.equal(child.answers(502)[0].result.success, false);
+    assert.equal(stillOpen(h, "c1"), 0);
+    assert.ok(!h.lines.some((m) => m.method === "workspace.rename"), "nothing sent to the page");
+  } finally { await h.close(); }
+});
+
+test("one read, while turn/start's answer is held, with an approval for this turn and its resolution: after the answer, no card and no accept", { timeout: 20000 }, async () => {
+  const child = scriptedChild();
+  child.hold.add("turn/start");
+  const h = harness({ children: [child] });
+  try {
+    h.say("c1", "hello");
+    await h.until(() => child.held.has("turn/start"), "turn/start sent");
+    const threadId = child.held.get("turn/start")[0].params.threadId;
+    child.chunk(
+      { id: 503, method: "item/commandExecution/requestApproval", params: { threadId, turnId: "tu-held", kind: "command", itemId: "x", command: "echo benign", cwd: "/tmp" } },
+      { method: "serverRequest/resolved", params: { threadId, requestId: 503 } },
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    child.release("turn/start", { turn: { id: "tu-held" } });
+    await h.until(() => child.answers(503).length === 1, "the answer");
+    assert.notEqual(child.answers(503)[0].result.decision, "accept");
+    assert.equal(stillOpen(h, "c1"), 0);
+  } finally { await h.close(); }
+});
+
+test("one read with an approval and then a later, unrelated notification: the card still opens (resolution only ends its own request)", { timeout: 20000 }, async () => {
+  const child = scriptedChild();
+  const h = harness({ children: [child] });
+  try {
+    const { threadId, turnId } = await runningTurn(h, child);
+    child.chunk(
+      { id: 504, method: "item/commandExecution/requestApproval", params: { threadId, turnId, kind: "command", itemId: "x", command: "echo benign", cwd: "/tmp" } },
+      { method: "serverRequest/resolved", params: { threadId, requestId: 999 } },
+    );
+    await h.until(() => cardsOf(h, "c1").some((c) => c.state === "open"), "the card");
+    const [q] = [...h.server.permissions.values()];
+    q.done(true);
+    await h.until(() => child.answers(504).length === 1, "the answer");
+    assert.equal(child.answers(504)[0].result.decision, "accept", "a live request's Allow still accepts");
   } finally { await h.close(); }
 });

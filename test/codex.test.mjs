@@ -406,3 +406,22 @@ test("SIGTERM: the agent ends Codex's app-server and exits 0", async () => {
     assert.ok(a.rec().some((m) => m.signal === "SIGTERM"), "the app-server got SIGTERM");
   } finally { a.kill(); }
 });
+
+test("a workspace tool call for a binding that isn't current is refused, even before its turn is stopped", async () => {
+  // (in-process: rebind() stops the old binding's turns at once, so through the pipes the stop is seen first; this
+  //  row holds the binding check on its own)
+  const { CodexBackend } = await import("../lib/codex.mjs");
+  const { CodexTurn } = await import("../lib/codex-turns.mjs");
+  let listed = 0;
+  const old = { grant: { folders: ["/"] } }, current = { grant: { folders: ["/"] } };
+  const server = { binding: current, workspaceToolList: () => [["workspace_list", "", {}, async () => { listed++; return { content: [{ type: "text", text: "{}" }] }; }]] };
+  const backend = new CodexBackend(server);
+  const active = { binding: old, signal: new AbortController().signal, turn: new CodexTurn("t"), conversation: "c1", c: {}, send: () => {} };
+  const r = await backend.toolCall(active, { tool: "workspace_list", arguments: {} });
+  assert.equal(r.success, false);
+  assert.match(r.contentItems[0].text, /^refused: /);
+  assert.equal(listed, 0);
+  active.binding = current; // (the same call under the current binding runs)
+  assert.equal((await backend.toolCall(active, { tool: "workspace_list", arguments: {} })).success, true);
+  assert.equal(listed, 1);
+});

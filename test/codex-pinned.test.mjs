@@ -107,14 +107,16 @@ test("each fetch refusal is one line in the turn; nothing is started; the next m
   }
 });
 
-test("the agent closing aborts a download under way (the signal locate gets)", T, async () => {
+test("the backend closing aborts a download under way (the signal locate gets), with its turn still waiting", T, async () => {
   let seen = null;
   const h = harness((bin, { signal }) => new Promise((_, reject) => { seen = signal; signal.addEventListener("abort", () => reject(new CodexFetchError("codex_download", "stopped"))); }));
-  h.say("hello");
-  await h.until(() => seen, "locate called");
-  assert.equal(seen.aborted, false);
-  await h.close();
-  assert.equal(seen.aborted, true);
+  try {
+    h.say("hello");
+    await h.until(() => seen, "locate called");
+    assert.equal(seen.aborted, false);
+    await h.server.backend.close(1000); // (the backend alone: no turn was stopped first)
+    assert.equal(seen.aborted, true);
+  } finally { await h.close(); }
 });
 
 // ---- cancelling a start: Stop and shutdown end the download, the app-server and the self-test's probe

@@ -191,3 +191,19 @@ test("two turns share a start: the first Stop doesn't cancel it, the last one do
     await within(() => sig.aborted, 2000, "cancelled with the last waiter");
   } finally { await h.close(); }
 });
+
+test("closing during the start with a Codex that ignores SIGTERM: within the one budget it's killed and reaped (by pid), and close() says so", T, async () => {
+  const h = harness((bin) => ({ bin, dir: "/x", version: "0.159.2" }), { generate: `echo $$ > "$PIDFILE"; sleep 30; exit 0`, fakeEnv: { FAKE_CODEX_IGNORE_TERM: "1" } });
+  h.say("hello");
+  const pidFile = join(h.scratch, "probe.pid");
+  await within(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").trim(), 10000, "the probe started");
+  const appPid = h.rec().find((m) => m.pid)?.pid;
+  assert.ok(appPid && alive(appPid));
+  const t = Date.now();
+  const problems = await h.server.backend.close(500);
+  const took = Date.now() - t;
+  assert.deepEqual(problems, ["Codex didn't stop in time and was killed"]);
+  assert.ok(!alive(appPid), "the app-server is gone when close() returns");
+  assert.ok(took < 500 + 2000 + 500, `within the budget plus the reap (${took} ms)`);
+  await h.close();
+});

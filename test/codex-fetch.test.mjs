@@ -10,7 +10,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
-import { CodexFetchError, archiveBounds, cacheRoot, download, ensureCodex, memberPath, platformKey, tarSink, treeMatches } from "../lib/codex-fetch.mjs";
+import { CodexFetchError, FETCH, archiveBounds, cacheRoot, download, ensureCodex, memberPath, platformKey, tarSink, treeMatches } from "../lib/codex-fetch.mjs";
 
 const sha = (b) => createHash("sha256").update(b).digest("hex");
 
@@ -211,7 +211,6 @@ test("progress: reported while the download goes on", T, async () => {
   const dir = scratch();
   try {
     const seen = [];
-    const { FETCH } = await import("../lib/codex-fetch.mjs");
     const was = FETCH.progressEvery;
     FETCH.progressEvery = 64;
     try { await run(dir, pinFor(GOOD), server({ [URL0]: GOOD }), { onProgress: (g, s) => seen.push([g, s]) }); } finally { FETCH.progressEvery = was; }
@@ -403,7 +402,8 @@ test("a Stop while a write waits: the download ends 'stopped' within 2 s of the 
   let aborted = 0;
   ac.signal.addEventListener("abort", () => { aborted = Date.now(); });
   setTimeout(() => ac.abort(), 30);
-  await refused(download(URL0, { size: GOOD.length, fetchFn: f, signal: ac.signal, onData: () => new Promise(() => {}) }), "codex_download", /stopped/);
+  // (short download limits: a write left waiting fails this row by name within its own time, not the run's)
+  await refused(download(URL0, { size: GOOD.length, fetchFn: f, signal: ac.signal, onData: () => new Promise(() => {}), limits: { ...FETCH, totalMs: 3000, idleMs: 3000 } }), "codex_download", /stopped/);
   assert.ok(aborted && Date.now() - aborted < 2000, `settled ${Date.now() - aborted} ms after the abort`);
 });
 

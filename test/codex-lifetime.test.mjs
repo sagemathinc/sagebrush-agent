@@ -333,3 +333,53 @@ test("past the open-request limit a workspace tool call runs nothing", { timeout
     for (const h of held) assert.equal((await h).success, false);
   } finally { await t.done(); }
 });
+
+test("a file change updated past the re-ask rounds is declined; no card after the last round", { timeout: 20000 }, async () => {
+  const t = setup();
+  const base = { threadId: "th", turnId: "turn1" };
+  const changes = (n) => [{ path: "/tmp/b.txt", kind: { type: "add" }, diff: `+v${n}\n` }];
+  try {
+    t.backend.notification(t.app, "item/started", { ...base, item: { id: "p1", type: "fileChange", status: "inProgress", changes: changes(0) } });
+    const answer = t.backend.request(t.app, "item/fileChange/requestApproval", { ...base, itemId: "p1" }, 90);
+    for (let n = 1; n <= 8; n++) {
+      await t.tick();
+      assert.equal(t.open().length, 1, `round ${n}: one card open`);
+      t.backend.notification(t.app, "item/fileChange/patchUpdated", { ...base, itemId: "p1", changes: changes(n) });
+    }
+    assert.deepEqual(await answer, { decision: "decline" });
+    await t.tick();
+    assert.equal(t.open().length, 0, "no ninth card");
+    assert.equal(t.cards().filter((c) => c.state === "open").length, 8, "eight cards, one per round");
+  } finally { await t.done(); }
+});
+
+test("a reused id: the earlier request finishing leaves the newer one's record, so resolving the newer one withdraws its card", { timeout: 20000 }, async () => {
+  const t = setup();
+  try {
+    const first = t.backend.request(t.app, "item/commandExecution/requestApproval", command(), 74);
+    await t.tick();
+    const second = t.backend.request(t.app, "item/commandExecution/requestApproval", { ...command(), command: "echo second" }, 74);
+    assert.deepEqual(await first, { decision: "cancel" }, "the earlier one is over");
+    await t.tick();
+    assert.equal(t.open().length, 1, "the newer one's card");
+    const [q] = t.open();
+    t.backend.notification(t.app, "serverRequest/resolved", { threadId: "th", requestId: 74 });
+    assert.equal(t.open().length, 0, "withdrawn: its record was still there");
+    q.done(true);
+    assert.deepEqual(await second, { decision: "cancel" });
+  } finally { await t.done(); }
+});
+
+test("an approval to send input to a running command: its own card title and tool", { timeout: 20000 }, async () => {
+  const { CODEX_TEXT } = await import("../lib/codex.mjs");
+  const t = setup();
+  try {
+    const answer = t.backend.request(t.app, "item/commandExecution/requestApproval", { ...command(), kind: "writeStdin" }, 75);
+    await t.tick();
+    const c = t.cards("open")[0];
+    assert.equal(c.title, CODEX_TEXT.titleStdin);
+    assert.equal(c.action.tool, "codex.stdin");
+    t.open()[0].done(false);
+    assert.deepEqual(await answer, { decision: "decline" });
+  } finally { await t.done(); }
+});

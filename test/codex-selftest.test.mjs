@@ -125,14 +125,15 @@ test("through the agent: a broken contract fails the turn in one line, and no th
   } finally { a.kill(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("through the agent: a Codex that can't describe its protocol fails the turn naming only its exit, nothing more sent", T, async () => {
+test("through the agent: a Codex that can't describe its protocol fails the turn naming only its exit (never its stderr), nothing more sent", T, async () => {
   const a = agent({ FAKE_CODEX_SCHEMA_FAIL: "1", FAKE_CODEX_SCHEMA: "/nonexistent" });
   try {
     a.say("hello");
     await a.until(() => a.finished().length, "the refused turn");
     const err = a.events().find((e) => e.type === "turn_error");
     assert.equal(err.code, "codex_incompatible");
-    assert.equal(err.message, CODEX_TEXT.noSchema("fake: no schema to generate"));
+    assert.equal(err.message, CODEX_TEXT.noSchema("exit 1"));
+    assert.ok(!err.message.includes("PRIVATE_CONFIG_MARKER") && !err.message.includes("sk-fake"), "never what Codex printed");
     assert.ok(!a.rec().some((m) => m.method === "thread/start" || m.method === "turn/start"));
   } finally { a.kill(); }
 });
@@ -145,4 +146,32 @@ test("through the agent: notifications before initialize's answer (as Codex 0.16
     assert.equal(a.finished()[0].outcome, "completed");
     assert.equal(a.rec().filter((m) => m.method === "initialize").length, 1);
   } finally { a.kill(); }
+});
+
+// ---- the probe itself: fixed words only, bounded, ended by the agent stopping
+
+import { generateSchemas } from "../lib/codex-selftest.mjs";
+import { chmodSync as chmod2 } from "node:fs";
+const script = (body) => { const d = mkdtempSync(join(tmpdir(), "probe-")); const f = join(d, "codex"); writeFileSync(f, `#!/bin/sh\n${body}\n`); chmod2(f, 0o755); return f; };
+
+test("the probe's failures are fixed words: an exit, a schema it can't read, not found; never its output", T, async () => {
+  await assert.rejects(generateSchemas([script("echo 'SECRET in stderr' >&2; exit 7")]), (e) => e.message === "exit 7");
+  await assert.rejects(generateSchemas([script('for a; do [ "$p" = --out ] && o=$a; p=$a; done; echo "{SECRET not json" > "$o/codex_app_server_protocol.schemas.json"; exit 0')]), (e) => e.message === "its protocol couldn't be read");
+  await assert.rejects(generateSchemas(["/nonexistent/codex"]), (e) => e.message === "it wasn't found");
+});
+
+test("the probe is bounded, and the agent stopping ends it (its whole process group)", T, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "probe-pg-"));
+  const marker = join(dir, "child-alive");
+  const slow = script(`(sleep 3; echo alive > "${marker}") & sleep 30`);
+  const t = Date.now();
+  await assert.rejects(generateSchemas([slow], { ms: 200 }), (e) => e.message === "it took too long");
+  assert.ok(Date.now() - t < 5000);
+  const ac = new AbortController();
+  const p = generateSchemas([slow], { signal: ac.signal });
+  setTimeout(() => ac.abort(), 100);
+  await assert.rejects(p, (e) => /stopped by SIGKILL/.test(e.message));
+  await new Promise((r) => setTimeout(r, 3500));
+  assert.ok(!existsSync(marker), "nothing it started outlived it");
+  rmSync(dir, { recursive: true, force: true });
 });

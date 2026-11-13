@@ -6,11 +6,11 @@ import { test } from "node:test";
 const T = { timeout: 20000 }; // (a row that hangs fails by name)
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
-import { CodexFetchError, archiveBounds, cacheRoot, ensureCodex, memberPath, platformKey, tarSink, treeMatches } from "../lib/codex-fetch.mjs";
+import { CodexFetchError, archiveBounds, cacheRoot, download, ensureCodex, memberPath, platformKey, tarSink, treeMatches } from "../lib/codex-fetch.mjs";
 
 const sha = (b) => createHash("sha256").update(b).digest("hex");
 
@@ -233,6 +233,7 @@ for (const [what, mutate] of [
   ["a file's bytes changed", (d) => writeFileSync(join(d, "vendor/bin/codex"), "#!/bin/sh\necho evil-ish codex\n")],
   ["an extra file", (d) => writeFileSync(join(d, "vendor/bin/extra"), "x")],
   ["a file replaced by a symlink", (d) => { rmSync(join(d, "LICENSE")); symlinkSync("/etc/hostname", join(d, "LICENSE")); }],
+  ["a directory replaced by a link to an identical copy (the walk mustn't follow it)", (d) => { const alt = `${d}-alt`; renameSync(join(d, "vendor"), alt); symlinkSync(alt, join(d, "vendor")); }],
   ["the executable's mode", (d) => chmodSync(join(d, "vendor/bin/codex"), 0o644)],
   ["a group-writable file", (d) => chmodSync(join(d, "LICENSE"), 0o664)],
 ]) {
@@ -336,4 +337,92 @@ test("the shipped pin: four platforms, each an https registry.npmjs.org tarball 
     assert.ok(e.files[e.bin]?.exec, `${k}: ${e.bin} executable in the manifest`);
     assert.ok(Number.isInteger(e.size) && e.size > 0, k);
   }
+});
+
+// ---- private modes and owners, whatever the umask; no write waits forever
+
+test("a cache directory others can read or write: refused, nothing fetched", T, async () => {
+  for (const level of ["sagebrush-agent", "sagebrush-agent/codex"]) {
+    const dir = scratch();
+    try {
+      mkdirSync(join(dir, "sagebrush-agent", "codex"), { recursive: true, mode: 0o700 });
+      chmodSync(join(dir, "sagebrush-agent"), 0o700);
+      chmodSync(join(dir, level), 0o777);
+      const f = server({ [URL0]: GOOD });
+      await refused(run(dir, pinFor(GOOD), f), "codex_cache");
+      assert.equal(f.calls.length, 0, level);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+for (const [what, mutate] of [
+  ["the copy's own directory opened to others", (d) => chmodSync(d, 0o777)],
+  ["a directory inside it opened to others", (d) => chmodSync(join(d, "vendor/bin"), 0o755)],
+  ["a special bit on the executable", (d) => chmodSync(join(d, "vendor/bin/codex"), 0o4755)],
+  ["a file executable that shouldn't be", (d) => chmodSync(join(d, "LICENSE"), 0o755)],
+]) {
+  test(`at start, ${what}: not used, moved aside, fetched once more`, T, async () => {
+    const { dir, f } = await cached(mutate);
+    try {
+      const r = await run(dir, pinFor(GOOD), f);
+      assert.equal(f.calls.length, 2);
+      assert.ok(treeMatches(r.dir, FILES));
+      assert.equal(lstatSync(r.dir).mode & 0o7777, 0o700);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+test("written under a strict umask, the copy still has its exact modes (and is used at the next start)", T, async () => {
+  const dir = scratch();
+  const was = process.umask(0o077);
+  try {
+    const f = server({ [URL0]: GOOD });
+    const r = await run(dir, pinFor(GOOD), f);
+    assert.equal(lstatSync(r.bin).mode & 0o7777, 0o755);
+    assert.equal(lstatSync(join(r.dir, "LICENSE")).mode & 0o7777, 0o644);
+    assert.equal(lstatSync(join(r.dir, "vendor")).mode & 0o7777, 0o700);
+    await run(dir, pinFor(GOOD), f);
+    assert.equal(f.calls.length, 1, "the cached copy matched");
+  } finally { process.umask(was); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("an archive that isn't gzip, larger than the gunzip takes at once: refused at once, not left waiting", T, async () => {
+  const dir = scratch();
+  try {
+    const junk = Buffer.alloc(4 << 20, 0x41);
+    const t = Date.now();
+    await refused(run(dir, pinFor(GOOD, { size: junk.length, sha256: sha(junk) }), server({ [URL0]: junk })), "codex_archive", /gzip|couldn't be read/);
+    assert.ok(Date.now() - t < 5000);
+    assert.deepEqual(leftovers(dir), []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a Stop while a write waits: the download ends 'stopped' within 2 s of the abort, the write never settling", T, async () => {
+  const ac = new AbortController();
+  const f = server({ [URL0]: GOOD });
+  let aborted = 0;
+  ac.signal.addEventListener("abort", () => { aborted = Date.now(); });
+  setTimeout(() => ac.abort(), 30);
+  await refused(download(URL0, { size: GOOD.length, fetchFn: f, signal: ac.signal, onData: () => new Promise(() => {}) }), "codex_download", /stopped/);
+  assert.ok(aborted && Date.now() - aborted < 2000, `settled ${Date.now() - aborted} ms after the abort`);
+});
+
+test("refused while the gunzip is busy (a bad first member, then megabytes in small chunks): settles at once, temp removed", T, async () => {
+  const dir = scratch();
+  try {
+    const archive = gzipSync(Buffer.concat([member("package/evil", Buffer.alloc(4 << 20, 1)), ...goodMembers(), END]), { level: 0 });
+    const f = server({ [URL0]: () => new Response(new ReadableStream({ start(c) { for (let i = 0; i < archive.length; i += 16384) c.enqueue(archive.subarray(i, i + 16384)); c.close(); } }), { status: 200 }) });
+    const t = Date.now();
+    await refused(run(dir, pinFor(archive), f), "codex_archive", /unexpected member evil/);
+    assert.ok(Date.now() - t < 5000);
+    assert.deepEqual(leftovers(dir), []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a network failure is said in fixed words, never the error's own text", T, async () => {
+  const dir = scratch();
+  try {
+    const f = async () => { throw new Error("getaddrinfo ENOTFOUND secret-host.internal /home/x/.npmrc"); };
+    await refused(run(dir, pinFor(GOOD), f), "codex_download", /^the connection failed$/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

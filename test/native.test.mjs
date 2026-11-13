@@ -414,3 +414,20 @@ test("each session's transcript is deleted where it ran: the runner's folder for
     assert.ok(existsSync(scratch), "the runner's folder is not");
   } finally { rmSync(scratch, { recursive: true, force: true }); }
 });
+
+test("native: a workspace remove the permission callback lets through is asked once, not twice", async () => {
+  const a = agent();
+  const answering = setInterval(() => {
+    for (const m of a.lines) if (typeof m.id === "string" && m.method && !m.answered) { m.answered = true; a.send({ jsonrpc: "2.0", id: m.id, result: m.method === "workspace.stat" ? { entry: null } : m.method === "workspace.list" ? { entries: [] } : { ok: true, rev: 1 } }); }
+  }, 5);
+  try {
+    a.grant({ native: true });
+    a.say("c1", "please remove the note");
+    await a.until(() => card(a, "c1"), "the card");
+    const c = card(a, "c1");
+    a.send({ jsonrpc: "2.0", method: "chat.permission", params: { request_id: c.request_id, behavior: "allow", digest: digest(c) } });
+    await a.until(() => a.finished("c1"), "the turn (a second card would leave it waiting)");
+    assert.equal(a.events("c1").filter((e) => e.type === "attention" && e.state === "open").length, 1);
+    assert.equal(a.lines.filter((m) => m.method === "workspace.remove").length, 1);
+  } finally { clearInterval(answering); a.kill(); }
+});

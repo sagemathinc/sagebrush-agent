@@ -214,3 +214,50 @@ test("an API-key login (no account, requiresOpenaiAuth false) runs; config/read 
     assert.equal(child.sent("thread/start")[0].params.cwd, h.scratch);
   } finally { await h.close(); }
 });
+
+test("a Stop while the thread starts, then the same conversation's next message: it waits for that same start (no second thread), and every later turn stays in that thread", { timeout: 20000 }, async () => {
+  const child = scriptedChild({ answer: (m) => (m.method === "thread/start" ? { thread: { id: "thread-A", ephemeral: true }, approvalPolicy: "on-request" } : defaultAnswer(m)) });
+  child.hold.add("thread/start");
+  const h = harness({ children: [child] });
+  try {
+    h.say("c1", "first");
+    await h.until(() => child.held.has("thread/start"), "thread/start A");
+    h.stop("c1");
+    await h.until(() => h.finished("c1").length === 1, "the first turn's end");
+    h.say("c1", "second");
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(child.sent("thread/start").length, 1, "no second thread/start while the first is under way");
+    child.release("thread/start");
+    await h.until(() => child.sent("turn/start").length === 1, "the second turn's start");
+    assert.equal(child.sent("turn/start")[0].params.threadId, "thread-A");
+    complete(child, "thread-A", h.server.backend.turns.get("thread-A").codexTurnId);
+    await h.until(() => h.finished("c1").length === 2, "the second turn's end");
+    h.say("c1", "third");
+    await h.until(() => child.sent("turn/start").length === 2, "the third turn's start");
+    assert.equal(child.sent("turn/start")[1].params.threadId, "thread-A", "still the same thread");
+    assert.equal(child.sent("thread/start").length, 1);
+  } finally { await h.close(); }
+});
+
+test("a thread start in an app-server that exits meanwhile sets nothing; the conversation's next thread is the new app-server's", { timeout: 20000 }, async () => {
+  const a = scriptedChild();
+  a.hold.add("thread/start");
+  const b = scriptedChild({ answer: (m) => (m.method === "thread/start" ? { thread: { id: "thread-B", ephemeral: true }, approvalPolicy: "on-request" } : defaultAnswer(m)) });
+  const h = harness({ children: [a, b] });
+  try {
+    h.say("c1", "first");
+    await h.until(() => a.held.has("thread/start"), "thread/start in A");
+    h.stop("c1");
+    await h.until(() => h.finished("c1").length === 1, "the first turn's end");
+    a.exit(1);
+    await h.until(() => h.server.backend.app === null, "A gone");
+    h.say("c1", "second");
+    await h.until(() => b.sent("turn/start").length === 1, "the second turn's start, in B");
+    assert.equal(b.sent("turn/start")[0].params.threadId, "thread-B");
+    complete(b, "thread-B", h.server.backend.turns.get("thread-B").codexTurnId);
+    await h.until(() => h.finished("c1").length === 2, "the second turn's end");
+    h.say("c1", "third");
+    await h.until(() => b.sent("turn/start").length === 2, "the third turn's start");
+    assert.equal(b.sent("turn/start")[1].params.threadId, "thread-B");
+  } finally { await h.close(); }
+});

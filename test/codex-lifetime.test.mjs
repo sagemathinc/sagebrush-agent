@@ -239,3 +239,97 @@ test("the turn's end marks every open request of it over, card or not", { timeou
     } finally { await t.done(); }
   }
 });
+
+// (a stand-in for the page's side of the workspace verbs: each call recorded; a call can be held open)
+function pageCalls(t, { hold = false } = {}) {
+  const calls = [];
+  t.server.request = (binding, method, params, signal, opts) => {
+    calls.push({ method, params });
+    if (!hold) return Promise.resolve({ ok: true });
+    // (held: settles only when its signal is aborted, as the real one does for a stopped call)
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) return reject(new Error("the turn was stopped"));
+      signal?.addEventListener("abort", () => reject(new Error("the turn was stopped")), { once: true });
+    });
+  };
+  return { calls };
+}
+const toolCall = (tool, args, turnId = "turn1") => ({ threadId: "th", turnId, callId: "k", namespace: null, tool, arguments: args });
+
+test("a workspace rename: Codex resolves the request while its card is open; the card goes, and an Allow dispatches nothing", { timeout: 20000 }, async () => {
+  const t = setup();
+  const page = pageCalls(t);
+  try {
+    const answer = t.backend.request(t.app, "item/tool/call", toolCall("workspace_rename", { from: "/a.md", to: "/b.md" }), 71);
+    await t.tick();
+    assert.equal(t.open().length, 1, "the rename's card");
+    const [q] = t.open();
+    t.backend.notification(t.app, "serverRequest/resolved", { threadId: "th", requestId: 71 });
+    assert.equal(t.open().length, 0, "withdrawn");
+    q.done(true);
+    const r = await answer;
+    assert.equal(r.success, false);
+    assert.deepEqual(page.calls, [], "no workspace.rename");
+  } finally { await t.done(); }
+});
+
+test("a workspace tool call resolved while it waits for turn/start's answer: nothing is dispatched", { timeout: 20000 }, async () => {
+  const t = setup({ turnId: null });
+  const page = pageCalls(t);
+  try {
+    const answer = t.backend.request(t.app, "item/tool/call", toolCall("workspace_mkdir", { path: "/benign" }), 70);
+    t.backend.notification(t.app, "serverRequest/resolved", { threadId: "th", requestId: 70 });
+    t.active.codexTurnId = "turn1";
+    t.ready("turn1");
+    const r = await answer;
+    assert.equal(r.success, false);
+    assert.match(r.contentItems[0].text, /^refused: /);
+    assert.deepEqual(page.calls, []);
+  } finally { await t.done(); }
+});
+
+test("a page call a workspace tool waits on is dropped when Codex resolves the request", { timeout: 20000 }, async () => {
+  const t = setup();
+  const page = pageCalls(t, { hold: true });
+  try {
+    const answer = t.backend.request(t.app, "item/tool/call", toolCall("workspace_list", { folder: "/" }), 72);
+    await t.tick();
+    assert.equal(page.calls.length, 1, "the list went to the page");
+    t.backend.notification(t.app, "serverRequest/resolved", { threadId: "th", requestId: 72 });
+    const r = await answer;
+    assert.equal(r.success, false);
+    assert.match(r.contentItems[0].text, /refused: the turn was stopped/);
+  } finally { await t.done(); }
+});
+
+test("Codex uses a request id again: the earlier request is over (its card goes, it dispatches nothing); the new one runs", { timeout: 20000 }, async () => {
+  const t = setup();
+  const page = pageCalls(t);
+  try {
+    const first = t.backend.request(t.app, "item/tool/call", toolCall("workspace_remove", { path: "/old.md" }), 73);
+    await t.tick();
+    const [q1] = t.open();
+    const second = t.backend.request(t.app, "item/tool/call", toolCall("workspace_mkdir", { path: "/new" }), 73);
+    assert.equal(t.open().length, 0, "the first card is withdrawn");
+    q1.done(true);
+    assert.equal((await first).success, false);
+    assert.equal((await second).success, true);
+    assert.deepEqual(page.calls.map((c) => c.method), ["workspace.mkdir"], "only the new request's call");
+  } finally { await t.done(); }
+});
+
+test("past the open-request limit a workspace tool call runs nothing", { timeout: 20000 }, async () => {
+  const t = setup();
+  const page = pageCalls(t, { hold: true });
+  try {
+    const held = [];
+    for (let i = 0; i < 64; i++) held.push(t.backend.request(t.app, "item/tool/call", toolCall("workspace_list", { folder: `/f${i}` }), `h${i}`));
+    await t.tick();
+    assert.equal(page.calls.length, 64);
+    const over = await t.backend.request(t.app, "item/tool/call", toolCall("workspace_mkdir", { path: "/x" }), "h64");
+    assert.equal(over.success, false);
+    assert.equal(page.calls.length, 64, "nothing more dispatched");
+    t.turnAbort.abort(); // (the held ones end with the turn)
+    for (const h of held) assert.equal((await h).success, false);
+  } finally { await t.done(); }
+});

@@ -125,7 +125,8 @@ const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { retu
 const within = async (f, ms, what) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) throw new Error(`not within ${ms} ms: ${what}`); await new Promise((r) => setTimeout(r, 10)); } };
 
 test("closing the agent during the schema probe: its process group is gone (by pid) within 2 s, nothing after initialize is sent", T, async () => {
-  const h = harness((bin) => ({ bin, dir: "/x", version: "0.159.2" }), { generate: `echo $$ > "$PIDFILE"; (sleep 3; echo alive > "$MARK") & sleep 30; exit 0` });
+  // (the app-server takes 300 ms to end: closing must wait for the cancelled start's own cleanup)
+  const h = harness((bin) => ({ bin, dir: "/x", version: "0.159.2" }), { generate: `echo $$ > "$PIDFILE"; (sleep 3; echo alive > "$MARK") & sleep 30; exit 0`, fakeEnv: { FAKE_CODEX_SLOW_EXIT: "1" } });
   h.say("hello");
   const pidFile = join(h.scratch, "probe.pid");
   await within(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").trim(), 10000, "the probe started");
@@ -136,7 +137,7 @@ test("closing the agent during the schema probe: its process group is gone (by p
   await h.server.close();
   await within(() => !alive(pid), 2000, "the probe ended");
   assert.ok(Date.now() - t < 5000);
-  assert.ok(!appPid || !alive(appPid), "the app-server ended");
+  assert.ok(appPid && !alive(appPid), "the app-server ended before close() returned");
   await new Promise((r) => setTimeout(r, 3300));
   assert.ok(!existsSync(join(h.scratch, "probe-child-alive")), "nothing the probe started outlived it");
   for (const m of ["initialized", "account/read", "thread/start", "turn/start"]) assert.ok(!h.rec().some((x) => x.method === m), `${m} never sent`);

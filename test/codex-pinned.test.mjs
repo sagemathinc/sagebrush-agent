@@ -3,6 +3,7 @@
 // the turn that asked; a fetch refusal is one line and nothing is started. In-process, with the fake app-server
 // behind a stand-in for the pinned executable.
 import { test } from "node:test";
+const T = { timeout: 20000 }; // (a row that hangs fails by name)
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -55,7 +56,7 @@ function harness(locate) {
   };
 }
 
-test("the pinned Codex runs by its absolute path, for the self-test and the app-server; the `codex` on PATH never runs", async () => {
+test("the pinned Codex runs by its absolute path, for the self-test and the app-server; the `codex` on PATH never runs", T, async () => {
   const h = harness((bin) => ({ bin, dir: "/x", version: "0.159.2" }));
   try {
     h.say("hello");
@@ -67,7 +68,7 @@ test("the pinned Codex runs by its absolute path, for the self-test and the app-
   } finally { await h.close(); }
 });
 
-test("the first download's progress: one line to the turn that asked, then the turn goes on", async () => {
+test("the first download's progress: one line to the turn that asked, then the turn goes on", T, async () => {
   const h = harness((bin, { onProgress }) => { onProgress(16e6, 162475310); onProgress(32e6, 162475310); return { bin, dir: "/x", version: "0.159.2" }; });
   try {
     h.say("hello");
@@ -78,7 +79,7 @@ test("the first download's progress: one line to the turn that asked, then the t
   } finally { await h.close(); }
 });
 
-test("each fetch refusal is one line in the turn; nothing is started; the next message tries again", async () => {
+test("each fetch refusal is one line in the turn; nothing is started; the next message tries again", T, async () => {
   for (const [code, message] of [
     ["codex_download", CODEX_TEXT.download("HTTP 404")],
     ["codex_archive", CODEX_TEXT.mismatch],
@@ -101,7 +102,7 @@ test("each fetch refusal is one line in the turn; nothing is started; the next m
   }
 });
 
-test("the agent closing aborts a download under way (the signal locate gets)", async () => {
+test("the agent closing aborts a download under way (the signal locate gets)", T, async () => {
   let seen = null;
   const h = harness((bin, { signal }) => new Promise((_, reject) => { seen = signal; signal.addEventListener("abort", () => reject(new CodexFetchError("codex_download", "stopped"))); }));
   h.say("hello");

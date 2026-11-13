@@ -4,6 +4,7 @@
 // the same through the agent with the fake Codex: a failing self-test sends nothing more, no thread and no turn.
 
 import { test } from "node:test";
+const T = { timeout: 20000 }; // (a row that hangs fails by name)
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -103,7 +104,7 @@ function agent(fakeEnv) {
   };
 }
 
-test("through the agent: a broken contract fails the turn in one line, and no thread or turn is ever started", async () => {
+test("through the agent: a broken contract fails the turn in one line, and no thread or turn is ever started", T, async () => {
   const dir = mkdtempSync(join(tmpdir(), "schema-"));
   const d = fresh();
   BREAKS[0][1](d);
@@ -124,7 +125,7 @@ test("through the agent: a broken contract fails the turn in one line, and no th
   } finally { a.kill(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("through the agent: a Codex that can't describe its protocol fails the turn naming only its exit, nothing more sent", async () => {
+test("through the agent: a Codex that can't describe its protocol fails the turn naming only its exit, nothing more sent", T, async () => {
   const a = agent({ FAKE_CODEX_SCHEMA_FAIL: "1", FAKE_CODEX_SCHEMA: "/nonexistent" });
   try {
     a.say("hello");
@@ -136,7 +137,7 @@ test("through the agent: a Codex that can't describe its protocol fails the turn
   } finally { a.kill(); }
 });
 
-test("through the agent: notifications before initialize's answer (as Codex 0.163.0 sends) don't disturb the start; the turn completes", async () => {
+test("through the agent: notifications before initialize's answer (as Codex 0.163.0 sends) don't disturb the start; the turn completes", T, async () => {
   const a = agent({ FAKE_CODEX_SCHEMA: fileURLToPath(new URL("./fixtures/codex-schema-0.163.0.json", import.meta.url)), FAKE_CODEX_EARLY_NOTES: "1" });
   try {
     a.say("hello");

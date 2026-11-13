@@ -3,6 +3,7 @@
 // are made in the test; nothing goes to the network (fetchFn is a stand-in).
 
 import { test } from "node:test";
+const T = { timeout: 20000 }; // (a row that hangs fails by name)
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -85,7 +86,7 @@ const leftovers = (dir) => readdirSync(rootIn(dir)).filter((n) => n.startsWith("
 
 // ---- rows
 
-test("first use: fetched from the pinned URL, unpacked, checked; a second start uses the cache without fetching", async () => {
+test("first use: fetched from the pinned URL, unpacked, checked; a second start uses the cache without fetching", T, async () => {
   const dir = scratch();
   try {
     const f = server({ [URL0]: GOOD });
@@ -101,7 +102,7 @@ test("first use: fetched from the pinned URL, unpacked, checked; a second start 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("the archive's sha256 isn't the pin's: refused, nothing put in place, no temp left", async () => {
+test("the archive's sha256 isn't the pin's: refused, nothing put in place, no temp left", T, async () => {
   const dir = scratch();
   try {
     const other = gzipSync(Buffer.concat([...goodMembers(), END, Buffer.alloc(512)]));
@@ -127,7 +128,7 @@ const BAD_ARCHIVES = [
   ["an unknown extension key", () => [paxRecord("linkpath", "/etc/passwd"), ...goodMembers()], /extension linkpath/],
 ];
 for (const [what, members, re] of BAD_ARCHIVES) {
-  test(`refused: ${what}`, async () => {
+  test(`refused: ${what}`, T, async () => {
     const dir = scratch();
     try {
       const archive = gzipSync(Buffer.concat([...members(), END]));
@@ -138,7 +139,7 @@ for (const [what, members, re] of BAD_ARCHIVES) {
   });
 }
 
-test("refused: an archive that ends early (truncated tar), and one that isn't gzip", async () => {
+test("refused: an archive that ends early (truncated tar), and one that isn't gzip", T, async () => {
   for (const [archive, re] of [[gzipSync(Buffer.concat(goodMembers()).subarray(0, 1700)), /ends early/], [Buffer.from("not gzip at all"), /gzip/]]) {
     const dir = scratch();
     try {
@@ -168,7 +169,7 @@ test("member paths: only under the package root, no empty, '.', '..' or backslas
   for (const n of ["a/b", "package/", "package//a", "package/./a", "package/a/../b", "package/a\\b", "/package/a", "packagex/a"]) assert.equal(memberPath(n), null, n);
 });
 
-test("the download: larger or shorter than pinned, another host, plain http, too many redirects; each refused", async () => {
+test("the download: larger or shorter than pinned, another host, plain http, too many redirects; each refused", T, async () => {
   const big = Buffer.concat([GOOD, Buffer.alloc(10)]);
   const cases = [
     [server({ [URL0]: big }), "codex_archive", /larger than pinned|another size/],
@@ -187,7 +188,7 @@ test("the download: larger or shorter than pinned, another host, plain http, too
   }
 });
 
-test("a redirect within the registry is followed (at most 3)", async () => {
+test("a redirect within the registry is followed (at most 3)", T, async () => {
   const dir = scratch();
   try {
     const f = server({ [URL0]: URL0 + "?cdn", [URL0 + "?cdn"]: GOOD });
@@ -196,7 +197,7 @@ test("a redirect within the registry is followed (at most 3)", async () => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("a Stop (the agent closing) ends a download under way: refused 'stopped', its temp dir removed", async () => {
+test("a Stop (the agent closing) ends a download under way: refused 'stopped', its temp dir removed", T, async () => {
   const dir = scratch();
   try {
     const ac = new AbortController();
@@ -206,7 +207,7 @@ test("a Stop (the agent closing) ends a download under way: refused 'stopped', i
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("progress: reported while the download goes on", async () => {
+test("progress: reported while the download goes on", T, async () => {
   const dir = scratch();
   try {
     const seen = [];
@@ -235,7 +236,7 @@ for (const [what, mutate] of [
   ["the executable's mode", (d) => chmodSync(join(d, "vendor/bin/codex"), 0o644)],
   ["a group-writable file", (d) => chmodSync(join(d, "LICENSE"), 0o664)],
 ]) {
-  test(`at start, the cached copy no longer matches (${what}): moved aside (never deleted), fetched once more`, async () => {
+  test(`at start, the cached copy no longer matches (${what}): moved aside (never deleted), fetched once more`, T, async () => {
     const { dir, f, r } = await cached(mutate);
     try {
       const again = await run(dir, pinFor(GOOD), f);
@@ -248,7 +249,7 @@ for (const [what, mutate] of [
   });
 }
 
-test("a cached copy that doesn't match, and a fetch that still doesn't: one re-fetch, then refused", async () => {
+test("a cached copy that doesn't match, and a fetch that still doesn't: one re-fetch, then refused", T, async () => {
   const { dir } = await cached((d) => writeFileSync(join(d, "LICENSE"), "changed!!!!!!"));
   try {
     const other = gzipSync(Buffer.concat([...goodMembers().slice(0, 4), member("package/LICENSE", Buffer.from("license tex!\n")), END]));
@@ -258,7 +259,7 @@ test("a cached copy that doesn't match, and a fetch that still doesn't: one re-f
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("the cached version dir is a symlink: not followed, moved aside, fetched again", async () => {
+test("the cached version dir is a symlink: not followed, moved aside, fetched again", T, async () => {
   const dir = scratch();
   try {
     const elsewhere = mkdtempSync(join(dir, "elsewhere-"));
@@ -271,7 +272,7 @@ test("the cached version dir is a symlink: not followed, moved aside, fetched ag
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("the cache directory is a symlink, or not a directory: refused, nothing fetched", async () => {
+test("the cache directory is a symlink, or not a directory: refused, nothing fetched", T, async () => {
   const dir = scratch();
   try {
     mkdirSync(join(dir, "real"));
@@ -282,7 +283,7 @@ test("the cache directory is a symlink, or not a directory: refused, nothing fet
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("a fetch that loses the race to put its copy in place keeps the winner's (same inode), and removes its own", async () => {
+test("a fetch that loses the race to put its copy in place keeps the winner's (same inode), and removes its own", T, async () => {
   const dir = scratch();
   try {
     let firstDone, n = 0;
@@ -302,7 +303,7 @@ test("a fetch that loses the race to put its copy in place keeps the winner's (s
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("two starts at once: one copy put in place, both use it, no temp dir left, nothing set aside", async () => {
+test("two starts at once: one copy put in place, both use it, no temp dir left, nothing set aside", T, async () => {
   const dir = scratch();
   try {
     const f = server({ [URL0]: GOOD });
@@ -314,7 +315,7 @@ test("two starts at once: one copy put in place, both use it, no temp dir left, 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("no pin for this platform: refused before anything; the platforms and the cache's place", async () => {
+test("no pin for this platform: refused before anything; the platforms and the cache's place", T, async () => {
   await refused(ensureCodex({ root: "/nonexistent", platform: null, pin: pinFor(GOOD) }), "codex_platform");
   await refused(ensureCodex({ root: "/nonexistent", platform: "darwin-arm64", pin: pinFor(GOOD) }), "codex_platform");
   assert.equal(platformKey("linux", "x64"), "linux-x64");
@@ -324,7 +325,7 @@ test("no pin for this platform: refused before anything; the platforms and the c
   assert.equal(cacheRoot({}, "darwin", "/h"), "/h/Library/Caches/sagebrush-agent/codex");
 });
 
-test("the shipped pin: four platforms, each an https registry.npmjs.org tarball with an executable bin in its manifest", async () => {
+test("the shipped pin: four platforms, each an https registry.npmjs.org tarball with an executable bin in its manifest", T, async () => {
   const { PIN } = await import("../lib/codex-fetch.mjs");
   assert.deepEqual(Object.keys(PIN.platforms).sort(), ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"]);
   for (const [k, e] of Object.entries(PIN.platforms)) {

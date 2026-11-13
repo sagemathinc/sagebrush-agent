@@ -51,6 +51,9 @@ if (stdio && loopbackFlags) {
 }
 
 let query, createServer, deleteSession;
+// (native mode's permission mode: the SDK's own settings resolver and the CLI's trust filter, with the fake model too)
+const { resolveSettings, filterEscalatingDefaultMode } = await import("@anthropic-ai/claude-agent-sdk");
+const resolver = { resolveSettings, filterEscalatingDefaultMode };
 if (process.env.SAGEBRUSH_AGENT_FAKE === "1") {
   // The fake model, for tests: chosen only by this variable, set where the agent is started; nothing the page or
   // the runner sends can choose it.
@@ -65,7 +68,7 @@ if (process.env.SAGEBRUSH_AGENT_FAKE === "1") {
 }
 
 if (stdio) {
-  const server = new AgentServer({ query, deleteSession, stdio: true });
+  const server = new AgentServer({ query, deleteSession, stdio: true, resolver });
   server.createServer = createServer;
   let stopping = false;
   const stop = async (code = 0) => {

@@ -11,7 +11,8 @@ import { mkdtempSync, existsSync, readFileSync, rmSync, realpathSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
-import { TEXT, AgentServer, parseGrant, settingsMode } from "../lib/server.mjs";
+import { TEXT, AgentServer, parseGrant } from "../lib/server.mjs";
+import { PassThrough, Writable } from "node:stream";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { fakeCreateServer, fakeQuery } from "../lib/fake.mjs";
 import { permissionDigest } from "../lib/canon.mjs";
@@ -19,7 +20,7 @@ import { permissionDigest } from "../lib/canon.mjs";
 const BIN = fileURLToPath(new URL("../bin/sagebrush-agent.mjs", import.meta.url));
 const F = 64 * 1024;
 
-function agent({ userMode, projectMode } = {}) {
+function agent({ userMode, projectMode, configMode } = {}) {
   // (the runner's working folder: where it started the agent; native mode works there. And a home of its own, so the
   //  person's settings are the row's, never this machine's)
   const runnerCwd = realpathSync(mkdtempSync(join(tmpdir(), "runner-cwd-")));
@@ -27,7 +28,13 @@ function agent({ userMode, projectMode } = {}) {
   mkdirSync(join(home, ".claude"), { recursive: true });
   if (userMode) writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ permissions: { defaultMode: userMode } }));
   if (projectMode) { mkdirSync(join(runnerCwd, ".claude")); writeFileSync(join(runnerCwd, ".claude", "settings.json"), JSON.stringify({ permissions: { defaultMode: projectMode } })); }
-  const p = spawn(process.execPath, [BIN, "--stdio"], { cwd: runnerCwd, env: { ...process.env, HOME: home, SAGEBRUSH_AGENT_FAKE: "1" }, stdio: ["pipe", "pipe", "pipe"] });
+  // (a configured folder of its own, as CLAUDE_CONFIG_DIR names one)
+  const config = configMode ? join(runnerCwd, ".config-claude") : null;
+  if (config) { mkdirSync(config); writeFileSync(join(config, "settings.json"), JSON.stringify({ permissions: { defaultMode: configMode } })); }
+  const env = { ...process.env, HOME: home, SAGEBRUSH_AGENT_FAKE: "1" };
+  delete env.CLAUDE_CONFIG_DIR;
+  if (config) env.CLAUDE_CONFIG_DIR = config;
+  const p = spawn(process.execPath, [BIN, "--stdio"], { cwd: runnerCwd, env, stdio: ["pipe", "pipe", "pipe"] });
   const a = { p, runnerCwd, lines: [], err: "", waiters: [] };
   a.exited = new Promise((r) => p.on("exit", (code) => r(code)));
   let buf = "";
@@ -319,33 +326,17 @@ test("a conversation goes on in its own folder only: after the mode changes, a n
   } finally { a.kill(); rmSync(a.runnerCwd, { recursive: true, force: true }); }
 });
 
-test("settingsMode: the person's configured mode (user, then project, then local; the last wins); none is default; bypass never", () => {
-  const root = mkdtempSync(join(tmpdir(), "modes-"));
-  try {
-    const home = join(root, "home"), cwd = join(root, "cwd");
-    mkdirSync(join(home, ".claude"), { recursive: true }); mkdirSync(join(cwd, ".claude"), { recursive: true });
-    const put = (f, mode) => writeFileSync(f, typeof mode === "string" ? JSON.stringify({ permissions: { defaultMode: mode } }) : mode.raw);
-    const U = join(home, ".claude", "settings.json"), P = join(cwd, ".claude", "settings.json"), L = join(cwd, ".claude", "settings.local.json");
-    assert.deepEqual(settingsMode(cwd, home), { mode: "default", bypass: false }, "none set");
-    put(U, "acceptEdits");
-    assert.deepEqual(settingsMode(cwd, home), { mode: "acceptEdits", bypass: false }, "the user's");
-    put(P, "plan");
-    assert.deepEqual(settingsMode(cwd, home), { mode: "plan", bypass: false }, "the project's over the user's");
-    put(L, "dontAsk");
-    assert.deepEqual(settingsMode(cwd, home), { mode: "dontAsk", bypass: false }, "local over the project's");
-    put(L, "bypassPermissions");
-    assert.deepEqual(settingsMode(cwd, home), { mode: "default", bypass: true }, "bypass: default, said");
-    put(L, "made-up");
-    assert.deepEqual(settingsMode(cwd, home), { mode: "default", bypass: false }, "an unknown mode: default");
-    put(L, { raw: "{not json" });
-    assert.deepEqual(settingsMode(cwd, home), { mode: "plan", bypass: false }, "a file that can't be read is skipped");
-    put(U, "auto"); rmSync(P); rmSync(L);
-    assert.deepEqual(settingsMode(cwd, home), { mode: "auto", bypass: false }, "auto, when the person chose it");
-  } finally { rmSync(root, { recursive: true, force: true }); }
-});
-
-test("native over the runner: the mode the person's settings choose there is the one the turn runs in", async () => {
-  for (const [o, want] of [[{ userMode: "acceptEdits" }, "acceptEdits"], [{ userMode: "acceptEdits", projectMode: "plan" }, "plan"], [{ projectMode: "dontAsk" }, "dontAsk"]]) {
+test("native over the runner: the mode the SDK's resolver and the CLI's filter give for the runner's folder (one agent per case)", async () => {
+  for (const [o, want] of [
+    [{}, "default"], // (none set: default, as an interactive claude)
+    [{ userMode: "acceptEdits" }, "acceptEdits"],
+    [{ userMode: "dontAsk" }, "dontAsk"],
+    [{ projectMode: "plan" }, "plan"],
+    [{ userMode: "dontAsk", projectMode: "acceptEdits" }, "default"], // (the folder's own escalation is filtered out; nothing restores the user's)
+    [{ projectMode: "bypassPermissions" }, "default"], // (filtered out)
+    [{ userMode: "auto" }, "auto"], // (the person's own choice)
+    [{ configMode: "dontAsk" }, "dontAsk"], // (CLAUDE_CONFIG_DIR is honoured)
+  ]) {
     const a = agent(o);
     try {
       a.grant({ native: true });
@@ -430,4 +421,110 @@ test("native: a workspace remove the permission callback lets through is asked o
     assert.equal(a.events("c1").filter((e) => e.type === "attention" && e.state === "open").length, 1);
     assert.equal(a.lines.filter((m) => m.method === "workspace.remove").length, 1);
   } finally { clearInterval(answering); a.kill(); }
+});
+
+// (an in-process --stdio server whose resolver the row holds: what a Stop, a new grant or a queued message does while the
+//  mode is being resolved)
+function held() {
+  const scratch = mkdtempSync(join(tmpdir(), "runner-cwd-"));
+  const calls = [];
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const resolver = {
+    resolveSettings: async () => { calls.push("resolve"); await gate; return { effective: {}, sources: [] }; },
+    filterEscalatingDefaultMode: (r) => r.effective,
+  };
+  const queries = [];
+  const query = (o) => { queries.push(o.prompt); return fakeQuery(o); };
+  const server = new AgentServer({ query, log: () => {}, stdio: true, resolver, runnerCwd: scratch });
+  server.createServer = fakeCreateServer;
+  const input = new PassThrough();
+  const lines = [];
+  let buf = "";
+  const output = new Writable({ write(chunk, _e, cb) { buf += chunk.toString("utf8"); let nl; while ((nl = buf.indexOf("\n")) >= 0) { lines.push(JSON.parse(buf.slice(0, nl))); buf = buf.slice(nl + 1); } cb(); } });
+  server.serveStdio({ input, output, fatal: () => {} });
+  const send = (o) => input.write(Buffer.from(JSON.stringify(o) + "\n"));
+  send({ relay: { start: { frame: F, protocol: 1, epoch: 0 } } });
+  const h = {
+    server, calls, queries, lines, send, release: () => release(),
+    grant: (extra = {}) => send({ jsonrpc: "2.0", method: "grant.changed", params: { folders: ["/"], write: true, ...extra } }),
+    say: (conversation, text) => send({ jsonrpc: "2.0", method: "chat.message", params: { conversation, id: `${conversation}-${lines.length}-${Math.random()}`, text, author: "person" } }),
+    finished: (conversation) => lines.filter((m) => m.method === "turn.event" && m.params.conversation === conversation && m.params.event.type === "turn_finished").map((m) => m.params.event.outcome),
+    until: async (f, what) => { const t = Date.now(); while (!f()) { if (Date.now() - t > 8000) throw new Error("timed out: " + what); await new Promise((r) => setTimeout(r, 5)); } },
+    close: async () => { input.end(); await server.close(); rmSync(scratch, { recursive: true, force: true }); },
+  };
+  return h;
+}
+
+test("native: a Stop while the mode is being resolved ends the turn there; nothing starts after", async () => {
+  const h = held();
+  try {
+    h.grant({ native: true });
+    h.say("c1", "options?");
+    await h.until(() => h.calls.length === 1, "the resolver called");
+    h.send({ jsonrpc: "2.0", method: "chat.interrupt", params: { conversation: "c1" } });
+    h.release();
+    await h.until(() => h.finished("c1").length === 1, "the turn's end");
+    assert.deepEqual(h.finished("c1"), ["interrupted"]);
+    assert.deepEqual(h.queries, [], "no query started");
+  } finally { await h.close(); }
+});
+
+test("native: a new grant while the mode is being resolved ends the turn there; nothing starts on the old grant", async () => {
+  const h = held();
+  try {
+    h.grant({ native: true });
+    h.say("c1", "options?");
+    await h.until(() => h.calls.length === 1, "the resolver called");
+    h.grant({ native: true }); // (a rebind: the old binding's turn must not start)
+    h.release();
+    await h.until(() => h.finished("c1").length === 1, "the turn's end");
+    assert.deepEqual(h.finished("c1"), ["interrupted"]);
+    assert.deepEqual(h.queries, [], "no query started for the old binding");
+  } finally { await h.close(); }
+});
+
+test("native: a message queued while the mode is being resolved runs after it, once; no turn is doubled", async () => {
+  const h = held();
+  try {
+    h.grant({ native: true });
+    h.say("c1", "options?");
+    await h.until(() => h.calls.length === 1, "the resolver called");
+    h.say("c1", "options?");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(h.calls.length, 1, "the second waits: one turn per conversation");
+    h.release();
+    await h.until(() => h.finished("c1").length === 2, "both turns");
+    assert.deepEqual(h.finished("c1"), ["completed", "completed"]);
+    assert.equal(h.queries.length, 2);
+  } finally { await h.close(); }
+});
+
+test("native: a resolver that fails ends the turn as an error; no mode is guessed and nothing starts", async () => {
+  const h = held();
+  h.server.resolver = { resolveSettings: async () => { throw new Error("unreadable"); }, filterEscalatingDefaultMode: (r) => r };
+  try {
+    h.grant({ native: true });
+    h.say("c1", "options?");
+    await h.until(() => h.finished("c1").length === 1, "the turn's end");
+    assert.deepEqual(h.finished("c1"), ["error"]);
+    assert.deepEqual(h.queries, []);
+    const err = h.lines.find((m) => m.method === "turn.event" && m.params.event.type === "turn_error");
+    assert.match(err.params.event.message, new RegExp(TEXT.noMode.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  } finally { await h.close(); }
+});
+
+test("native without a resolver: the turn ends as an error; tools-only needs none", async () => {
+  const h = held();
+  h.server.resolver = null;
+  try {
+    h.grant({ native: true });
+    h.say("c1", "options?");
+    await h.until(() => h.finished("c1").length === 1, "the native turn's end");
+    assert.deepEqual(h.finished("c1"), ["error"]);
+    h.grant({ native: false });
+    h.say("c2", "options?");
+    await h.until(() => h.finished("c2").length === 1, "the tools-only turn's end");
+    assert.deepEqual(h.finished("c2"), ["completed"]);
+  } finally { await h.close(); }
 });

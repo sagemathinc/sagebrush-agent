@@ -191,6 +191,30 @@ test("a command Codex asks about: a card with exactly what it sent; Allow with i
   }
 });
 
+test("Codex's sandbox can't start here: the person is told once per conversation, just before its first command card", async () => {
+  const a = agent({ FAKE_CODEX_NO_SANDBOX: "1" });
+  try {
+    a.grant({ native: true });
+    for (const [n, conv] of [[1, "c1"], [2, "c1"], [1, "c2"]]) {
+      a.say(conv, "command");
+      await a.until(() => a.cards(conv).length >= n, "the card");
+      const evs = a.events(conv);
+      const said = evs.filter((e) => e.type === "thinking_delta" && e.text === CODEX_TEXT.noSandbox);
+      assert.equal(said.length, 1, `${conv}: said once`);
+      assert.ok(evs.indexOf(said[0]) < evs.indexOf(a.cards(conv)[0]), "before the first card");
+      await a.permit(a.cards(conv).at(-1), false);
+      await a.until(() => a.finished(conv, n), "the turn");
+    }
+  } finally { a.kill(); }
+  const b = agent();
+  try {
+    b.grant({ native: true });
+    b.say("c1", "command");
+    await b.until(() => b.cards("c1").length, "the card");
+    assert.ok(!b.events("c1").some((e) => e.text === CODEX_TEXT.noSandbox), "not said where the sandbox runs");
+  } finally { b.kill(); }
+});
+
 test("an Allow whose digest is for another action declines (logged)", async () => {
   const a = agent();
   try {

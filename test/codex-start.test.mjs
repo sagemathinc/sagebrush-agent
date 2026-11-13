@@ -359,3 +359,15 @@ test("a self-test that fails with words of its own: the person sees fixed words 
     assert.ok(!h.logs.join("\n").includes("SECRET"), "nor in the log");
   } finally { await h.close(); }
 });
+
+test("a self-test with many problems: at most 5 named, each at most 120 characters", async () => {
+  const many = ["x".repeat(500), ...Array.from({ length: 7 }, (_, i) => `no request m${i}`)];
+  const h = harness({ children: [scriptedChild()], selfTest: async () => many });
+  try {
+    h.say("c1", "hello");
+    await h.until(() => h.finished("c1").length, "the refused turn");
+    const err = h.events("c1").find((e) => e.type === "turn_error");
+    assert.equal(err.code, "codex_incompatible");
+    assert.equal(err.message, CODEX_TEXT.incompatible(["x".repeat(120), "no request m0", "no request m1", "no request m2", "no request m3"].join("; ")));
+  } finally { await h.close(); }
+});

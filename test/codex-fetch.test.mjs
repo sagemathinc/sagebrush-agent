@@ -426,3 +426,21 @@ test("a network failure is said in fixed words, never the error's own text", T, 
     await refused(run(dir, pinFor(GOOD), f), "codex_download", /^the connection failed$/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("every request: no credentials or cookies, and redirects never followed by fetch itself (each hop checked here)", T, async () => {
+  const dir = scratch();
+  try {
+    const seen = [];
+    const inner = server({ [URL0]: URL0 + "?cdn", [URL0 + "?cdn"]: GOOD });
+    const spy = async (url, opts) => { seen.push(opts); return inner(url, opts); };
+    await run(dir, pinFor(GOOD), spy);
+    assert.equal(seen.length, 2);
+    for (const o of seen) {
+      assert.equal(o.redirect, "manual");
+      assert.notEqual(o.credentials, "include");
+      const names = Object.keys(o.headers ?? {}).map((h) => h.toLowerCase());
+      for (const h of ["authorization", "cookie", "proxy-authorization"]) assert.ok(!names.includes(h), `no ${h}`);
+      assert.deepEqual(names, ["accept"]);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

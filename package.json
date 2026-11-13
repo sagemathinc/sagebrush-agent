@@ -1,7 +1,7 @@
 {
   "name": "sagebrush-agent",
-  "version": "0.6.0",
-  "description": "Chat with Claude in Sagebrush: a small daemon on your computer that runs Claude (with your own Claude login) and talks to the Sagebrush page over the loopback address.",
+  "version": "0.7.0",
+  "description": "Chat with Claude or Codex in Sagebrush: a small daemon on your computer that runs Claude (with your own Claude login), or your own Codex through sagebrush remote, and talks to the Sagebrush page.",
   "type": "module",
   "bin": {
     "sagebrush-agent": "bin/sagebrush-agent.mjs"
@@ -14,6 +14,9 @@
     "lib/canon.mjs",
     "lib/stdio.mjs",
     "lib/fake.mjs",
+    "lib/codex.mjs",
+    "lib/codex-turns.mjs",
+    "lib/fake-codex.mjs",
     "lib/page-tools.mjs",
     "lib/page-verbs.json",
     "README.md",

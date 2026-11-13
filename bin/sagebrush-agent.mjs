@@ -13,6 +13,12 @@
 // reached through the runner, one JSON message per line on stdin and stdout
 // (stdout carries nothing else). SIGINT stops the running turns; SIGTERM, or
 // the end of stdin, stops the agent.
+//
+//   sagebrush-agent --codex --stdio
+//
+// runs the person's own Codex there instead (`codex app-server`, with that
+// computer's Codex login and settings): only over the runner, and only for a
+// connection with shell and files on.
 
 import { AgentServer, DEFAULT_ORIGINS, TEXT } from "../lib/server.mjs";
 import { stdinChunks } from "../lib/stdio.mjs";
@@ -31,19 +37,25 @@ function exactOrigin(s) {
 const args = process.argv.slice(2);
 let port = 0;
 let stdio = false;
+let codex = false;
 let loopbackFlags = false;
 const origins = [...DEFAULT_ORIGINS];
 for (let i = 0; i < args.length; i++) {
   if (args[i] === "--port") { port = Number(args[++i]); loopbackFlags = true; }
   else if (args[i] === "--origin") { origins.push(exactOrigin(String(args[++i]))); loopbackFlags = true; }
   else if (args[i] === "--stdio") stdio = true;
+  else if (args[i] === "--codex") codex = true;
   else if (args[i] === "--help" || args[i] === "-h") {
-    console.log("usage: sagebrush-agent [--port N] [--origin https://...]\n       sagebrush-agent --stdio   (run by sagebrush remote --serve-agents)");
+    console.log("usage: sagebrush-agent [--port N] [--origin https://...]\n       sagebrush-agent [--codex] --stdio   (run by sagebrush remote --serve-agents)");
     process.exit(0);
   } else {
     console.error(`unknown argument: ${args[i]}`);
     process.exit(2);
   }
+}
+if (codex && !stdio) {
+  console.error("--codex works only with --stdio: Codex is run by sagebrush remote --serve-agents, with shell and files on");
+  process.exit(2);
 }
 if (stdio && loopbackFlags) {
   console.error("--stdio can't be used with --port or --origin: the runner is the only peer");
@@ -68,8 +80,14 @@ if (process.env.SAGEBRUSH_AGENT_FAKE === "1") {
 }
 
 if (stdio) {
-  const server = new AgentServer({ query, deleteSession, stdio: true, resolver });
+  const server = new AgentServer({ query, deleteSession, stdio: true, resolver, ...(codex ? { name: "Codex", client: "codex-app-server" } : {}) });
   server.createServer = createServer;
+  if (codex) {
+    const { CodexBackend } = await import("../lib/codex.mjs");
+    // (the fake app-server, for tests: chosen only by SAGEBRUSH_AGENT_FAKE=1, like the fake model)
+    const command = process.env.SAGEBRUSH_AGENT_FAKE === "1" ? [process.execPath, new URL("../lib/fake-codex.mjs", import.meta.url).pathname] : ["codex", "app-server"];
+    server.backend = new CodexBackend(server, { command });
+  }
   let stopping = false;
   const stop = async (code = 0) => {
     if (stopping) return;

@@ -22,6 +22,12 @@ function png(width, height, bytes) {
 test("notebookDoc: a closed grammar with bounds", () => {
   const ok = notebookDoc({ mode: "sage", cells: [{ type: "code", source: "1+1" }, { type: "markdown", source: "# t" }] });
   assert.equal(ok.mode, "sage");
+  // (every language a Sagebrush notebook runs: MATLAB's and Magma's too)
+  for (const mode of ["python", "matlab", "magma"]) {
+    const d = notebookDoc({ mode, cells: [{ type: "code", source: mode === "matlab" ? "x = linspace(0, 3, 200); plot(x, sin(x.^2))" : "1+1" }] });
+    assert.equal(d.mode, mode);
+    assert.equal(d.cells.length, 1);
+  }
   assert.deepEqual(ok.cells.map((c) => [c.type ?? "code", c.code]), [["code", "1+1"], ["markdown", "# t"]]);
   assert.equal(new Set(ok.cells.map((c) => c.id)).size, 2);
   for (const [bad, why] of [

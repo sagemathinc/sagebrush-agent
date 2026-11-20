@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import WebSocket from "ws";
 import { fakeCreateServer } from "../lib/fake.mjs";
-import { AgentServer } from "../lib/server.mjs";
+import { AgentServer, sameGrant, scopeOf } from "../lib/server.mjs";
 
 const ORIGIN = "https://agents.sagebrush.cloud";
 const gates = new Map();
@@ -63,7 +63,8 @@ async function start(opts = {}) {
   const port = await server.listen();
   return { server, port, code: server.newCode() };
 }
-async function paired(port, code) {
+const G1 = { folders: ["/"], write: true, run: false, expires: null, id: "grant-one" };
+async function paired(port, code, grant = G1) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/sagebrush`, { origin: ORIGIN });
   const msgs = [];
   let onHello;
@@ -79,7 +80,7 @@ async function paired(port, code) {
     ws.send(JSON.stringify({ jsonrpc: "2.0", id: "p1", method: "hello", params: { protocol: 1, page: { origin: ORIGIN, path: "/agents/" }, code } }));
   });
   notify("page.features", { features: ["permission.digest"] });
-  notify("grant.changed", { folders: ["/"], write: true, run: false, expires: null, id: "grant-one" });
+  notify("grant.changed", grant);
   return { ws, msgs, notify };
 }
 const until = async (f, ms = 8000) => {
@@ -145,6 +146,7 @@ test("a steer the turn ends without taking: queued (ended), and it runs next as 
   const openB = gate("B");
   openA();
   await until(() => started(server, "c1") === 2);
+  await until(() => receipts(p.msgs, "u2").length === 2);
   assert.deepEqual(receipts(p.msgs, "u2"), ["steering", "queued:ended"]);
   openB();
   await until(() => finished(server, "c1").length === 2);
@@ -190,6 +192,7 @@ test("Stop with a steer not yet taken: the turn ends interrupted, and the steer 
   p.notify("chat.interrupt", { conversation: "c1" });
   await until(() => finished(server, "c1").length === 2);
   assert.deepEqual(finished(server, "c1"), ["interrupted", "completed"]);
+  await until(() => receipts(p.msgs, "u2").length === 2); // (the log has it first; the socket a moment later)
   assert.deepEqual(receipts(p.msgs, "u2"), ["steering", "queued:ended"]);
   p.ws.close();
   server.close();
@@ -238,3 +241,61 @@ test("steers count against the waiting cap: past it, one more is refused as busy
   p.ws.close();
   server.close();
 });
+
+// SEC-STEER-1: a turn's tools are fixed at its start, so a change of native, either way, is another grant: the turn
+// ends, and a steer sent after it never enters the old turn's input; it starts a turn under the new grant.
+test("sameGrant: native must be exactly as it was, in either direction", () => {
+  assert.equal(sameGrant(scopeOf({ id: "g", folders: ["/"], native: true }), { id: "g", folders: ["/"], native: false }), false);
+  assert.equal(sameGrant(scopeOf({ id: "g", folders: ["/"], native: true }), { id: "g", folders: ["/"] }), false);
+  assert.equal(sameGrant(scopeOf({ id: "g", folders: ["/"] }), { id: "g", folders: ["/"], native: true }), false);
+  assert.equal(sameGrant(scopeOf({ id: "g", folders: ["/"], native: true }), { id: "g", folders: ["/"], native: true }), true);
+});
+
+test("a native turn, then the same grant id with native off: the turn ends; a steer then runs as a new turn, never in the old one", async () => {
+  const seen = [];
+  const { server, port, code } = await start({ query: (o) => { seen.push(o.options); return scriptedQuery(o); } });
+  gate("A");
+  const p = await paired(port, code, { ...G1, native: true });
+  p.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "wait A; take" });
+  await until(() => server.counters().running === 1);
+  p.notify("grant.changed", { ...G1, native: false });
+  await until(() => finished(server, "c1").length === 1);
+  assert.deepEqual(finished(server, "c1"), ["interrupted"]);
+  p.notify("chat.message", { conversation: "c1", id: "u2", author: "person", text: "after", steer: true });
+  await until(() => finished(server, "c1").length === 2);
+  assert.deepEqual(receipts(p.msgs, "u2"), ["queued:idle"], "it never entered the old turn");
+  assert.doesNotMatch(texts(server, "c1"), /GOT after/);
+  assert.equal(seen.length, 2);
+  assert.deepEqual(seen[1].settingSources, [], "the new turn's query is tools-only, not native");
+  p.ws.close();
+  server.close();
+});
+
+// SEC-STEER-2: steers a turn never took are refused, as queued messages are (D7), when the turn ends for another
+// grant, a revoke or the grant's expiry; they run next only after the turn's own end or the person's Stop.
+for (const [what, change] of [
+  ["another grant", (p) => p.notify("grant.changed", { ...G1, id: "grant-two" })],
+  ["a revoke", (p) => p.notify("grant.changed", {})],
+  ["the grant's expiry", null],
+]) {
+  test(`a steer not yet taken when the turn ends for ${what}: refused (cancelled), never run, not counted`, async () => {
+    const ran = [];
+    const { server, port, code } = await start({ query: (o) => { ran.push(o); return scriptedQuery(o); } });
+    gate("A");
+    const p = await paired(port, code, change ? G1 : { ...G1, expires: Date.now() + 600 });
+    p.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "wait A" });
+    await until(() => server.counters().running === 1);
+    p.notify("chat.message", { conversation: "c1", id: "u2", author: "person", text: "steer me", steer: true });
+    await until(() => receipts(p.msgs, "u2").length === 1);
+    change?.(p);
+    await until(() => p.msgs.some((m) => m.method === "chat.rejected" && m.params.id === "u2"), 5000);
+    assert.equal(p.msgs.find((m) => m.method === "chat.rejected" && m.params.id === "u2").params.reason.code, "cancelled");
+    assert.deepEqual(receipts(p.msgs, "u2"), ["steering"], "no queued receipt");
+    assert.equal(server.counters().queued, 0);
+    if (change) p.notify("grant.changed", G1); // (the first grant back: still nothing runs)
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(ran.length, 1, "the steer never started a turn");
+    p.ws.close();
+    server.close();
+  });
+}

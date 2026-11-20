@@ -40,6 +40,9 @@ function scriptedQuery({ prompt, options }) {
       else if (cmd === "list") {
         const r = await tools.workspace_list({ folder: "/" });
         yield* say(`LIST ${r.isError ? r.content[0].text : "ok"}`);
+      } else if (cmd === "run") {
+        const r = await tools.workspace_run_notebook({ path: "/a.ipynb" });
+        yield* say(`RUN ${r.isError ? r.content[0].text : "ok"}`);
       } else if (cmd === "ask") {
         const v = await options.canUseTool("WebFetch", { url: "https://example.com", prompt: "x" }, { signal });
         yield* say(`ASK ${v.behavior}`);
@@ -336,5 +339,44 @@ test("a card asked while no page is there: it waits in the log, and the page bac
   await until(() => finished(server, "c1").length === 1);
   assert.match(texts(server, "c1"), /ASK deny/);
   b.ws.close();
+  server.close();
+});
+
+test("run.context is decided on the page the run goes to, after the wait: with it, the turn's context; without it, none", async () => {
+  for (const [what, features, has] of [["a page that offers run.context", ["run.context"], true], ["an older page that doesn't", [], false]]) {
+    const { server, port, code } = await start();
+    const openA = gate("B1");
+    const { a, session } = await paired(port, code);
+    a.notify("page.features", { features: ["run.context"] });
+    a.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "wait B1; run" });
+    await until(() => server.counters().running === 1);
+    a.ws.close();
+    await a.closed;
+    openA();
+    await until(() => server.waiterCount === 1);
+    const b = await again(port, session);
+    b.notify("page.features", { features });
+    await until(() => b.requests.some((r) => r.method === "workspace.run_notebook"));
+    const p = b.requests.find((r) => r.method === "workspace.run_notebook").params;
+    assert.equal("conversation" in p && "turn_id" in p, has, `${what}: ${JSON.stringify(p)}`);
+    if (has) assert.equal(p.conversation, "c1");
+    await until(() => finished(server, "c1").length === 1);
+    b.ws.close();
+    server.close();
+  }
+});
+
+test("a turn whose grant ends with a card open: the card is resolved (denied) and none is left open", async () => {
+  const { server, port, code } = await start();
+  const { a } = await paired(port, code);
+  a.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "ask" });
+  await until(() => server.permissions.size === 1);
+  a.notify("grant.changed", {}); // (a revoke)
+  await until(() => finished(server, "c1").length === 1);
+  assert.deepEqual(finished(server, "c1"), ["interrupted"]);
+  assert.equal(server.permissions.size, 0);
+  const states = logOf(server, "c1").filter((e) => e.method === "turn.event" && e.params.event.type === "attention").map((e) => e.params.event.state);
+  assert.deepEqual(states, ["open", "denied"]);
+  a.ws.close();
   server.close();
 });

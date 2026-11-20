@@ -11,7 +11,8 @@ import { AgentServer, sameGrant, scopeOf } from "../lib/server.mjs";
 const ORIGIN = "https://agents.sagebrush.cloud";
 
 // A scripted model: its prompt is steps separated by ";": "wait NAME" (until the test opens that gate), "list"
-// (workspace_list, its outcome said as text), "ask" (WebFetch through the permission callback, its verdict said).
+// (workspace_list, its outcome said as text), "run" (workspace_run_notebook), "edit" (workspace_edit_notebook, from a
+// read the test puts in the conversation), "ask" (WebFetch through the permission callback, its verdict said).
 const gates = new Map();
 const gate = (name) => {
   let open;
@@ -43,6 +44,9 @@ function scriptedQuery({ prompt, options }) {
       } else if (cmd === "run") {
         const r = await tools.workspace_run_notebook({ path: "/a.ipynb" });
         yield* say(`RUN ${r.isError ? r.content[0].text : "ok"}`);
+      } else if (cmd === "edit") {
+        const r = await tools.workspace_edit_notebook({ path: "/n.ipynb", base: 3, set: [{ id: "c1", source: "x = 1" }] });
+        yield* say(`EDIT ${r.isError ? r.content[0].text : "ok"}`);
       } else if (cmd === "ask") {
         const v = await options.canUseTool("WebFetch", { url: "https://example.com", prompt: "x" }, { signal });
         yield* say(`ASK ${v.behavior}`);
@@ -109,7 +113,7 @@ async function again(port, session, grant = G1, opts) {
   const b = page(port, opts);
   await b.open;
   await b.hello({ session });
-  if (grant !== undefined) b.notify("grant.changed", grant);
+  if (grant !== null) b.notify("grant.changed", grant); // (null: no grant yet)
   return b;
 }
 
@@ -311,7 +315,7 @@ test("Stop while a call waits for the page: the wait ends with the turn, nothing
   openA();
   await until(() => server.waiterCount === 1);
   // (the person's Stop, from a page that paired again without its grant yet: Stop is the paired page's to send)
-  const b = await again(port, session, undefined);
+  const b = await again(port, session, null);
   b.notify("chat.interrupt", { conversation: "c1" });
   await until(() => finished(server, "c1").length === 1);
   assert.deepEqual(finished(server, "c1"), ["interrupted"]);
@@ -342,28 +346,90 @@ test("a card asked while no page is there: it waits in the log, and the page bac
   server.close();
 });
 
-test("run.context is decided on the page the run goes to, after the wait: with it, the turn's context; without it, none", async () => {
-  for (const [what, features, has] of [["a page that offers run.context", ["run.context"], true], ["an older page that doesn't", [], false]]) {
-    const { server, port, code } = await start();
-    const openA = gate("B1");
-    const { a, session } = await paired(port, code);
-    a.notify("page.features", { features: ["run.context"] });
-    a.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "wait B1; run" });
-    await until(() => server.counters().running === 1);
-    a.ws.close();
-    await a.closed;
-    openA();
-    await until(() => server.waiterCount === 1);
-    const b = await again(port, session);
-    b.notify("page.features", { features });
-    await until(() => b.requests.some((r) => r.method === "workspace.run_notebook"));
-    const p = b.requests.find((r) => r.method === "workspace.run_notebook").params;
-    assert.equal("conversation" in p && "turn_id" in p, has, `${what}: ${JSON.stringify(p)}`);
-    if (has) assert.equal(p.conversation, "c1");
-    await until(() => finished(server, "c1").length === 1);
-    b.ws.close();
-    server.close();
-  }
+// A2-1: a page says what it offers (page.features) before its grant (grant.changed) on every bind. A turn that left its
+// page runs and edits on the page back only where that page ties them to the turn (run.context, edit.turn); otherwise,
+// and when the grant comes before the features, the call is refused and nothing is sent. A turn that never left its page
+// runs and edits as before.
+const ALL = ["notebook.edit", "run.context", "edit.turn"];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function leftTurn({ port, code, server }) {
+  const openA = gate("B1");
+  const { a, session } = await paired(port, code);
+  a.notify("page.features", { features: ALL });
+  a.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "wait B1; run; edit" });
+  await until(() => server.counters().running === 1);
+  server.conversations.get("c1").reads.set("/n.ipynb", new Map([[3, { ref: "r1", hashes: new Map([["c1", "h1"]]) }]]));
+  a.ws.close();
+  await a.closed;
+  openA();
+  await until(() => server.waiterCount === 1);
+  return session;
+}
+const sentTo = (b, method) => b.requests.filter((r) => r.method === method);
+
+test("A2-1 split frame: page.features, a 100 ms gap, then grant.changed: the adopted turn's run and edit carry the turn", async () => {
+  const { server, port, code } = await start();
+  const session = await leftTurn({ port, code, server });
+  const b = await again(port, session, null);
+  b.notify("page.features", { features: ALL });
+  await sleep(100);
+  b.notify("grant.changed", G1);
+  await until(() => finished(server, "c1").length === 1);
+  const [run] = sentTo(b, "workspace.run_notebook"), [edit] = sentTo(b, "notebook.edit");
+  assert.equal(run?.params.conversation, "c1");
+  assert.ok(run.params.turn_id);
+  assert.equal(edit?.params.turn_id, run.params.turn_id);
+  assert.match(texts(server, "c1"), /RUN ok.*EDIT ok/s);
+  b.ws.close();
+  server.close();
+});
+
+test("A2-1 reverse order: grant.changed before page.features: the adopted turn's run and edit are refused, nothing sent", async () => {
+  const { server, port, code } = await start();
+  const session = await leftTurn({ port, code, server });
+  const b = await again(port, session, G1);
+  await until(() => finished(server, "c1").length === 1);
+  b.notify("page.features", { features: ALL }); // (too late for this turn's calls: they were refused, not held)
+  await sleep(50);
+  assert.equal(sentTo(b, "workspace.run_notebook").length, 0);
+  assert.equal(sentTo(b, "notebook.edit").length, 0);
+  assert.match(texts(server, "c1"), /RUN refused: the page can't tie this run to its turn/);
+  assert.match(texts(server, "c1"), /EDIT refused: the page can't tie this edit to its turn/);
+  b.ws.close();
+  server.close();
+});
+
+test("an adopted turn on a page without run.context and edit.turn: both refused, nothing sent", async () => {
+  const { server, port, code } = await start();
+  const session = await leftTurn({ port, code, server });
+  const b = await again(port, session, null);
+  b.notify("page.features", { features: ["notebook.edit"] });
+  b.notify("grant.changed", G1);
+  await until(() => finished(server, "c1").length === 1);
+  assert.equal(sentTo(b, "workspace.run_notebook").length + sentTo(b, "notebook.edit").length, 0);
+  assert.match(texts(server, "c1"), /RUN refused: the page can't tie this run to its turn.*EDIT refused: the page can't tie this edit to its turn/s);
+  b.ws.close();
+  server.close();
+});
+
+test("a turn that never left its page, on that same page (no run.context, no edit.turn): it runs and edits as before, a grant refresh included", async () => {
+  const { server, port, code } = await start();
+  const openA = gate("B1");
+  const { a } = await paired(port, code);
+  a.notify("page.features", { features: ["notebook.edit"] });
+  a.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "wait B1; run; edit" });
+  await until(() => server.counters().running === 1);
+  server.conversations.get("c1").reads.set("/n.ipynb", new Map([[3, { ref: "r1", hashes: new Map([["c1", "h1"]]) }]]));
+  a.notify("grant.changed", G1); // (the same grant again, on the same page: not leaving it)
+  await sleep(50);
+  openA();
+  await until(() => finished(server, "c1").length === 1);
+  const [run] = sentTo(a, "workspace.run_notebook"), [edit] = sentTo(a, "notebook.edit");
+  assert.ok(run && !("turn_id" in run.params));
+  assert.ok(edit && !("turn_id" in edit.params));
+  assert.match(texts(server, "c1"), /RUN ok.*EDIT ok/s);
+  a.ws.close();
+  server.close();
 });
 
 test("a turn whose grant ends with a card open: the card is resolved (denied) and none is left open", async () => {

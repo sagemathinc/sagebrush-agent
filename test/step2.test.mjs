@@ -380,3 +380,21 @@ test("a turn whose grant ends with a card open: the card is resolved (denied) an
   a.ws.close();
   server.close();
 });
+
+test("edit.turn: notebook.edit carries the turn's id only to a page that said edit.turn, decided on the page it goes to", async () => {
+  for (const [what, features, has] of [["a page that offers edit.turn", ["notebook.edit", "edit.turn"], true], ["a page that doesn't", ["notebook.edit"], false]]) {
+    const server = new AgentServer({ log: () => {} });
+    const binding = { grant: { folders: ["/"], write: true }, features };
+    server.binding = binding;
+    const sent = [];
+    server.request = (b, method, params) => { sent.push({ b, method, params }); return Promise.resolve({ ok: true }); };
+    const c = { reads: new Map([["/n.ipynb", new Map([[3, { ref: "r1", hashes: new Map([["c1", "h1"]]) }]])]]) };
+    const tools = Object.fromEntries(server.workspaceToolList("c1", c, binding, undefined, null, "turn-abc").map(([name, , , h]) => [name, h]));
+    await tools.workspace_edit_notebook({ path: "/n.ipynb", base: 3, set: [{ id: "c1", source: "x = 1" }] });
+    const p = sent.find((x) => x.method === "notebook.edit")?.params;
+    assert.ok(p, what);
+    assert.equal(p.turn_id === "turn-abc", has, `${what}: ${JSON.stringify(p)}`);
+    if (!has) assert.equal("turn_id" in p, false, what);
+    server.close();
+  }
+});

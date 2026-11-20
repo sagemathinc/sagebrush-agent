@@ -331,21 +331,11 @@ test("approvals: a request too large to review is refused without asking; an ans
   p.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "hi" });
   await until(() => p.events.some((e) => e.event.type === "turn_finished"));
   const before = p.events.length;
-  assert.equal((await options.canUseTool("mcp__sagebrush_page__web_fetch", { url: "https://example.org/" + "y".repeat(5000) }, {})).behavior, "deny");
-  assert.equal(p.events.length, before);
-  // (step 4: the card shows the request sanitized, its origin and path, never its query; the Allow releases the exact
-  //  request it was bound to, as it was when asked, whatever the model's object becomes after)
-  const input = { url: "https://example.org/a?secret=hunter2", reason: "summarize" };
-  const v = options.canUseTool("mcp__sagebrush_page__web_fetch", input, {});
-  await until(() => p.events.length > before);
-  const ask = p.events.at(-1).event;
-  assert.equal(ask.summary, "https://example.org/a");
-  assert.deepEqual(ask.action.input, { origin: "https://example.org", path: "/a", reason: "summarize" });
-  assert.ok(!JSON.stringify(ask).includes("hunter2"), "no query anywhere on the card");
-  p.notify("chat.permission", { request_id: ask.id, behavior: "allow" });
-  const r = await v;
-  assert.equal(r.behavior, "allow");
-  assert.equal(r.updatedInput.url, "https://example.org/a?secret=hunter2", "the exact request it was asked for");
+  // (step 4: the turn has ended, so no web request is released, and none is asked about (S5); the card, its sanitized
+  //  action and the exact request it binds are rows of test/step4-server.test.mjs)
+  for (const url of ["https://example.org/a?secret=hunter2", "https://example.org/" + "y".repeat(5000)])
+    assert.equal((await options.canUseTool("mcp__sagebrush_page__web_fetch", { url, reason: "summarize" }, {})).behavior, "deny");
+  assert.equal(p.events.length, before, "no card");
   p.ws.close();
   await server.close();
 });

@@ -60,9 +60,14 @@ test("egress: the display path and reason: no query, escapes kept, 200 bytes wit
   assert.ok(d.endsWith("…") && !/%.?…$/.test(d) && d.length <= 201, d);
   assert.equal(displayPath("/x"), "/x");
   assert.equal(displayReason("look up the docs"), "look up the docs");
-  assert.equal(displayReason("send token=hunter2 please", "?token=hunter2&x=1"), "(the agent's reason repeated the request's query, so it isn't shown)");
+  // (SEC 2: any query drops the reason, whatever it says: encoded, decoded, value only, another case)
+  for (const reason of ["send token=hunter2 please", "hunter2", "hunter 2", "HUNTER2", "unrelated"]) for (const q of ["?token=hunter2&x=1", "?x=hunter2", "?q=hunter%202", "?a"])
+    assert.equal(displayReason(reason, q), "(not shown for a request with a query)", `${reason} ${q}`);
+  assert.equal(displayReason("read it", ""), "read it");
+  assert.equal(displayReason("read it", "?"), "read it", "an empty query is none");
+  for (const r of ["x".repeat(201), "x".repeat(198) + "\u202e", "é".repeat(300), "\u202e".repeat(60)]) assert.ok([...displayReason(r)].length <= 200, `≤200 scalars, ellipsis included: ${[...displayReason(r)].length}`);
   assert.equal(displayReason("a‮b\u0000c"), "a\\u{202e}b\\u{0}c");
-  assert.equal([...displayReason("é".repeat(300))].length, 201);
+  assert.equal([...displayReason("é".repeat(300))].length, 200, "≤200 scalars with its ellipsis (the page admits at most 200)");
 });
 
 test("egress: a name with any non-public answer is refused, with no connection made (mixed DNS answers, S1)", async () => {
@@ -203,4 +208,9 @@ test("egress: web_fetch through the transport: HTML as text, labeled with its or
   const red = await v.web_fetch({ url: "https://example.test/away" });
   assert.equal(red.content[0].text, "It redirected to https://elsewhere.example, another site: fetch a URL there to ask for it.");
   assert.ok(!JSON.stringify(red).includes("hunter2") && !JSON.stringify(red).includes("/secret"));
+});
+
+test("egress: A-labels as the page takes them: decode, encode back to itself, round-trip; other ??-- labels reserved (SEC 5)", () => {
+  const hosts = { "xn--bcher-kva.com": true, "xn--bcher-kvaa.com": true, "xn--ls8h.la": true, "xn--bcher-kva.xn--p1ai": true, "github.com": true, "xn--a.com": false, "xn--abc.com": false, "xn--zz.com": false, "xn--.com": false, "ab--c.com": false };
+  for (const [h, ok] of Object.entries(hosts)) assert.equal(!!canonicalUrl(`https://${h}/`), ok, h);
 });

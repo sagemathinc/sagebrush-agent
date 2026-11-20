@@ -12,7 +12,8 @@ const ORIGIN = "https://agents.sagebrush.cloud";
 
 // A scripted model: its prompt is steps separated by ";": "wait NAME" (until the test opens that gate), "list"
 // (workspace_list, its outcome said as text), "run" (workspace_run_notebook), "edit" (workspace_edit_notebook, from a
-// read the test puts in the conversation), "ask" (WebSearch through the permission callback, its verdict said).
+// read the test puts in the conversation), "ask" (removing a workspace file, through the permission callback, its verdict
+// said: a card that waits while no page is there; a web request isn't released then, step 4's S5).
 const gates = new Map();
 const gate = (name) => {
   let open;
@@ -48,7 +49,7 @@ function scriptedQuery({ prompt, options }) {
         const r = await tools.workspace_edit_notebook({ path: "/n.ipynb", base: 3, set: [{ id: "c1", source: "x = 1" }] });
         yield* say(`EDIT ${r.isError ? r.content[0].text : "ok"}`);
       } else if (cmd === "ask") {
-        const v = await options.canUseTool("WebSearch", { query: "x" }, { signal });
+        const v = await options.canUseTool("mcp__sagebrush_page__workspace_remove", { path: "/a" }, { signal });
         yield* say(`ASK ${v.behavior}`);
       }
     }

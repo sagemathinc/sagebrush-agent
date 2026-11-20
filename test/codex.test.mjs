@@ -298,7 +298,7 @@ test("removing a workspace file asks, in the handler; a No refuses it before the
     a.say("c1", "remove");
     await a.until(() => a.cards("c1").length, "the card");
     const c = a.cards("c1")[0];
-    assert.equal(c.action.tool, "mcp__sagebrush__workspace_remove");
+    assert.equal(c.action.tool, "mcp__sagebrush_page__workspace_remove");
     await a.permit(c, false);
     await a.until(() => a.finished("c1"), "the turn");
     assert.match(a.text("c1"), /remove refused: refused: The person said no\./);

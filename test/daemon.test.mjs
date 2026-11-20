@@ -155,7 +155,7 @@ test("the real SDK accepts the workspace tools (built only, no Anthropic call)",
   server.createServer = (spec) => sdk.createSdkMcpServer({ name: spec.name, version: spec.version, tools: spec.tools.map(([n, d, s, h]) => sdk.tool(n, d, s, h)) });
   const cfg = server.workspaceTools();
   assert.equal(cfg.type, "sdk");
-  assert.equal(cfg.name, "sagebrush");
+  assert.equal(cfg.name, "sagebrush_page", "never \"sagebrush\", the person's own sagebrush-mcp's name (step 4, S8)");
   await server.close();
 });
 
@@ -183,20 +183,20 @@ test("the SDK options: ask, never decide alone; only our MCP server; no settings
   assert.equal(options.strictMcpConfig, true);
   assert.deepEqual(options.settingSources, []);
   assert.deepEqual(options.tools, ["WebSearch", "WebFetch"]);
-  assert.deepEqual(options.settings.permissions.ask, ["WebSearch", "WebFetch", "mcp__sagebrush__workspace_rename", "mcp__sagebrush__workspace_remove"]);
+  assert.deepEqual(options.settings.permissions.ask, ["WebSearch", "WebFetch", "mcp__sagebrush_page__workspace_rename", "mcp__sagebrush_page__workspace_remove"]);
   assert.equal(options.settings.permissions.disableAutoMode, "disable");
   assert.equal(options.settings.permissions.disableBypassPermissionsMode, "disable");
   // no bare allowedTools: every call reaches canUseTool (no SDK "shadowed" warning)
   assert.equal(options.allowedTools, undefined);
   for (const t of ["list", "read", "write", "mkdir"]) {
     const n = p.events.length;
-    assert.deepEqual(await options.canUseTool(`mcp__sagebrush__workspace_${t}`, { path: "/a" }, {}), { behavior: "allow", updatedInput: { path: "/a" } });
+    assert.deepEqual(await options.canUseTool(`mcp__sagebrush_page__workspace_${t}`, { path: "/a" }, {}), { behavior: "allow", updatedInput: { path: "/a" } });
     assert.equal(p.events.length, n); // (no question for these)
   }
   // under a later binding (the grant changed), the old turn's workspace calls are refused here too
   p.notify("grant.changed", { folders: ["/notes"], write: false, expires: null });
   await until(() => server.binding?.grant?.folders?.[0] === "/notes");
-  assert.equal((await options.canUseTool("mcp__sagebrush__workspace_read", { path: "/a" }, {})).behavior, "deny");
+  assert.equal((await options.canUseTool("mcp__sagebrush_page__workspace_read", { path: "/a" }, {})).behavior, "deny");
   // a tool outside the ask list is refused without asking the person
   const before = p.events.length;
   const v = await options.canUseTool("Bash", { command: "ls" }, {});

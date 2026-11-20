@@ -442,12 +442,12 @@ test("row 6: the page's refusals reach the model as its own text", async () => {
 test("row 7: all 8 allowed without a card while bound; after the grant changes, each denied and nothing sent", async () => {
   const s = setup();
   for (const verb of PAGE_TOOL_VERBS) {
-    const r = await s.server.decide(s.binding, () => {}, "mcp__sagebrush__workspace_" + verb, {}, {}, "c1");
+    const r = await s.server.decide(s.binding, () => {}, "mcp__sagebrush_page__workspace_" + verb, {}, {}, "c1");
     assert.equal(r.behavior, "allow", verb);
   }
   s.server.rebind({ ws: s.ws, grant: { folders: ["/"], write: true }, gen: 2 }, "the grant changed");
   for (const verb of PAGE_TOOL_VERBS) {
-    const r = await s.server.decide(s.binding, () => {}, "mcp__sagebrush__workspace_" + verb, {}, {}, "c1");
+    const r = await s.server.decide(s.binding, () => {}, "mcp__sagebrush_page__workspace_" + verb, {}, {}, "c1");
     assert.deepEqual(r, { behavior: "deny", message: "The page disconnected or the grant changed." }, verb);
   }
   const n = s.ws.sent.length;

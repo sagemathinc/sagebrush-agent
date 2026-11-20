@@ -377,7 +377,7 @@ test("native: removing a workspace file asks even when the person's rules let th
       await a.until(() => card(a, "c1"), "the card");
       const c = card(a, "c1");
       assert.equal(c.title, "Allow workspace_remove?");
-      assert.deepEqual(c.action, { tool: "mcp__sagebrush__workspace_remove", input: { path: "/notes/a.md" } });
+      assert.deepEqual(c.action, { tool: "mcp__sagebrush_page__workspace_remove", input: { path: "/notes/a.md" } });
       assert.equal(removes().length, 0, "nothing sent to the page while the card is open");
       a.send({ jsonrpc: "2.0", method: "chat.permission", params: { request_id: c.request_id, behavior: answer, ...(answer === "allow" ? { digest: digest(c) } : {}) } });
       await a.until(() => a.finished("c1"), "the turn");

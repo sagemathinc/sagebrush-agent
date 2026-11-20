@@ -21,7 +21,7 @@ const gate = (name) => {
   return () => open();
 };
 function scriptedQuery({ prompt, options }) {
-  const tools = options.mcpServers.sagebrush.handlers;
+  const tools = options.mcpServers.sagebrush_page.handlers;
   const signal = options.abortController?.signal;
   let index = 0;
   const say = (t) => {

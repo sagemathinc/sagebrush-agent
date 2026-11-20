@@ -401,6 +401,49 @@ test("resume.tag: the hello says chat.resume.tag; a tag comes back on every repl
   server.close();
 });
 
+test("resume.tag: control characters and non-strings get no replay; at the exact byte bound, a 16-letter tag still fits every replay (WebSocket 1 MiB, stdio 64 KiB)", () => {
+  const server = new AgentServer({ query: fakeQuery, log: () => {} });
+  const lines = [];
+  const sock = { readyState: 1, send: (text) => { lines.push(text); return "ok"; }, room: () => true };
+  server.sock = sock;
+  server.binding = { ws: sock, grant: null, gen: 1 };
+  for (const tag of ["mirror\n", "mirror\r", "mirror\u2028", "mirror\u2029", "a".repeat(16) + "\n", 0, false]) {
+    lines.length = 0;
+    server.resume({ conversation: "c1", after: 0, tag });
+    assert.equal(lines.length, 0, JSON.stringify(tag));
+  }
+  // (an empty log: one replay, done, with its tag, or with no tag field for an untagged request)
+  for (const tag of ["a", "abcdefghijklmnop", undefined]) {
+    lines.length = 0;
+    server.resume({ conversation: "empty", after: 0, ...(tag === undefined ? {} : { tag }) });
+    assert.equal(lines.length, 1);
+    const p = JSON.parse(lines[0]).params;
+    assert.equal(p.done, true);
+    assert.equal(Object.hasOwn(p, "tag"), tag !== undefined);
+    assert.equal(p.tag, tag);
+  }
+  // (entries that fill an untagged replay to exactly its bound: with the tag counted, they split, and every line fits)
+  for (const frame of [0, 64 * 1024]) {
+    server.frame = frame;
+    const limit = frame ? frame / 2 : REPLAY_BYTES;
+    const tag = "abcdefghijklmnop";
+    const events = Array.from({ length: 5 }, (_, i) => ({ seq: i + 1, method: "turn.event", params: { conversation: "c1", turn_id: "t", event: { type: "text_delta", text: i < 4 ? "x".repeat(Math.floor(limit / 5)) : "" } } }));
+    const bare = { jsonrpc: "2.0", method: "chat.replay", params: { conversation: "c1", instance: server.logs.instance, last: 5, running: [], events, done: false } };
+    const gap = limit - Buffer.byteLength(JSON.stringify(bare));
+    assert.ok(gap > 0);
+    events[4].params.event.text = "y".repeat(gap);
+    assert.equal(Buffer.byteLength(JSON.stringify(bare)), limit);
+    server.logs.since = () => ({ events, last: 5 });
+    lines.length = 0;
+    server.resume({ conversation: "c1", after: 0, tag });
+    assert.ok(lines.length > 1, "split by the tag's bytes");
+    assert.ok(lines.every((x) => Buffer.byteLength(x) <= limit));
+    assert.ok(lines.every((x) => JSON.parse(x).params.tag === tag));
+    assert.deepEqual(lines.flatMap((x) => JSON.parse(x).params.events), events);
+  }
+  server.close();
+});
+
 test("resume with --stdio: every replay line fits the runner's frame; an entry too big to wrap is replayed as a stub", () => {
   const server = new AgentServer({ query: fakeQuery, log: () => {} });
   const frame = 64 * 1024; // (FRAME_MIN)

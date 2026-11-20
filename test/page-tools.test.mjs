@@ -17,17 +17,17 @@ const tick = () => new Promise((r) => setImmediate(r));
 const until = async (f) => { for (let i = 0; i < 200 && !f(); i++) await tick(); assert.ok(f(), "waited for it"); };
 
 /** A server bound to a fake page that records what it's sent and answers when told. */
-function setup({ requestsTaken = 0 } = {}) {
+function setup({ requestsTaken = 0, features = [], turnId = null } = {}) {
   const server = new AgentServer({ query: fakeQuery, log: () => {}, stdio: true });
   let spec;
   server.createServer = (s) => { spec = s; return fakeCreateServer(s); };
   const ws = { readyState: 1, sent: [], send(s) { this.sent.push(JSON.parse(s)); return "ok"; } };
-  const binding = { ws, grant: { folders: ["/"], write: true }, features: [] };
+  const binding = { ws, grant: { folders: ["/"], write: true }, features };
   server.binding = binding;
   server.sock = ws;
   for (let i = 0; i < requestsTaken; i++) server.pending.set(`x${i}`, { binding, resolve() {}, reject() {} });
   const ac = new AbortController();
-  const tools = server.workspaceTools("c1", server.conversation("c1"), binding, ac.signal).handlers;
+  const tools = server.workspaceTools("c1", server.conversation("c1"), binding, ac.signal, null, turnId).handlers;
   const msg = (method) => ws.sent.filter((m) => m.method === method);
   const answer = (m, result) => server.dispatch(ws, { jsonrpc: "2.0", id: m.id, result });
   const fail = (m, message, code = "invalid") => server.dispatch(ws, { jsonrpc: "2.0", id: m.id, error: { code: -32000, message, data: { code, message } } });
@@ -88,6 +88,29 @@ test("row 2: each tool sends exactly its page verb with the model's arguments, b
     await p;
   }
   await done(s);
+});
+
+test("row 2b: run.context: where the page said it, each run says its chat and turn after the model's arguments; run_stop and the other tools never; without the page's feature or a turn, nothing added", async () => {
+  const args = { run_notebook: { path: "/n.ipynb", timeout_s: 9 }, run_file: { path: "/a.py" }, latex_build: { path: "/p.tex" }, run_stop: {}, git_status: { name: "fix-1" } };
+  const sent = async (s, verb) => {
+    const n = s.ws.sent.length;
+    const p = s.tools["workspace_" + verb](args[verb]);
+    await tick();
+    assert.equal(s.ws.sent.length, n + 1, verb);
+    const m = s.ws.sent.at(-1);
+    s.answer(m, { ok: true });
+    await p;
+    return JSON.stringify(m.params);
+  };
+  const on = setup({ features: ["run.context"], turnId: "turn-abc" });
+  for (const verb of ["run_notebook", "run_file", "latex_build"]) assert.equal(await sent(on, verb), JSON.stringify({ ...args[verb], conversation: "c1", turn_id: "turn-abc" }), verb);
+  for (const verb of ["run_stop", "git_status"]) assert.equal(await sent(on, verb), JSON.stringify(args[verb]), verb);
+  await done(on);
+  for (const o of [{ features: [], turnId: "turn-abc" }, { features: ["run.context"], turnId: null }]) {
+    const s = setup(o);
+    assert.equal(await sent(s, "run_notebook"), JSON.stringify(args.run_notebook), JSON.stringify(o));
+    await done(s);
+  }
 });
 
 test("row 2: an unknown key, or a required one missing, is refused by the schema and nothing is sent", async () => {

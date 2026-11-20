@@ -226,3 +226,9 @@ test("egress: a query never reaches any sink: the conversation's log, the page's
   ws.close();
   server.close();
 });
+
+test("egress: the wire contract's exact strings: a search's tool row and card summary are \"Anthropic\", which the page's backstop takes as is (#1411's webSummary)", () => {
+  assert.equal(summaryOf("WebSearch", { query: "anything" }), "Anthropic");
+  assert.equal(summaryOf("WebSearch", {}), "Anthropic");
+  assert.equal(summaryOf(WF, { url: "https://Example.org/a%20b?q=1" }), "https://example.org/a%20b");
+});

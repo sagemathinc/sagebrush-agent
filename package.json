@@ -10,6 +10,7 @@
     "bin/",
     "lib/server.mjs",
     "lib/turns.mjs",
+    "lib/log.mjs",
     "lib/notebook.mjs",
     "lib/canon.mjs",
     "lib/stdio.mjs",

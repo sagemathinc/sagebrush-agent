@@ -299,3 +299,29 @@ for (const [what, change] of [
     server.close();
   });
 }
+
+// A grant's end wins over a Stop (astra): Stop and another grant back to back, in either order, and the untaken steer
+// is refused and never runs, even after the first grant comes back.
+for (const order of ["Stop, then another grant", "another grant, then Stop"]) {
+  test(`${order}, with a steer not yet taken: refused, never run`, async () => {
+    const ran = [];
+    const { server, port, code } = await start({ query: (o) => { ran.push(o); return scriptedQuery(o); } });
+    gate("A");
+    const p = await paired(port, code);
+    p.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "wait A" });
+    await until(() => server.counters().running === 1);
+    p.notify("chat.message", { conversation: "c1", id: "u2", author: "person", text: "steer me", steer: true });
+    await until(() => receipts(p.msgs, "u2").length === 1);
+    const stop = () => p.notify("chat.interrupt", { conversation: "c1" });
+    const other = () => p.notify("grant.changed", { ...G1, id: "grant-two" });
+    if (order.startsWith("Stop")) { stop(); other(); } else { other(); stop(); }
+    await until(() => p.msgs.some((m) => m.method === "chat.rejected" && m.params.id === "u2"), 5000);
+    assert.equal(p.msgs.find((m) => m.method === "chat.rejected" && m.params.id === "u2").params.reason.code, "cancelled");
+    p.notify("grant.changed", G1);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(ran.length, 1, "the steer never started a turn");
+    assert.equal(server.counters().queued, 0);
+    p.ws.close();
+    server.close();
+  });
+}

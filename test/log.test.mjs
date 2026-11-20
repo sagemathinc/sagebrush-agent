@@ -321,7 +321,7 @@ test("resume: every replay holding more than one entry is at most REPLAY_BYTES, 
   //  one; one byte more splits it)
   for (const extra of [0, 1]) {
     const c = capture();
-    const env = jsonBytes({ jsonrpc: "2.0", method: "chat.replay", params: { conversation: "d", instance: c.server.logs.instance, last: 5, events: [], done: false } }, 1e9); // (done's longer value: the budget counts it)
+    const env = jsonBytes({ jsonrpc: "2.0", method: "chat.replay", params: { conversation: "d", instance: c.server.logs.instance, last: 5, running: [], events: [], done: false } }, 1e9); // (done's longer value: the budget counts it)
     const room = REPLAY_BYTES - env - 4; // (four commas)
     const base = Math.floor(room / 5);
     for (let i = 0; i < 4; i++) sized(c.server.logs, "d", base);

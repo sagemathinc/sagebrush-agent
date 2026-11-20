@@ -334,7 +334,7 @@ test("K1: with --codex (a backend), features() (what the hello and agent.ready s
   assert.ok(server.features().includes("chat.steer"));
   server.backend = new CodexBackend(server, { command: "/nonexistent-codex" });
   assert.ok(!server.features().includes("chat.steer"));
-  assert.deepEqual(server.features(), ["notebook.edit", "permission.digest", "run.context", "chat.resume", "edit.turn"]);
+  assert.deepEqual(server.features(), ["notebook.edit", "permission.digest", "run.context", "chat.resume", "edit.turn", "chat.resume.tag"]); // (a replay tag is the log's, any backend)
   await server.backend.close?.(Date.now() + 1000);
   server.close();
 });

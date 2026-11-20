@@ -371,6 +371,36 @@ test("resume: a long log comes in several replays, in order, each within its bou
   server.close();
 });
 
+test("resume.tag: the hello says chat.resume.tag; a tag comes back on every replay of its request, within the bound; none without one; a malformed tag gets no replay", async () => {
+  const { server, port, code } = await start();
+  const a = page(port);
+  await a.open;
+  const h = (await a.hello({ code })).result;
+  assert.ok(h.features.includes("chat.resume.tag"));
+  for (let i = 0; i < 30; i++) server.logs.append("c1", "turn.event", { conversation: "c1", turn_id: "t", event: { type: "text_delta", text: "w".repeat(60_000) } });
+  a.notify("chat.resume", { conversation: "c1", after: 0, tag: "mirror" });
+  await until(() => a.replays().some((r) => r.done));
+  const tagged = a.msgs.filter((m) => m.method === "chat.replay");
+  assert.ok(tagged.length > 1, "several replays");
+  assert.ok(tagged.every((m) => m.params.tag === "mirror"), "every replay of the request carries its tag");
+  for (const m of tagged) assert.ok(Buffer.byteLength(JSON.stringify(m)) <= REPLAY_BYTES, "the tag is counted in the bound");
+  assert.deepEqual(tagged.flatMap((m) => m.params.events).map((e) => e.seq), Array.from({ length: 30 }, (_, i) => i + 1));
+  // (untagged: no tag field at all)
+  const n = a.replays().length;
+  a.notify("chat.resume", { conversation: "c1", after: 29 });
+  await until(() => a.replays().length === n + 1);
+  assert.equal("tag" in a.replays()[n], false);
+  // (malformed: nothing comes back, not even an untagged replay; the next good request still does)
+  for (const bad of ["", "Mirror", "mirror!", "a".repeat(17), 5, null, ["mirror"], { t: "mirror" }]) a.notify("chat.resume", { conversation: "c1", after: 29, tag: bad });
+  a.notify("chat.resume", { conversation: "c1", after: 29, tag: "abcdefghijklmnop" });
+  await until(() => a.replays().length === n + 2);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(a.replays().length, n + 2, "only the well-formed request was answered");
+  assert.equal(a.replays()[n + 1].tag, "abcdefghijklmnop");
+  a.ws.close();
+  server.close();
+});
+
 test("resume with --stdio: every replay line fits the runner's frame; an entry too big to wrap is replayed as a stub", () => {
   const server = new AgentServer({ query: fakeQuery, log: () => {} });
   const frame = 64 * 1024; // (FRAME_MIN)

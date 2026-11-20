@@ -472,3 +472,23 @@ test("before Codex answers turn/start: a request for an earlier turn is declined
     assert.equal(finishedEvent(a, "c1").outcome, "completed");
   } finally { a.kill(); }
 });
+
+test("turn_info (W3): Codex's model and reasoningEffort from its thread/start answer, said by the turn that started the thread; a malformed field left out", async () => {
+  const a = agent({ FAKE_CODEX_EFFORT: "high", FAKE_CODEX_MODEL: "gpt-5.1-codex" });
+  try {
+    a.grant({ native: true });
+    a.say("c1", "hello");
+    await a.until(() => a.finished("c1"), "the first turn");
+    a.say("c1", "again");
+    await a.until(() => a.finished("c1", 2), "the second turn, same thread");
+    const infos = a.events("c1").filter((e) => e.type === "turn_info");
+    assert.deepEqual(infos, [{ type: "turn_info", model: "gpt-5.1-codex", effort: "high" }], "once, by the turn that started the thread");
+  } finally { a.kill(); }
+  const b = agent({ FAKE_CODEX_EFFORT: "Not A Level" });
+  try {
+    b.grant({ native: true });
+    b.say("c2", "hello");
+    await b.until(() => b.finished("c2"), "the turn");
+    assert.deepEqual(b.events("c2").filter((e) => e.type === "turn_info"), [{ type: "turn_info", model: "fake" }]);
+  } finally { b.kill(); }
+});

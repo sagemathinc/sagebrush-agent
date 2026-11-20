@@ -412,6 +412,46 @@ test("the command line: the printed link opens sagebrush.space/agents unless SAG
   assert.match(await link({ SAGEBRUSH_AGENT_PAGE: "https://dev.sagebrush.space/agents" }), /^https:\/\/dev\.sagebrush\.space\/agents\/\?pair=/);
 });
 
+test("the command line: when the page goes away, a fresh one-time link is printed; the page's session still reconnects", async () => {
+  const { spawn } = await import("node:child_process");
+  const c = spawn(process.execPath, ["bin/sagebrush-agent.mjs"], { env: { ...process.env, SAGEBRUSH_AGENT_FAKE: "1", SAGEBRUSH_AGENT_PAGE: "https://agents.sagebrush.cloud/agents/" }, stdio: ["ignore", "pipe", "pipe"] });
+  let out = "";
+  c.stdout.on("data", (d) => (out += d));
+  try {
+    const links = () => [...out.matchAll(/\?pair=([A-Z2-7]+)&port=(\d+)/g)].map((m) => ({ code: m[1], port: Number(m[2]) }));
+    await until(() => links().length >= 1, 10000);
+    const first = links()[0];
+    const p1 = page(first.port);
+    await p1.open;
+    const r1 = await p1.hello({ code: first.code });
+    assert.ok(r1.result, "the first link's code pairs");
+    const session = r1.result.session;
+    assert.equal(typeof session, "string");
+    p1.ws.close();
+    await until(() => links().length >= 2, 10000);
+    assert.match(out, /The page disconnected; Claude's turns go on\. To connect a page, open:/);
+    const second = links()[1];
+    assert.notEqual(second.code, first.code, "a new code");
+    assert.equal(second.port, first.port, "the same port");
+    // the page's own session reconnects it, with no code
+    const p2 = page(first.port);
+    await p2.open;
+    assert.ok((await p2.hello({ session })).result, "the session reconnects");
+    p2.ws.close();
+    await until(() => links().length >= 3, 10000);
+    // the newest code pairs a page; a spent one doesn't
+    const p3 = page(first.port);
+    await p3.open;
+    assert.ok((await p3.hello({ code: first.code })).error, "the first, spent code is refused");
+    const p4 = page(first.port);
+    await p4.open;
+    assert.ok((await p4.hello({ code: links().at(-1).code })).result, "the newest code pairs");
+    p4.ws.close();
+  } finally {
+    c.kill("SIGKILL");
+  }
+});
+
 test("a malformed frame before the hello closes only that socket", async () => {
   const net = await import("node:net");
   const { server, port, code } = await start();

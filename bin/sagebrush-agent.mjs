@@ -127,10 +127,28 @@ Sagebrush agent: Claude on this computer, waiting for your Sagebrush page.
   Open:  ${page}?pair=${code}&port=${p}
   (or enter code ${code} and port ${p} in the page)
 
-The code works once, for 5 minutes. Claude uses your own Claude login, and only the
-workspace files you allow in the page. Press Ctrl+C to stop (this run's conversation
-transcripts are deleted then).
+The code works once, for 5 minutes; press Enter here for a new one. Claude uses your own
+Claude login, and only the workspace files you allow in the page. Press Ctrl+C to stop
+(this run's conversation transcripts are deleted then).
 `);
+// (a fresh one-time link: when the page goes away, and on Enter. A new code ends only the old code; it never ends
+//  the page's session or a running turn)
+const fresh = (why) => {
+  const c = server.newCode();
+  console.log(`
+${why} To connect a page, open:
+
+  ${page}?pair=${c}&port=${p}
+  (or enter code ${c} and port ${p} in the page)
+
+The code works once, for 5 minutes; press Enter here for a new one. A page that reconnects by itself doesn't need it.
+`);
+};
+server.onPageGone = () => fresh("The page disconnected; Claude's turns go on.");
+if (process.stdin.isTTY) {
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (d) => { if (/\n/.test(d)) fresh("A new link."); });
+}
 const stop = async () => {
   console.error("stopping: deleting this run's transcripts ...");
   let problems;

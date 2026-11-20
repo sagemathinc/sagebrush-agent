@@ -27,6 +27,7 @@
     "lib/egress.mjs",
     "lib/netverbs.mjs",
     "lib/docs-paths.json",
+    "lib/turn-info.mjs",
     "README.md",
     "npm-shrinkwrap.json"
   ],

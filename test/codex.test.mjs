@@ -492,3 +492,34 @@ test("turn_info (W3): Codex's model and reasoningEffort from its thread/start an
     assert.deepEqual(b.events("c2").filter((e) => e.type === "turn_info"), [{ type: "turn_info", model: "fake" }]);
   } finally { b.kill(); }
 });
+
+test("turn_info (W3): a thread's start info goes to the first live turn that gets the reply: A stopped before it never says it, B on that thread says it once; a turn on another thread never says A's", async () => {
+  const a = agent({ FAKE_CODEX_START_DELAY_MS: "1500", FAKE_CODEX_MODEL_PER_THREAD: "1", FAKE_CODEX_EFFORT: "high" });
+  try {
+    a.grant({ native: true });
+    a.say("c1", "first"); // (turn A: asks for the thread; the answer comes 1.5 s later)
+    await a.until(() => a.calls("thread/start").length === 1, "A's thread/start");
+    a.send({ jsonrpc: "2.0", method: "chat.interrupt", params: { conversation: "c1" } });
+    await a.until(() => a.finished("c1"), "A, stopped before the answer");
+    assert.equal(finishedEvent(a, "c1").outcome, "interrupted");
+    a.say("c1", "second"); // (turn B: the same conversation, the same pending start)
+    await a.until(() => a.finished("c1", 2), "B");
+    const turns = [...new Set(a.lines.filter((m) => m.method === "turn.event" && m.params.conversation === "c1").map((m) => m.params.turn_id))];
+    const infoOf = (t) => a.lines.filter((m) => m.method === "turn.event" && m.params.turn_id === t && m.params.event.type === "turn_info").map((m) => m.params.event);
+    assert.equal(turns.length, 2);
+    assert.deepEqual(infoOf(turns[0]), [], "A, ended before the reply: nothing");
+    assert.equal(a.calls("thread/start").length, 1, "B waited for A's start: one thread");
+    const thr = a.calls("turn/start")[0].params.threadId;
+    assert.deepEqual(infoOf(turns[1]), [{ type: "turn_info", model: `fake-${thr}`, effort: "high" }], "B says its own thread's reply, once");
+    // (another conversation starts another thread: its own values only)
+    a.say("c2", "other");
+    await a.until(() => a.finished("c2"), "C on another thread");
+    const thr2 = a.calls("turn/start").map((m) => m.params.threadId).find((t) => t !== thr);
+    const c2 = a.events("c2").filter((e) => e.type === "turn_info");
+    assert.deepEqual(c2, [{ type: "turn_info", model: `fake-${thr2}`, effort: "high" }], "never the first thread's values");
+    // (a third turn on c1: its thread's info was said already: nothing again)
+    a.say("c1", "third");
+    await a.until(() => a.finished("c1", 3), "a later turn of c1");
+    assert.equal(a.events("c1").filter((e) => e.type === "turn_info").length, 1);
+  } finally { a.kill(); }
+});

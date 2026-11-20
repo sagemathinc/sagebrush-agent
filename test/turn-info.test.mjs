@@ -33,7 +33,9 @@ async function claudeTurn(script) {
   server.binding = { ws, grant: { folders: ["/"], write: true, run: false, expires: null }, gen: 1, features: [] };
   await server.runTurn("c1", server.conversation("c1"), { id: "u1", text: "hi", scope: null }, server.binding);
   server.close();
-  return { opts, events: sent.filter((m) => m.method === "turn.event").map((m) => m.params.event) };
+  // (events: as they stood when the turn ended; now(): read live from what was sent, for anything after the end)
+  const now = () => sent.filter((m) => m.method === "turn.event").map((m) => m.params.event);
+  return { opts, events: now(), now };
 }
 const done = { type: "result", subtype: "success", is_error: false, result: "ok", usage: { input_tokens: 1, output_tokens: 1 }, session_id: "s1" };
 
@@ -95,7 +97,7 @@ test("turn_info: each turn says only what its own query reports (nothing carried
 
 test("turn_info: a hook from inside a subagent is not this turn's effort; a hook answered after the turn ended says nothing", async () => {
   let stop;
-  const { events } = await claudeTurn((options) => (async function* () {
+  const { events, now } = await claudeTurn((options) => (async function* () {
     yield { type: "system", subtype: "init", session_id: "s1", model: "claude-opus-5-5", tools: [] };
     const pre = options.hooks.PreToolUse[0].hooks[0];
     stop = options.hooks.Stop[0].hooks[0];
@@ -108,7 +110,7 @@ test("turn_info: a hook from inside a subagent is not this turn's effort; a hook
   // (the turn is over: a late Stop hook's answer adds nothing, and still decides nothing)
   const out = await stop({ hook_event_name: "Stop", effort: { level: "max" } }, undefined, { signal: new AbortController().signal });
   assert.deepEqual(out, {});
-  assert.equal(events.filter((e) => e.type === "turn_info").length, 2, "nothing after the turn");
+  assert.equal(now().filter((e) => e.type === "turn_info").length, 2, "nothing sent after the turn (the live buffer, read after the late hook)");
 });
 
 // (Whether the SDK still sends every tool call to canUseTool with these hooks registered can't be shown with a fake

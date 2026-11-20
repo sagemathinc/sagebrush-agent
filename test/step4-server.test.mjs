@@ -56,7 +56,7 @@ test("egress: a web_fetch card shows {origin, path, reason} only, never the quer
   s.answer(c, "deny");
   assert.equal((await v).behavior, "deny");
   assert.equal(summaryOf(WF, { url: "https://docs.example.org/a?token=hunter2" }), "https://docs.example.org/a", "the tool row too (S6)");
-  assert.equal(summaryOf("WebSearch", { query: "secret terms" }), "Anthropic's web search");
+  assert.equal(summaryOf("WebSearch", { query: "secret terms" }), "Anthropic");
 });
 
 test("egress: a page without egress.turn gets no turn_action, and allow_turn from it is denied", async () => {

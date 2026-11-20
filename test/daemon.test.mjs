@@ -94,7 +94,7 @@ test("an approval: asked in the chat, answered by the person", async () => {
   await until(() => p.events.some((e) => e.event.type === "attention" && e.event.state === "open"));
   const ask = p.events.find((e) => e.event.type === "attention").event;
   // the card names the search's provider, never its terms (step 4, S6/P5), and carries the action it asks about
-  assert.equal(ask.summary, "Anthropic's web search");
+  assert.equal(ask.summary, "Anthropic");
   assert.deepEqual(JSON.parse(ask.detail), { provider: "Anthropic", reason: "" });
   assert.ok(!JSON.stringify(ask).includes("please search for this"), "the terms appear nowhere on the card");
   p.notify("chat.permission", { request_id: ask.id, behavior: "deny" });

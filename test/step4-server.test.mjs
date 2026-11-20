@@ -395,3 +395,34 @@ test("egress: guards each on their own: an ended turn's cached grant, a changed 
     assert.equal(gets.length, 0);
   }
 });
+
+test("egress: today's page (no egress.turn): no turn action, and a one-request Allow with the request's digest works as before", async () => {
+  const s = setup({ features: ["permission.digest"] });
+  const v = s.ask(WF, { url: "https://example.org/a?x=1", reason: "r" });
+  await tick();
+  const c = s.cards[0];
+  assert.equal(c.turn_action, undefined);
+  s.answer(c, "allow", s.digest(c));
+  const r = await v;
+  assert.equal(r.behavior, "allow");
+  assert.equal(r.updatedInput.url, "https://example.org/a?x=1");
+  assert.equal(s.link.egress.origins.size, 0, "no turn grant from a one-request Allow");
+  const v2 = s.ask("WebSearch", { query: "q" });
+  await tick();
+  s.answer(s.cards[1], "allow", s.digest(s.cards[1]));
+  assert.equal((await v2).behavior, "allow", "a search too");
+});
+
+test("egress: an Allow refused by a check says the request wasn't approved; a Deny says the person said no", async () => {
+  const s = setup();
+  const v = s.ask(WF, { url: "https://example.org/" });
+  await tick();
+  s.link.ended = true;
+  s.answer(s.cards[0], "allow", s.digest(s.cards[0]));
+  assert.deepEqual(await v, { behavior: "deny", message: "This request was not approved." });
+  const t = setup();
+  const w = t.ask(WF, { url: "https://example.org/" });
+  await tick();
+  t.answer(t.cards[0], "deny");
+  assert.deepEqual(await w, { behavior: "deny", message: "The person said no." });
+});

@@ -111,14 +111,18 @@ test("turn_info: a hook from inside a subagent is not this turn's effort; a hook
   assert.equal(events.filter((e) => e.type === "turn_info").length, 2, "nothing after the turn");
 });
 
-test("turn_info: with the hooks registered, every tool call still goes through canUseTool (a refused one is refused)", async () => {
-  let decision;
+// (Whether the SDK still sends every tool call to canUseTool with these hooks registered can't be shown with a fake
+//  query, which calls canUseTool itself. It was checked live with the pinned Claude Code and the signed-in login, Nov 20
+//  2026: a PreToolUse and a Stop hook answering {}, a tool refused in canUseTool: canUseTool was asked, the tool never
+//  ran; the init said model "claude-opus-5-5" and both hooks said effort.level "medium", agent_id absent.)
+test("turn_info: the hooks' answer carries no field at all: nothing a permission flow could read as a decision", async () => {
+  const outs = [];
   await claudeTurn((options) => (async function* () {
     yield { type: "system", subtype: "init", session_id: "s1", model: "claude-opus-5-5", tools: [] };
-    const hookOut = await options.hooks.PreToolUse[0].hooks[0]({ hook_event_name: "PreToolUse", tool_name: "WebFetch", tool_input: { url: "https://example.org/" }, effort: { level: "high" } }, "toolu_1", { signal: options.abortController.signal });
-    assert.deepEqual(hookOut, {}, "the hook gives no permission decision");
-    decision = await options.canUseTool("WebFetch", { url: "https://example.org/", prompt: "x" }, { signal: options.abortController.signal });
+    for (const [ev, h] of [["PreToolUse", options.hooks.PreToolUse[0].hooks[0]], ["Stop", options.hooks.Stop[0].hooks[0]]])
+      outs.push(await h({ hook_event_name: ev, tool_name: "WebFetch", tool_input: { url: "https://example.org/" }, effort: { level: "high" } }, "toolu_1", { signal: options.abortController.signal }));
     yield done;
   })());
-  assert.equal(decision?.behavior, "deny", JSON.stringify(decision));
+  assert.deepEqual(outs, [{}, {}]);
+  for (const o of outs) for (const k of ["decision", "permissionDecision", "continue", "updatedInput", "hookSpecificOutput", "stopReason"]) assert.ok(!(k in o), k);
 });

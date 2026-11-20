@@ -1,0 +1,4 @@
+{
+  "host": "sagebrush.space",
+  "paths": ["/llms.txt", "/board-format.md", "/board-host-protocol.md", "/capabilities.md", "/agents/connect.md", "/atlas/llms.txt"]
+}

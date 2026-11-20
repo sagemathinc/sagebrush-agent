@@ -93,9 +93,10 @@ test("an approval: asked in the chat, answered by the person", async () => {
   p.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "please search for this" });
   await until(() => p.events.some((e) => e.event.type === "attention" && e.event.state === "open"));
   const ask = p.events.find((e) => e.event.type === "attention").event;
-  // the card names the query and carries every argument
-  assert.equal(ask.summary, "please search for this");
-  assert.deepEqual(JSON.parse(ask.detail), { query: "please search for this" });
+  // the card names the search's provider, never its terms (step 4, S6/P5), and carries the action it asks about
+  assert.equal(ask.summary, "Anthropic's web search");
+  assert.deepEqual(JSON.parse(ask.detail), { provider: "Anthropic", reason: "" });
+  assert.ok(!JSON.stringify(ask).includes("please search for this"), "the terms appear nowhere on the card");
   p.notify("chat.permission", { request_id: ask.id, behavior: "deny" });
   await until(() => p.events.some((e) => e.event.type === "turn_finished"));
   assert.ok(p.events.some((e) => e.event.type === "attention" && e.event.state === "denied"));
@@ -182,8 +183,8 @@ test("the SDK options: ask, never decide alone; only our MCP server; no settings
   assert.equal(options.permissionMode, "default");
   assert.equal(options.strictMcpConfig, true);
   assert.deepEqual(options.settingSources, []);
-  assert.deepEqual(options.tools, ["WebSearch", "WebFetch"]);
-  assert.deepEqual(options.settings.permissions.ask, ["WebSearch", "WebFetch", "mcp__sagebrush_page__workspace_rename", "mcp__sagebrush_page__workspace_remove"]);
+  assert.deepEqual(options.tools, ["WebSearch"], "no built-in WebFetch: web_fetch is ours (step 4)");
+  assert.deepEqual(options.settings.permissions.ask, ["WebSearch", "mcp__sagebrush_page__web_fetch", "mcp__sagebrush_page__workspace_rename", "mcp__sagebrush_page__workspace_remove"]);
   assert.equal(options.settings.permissions.disableAutoMode, "disable");
   assert.equal(options.settings.permissions.disableBypassPermissionsMode, "disable");
   // no bare allowedTools: every call reaches canUseTool (no SDK "shadowed" warning)
@@ -330,18 +331,21 @@ test("approvals: a request too large to review is refused without asking; an ans
   p.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "hi" });
   await until(() => p.events.some((e) => e.event.type === "turn_finished"));
   const before = p.events.length;
-  assert.equal((await options.canUseTool("WebFetch", { url: "https://example.org", prompt: "y".repeat(20000) }, {})).behavior, "deny");
+  assert.equal((await options.canUseTool("mcp__sagebrush_page__web_fetch", { url: "https://example.org/" + "y".repeat(5000) }, {})).behavior, "deny");
   assert.equal(p.events.length, before);
-  const input = { url: "https://example.org/a", prompt: "summarize" };
-  const v = options.canUseTool("WebFetch", input, {});
+  // (step 4: the card shows the request sanitized, its origin and path, never its query; the Allow releases the exact
+  //  request it was bound to, as it was when asked, whatever the model's object becomes after)
+  const input = { url: "https://example.org/a?secret=hunter2", reason: "summarize" };
+  const v = options.canUseTool("mcp__sagebrush_page__web_fetch", input, {});
   await until(() => p.events.length > before);
   const ask = p.events.at(-1).event;
   assert.equal(ask.summary, "https://example.org/a");
-  input.url = "https://elsewhere.example"; // (changed after it was shown)
+  assert.deepEqual(ask.action.input, { origin: "https://example.org", path: "/a", reason: "summarize" });
+  assert.ok(!JSON.stringify(ask).includes("hunter2"), "no query anywhere on the card");
   p.notify("chat.permission", { request_id: ask.id, behavior: "allow" });
   const r = await v;
   assert.equal(r.behavior, "allow");
-  assert.equal(r.updatedInput.url, "https://example.org/a");
+  assert.equal(r.updatedInput.url, "https://example.org/a?secret=hunter2", "the exact request it was asked for");
   p.ws.close();
   await server.close();
 });

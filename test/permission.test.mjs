@@ -66,7 +66,7 @@ test("the card: the action, the child, the conversation and the request id; neve
   try {
     const { card, allowed } = await ask(p, (c) => ({ behavior: "allow", digest: pageDigest(c) }));
     assert.equal(allowed, true, "an Allow with the right digest is allowed");
-    assert.deepEqual(card.action, { tool: "WebSearch", input: { query: "please search for primes" } });
+    assert.deepEqual(card.action, { tool: "WebSearch", input: { provider: "Anthropic", reason: "" } }, "a search's card: its provider, never its terms (S6/P5)");
     assert.equal(card.child, p.hello.result.child);
     assert.equal(card.conversation, "c1");
     assert.equal(card.request_id, card.id);
@@ -125,7 +125,7 @@ test("an action canon can't show exactly is denied before any card, with board's
   server.binding = binding;
   const sent = [];
   for (const input of [{ n: 1.5 }, { deep: JSON.parse("[".repeat(40) + "]".repeat(40)) }, { s: "x".repeat(20000) }]) {
-    const r = await server.askPerson(binding, (d) => sent.push(d), "WebFetch", input, {}, "c1");
+    const r = await server.askPerson(binding, (d) => sent.push(d), "mcp__sagebrush_page__workspace_remove", input, {}, "c1");
     assert.deepEqual(r, { behavior: "deny", message: TEXT.notReviewable }, JSON.stringify(input).slice(0, 40));
   }
   assert.equal(sent.length, 0, "no card was shown");

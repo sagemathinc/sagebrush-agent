@@ -76,8 +76,8 @@ const optionsFull = async (a, conversation, n) => {
   await a.until(() => a.finished(conversation, n), "the options turn");
   return [...a.text(conversation).matchAll(/OPTIONS (\{.*?\})(?=OPTIONS|$)/g)].map((m) => JSON.parse(m[1])).at(-1);
 };
-const NATIVE = { tools: { type: "preset", preset: "claude_code" }, settingSources: ["user", "project", "local"], permissionMode: "default", strictMcpConfig: null, systemPrompt: "claude_code", settings: null };
-const TOOLS_ONLY = { tools: ["WebSearch", "WebFetch"], settingSources: [], permissionMode: "default", strictMcpConfig: true, systemPrompt: "sagebrush", settings: "set" };
+const NATIVE = { tools: { type: "preset", preset: "claude_code" }, settingSources: ["user", "project", "local"], permissionMode: "default", strictMcpConfig: null, systemPrompt: "claude_code", settings: "set" };
+const TOOLS_ONLY = { tools: ["WebSearch"], settingSources: [], permissionMode: "default", strictMcpConfig: true, systemPrompt: "sagebrush", settings: "set" };
 
 test("parseGrant: native exactly true or false; absent false; anything else refuses the grant", () => {
   assert.equal(parseGrant({ folders: ["/"] }).grant.native, false);

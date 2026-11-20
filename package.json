@@ -24,6 +24,9 @@
     "lib/fake-codex.mjs",
     "lib/page-tools.mjs",
     "lib/page-verbs.json",
+    "lib/egress.mjs",
+    "lib/netverbs.mjs",
+    "lib/docs-paths.json",
     "README.md",
     "npm-shrinkwrap.json"
   ],

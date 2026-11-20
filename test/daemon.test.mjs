@@ -452,6 +452,15 @@ test("the command line: when the page goes away, a fresh one-time link is printe
   }
 });
 
+test("the instructions: a notebook that runs by itself isn't run again; the Run button is named as the person sees it (A2, A4)", async () => {
+  const { SYSTEM, SYSTEM_NATIVE } = await import("../lib/server.mjs");
+  for (const [name, t] of [["scoped", SYSTEM], ["native", SYSTEM_NATIVE]]) {
+    assert.match(t, /runs once by itself/, name);
+    assert.match(t, /read it back for its outputs.{0,60}rather than running it again/, name);
+    assert.match(t, /click ▶ \(Run\) beside the cell/, name);
+  }
+});
+
 test("a malformed frame before the hello closes only that socket", async () => {
   const net = await import("node:net");
   const { server, port, code } = await start();

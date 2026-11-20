@@ -75,13 +75,13 @@ async function paired(port, code, grant = G1) {
   });
   await new Promise((resolve, reject) => { ws.on("open", resolve); ws.on("error", reject); });
   const notify = (method, params) => ws.send(JSON.stringify({ jsonrpc: "2.0", method, params }));
-  await new Promise((resolve) => {
+  const hello = await new Promise((resolve) => {
     onHello = resolve;
     ws.send(JSON.stringify({ jsonrpc: "2.0", id: "p1", method: "hello", params: { protocol: 1, page: { origin: ORIGIN, path: "/agents/" }, code } }));
   });
   notify("page.features", { features: ["permission.digest"] });
   notify("grant.changed", grant);
-  return { ws, msgs, notify };
+  return { ws, msgs, notify, hello };
 }
 const until = async (f, ms = 8000) => {
   const t = Date.now();
@@ -214,6 +214,8 @@ test("a turn run by another agent (Codex) isn't steered: queued (codex), and it 
     },
   };
   const p = await paired(port, code);
+  assert.ok(!p.hello.result.features.includes("chat.steer"), "an agent running Codex never says it steers (K1)");
+  assert.ok(p.hello.result.features.includes("chat.resume"));
   p.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "first" });
   await until(() => ran.length === 1);
   p.notify("chat.message", { conversation: "c1", id: "u2", author: "person", text: "second", steer: true });
@@ -325,3 +327,14 @@ for (const order of ["Stop, then another grant", "another grant, then Stop"]) {
     server.close();
   });
 }
+
+test("K1: with --codex (a backend), features() (what the hello and agent.ready send) has no chat.steer; with Claude it does", async () => {
+  const { CodexBackend } = await import("../lib/codex.mjs");
+  const server = new AgentServer({ log: () => {} });
+  assert.ok(server.features().includes("chat.steer"));
+  server.backend = new CodexBackend(server, { command: "/nonexistent-codex" });
+  assert.ok(!server.features().includes("chat.steer"));
+  assert.deepEqual(server.features(), ["notebook.edit", "permission.digest", "run.context", "chat.resume", "edit.turn"]);
+  await server.backend.close?.(Date.now() + 1000);
+  server.close();
+});

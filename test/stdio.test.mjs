@@ -69,7 +69,7 @@ test("stdio: start, then agent.ready with this child's id and features; stdout i
   try {
     await a.until(() => ready(a), "agent.ready");
     const r = a.find((m) => m.method === "agent.ready").msg.params;
-    assert.deepEqual(r.features, ["notebook.edit", "permission.digest", "run.context", "chat.resume", "edit.turn"]);
+    assert.deepEqual(r.features, ["notebook.edit", "permission.digest", "run.context", "chat.resume", "edit.turn", "chat.steer"]);
     assert.match(r.child, /^[A-Za-z0-9_-]{43}$/);
     a.p.stdin.end();
     assert.deepEqual(await a.exited, { code: 0, sig: null });

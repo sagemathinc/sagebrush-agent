@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import WebSocket from "ws";
-import { fakeCreateServer } from "../lib/fake.mjs";
+import { fakeCreateServer, promptText } from "../lib/fake.mjs";
 import { AgentServer, sameGrant, scopeOf } from "../lib/server.mjs";
 
 const ORIGIN = "https://agents.sagebrush.cloud";
@@ -35,7 +35,7 @@ function scriptedQuery({ prompt, options }) {
   const aborted = () => new Promise((_, reject) => signal?.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })), { once: true }));
   async function* run() {
     yield { type: "system", subtype: "init", session_id: `s-${Math.random().toString(36).slice(2)}`, model: "fake", tools: [] };
-    for (const step of prompt.split(";").map((x) => x.trim())) {
+    for (const step of (await promptText(prompt)).split(";").map((x) => x.trim())) {
       const [cmd, arg] = step.split(" ");
       if (cmd === "wait") await Promise.race([gates.get(arg).p, aborted()]);
       else if (cmd === "list") {

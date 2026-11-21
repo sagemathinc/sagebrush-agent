@@ -56,7 +56,7 @@ Delegate works over the loopback address only, and only while the page's grant h
   - at most 64 tasks and 4 GB in all.
   - A start, an Ask or a Resume is refused while the disk has less free than the task's remaining room plus 64 MB.
   - While a turn runs, its transcript, the task's size and the free space are checked every half second. A turn past a limit is interrupted then, with the reason. Between two checks a turn can write a little past a limit: the 64 MB of free space kept is for that.
-- **What is kept on disk:** the SDK keeps each task's transcript under `~/.claude/projects/`, in the folder named after the task's `sdk/` folder. It is deleted when the task is merged or closed. The task's own folder stays until you delete it.
+- **What is kept on disk:** the SDK keeps each task's transcript under `~/.claude/projects/`, in the folder named after the task's `sdk/` folder. Deleting it when the task is merged, closed or revoked is best effort, and is tried again whenever the agent loads a valid task that is already merged or closed. A deletion that fails can leave transcript bytes on disk, and they still count against the task's budget. A link in the transcript's place is left alone on purpose: it is never followed or deleted. The task's own folder stays until you delete it.
 - **What leaves your computer:** the task's conversation goes to Anthropic through the SDK, as with any Claude session. That includes the files of the copy that Claude reads. Nothing else goes anywhere.
 
 ## With `sagebrush remote`

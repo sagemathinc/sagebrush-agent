@@ -12,7 +12,7 @@
   - A runner on Windows can stop the running turns with a control line, since it can't send a signal there.
   - A few file paths are now built in a way that works on Windows.
   - Delegate stays off on Windows in this version, and says why.
-- **Tests:** the suite runs on Windows. The rows that can't apply there (Delegate, POSIX modes, signals) are declared skips with their reasons, never silent passes.
+- **Tests (pending Windows confirmation):** the suite is made to run on Windows. The rows that can't apply there (Delegate, POSIX modes, signals) are declared skips with their reasons, never silent passes.
 
 ## 0.8.1
 

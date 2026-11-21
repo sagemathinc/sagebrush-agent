@@ -185,3 +185,34 @@ test("a failure of the task host that isn't a refusal: answered unavailable, its
   await h.server.close();
   rmSync(h.dir, { recursive: true, force: true });
 });
+
+test("the switch off after a reconnect: a new page's grant without delegate stops the old task's turn at once, and its model's late work is refused; a disconnect alone changes nothing", async () => {
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const h = await setup({ gate });
+  let p = page(h.port);
+  await p.open;
+  await p.hello(h.code);
+  p.notify("grant.changed", { folders: ["/"], write: true, delegate: true });
+  await new Promise((r) => setTimeout(r, 50));
+  const { task } = (await p.call("tasks.start", START)).result;
+  await until(() => h.turns.isRunning(task), "running");
+  p.ws.close();
+  await new Promise((r) => setTimeout(r, 100));
+  assert.ok(h.turns.isRunning(task), "a page going away leaves the task running");
+  assert.equal(h.store.state(task).status, "working");
+  p = page(h.port);
+  await p.open;
+  await p.hello(h.server.newCode());
+  p.notify("grant.changed", { folders: ["/"], write: true, delegate: false });
+  await until(() => h.store.state(task).status === "interrupted" && !h.turns.isRunning(task), "switched off");
+  assert.match(h.store.state(task).reason, /switch was turned off|turn was stopped/);
+  release();
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(h.store.state(task).status, "interrupted");
+  assert.equal(h.store.state(task).proposals.length, 0);
+  assert.equal(code(await p.call("tasks.list", {})), "forbidden");
+  p.ws.close();
+  await h.server.close();
+  rmSync(h.dir, { recursive: true, force: true });
+});

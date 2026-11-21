@@ -21,6 +21,13 @@ import { checkRequest } from "../lib/tasks-schema.mjs";
 const NB = JSON.stringify({ cells: [{ cell_type: "code", id: "a", metadata: {}, source: "x = 1", outputs: [], execution_count: null }], metadata: { kernelspec: { name: "python3", language: "python" } }, nbformat: 4, nbformat_minor: 5 });
 const until = async (f, what, ms = 10000) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) throw new Error(`timed out: ${what}`); await new Promise((r) => setTimeout(r, 5)); } };
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+// (the stand-in's grandchild, by the pid it wrote: a positive pid or a failure, never 0, which kill(0, 0) would take as
+//  this test's own process group, always alive)
+const grandchildPid = (fake) => {
+  const raw = readFileSync(join(fake, "grandchild"), "utf8"), pid = Number(raw);
+  assert.ok(Number.isSafeInteger(pid) && pid > 0, `the grandchild's pid: ${JSON.stringify(raw)}`);
+  return pid;
+};
 // (a pin with an engine named, so only the switch and the grant decide; the engine is never fetched here)
 const PIN = { ...RUNNER_PIN, engine: { version: "0.0.0-test", entry: "dist/sagebrush.cjs", files: {} } };
 
@@ -39,7 +46,9 @@ if (ctl.mode === "report") { fs.writeFileSync(path.join(work, "out.txt"), "made 
 else if (ctl.mode === "hang") {
   fs.writeFileSync(path.join(work, "partial.txt"), "half done");
   const g = cp.spawn(process.execPath, [ctl.runtime === "deno" ? "eval" : "-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-  fs.writeFileSync(path.join(dir, "grandchild"), String(g.pid));
+  // (written whole, then renamed into place: a reader never sees it half written)
+  fs.writeFileSync(path.join(dir, "grandchild.tmp"), String(g.pid));
+  fs.renameSync(path.join(dir, "grandchild.tmp"), path.join(dir, "grandchild"));
   setInterval(() => {}, 1000);
 }
 else if (ctl.mode === "plant") { fs.symlinkSync("/etc/passwd", path.join(work, "evil")); process.stdout.write(JSON.stringify(report)); }
@@ -139,7 +148,7 @@ test("Stop: the run's whole process group killed (a grandchild too), the exit wa
   const ac = new AbortController();
   const run = h.runner.run(h.task, "nb dir/a.ipynb", { signal: ac.signal });
   await until(() => existsSync(join(h.fake, "grandchild")), "the grandchild");
-  const g = Number(readFileSync(join(h.fake, "grandchild"), "utf8"));
+  const g = grandchildPid(h.fake);
   assert.ok(alive(g));
   ac.abort();
   await assert.rejects(run, (e) => /stopped \(the task's turn was stopped\): its changes were undone/.test(e.message));
@@ -208,7 +217,7 @@ test("in a turn: notebook_run gives the model the report; calls run one at a tim
   const turns = new TaskTurns({ store: h.store, query, createServer: fakeCreateServer, free: () => 1e12, runner: h.runner, limits: { pollMs: 10, stopMs: 1 } }); // (a bound too short to cover the run: only the turn's own wait can)
   turns.begin(h.task, "start");
   await until(() => existsSync(join(h.fake, "grandchild")), "the run started");
-  const g = Number(readFileSync(join(h.fake, "grandchild"), "utf8"));
+  const g = grandchildPid(h.fake);
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(writeDone, null, "the write waits while the run is alive");
   // (the undoing made slow, so only the turn's own wait for its run can cover it)
@@ -480,7 +489,7 @@ test("the run's identity can't be recorded once it has started (an EIO): the run
   h.store.writeRunRecord = (task, rec) => { if (rec.pid !== null) throw Object.assign(new Error("EIO"), { code: "EIO" }); return write(task, rec); };
   // (a short wall bound: a run that went on regardless would end by it, with another reason)
   await assert.rejects(h.runner.run(h.task, "nb dir/a.ipynb", { timeoutS: 1 }), (e) => e.code === "unavailable" && /the run failed: couldn't record the run; its changes were undone/.test(e.message));
-  const g = existsSync(join(h.fake, "grandchild")) ? Number(readFileSync(join(h.fake, "grandchild"), "utf8")) : null;
+  const g = existsSync(join(h.fake, "grandchild")) ? grandchildPid(h.fake) : null;
   if (g) await until(() => !alive(g), "the run's group gone", 3000);
   assert.equal(existsSync(join(h.store.work(h.task), "partial.txt")), false, "undone");
   assert.equal(existsSync(join(h.store.dir(h.task), "run.json")), false, "settled: no record left");

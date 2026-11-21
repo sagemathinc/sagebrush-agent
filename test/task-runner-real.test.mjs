@@ -8,7 +8,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { RUNNER_PIN } from "../lib/runner-fetch.mjs";
-import { TaskRunner } from "../lib/task-runner.mjs";
+import { cfUserTextEncoding, TaskRunner } from "../lib/task-runner.mjs";
 import { TaskStore } from "../lib/tasks.mjs";
 import { checkRequest } from "../lib/tasks-schema.mjs";
 import { platformKey } from "../lib/codex-fetch.mjs";
@@ -70,20 +70,30 @@ test("sentinels outside the copy (under the real home, beside the engine, anothe
 });
 
 test("no network, no subprocess, no foreign code, no Deno namespace; the environment exactly the runner's (and Deno's own PATH and shim key), none of this process's", T, async () => {
+  // (this process's environment poisoned: a planted secret, and a different, valid __CF_USER_TEXT_ENCODING; the run
+  //  sees neither: on macOS exactly the runner's own value, at its first cell and at its last, elsewhere none)
+  const cfBefore = process.env.__CF_USER_TEXT_ENCODING, darwin = process.platform === "darwin";
   process.env.SB_PARENT_SECRET = "must not be seen";
+  process.env.__CF_USER_TEXT_ENCODING = `0x${((process.getuid?.() ?? 0) + 1).toString(16).toUpperCase()}:0x8000100:0x0`;
+  const cf = "import json, os\nprint(json.dumps(os.environ.get('__CF_USER_TEXT_ENCODING')))";
   const h = setup([
-    "import json, os\nprint(json.dumps(sorted(os.environ)))\nprint('secret' in str(os.environ.get('SB_PARENT_SECRET')))",
+    "import json, os\nprint(json.dumps(sorted(os.environ)))\nprint('secret' in str(os.environ.get('SB_PARENT_SECRET')))\nprint(json.dumps(os.environ.get('__CF_USER_TEXT_ENCODING')))",
     "res = []\nfor m in ('socket', 'subprocess', 'js', 'pyodide', 'ctypes'):\n    try:\n        mod = __import__(m)\n        res.append(m + ' imported')\n        if m == 'ctypes': mod.CDLL(None); res.append('ctypes CDLL OK')\n    except Exception as e:\n        res.append(m + ' refused')\nimport os\nfor name in ('system', 'symlink', 'link', 'mkfifo', 'readlink'):\n    res.append(name + (' present' if hasattr(os, name) else ' absent'))\nprint(res)",
+    cf,
   ]);
   try {
     const r = await h.runner.run(h.task, "nb/a.ipynb");
-    const [envLine, secret] = r.report.cells[0].stdout.trim().split("\n");
-    assert.deepEqual(JSON.parse(envLine), ["DENO_DIR", "DENO_NODE_SHIM_ACTIVE", "HOME", "NO_COLOR", "PATH", "PYTHONTZPATH", "TMPDIR", "TZ", "TZDIR"]);
+    const [envLine, secret, cfFirst] = r.report.cells[0].stdout.trim().split("\n");
+    assert.deepEqual(JSON.parse(envLine), ["DENO_DIR", "DENO_NODE_SHIM_ACTIVE", "HOME", "NO_COLOR", "PATH", "PYTHONTZPATH", "TMPDIR", "TZ", "TZDIR", ...(darwin ? ["__CF_USER_TEXT_ENCODING"] : [])]);
     assert.equal(secret, "False");
+    const cfWant = darwin ? cfUserTextEncoding(process.getuid()) : null;
+    assert.equal(JSON.parse(cfFirst), cfWant, "the first cell's __CF_USER_TEXT_ENCODING");
+    assert.equal(JSON.parse(r.report.cells[2].stdout.trim()), cfWant, "the last cell's __CF_USER_TEXT_ENCODING");
     const res = r.report.cells[1].stdout;
     for (const bad of ["socket imported", "subprocess imported", "js imported", "pyodide imported", "CDLL OK", "system present", "symlink present", "link present", "mkfifo present", "readlink present"]) assert.ok(!res.includes(`'${bad}`), `${bad} in ${res}`);
   } finally {
     delete process.env.SB_PARENT_SECRET;
+    if (cfBefore === undefined) delete process.env.__CF_USER_TEXT_ENCODING; else process.env.__CF_USER_TEXT_ENCODING = cfBefore;
     h.done();
   }
 });

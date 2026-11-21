@@ -12,7 +12,7 @@ import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { fakeCreateServer } from "../lib/fake.mjs";
 import { RUNNER_PIN } from "../lib/runner-fetch.mjs";
-import { copyZones, RUNS_ENABLED, runArgv, runEnv, TaskRunner, TZ_SOURCE } from "../lib/task-runner.mjs";
+import { cfUserTextEncoding, copyZones, RUNS_ENABLED, runArgv, runEnv, TaskRunner, TZ_SOURCE } from "../lib/task-runner.mjs";
 import { TaskRpc } from "../lib/task-rpc.mjs";
 import { TaskTurns, TASK_SERVER } from "../lib/task-turns.mjs";
 import { TaskStore } from "../lib/tasks.mjs";
@@ -104,7 +104,7 @@ test("the fixed launch: exactly the plan's argv, the environment replaced whole,
     `--allow-read=${work},${runTmp},${h.engine}`, `--allow-write=${work},${runTmp}`, "--allow-env", "--deny-net", "--deny-run", "--deny-ffi", "--deny-sys",
     h.engine, "notebook", "run", join(work, "nb dir/a.ipynb"), "--json", "--write", "--timeout", "300", "--confine", work, "--confine", runTmp, "--until-stdin-ends"]);
   // (the environment: exactly these keys, nothing of this process's)
-  assert.deepEqual(Object.keys(h.spawned[0].opts.env).sort(), ["DENO_DIR", "HOME", "NO_COLOR", "PYTHONTZPATH", "TMPDIR", "TZ", "TZDIR"]);
+  assert.deepEqual(Object.keys(h.spawned[0].opts.env).sort(), ["DENO_DIR", "HOME", "NO_COLOR", "PYTHONTZPATH", "TMPDIR", "TZ", "TZDIR", ...(process.platform === "darwin" ? ["__CF_USER_TEXT_ENCODING"] : [])]);
   assert.deepEqual(h.spawned[0].opts.env, runEnv({ work, runTmp }));
   for (const [k, v] of Object.entries(runEnv({ work, runTmp }))) assert.equal(s.env[k], v, k);
   assert.equal(h.spawned[0].opts.detached, true, "a process group of its own");
@@ -541,4 +541,22 @@ test("procInfo (macOS's answers, from a stand-in ps): gone only on ESRCH; a star
     assert.ok(procInfo(4321, "darwin", { ps, kill: kill("EINVAL") }).unknown, "an error other than ESRCH or EPERM: unknown");
     assert.ok(procInfo(4321, "darwin", { ps: join(dir, "no-such-ps"), kill: kill(null) }).unknown, "no ps at all: unknown");
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("on macOS the run's __CF_USER_TEXT_ENCODING is the runner's own, from the uid, never this process's; elsewhere there is none", () => {
+  const before = process.env.__CF_USER_TEXT_ENCODING;
+  process.env.__CF_USER_TEXT_ENCODING = "0x0:0x8000100:0x0";
+  try {
+    const at = { work: "/w", runTmp: "/t" };
+    const base = ["DENO_DIR", "HOME", "NO_COLOR", "PYTHONTZPATH", "TMPDIR", "TZ", "TZDIR"];
+    assert.deepEqual(Object.keys(runEnv(at, { platform: "linux", uid: 501 })).sort(), base);
+    const mac = runEnv(at, { platform: "darwin", uid: 501 });
+    assert.deepEqual(Object.keys(mac).sort(), [...base, "__CF_USER_TEXT_ENCODING"]);
+    assert.equal(mac.__CF_USER_TEXT_ENCODING, "0x1F5:0:0");
+    assert.equal(cfUserTextEncoding(0), "0x0:0:0");
+    assert.equal(cfUserTextEncoding(4294967294), "0xFFFFFFFE:0:0");
+    for (const uid of [null, -1, 1.5, "501"]) assert.throws(() => runEnv(at, { platform: "darwin", uid }), /uid/, String(uid));
+  } finally {
+    if (before === undefined) delete process.env.__CF_USER_TEXT_ENCODING; else process.env.__CF_USER_TEXT_ENCODING = before;
+  }
 });

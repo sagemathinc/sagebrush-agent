@@ -326,15 +326,16 @@ test("no pin for this platform: refused before anything; the platforms and the c
   assert.equal(cacheRoot({}, "darwin", "/h"), "/h/Library/Caches/sagebrush-agent/codex");
 });
 
-test("the shipped pin: four platforms, each an https registry.npmjs.org tarball with an executable bin in its manifest", T, async () => {
+test("the shipped pin: five platforms, each an https registry.npmjs.org tarball with its bin in its manifest (executable, but for Windows's .exe)", T, async () => {
   const { PIN } = await import("../lib/codex-fetch.mjs");
-  assert.deepEqual(Object.keys(PIN.platforms).sort(), ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"]);
+  assert.deepEqual(Object.keys(PIN.platforms).sort(), ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-x64"]);
   for (const [k, e] of Object.entries(PIN.platforms)) {
     const u = new URL(e.url);
     assert.equal(u.protocol, "https:", k);
     assert.equal(u.hostname, "registry.npmjs.org", k);
     assert.match(e.sha256, /^[0-9a-f]{64}$/, k);
-    assert.ok(e.files[e.bin]?.exec, `${k}: ${e.bin} executable in the manifest`);
+    if (k.startsWith("win32-")) assert.ok(e.bin.endsWith(".exe") && e.files[e.bin], `${k}: ${e.bin} in the manifest`);
+    else assert.ok(e.files[e.bin]?.exec, `${k}: ${e.bin} executable in the manifest`);
     assert.ok(Number.isInteger(e.size) && e.size > 0, k);
   }
 });

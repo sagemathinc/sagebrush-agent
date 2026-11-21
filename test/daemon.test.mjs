@@ -446,7 +446,7 @@ test("the command line: when the page goes away, a fresh one-time link is printe
     const p3 = page(first.port);
     await p3.open;
     const old = await p3.hello({ code: second.code });
-    assert.ok(old.error && /press Enter in sagebrush-agent's terminal for a new one/.test(old.error.data.message) && !/start sagebrush-agent again/.test(old.error.data.message), "the second link's code, replaced by the third, is refused, with where a new one comes from");
+    assert.ok(old.error && /use the newest link sagebrush-agent printed/.test(old.error.data.message) && !/start sagebrush-agent again/.test(old.error.data.message), "the second link's code, replaced by the third, is refused, with where a new one comes from");
     const p4 = page(first.port);
     await p4.open;
     assert.ok((await p4.hello({ code: links().at(-1).code })).result, "the newest code pairs");
@@ -454,12 +454,14 @@ test("the command line: when the page goes away, a fresh one-time link is printe
     const p5 = page(first.port);
     const r5 = await p5.open.then(() => "open", (e) => String(e?.message ?? e));
     assert.match(r5, /409/, "a second page while one is paired: refused (409)");
-    p4.ws.close();
-    // stopping: no new link is printed for the page's socket closing on the way out
+    // stopping while a page is paired: its socket closing on the way out prints no new link
+    await new Promise((r) => setTimeout(r, 200));
     const n = links().length;
     c.kill("SIGTERM");
     await new Promise((r) => c.once("exit", r));
-    assert.equal(links().length, n, "stopping prints no new link");
+    assert.equal(links().length, n, "stopping, with a page paired, prints no new link");
+    assert.match(out, /^The code works once, for 5 minutes; a new one is printed here each time the page goes away\.$/m);
+    assert.doesNotMatch(out, /press Enter/);
   } finally {
     c.kill("SIGKILL");
   }

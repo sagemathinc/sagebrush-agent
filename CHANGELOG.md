@@ -12,7 +12,7 @@
   - A runner on Windows can stop the running turns with a control line, since it can't send a signal there.
   - A few file paths are now built in a way that works on Windows.
   - Delegate stays off on Windows in this version, and says why.
-  - Codex itself is still refused on Windows in this version ("Codex on Windows isn't supported here."). It is downloaded and checked there, but it isn't started for a turn.
+  - Codex itself is still refused on Windows in this version ("Codex on Windows isn't supported here."). It is downloaded and checked there, then refused as soon as it answers its first request; no turn runs.
   - Known on Windows: Node writes the agent's output to its runner synchronously there, so a runner that stops reading holds up the whole agent until it reads again. On other systems only that turn is stopped.
 - **Tests (pending Windows confirmation):** the suite is made to run on Windows. The rows that can't apply there (Delegate, POSIX modes, signals) are declared skips with their reasons, never silent passes.
 

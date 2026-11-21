@@ -28,6 +28,11 @@
     "lib/netverbs.mjs",
     "lib/docs-paths.json",
     "lib/turn-info.mjs",
+    "lib/tasks.mjs",
+    "lib/tasks-schema.mjs",
+    "lib/task-git.mjs",
+    "lib/task-paths.mjs",
+    "lib/fake-tasks.mjs",
     "README.md",
     "npm-shrinkwrap.json"
   ],

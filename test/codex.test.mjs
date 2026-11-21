@@ -63,7 +63,9 @@ function agent(fakeEnv = {}) {
     a.send({ jsonrpc: "2.0", id: q.id, result });
   };
   a.permit = async (c, allow = true, digestOf = c) => a.send({ jsonrpc: "2.0", method: "chat.permission", params: { request_id: c.request_id, behavior: allow ? "allow" : "deny", ...(allow ? { digest: await digest(digestOf) } : {}) } });
-  a.kill = () => { try { p.kill("SIGKILL"); } catch {} rmSync(runnerCwd, { recursive: true, force: true }); };
+  // (the folder goes once the child has exited: Windows won't remove the folder a live process is in; retried, since
+  //  Windows can still hold it for a moment after the exit)
+  a.kill = () => { try { p.kill("SIGKILL"); } catch {} const rm = () => rmSync(runnerCwd, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); if (p.exitCode !== null || p.signalCode !== null) rm(); else p.once("exit", rm); };
   a.send({ relay: { start: { frame: F, protocol: 1, epoch: 0 } } });
   return a;
 }

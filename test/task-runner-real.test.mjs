@@ -15,8 +15,9 @@ import { platformKey } from "../lib/codex-fetch.mjs";
 
 const DENO = process.env.SAGEBRUSH_RUNNER_DENO, ENGINE = process.env.SAGEBRUSH_RUNNER_ENGINE;
 const missing = !DENO || !ENGINE || !existsSync(DENO) || !existsSync(ENGINE) ? "needs SAGEBRUSH_RUNNER_DENO and SAGEBRUSH_RUNNER_ENGINE (the pinned deno, a built engine with --confine)" : null;
-if (missing && process.env.SAGEBRUSH_REQUIRE_RUNNER === "1") test("the runner's acceptance rows are required here (SAGEBRUSH_REQUIRE_RUNNER=1)", () => assert.fail(missing));
-const T = missing ? { skip: missing } : {};
+if (missing && process.env.SAGEBRUSH_REQUIRE_RUNNER === "1" && process.platform !== "win32") test("the runner's acceptance rows are required here (SAGEBRUSH_REQUIRE_RUNNER=1)", () => assert.fail(missing));
+// (Delegate is refused on Windows in this version: there these rows are declared skips, whatever is given)
+const T = process.platform === "win32" ? { skip: "Delegate refused on win32 in this version" } : missing ? { skip: missing } : {};
 const PIN = { ...RUNNER_PIN, engine: { version: "local", entry: "engine", files: {} } };
 
 const nb = (cells) => JSON.stringify({ cells: cells.map((src, i) => ({ cell_type: "code", id: `c${i}`, metadata: {}, source: src, outputs: [], execution_count: null })), metadata: { kernelspec: { name: "python3", language: "python", display_name: "Python 3" } }, nbformat: 4, nbformat_minor: 5 });

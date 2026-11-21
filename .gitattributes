@@ -1,0 +1,5 @@
+# Files whose exact bytes are pinned (sha256 in a test or a pin) keep LF everywhere: Git for Windows' default
+# core.autocrlf=true would check them out with CRLF, and their hashes would no longer match.
+lib/*.json text eol=lf
+# The pinned zone data: compared byte for byte against lib/runner-pin.json, never converted.
+lib/tzdata/** -text

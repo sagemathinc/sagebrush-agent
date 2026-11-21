@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { test, before, after } from "node:test";
 import https from "node:https";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,9 +12,14 @@ import { isPublicAddress, canonicalUrl, displayPath, displayReason, safeGet, asT
 import { repoTarget, CardlessBudget, CARDLESS_CALLS, netVerbs, DOCS_PATHS } from "../lib/netverbs.mjs";
 
 let dir, cert, key, server, port;
+// (the throwaway certificate comes from openssl; where there is none (Windows, by default), the rows that need the local
+//  TLS server are declared skips, saying so; the others run)
+const OPENSSL = (() => { try { return spawnSync("openssl", ["version"], { stdio: "ignore" }).status === 0; } catch { return false; } })();
+const TLS = OPENSSL ? {} : { skip: "needs openssl for the local TLS server's throwaway certificate, and there is none on PATH" };
 const routes = new Map(); // path -> (req, res) => void
 const seen = []; // {host, path} of every request the server got
 before(async () => {
+  if (!OPENSSL) return;
   dir = mkdtempSync(join(tmpdir(), "step4-tls-"));
   execFileSync("openssl", ["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "2", "-subj", "/CN=example.test", "-addext", "subjectAltName=DNS:example.test", "-keyout", join(dir, "k.pem"), "-out", join(dir, "c.pem")], { stdio: "ignore" });
   cert = readFileSync(join(dir, "c.pem"));
@@ -70,14 +75,14 @@ test("egress: the display path and reason: no query, escapes kept, 200 bytes wit
   assert.equal([...displayReason("é".repeat(300))].length, 200, "≤200 scalars with its ellipsis (the page admits at most 200)");
 });
 
-test("egress: a name with any non-public answer is refused, with no connection made (mixed DNS answers, S1)", async () => {
+test("egress: a name with any non-public answer is refused, with no connection made (mixed DNS answers, S1)", TLS, async () => {
   const n = seen.length;
   await assert.rejects(safeGet(url("https://example.test/x"), T({ lookup: async () => [{ address: PUBLIC, family: 4 }, { address: "10.0.0.1", family: 4 }] })), (e) => e instanceof EgressError && /isn't public/.test(e.message));
   await assert.rejects(safeGet(url("https://example.test/x"), T({ lookup: async () => [{ address: "::ffff:127.0.0.1", family: 6 }] })), EgressError);
   assert.equal(seen.length, n, "nothing reached the server");
 });
 
-test("egress: the socket goes to the checked address while TLS checks the name; a certificate for another name fails (S1)", async () => {
+test("egress: the socket goes to the checked address while TLS checks the name; a certificate for another name fails (S1)", TLS, async () => {
   routes.set("/hello", text("hi"));
   const r = await safeGet(url("https://example.test/hello"), T());
   assert.equal(asText(r.body), "hi");
@@ -88,7 +93,7 @@ test("egress: the socket goes to the checked address while TLS checks the name; 
   await assert.rejects(safeGet(url("https://other.test/hello"), T()), EgressError, "a certificate for example.test doesn't serve other.test");
 });
 
-test("egress: HTTP(S)_PROXY and NODE_USE_ENV_PROXY in the environment are never honored (S1)", async () => {
+test("egress: HTTP(S)_PROXY and NODE_USE_ENV_PROXY in the environment are never honored (S1)", TLS, async () => {
   routes.set("/proxy", text("direct"));
   const script = `
     import { safeGet, canonicalUrl } from ${JSON.stringify(new URL("../lib/egress.mjs", import.meta.url).href)};
@@ -105,7 +110,7 @@ test("egress: HTTP(S)_PROXY and NODE_USE_ENV_PROXY in the environment are never 
   assert.equal(out, "direct", err);
 });
 
-test("egress: redirects: same origin followed (at most 3), another origin never contacted and returned as its origin alone (S2)", async () => {
+test("egress: redirects: same origin followed (at most 3), another origin never contacted and returned as its origin alone (S2)", TLS, async () => {
   routes.set("/r1", (q, s) => { s.writeHead(302, { location: "/r2" }); s.end(); });
   routes.set("/r2", text("arrived"));
   assert.equal(asText((await safeGet(url("https://example.test/r1"), T())).body), "arrived");
@@ -119,7 +124,7 @@ test("egress: redirects: same origin followed (at most 3), another origin never 
   await assert.rejects(safeGet(url("https://example.test/away"), T({ hosts: ["example.test"] })), /redirected outside example.test/, "a fixed-host verb never leaves its hosts");
 });
 
-test("egress: caps: a declared or streamed body over the cap, compression, a type not allowed, binary bytes; the deadline (S4)", async () => {
+test("egress: caps: a declared or streamed body over the cap, compression, a type not allowed, binary bytes; the deadline (S4)", TLS, async () => {
   routes.set("/big", text("x".repeat(5000)));
   await assert.rejects(safeGet(url("https://example.test/big"), T()), /over the 4096/);
   routes.set("/stream", (q, s) => { s.writeHead(200, { "content-type": "text/plain" }); for (let i = 0; i < 10; i++) s.write("y".repeat(1000)); s.end(); });
@@ -198,7 +203,7 @@ test("egress: sagebrush_docs: only the allowlist, only sagebrush.space, never a 
   assert.deepEqual(DOCS_PATHS, ["/llms.txt", "/board-format.md", "/board-host-protocol.md", "/capabilities.md", "/agents/connect.md", "/atlas/llms.txt"]);
 });
 
-test("egress: web_fetch through the transport: HTML as text, labeled with its origin; a cross-origin redirect said as its origin alone", async () => {
+test("egress: web_fetch through the transport: HTML as text, labeled with its origin; a cross-origin redirect said as its origin alone", TLS, async () => {
   routes.set("/page", text("<h1>Title</h1><p>Body</p>", "text/html"));
   const get = (u, o) => safeGet(u, { ...o, ...T({ maxBytes: o.maxBytes, types: o.types }) });
   const v = netVerbs({ budget: new CardlessBudget(), get });

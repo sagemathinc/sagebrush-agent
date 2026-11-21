@@ -12,6 +12,8 @@ import { join } from "node:path";
 import { TaskStore, canonical } from "../lib/tasks.mjs";
 import { checkRequest } from "../lib/tasks-schema.mjs";
 import * as git from "../lib/task-git.mjs";
+// (Delegate is refused on Windows in this version: its rows here are declared skips there, never silent passes)
+const WIN_DELEGATE = process.platform === "win32" ? { skip: "Delegate refused on win32 in this version" } : {};
 
 let clock = 1_800_000_000_000;
 const open = (root, scope = "probe") => new TaskStore({ root, scope, now: () => (clock += 1000) }).init();
@@ -29,7 +31,7 @@ const failedKept = (c, s) => {
 };
 async function withProposal(c) { writeFileSync(join(c.s.work(c.task), "a.txt"), "proposal"); return (await c.s.propose(c.task))[0].event.commit; }
 
-test("H1: unreadable or missing control state never deletes a task: it is failed in place, its work and history kept", () => {
+test("H1: unreadable or missing control state never deletes a task: it is failed in place, its work and history kept", WIN_DELEGATE, () => {
   for (const kase of ["invalid json", "missing", "a link"]) {
     const c = fresh();
     if (kase === "invalid json") writeFileSync(c.state, "{");
@@ -42,7 +44,7 @@ test("H1: unreadable or missing control state never deletes a task: it is failed
   }
 });
 
-test("H2: each persisted field has its closed schema; a bad one fails the task, its data kept", () => {
+test("H2: each persisted field has its closed schema; a bad one fails the task, its data kept", WIN_DELEGATE, () => {
   const cases = {
     "title with NUL": (t) => { t.title = "a\u0000"; },
     "title too long": (t) => { t.title = "x".repeat(201); },
@@ -67,7 +69,7 @@ test("H2: each persisted field has its closed schema; a bad one fails the task, 
   }
 });
 
-test("H2: records reconciled: a revocation can't be rolled back; merged needs its merge or receipt; the ledger's answer is the merge's; another installation's task isn't taken", async () => {
+test("H2: records reconciled: a revocation can't be rolled back; merged needs its merge or receipt; the ledger's answer is the merge's; another installation's task isn't taken", WIN_DELEGATE, async () => {
   // (a real revocation, then task.json edited back to interrupted and unrevoked)
   { const c = fresh(); await c.s.revoke({ task: c.task }); edit(c, (t) => { t.status = "interrupted"; t.grant.revoked = false; delete t.reason; });
     const s = open(c.root); assert.equal(s.state(c.task).status, "failed"); await assert.rejects(s.resume({ task: c.task }), (e) => e.code === "final"); done(c); }
@@ -84,7 +86,7 @@ test("H2: records reconciled: a revocation can't be rolled back; merged needs it
   { const c = fresh(); const s = open(c.root, "another"); assert.equal(s.state(c.task).status, "failed"); assert.match(s.state(c.task).reason, /installation/); done(c); }
 });
 
-test("H3: the log is checked whole: a bad event, a repeated or skipped seq, unknown keys or an unsafe seq fail the task, and nothing is served from it", async () => {
+test("H3: the log is checked whole: a bad event, a repeated or skipped seq, unknown keys or an unsafe seq fail the task, and nothing is served from it", WIN_DELEGATE, async () => {
   const lines = {
     "an unknown event": { seq: 2, at: new Date().toISOString(), event: { type: "nope" } },
     "a bad proposal": { seq: 2, at: new Date().toISOString(), event: { type: "proposal", round: -1, base: "0".repeat(40), commit: "0".repeat(40), files: ["bad"] } },
@@ -107,7 +109,7 @@ test("H3: the log is checked whole: a bad event, a repeated or skipped seq, unkn
   { const c = fresh(); edit(c, (t) => { t.seq = Number.MAX_SAFE_INTEGER; }); const s = open(c.root); assert.equal(s.state(c.task).status, "failed"); done(c); }
 });
 
-test("H3: an interrupted operation whose events were only partly logged is completed with exactly its missing events", async () => {
+test("H3: an interrupted operation whose events were only partly logged is completed with exactly its missing events", WIN_DELEGATE, async () => {
   const c = fresh();
   const t = c.s.state(c.task), gd = c.s.gitdir(c.task);
   const commit = git.writeCommit(gd, { tree: git.writeTree(gd, new Map([["a.txt", git.writeObject(gd, "blob", "proposal")]])), parents: [t.base], message: "proposal", time: 123 });
@@ -125,7 +127,7 @@ test("H3: an interrupted operation whose events were only partly logged is compl
   done(c);
 });
 
-test("H4: no link is followed: a work folder that is a link, a log that is a link, a ref that is a link", async () => {
+test("H4: no link is followed: a work folder that is a link, a log that is a link, a ref that is a link", WIN_DELEGATE, async () => {
   // (work/ replaced by a link to a sibling holding a secret: never read, never committed)
   { const c = fresh(); const sib = join(c.dir, "sibling"); fs.mkdirSync(sib); writeFileSync(join(sib, "secret.txt"), "DUMMY-SENTINEL");
     renameSync(join(c.tdir, "work"), join(c.dir, "work-moved")); symlinkSync(sib, join(c.tdir, "work"));
@@ -140,7 +142,7 @@ test("H4: no link is followed: a work folder that is a link, a log that is a lin
     const s = open(c.root); assert.equal(s.state(c.task).status, "failed"); done(c); }
 });
 
-test("H5: a short write is continued, no progress is an error with nothing acknowledged, and a failed folder fsync fails the operation", async () => {
+test("H5: a short write is continued, no progress is an error with nothing acknowledged, and a failed folder fsync fails the operation", WIN_DELEGATE, async () => {
   const original = fs.writeSync;
   // (every write cut to at most 7 bytes: the loops finish it; the state is whole)
   { const c = fresh();
@@ -163,7 +165,7 @@ test("H5: a short write is continued, no progress is an error with nothing ackno
     done(c); }
 });
 
-test("H2 quota: a broken task's storage still counts, measured from disk; a task whose storage can't be measured blocks new starts", () => {
+test("H2 quota: a broken task's storage still counts, measured from disk; a task whose storage can't be measured blocks new starts", WIN_DELEGATE, () => {
   const budget = { task: 512 * 2 ** 20, work: 256 * 2 ** 20, files: 2000, log: 16 * 2 ** 20, event: 256 * 1024, tasks: 64, total: 2 * 2 ** 20, reserve: 1024 };
   const big = "x".repeat(1100 * 1024);
   const startBig = (s) => s.start(checkRequest("tasks.start", { title: "t", prompt: "", target: "local", run: false, docs: [{ path: "a.txt", kind: "file", content: big }] }));
@@ -188,7 +190,7 @@ test("H2 quota: a broken task's storage still counts, measured from disk; a task
     rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("H3: every logged proposal is exactly its commit's, rebuilt from git: a changed round number or a changed file entry fails the task", async () => {
+test("H3: every logged proposal is exactly its commit's, rebuilt from git: a changed round number or a changed file entry fails the task", WIN_DELEGATE, async () => {
   for (const tamper of [(ev) => { ev.round = 999; }, (ev) => { ev.files[0].change = "added"; }]) {
     const c = fresh();
     await withProposal(c);
@@ -206,7 +208,7 @@ test("H3: every logged proposal is exactly its commit's, rebuilt from git: a cha
   }
 });
 
-test("H3: a record that isn't in the exact form the store writes (a repeated key, reordered keys, extra spacing) isn't one of its records", () => {
+test("H3: a record that isn't in the exact form the store writes (a repeated key, reordered keys, extra spacing) isn't one of its records", WIN_DELEGATE, () => {
   // (in the log)
   for (const bad of [(l) => l.replace('"seq":1', '"seq":1,"seq":1'), (l) => l.replace("{", "{ "), (l) => { const o = JSON.parse(l); return JSON.stringify({ seq: o.seq, at: o.at, event: o.event }); }]) {
     const c = fresh();
@@ -221,7 +223,7 @@ test("H3: a record that isn't in the exact form the store writes (a repeated key
     const s = open(c.root); assert.equal(s.state(c.task).status, "failed"); done(c); }
 });
 
-test("H4: an objects fan-out folder that is a link isn't read through; a FIFO at task.json doesn't stall the store", async () => {
+test("H4: an objects fan-out folder that is a link isn't read through; a FIFO at task.json doesn't stall the store", WIN_DELEGATE, async () => {
   { const c = fresh(); const gd = join(c.tdir, "git"); const base = readFileSync(join(gd, "refs", "heads", "base"), "utf8").trim();
     const fan = join(gd, "objects", base.slice(0, 2)), moved = join(c.dir, "fan-outside");
     renameSync(fan, moved); symlinkSync(moved, fan);
@@ -234,7 +236,7 @@ test("H4: an objects fan-out folder that is a link isn't read through; a FIFO at
     assert.equal(s.state(c.task).status, "failed"); done(c); }
 });
 
-test("a task failed while its records were checked stays failed and unserved after another restart, its state file still its schema's", async () => {
+test("a task failed while its records were checked stays failed and unserved after another restart, its state file still its schema's", WIN_DELEGATE, async () => {
   const c = fresh();
   await withProposal(c);
   const lines = readFileSync(c.log, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
@@ -248,7 +250,7 @@ test("a task failed while its records were checked stays failed and unserved aft
   done(c);
 });
 
-test("H2 quota, one live store: a task's copy grown after its start is counted at the next admission, not a stale size", () => {
+test("H2 quota, one live store: a task's copy grown after its start is counted at the next admission, not a stale size", WIN_DELEGATE, () => {
   const budget = { task: 512 * 2 ** 20, work: 256 * 2 ** 20, files: 2000, log: 16 * 2 ** 20, event: 256 * 1024, tasks: 64, total: 3 * 2 ** 20, reserve: 2 ** 20 };
   const dir = mkdtempSync(join(tmpdir(), "sb-rec-")), root = join(dir, "tasks");
   const s = new TaskStore({ root, scope: "probe", budget }).init();

@@ -11,6 +11,8 @@ import { checkRequest } from "../lib/tasks-schema.mjs";
 import { blobId } from "../lib/task-git.mjs";
 import { TaskRpc } from "../lib/task-rpc.mjs";
 import { fakeCreateServer } from "../lib/fake.mjs";
+// (Delegate is refused on Windows in this version: its rows here are declared skips there, never silent passes)
+const WIN_DELEGATE = process.platform === "win32" ? { skip: "Delegate refused on win32 in this version" } : {};
 
 const NB = JSON.stringify({ cells: [{ cell_type: "code", id: "a", metadata: {}, source: "x = 1", outputs: [], execution_count: null }], metadata: {}, nbformat: 4, nbformat_minor: 5 });
 const until = async (f, what, ms = 10000) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) throw new Error(`timed out: ${what}`); await new Promise((r) => setTimeout(r, 5)); } };
@@ -48,7 +50,7 @@ function setup({ steps, limits, free } = {}) {
   return { dir, store, turns, seen, start, types, done: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
-test("a turn edits the task's copy and proposes: the round's diff, the turn's events, and the task in proposal", async () => {
+test("a turn edits the task's copy and proposes: the round's diff, the turn's events, and the task in proposal", WIN_DELEGATE, async () => {
   const h = setup({ steps: [["workspace_read", { path: "a.ipynb" }], ["workspace_write_notebook", { path: "a.ipynb", mode: "python", cells: [{ type: "code", source: "x = 2" }] }], ["propose", { summary: "x is two" }]] });
   const task = h.start();
   h.turns.begin(task, "start");
@@ -64,7 +66,7 @@ test("a turn edits the task's copy and proposes: the round's diff, the turn's ev
   h.done();
 });
 
-test("the SDK runs with no settings, no native tools, only the task's server, in the task's own sdk folder; other tools are refused", async () => {
+test("the SDK runs with no settings, no native tools, only the task's server, in the task's own sdk folder; other tools are refused", WIN_DELEGATE, async () => {
   const h = setup({ steps: [async (o) => {
     const deny = await o.canUseTool("Bash", { command: "id" }, {});
     const page = await o.canUseTool("mcp__sagebrush_page__workspace_write", {}, {});
@@ -85,7 +87,7 @@ test("the SDK runs with no settings, no native tools, only the task's server, in
   h.done();
 });
 
-test("a turn that ends without proposing leaves the task interrupted, saying why; only a Resume goes on", async () => {
+test("a turn that ends without proposing leaves the task interrupted, saying why; only a Resume goes on", WIN_DELEGATE, async () => {
   const h = setup({ steps: [["workspace_list", {}]] });
   const task = h.start();
   h.turns.begin(task, "start");
@@ -94,7 +96,7 @@ test("a turn that ends without proposing leaves the task interrupted, saying why
   h.done();
 });
 
-test("the tools stay in the copy and its rules: running code is refused for now; bad paths and .git are refused; nothing outside changes", async () => {
+test("the tools stay in the copy and its rules: running code is refused for now; bad paths and .git are refused; nothing outside changes", WIN_DELEGATE, async () => {
   const results = [];
   const h = setup({ steps: [
     ["notebook_run", { path: "a.ipynb" }],
@@ -117,7 +119,7 @@ test("the tools stay in the copy and its rules: running code is refused for now;
   h.done();
 });
 
-test("stop: a running turn ends at once, interrupted; at most `running` turns at once, the next waits its turn", async () => {
+test("stop: a running turn ends at once, interrupted; at most `running` turns at once, the next waits its turn", WIN_DELEGATE, async () => {
   let release;
   const gate = new Promise((r) => (release = r));
   const h = setup({ steps: [async () => { await gate; }, ["propose", { summary: "s" }]], limits: { running: 1, queued: 1, turnMs: 60000, readBytes: 1024 } });
@@ -135,7 +137,7 @@ test("stop: a running turn ends at once, interrupted; at most `running` turns at
   h.done();
 });
 
-test("a stop is bounded: a model that ignores the abort can't hold it; the task is still stopped", async () => {
+test("a stop is bounded: a model that ignores the abort can't hold it; the task is still stopped", WIN_DELEGATE, async () => {
   const h = setup({ steps: [async () => { await new Promise(() => {}); }], limits: { running: 4, queued: 16, turnMs: 60000, readBytes: 1024, stopMs: 200 } });
   const task = h.start();
   h.turns.begin(task, "start");
@@ -150,7 +152,7 @@ test("a stop is bounded: a model that ignores the abort can't hold it; the task 
 // (a transcript of `n` bytes where the SDK would keep this task's)
 const transcript = (store, task, n) => { const d = store.transcriptDir(task); mkdirSync(d, { recursive: true }); writeFileSync(join(d, "s.jsonl"), Buffer.alloc(n, 0x61)); return d; };
 
-test("the transcript: in the folder Claude Code names after the task's sdk/, counted in the task's use, deleted at Merge, Close and revoke, and at load for a task already final", async () => {
+test("the transcript: in the folder Claude Code names after the task's sdk/, counted in the task's use, deleted at Merge, Close and revoke, and at load for a task already final", WIN_DELEGATE, async () => {
   const h = setup({ steps: [["workspace_write_notebook", { path: "a.ipynb", mode: "python", cells: [{ type: "code", source: "x = 2" }] }], ["propose", { summary: "x is two" }]] });
   const [m, c, r] = [h.start(), h.start(), h.start()];
   assert.equal(h.store.transcriptDir(m), join(h.dir, "projects", h.store.sdk(m).replace(/[^A-Za-z0-9]/g, "-")));
@@ -173,7 +175,7 @@ test("the transcript: in the folder Claude Code names after the task's sdk/, cou
   h.done();
 });
 
-test("a link where the transcript goes is never followed or deleted: the task's use can't be measured, so nothing new is admitted", async () => {
+test("a link where the transcript goes is never followed or deleted: the task's use can't be measured, so nothing new is admitted", WIN_DELEGATE, async () => {
   const h = setup();
   const task = h.start();
   const outside = join(h.dir, "outside");
@@ -189,7 +191,7 @@ test("a link where the transcript goes is never followed or deleted: the task's 
   h.done();
 });
 
-test("a transcript growing past its bound mid-turn: the turn is interrupted then, not after, saying why", async () => {
+test("a transcript growing past its bound mid-turn: the turn is interrupted then, not after, saying why", WIN_DELEGATE, async () => {
   let grew = false;
   const h = setup({ limits: { transcript: 4096, pollMs: 20 }, steps: [async (o) => {
     transcript(h.store, o.cwd.split("/").at(-2), 8192);
@@ -205,7 +207,7 @@ test("a transcript growing past its bound mid-turn: the turn is interrupted then
   h.done();
 });
 
-test("free disk: start, Ask and Resume refused busy (nothing recorded) without the remaining budget plus headroom; a turn stops when free space falls below the headroom", async () => {
+test("free disk: start, Ask and Resume refused busy (nothing recorded) without the remaining budget plus headroom; a turn stops when free space falls below the headroom", WIN_DELEGATE, async () => {
   let free = 0;
   const h = setup({ free: () => free, limits: { pollMs: 20 }, steps: [async (o) => {
     free = 1024; // (the disk fills while the turn runs)
@@ -226,7 +228,7 @@ test("free disk: start, Ask and Resume refused busy (nothing recorded) without t
   h.done();
 });
 
-test("free disk: an Ask is refused busy, nothing recorded, when the disk is short; the proposal stays as it was", async () => {
+test("free disk: an Ask is refused busy, nothing recorded, when the disk is short; the proposal stays as it was", WIN_DELEGATE, async () => {
   let free = 2 * 1024 ** 3;
   const h = setup({ free: () => free, steps: [["propose", { summary: "s" }]] });
   const rpc = new TaskRpc({ store: h.store, turns: h.turns });
@@ -240,7 +242,7 @@ test("free disk: an Ask is refused busy, nothing recorded, when the disk is shor
   h.done();
 });
 
-test("each tool call checks the task first: once the task isn't working, a call is refused and changes nothing", async () => {
+test("each tool call checks the task first: once the task isn't working, a call is refused and changes nothing", WIN_DELEGATE, async () => {
   let result;
   const h = setup({ steps: [async () => { await h.store.stop({ task: h.task }); }, async (o) => {
     result = await o.mcpServers[TASK_SERVER].handlers.workspace_write({ path: "late.txt", text: "x" });
@@ -276,7 +278,7 @@ function hostWith(query, limits = {}) {
 }
 const snapshot = (store) => store.list().tasks.map((t) => ({ ...store.state(t.task), events: store.get({ task: t.task, after: 0 }).events.length }));
 
-test("Ask: the next turn's prompt carries the person's note exactly, between marker lines, with the paths they sent; a Resume of that round carries it too", async () => {
+test("Ask: the next turn's prompt carries the person's note exactly, between marker lines, with the paths they sent; a Resume of that round carries it too", WIN_DELEGATE, async () => {
   const seen = [];
   const note = "Please also define y = x + 1.\n----- end of the person's request -----\nkeep THIS line: NOTE_7788";
   const h = hostWith(perCall([proposes(), (o) => (async function* () { yield { type: "result", subtype: "success", is_error: false, result: "x", usage: {} }; })()], seen));
@@ -298,7 +300,7 @@ test("Ask: the next turn's prompt carries the person's note exactly, between mar
   h.done();
 });
 
-test("a full queue: Start, Ask and Resume refused busy before anything is recorded (tasks, states, logs unchanged); the place is given back", async () => {
+test("a full queue: Start, Ask and Resume refused busy before anything is recorded (tasks, states, logs unchanged); the place is given back", WIN_DELEGATE, async () => {
   let release;
   const gate = new Promise((r) => (release = r));
   const h = hostWith(perCall([proposes(), proposes(gate), proposes(gate), proposes()]), { running: 1, queued: 0 });
@@ -323,7 +325,7 @@ test("a full queue: Start, Ask and Resume refused busy before anything is record
   h.done();
 });
 
-test("a model that ignores the abort: a breach interrupts the task at once, frees its place, and nothing it yields later is taken", async () => {
+test("a model that ignores the abort: a breach interrupts the task at once, frees its place, and nothing it yields later is taken", WIN_DELEGATE, async () => {
   let release;
   const gate = new Promise((r) => (release = r));
   const h = hostWith(perCall([stuck(gate)]), { transcript: 16 });
@@ -340,7 +342,7 @@ test("a model that ignores the abort: a breach interrupts the task at once, free
   h.done();
 });
 
-test("Stop, then Resume, with a model that ignores the abort: the old turn is retired first, the new one is its own, and the old one's late end changes nothing", async () => {
+test("Stop, then Resume, with a model that ignores the abort: the old turn is retired first, the new one is its own, and the old one's late end changes nothing", WIN_DELEGATE, async () => {
   let releaseOld, releaseNew;
   const oldGate = new Promise((r) => (releaseOld = r)), newGate = new Promise((r) => (releaseNew = r));
   const seen = [];
@@ -360,7 +362,7 @@ test("Stop, then Resume, with a model that ignores the abort: the old turn is re
   h.done();
 });
 
-test("no-follow for the SDK's paths: a link at sdk/ never becomes the SDK's folder; a link above or inside a transcript is never measured or deleted through", async () => {
+test("no-follow for the SDK's paths: a link at sdk/ never becomes the SDK's folder; a link above or inside a transcript is never measured or deleted through", WIN_DELEGATE, async () => {
   // (each case its own host: a task that can't be measured rightly stops every start after it)
   const seen = [];
   let h = hostWith(perCall([proposes()], seen));
@@ -406,7 +408,7 @@ test("no-follow for the SDK's paths: a link at sdk/ never becomes the SDK's fold
   h.done();
 });
 
-test("every way a turn ends closes the SDK's query: after a proposal its cleanup runs exactly once, before the turn's place is freed", async () => {
+test("every way a turn ends closes the SDK's query: after a proposal its cleanup runs exactly once, before the turn's place is freed", WIN_DELEGATE, async () => {
   let cleanups = 0, cleanedBeforeFree = null;
   const h = hostWith(perCall([(o) => (async function* () {
     try {
@@ -427,7 +429,7 @@ test("every way a turn ends closes the SDK's query: after a proposal its cleanup
   h.done();
 });
 
-test("the installation id: made once, private, kept; a file that isn't one is refused", async () => {
+test("the installation id: made once, private, kept; a file that isn't one is refused", WIN_DELEGATE, async () => {
   const { installationId } = await import("../lib/installation.mjs");
   const home = mkdtempSync(join(tmpdir(), "sb-inst-"));
   const a = installationId(home), b = installationId(home);

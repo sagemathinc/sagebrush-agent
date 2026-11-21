@@ -7,12 +7,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fakeTasks } from "../lib/fake-tasks.mjs";
 import { blobId } from "../lib/task-git.mjs";
+// (Delegate is refused on Windows in this version: its rows here are declared skips there, never silent passes)
+const WIN_DELEGATE = process.platform === "win32" ? { skip: "Delegate refused on win32 in this version" } : {};
 
 const NB = JSON.stringify({ cells: [{ cell_type: "code", id: "a", metadata: {}, source: "x = 1", outputs: [], execution_count: null }], metadata: {}, nbformat: 4, nbformat_minor: 5 });
 let n = 0;
 const req = (method, params) => JSON.stringify({ jsonrpc: "2.0", id: `p${++n}`, method, params });
 
-test("a task end to end through frames: start, the scripted proposal, diff, file, merged; task.event notifications", async () => {
+test("a task end to end through frames: start, the scripted proposal, diff, file, merged; task.event notifications", WIN_DELEGATE, async () => {
   const dir = mkdtempSync(join(tmpdir(), "sb-fake-"));
   const host = await fakeTasks({ root: join(dir, "tasks") });
   const seen = [];
@@ -34,7 +36,7 @@ test("a task end to end through frames: start, the scripted proposal, diff, file
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("refusals as the protocol words them: bad frames, unknown methods and fields, not_found, remote targets", async () => {
+test("refusals as the protocol words them: bad frames, unknown methods and fields, not_found, remote targets", WIN_DELEGATE, async () => {
   const dir = mkdtempSync(join(tmpdir(), "sb-fake-"));
   const host = await fakeTasks({ root: join(dir, "tasks") });
   const code = (a) => a.error?.data?.code;

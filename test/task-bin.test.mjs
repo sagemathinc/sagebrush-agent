@@ -9,6 +9,8 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { DEFAULT_ORIGINS } from "../lib/server.mjs";
+// (Delegate is refused on Windows in this version: its rows here are declared skips there, never silent passes)
+const WIN_DELEGATE = process.platform === "win32" ? { skip: "Delegate refused on win32 in this version" } : {};
 
 const BIN = fileURLToPath(new URL("../bin/sagebrush-agent.mjs", import.meta.url));
 const ORIGIN = DEFAULT_ORIGINS[0];
@@ -42,7 +44,7 @@ async function pairOnce(env) {
   }
 }
 
-test("fake model: Delegate on only in SAGEBRUSH_TASKS_HOME (private store made there), off without it; the home is never touched", async () => {
+test("fake model: Delegate on only in SAGEBRUSH_TASKS_HOME (private store made there), off without it; the home is never touched", WIN_DELEGATE, async () => {
   const base = mkdtempSync(join(tmpdir(), "sb-taskbin-"));
   try {
     const home = join(base, "home"), tasks = join(base, "tasks");

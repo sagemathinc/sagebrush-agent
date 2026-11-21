@@ -12,7 +12,9 @@ import { join } from "node:path";
 import { TaskStore, buildIntent, canonical } from "../lib/tasks.mjs";
 import { checkRequest, TaskError } from "../lib/tasks-schema.mjs";
 import { blobId, casRef, readRef, RefConflict } from "../lib/task-git.mjs";
-import { pathProblem, pathSetProblem } from "../lib/task-paths.mjs";
+import { pathProblem, pathSetProblem, privateDirProblem } from "../lib/task-paths.mjs";
+// (Delegate is refused on Windows in this version: its rows here are declared skips there, never silent passes)
+const WIN_DELEGATE = process.platform === "win32" ? { skip: "Delegate refused on win32 in this version" } : {};
 
 const NB = JSON.stringify({ cells: [{ cell_type: "code", id: "a", metadata: {}, source: "x = 1", outputs: [], execution_count: null }], metadata: { sagebrush: { seed: "0".repeat(64) } }, nbformat: 4, nbformat_minor: 5 });
 const NB2 = NB.replace("x = 1", "x = 2");
@@ -23,7 +25,15 @@ const start = (s, extra = {}) => s.start(checkRequest("tasks.start", { title: "F
 const git = (dir, ...args) => spawnSync("git", [`--git-dir=${dir}/git`, ...args], { encoding: "utf8" });
 const err = (code) => (e) => e instanceof TaskError && e.code === code;
 
-test("start: the documents in work/, a base commit with the frozen grant, ordinary git agrees", () => {
+test("on Windows, Delegate is refused: the task store won't start there, saying why (every other row here is a declared skip there)", { skip: process.platform === "win32" ? false : "the refusal is Windows's" }, () => {
+  const { dir } = fresh();
+  try {
+    assert.throws(() => store(join(dir, "tasks")), /Delegate isn't available on Windows yet/);
+    assert.match(privateDirProblem(dir) ?? "", /Delegate isn't available on Windows yet/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("start: the documents in work/, a base commit with the frozen grant, ordinary git agrees", WIN_DELEGATE, () => {
   const { root, dir } = fresh();
   const s = store(root);
   const r = start(s);
@@ -41,7 +51,7 @@ test("start: the documents in work/, a base commit with the frozen grant, ordina
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("propose, diff, file: the round's commit, the changed files with their blobs, and the bytes", async () => {
+test("propose, diff, file: the round's commit, the changed files with their blobs, and the bytes", WIN_DELEGATE, async () => {
   const { root, dir } = fresh();
   const s = store(root);
   const { task, base } = start(s);
@@ -62,7 +72,7 @@ test("propose, diff, file: the round's commit, the changed files with their blob
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("propose refuses a working copy with a link, a hard link or a special file in it", async () => {
+test("propose refuses a working copy with a link, a hard link or a special file in it", WIN_DELEGATE, async () => {
   const { root, dir } = fresh();
   const s = store(root);
   const { task } = start(s);
@@ -75,7 +85,7 @@ test("propose refuses a working copy with a link, a hard link or a special file 
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("merged: full bytes record mine-<n> and a merge commit whose parents are mine and the proposal", async () => {
+test("merged: full bytes record mine-<n> and a merge commit whose parents are mine and the proposal", WIN_DELEGATE, async () => {
   const { root, dir } = fresh();
   const s = store(root);
   const { task } = start(s);
@@ -99,7 +109,7 @@ test("merged: full bytes record mine-<n> and a merge commit whose parents are mi
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("merged: stale, wrong file set, a blob that isn't its content, and a receipt when content isn't sent", async () => {
+test("merged: stale, wrong file set, a blob that isn't its content, and a receipt when content isn't sent", WIN_DELEGATE, async () => {
   const { root, dir } = fresh();
   const s = store(root);
   const { task } = start(s);
@@ -116,7 +126,7 @@ test("merged: stale, wrong file set, a blob that isn't its content, and a receip
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("ask, close, stop, revoke, resume: the transitions, and what each refuses", async () => {
+test("ask, close, stop, revoke, resume: the transitions, and what each refuses", WIN_DELEGATE, async () => {
   const { root, dir } = fresh();
   const s = store(root);
   const { task } = start(s);
@@ -136,7 +146,7 @@ test("ask, close, stop, revoke, resume: the transitions, and what each refuses",
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("get: events after a seq, the seq persisted across a restart, reset for an unknown one", async () => {
+test("get: events after a seq, the seq persisted across a restart, reset for an unknown one", WIN_DELEGATE, async () => {
   const { root, dir } = fresh();
   let s = store(root);
   const { task } = start(s);
@@ -152,7 +162,7 @@ test("get: events after a seq, the seq persisted across a restart, reset for an 
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("recovery: a task working at a restart is interrupted; a torn log line is cut; seqs never go back", () => {
+test("recovery: a task working at a restart is interrupted; a torn log line is cut; seqs never go back", WIN_DELEGATE, () => {
   const { root, dir } = fresh();
   let s = store(root);
   const { task } = start(s);
@@ -166,7 +176,7 @@ test("recovery: a task working at a restart is interrupted; a torn log line is c
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("recovery: an intent whose ref moved is finished; one whose ref didn't is dropped; a third value fails the task", async () => {
+test("recovery: an intent whose ref moved is finished; one whose ref didn't is dropped; a third value fails the task", WIN_DELEGATE, async () => {
   for (const kase of ["moved", "not-moved", "third"]) {
     const { root, dir } = fresh();
     let s = store(root);
@@ -196,7 +206,7 @@ test("recovery: an intent whose ref moved is finished; one whose ref didn't is d
   }
 });
 
-test("recovery: a grant edited in task.json doesn't match the base commit's, and the task is failed", () => {
+test("recovery: a grant edited in task.json doesn't match the base commit's, and the task is failed", WIN_DELEGATE, () => {
   const { root, dir } = fresh();
   let s = store(root);
   const { task } = start(s);
@@ -209,7 +219,7 @@ test("recovery: a grant edited in task.json doesn't match the base commit's, and
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("the tasks folder: refused when it is open to others or a link; a start that never finished is removed", () => {
+test("the tasks folder: refused when it is open to others or a link; a start that never finished is removed", WIN_DELEGATE, () => {
   const { root, dir } = fresh();
   store(root);
   chmodSync(root, 0o755);
@@ -232,7 +242,7 @@ test("the tasks folder: refused when it is open to others or a link; a start tha
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("refs move only by compare-and-swap: a wrong expectation or another writer's lock is a conflict", () => {
+test("refs move only by compare-and-swap: a wrong expectation or another writer's lock is a conflict", WIN_DELEGATE, () => {
   const { root, dir } = fresh();
   const s = store(root);
   const { task, base } = start(s);
@@ -283,7 +293,7 @@ async function crashAt(k, f) {
   try { await f(); return false; } catch (e) { if (!/simulated crash/.test(e.message)) throw e; return true; } finally { fs.renameSync = rename; syncBuiltinESMExports(); }
 }
 
-test("merged: a crash after each durable step, then a restart and the identical retry: always merged, both refs, one answer", async () => {
+test("merged: a crash after each durable step, then a restart and the identical retry: always merged, both refs, one answer", WIN_DELEGATE, async () => {
   let crashed = 0;
   for (let k = 1; ; k++) {
     const { root, dir } = fresh();
@@ -309,7 +319,7 @@ test("merged: a crash after each durable step, then a restart and the identical 
   assert.ok(crashed >= 4, `crashed at ${crashed} steps`);
 });
 
-test("propose and ask: a crash after each durable step, then a restart: the round is whole or absent, never half", async () => {
+test("propose and ask: a crash after each durable step, then a restart: the round is whole or absent, never half", WIN_DELEGATE, async () => {
   for (const op of ["propose", "ask"]) {
     let crashed = 0;
     for (let k = 1; ; k++) {
@@ -340,7 +350,7 @@ test("propose and ask: a crash after each durable step, then a restart: the roun
 });
 
 
-test("every event the store logs is one of §6.1's (task_status, proposal), with exactly its fields", async () => {
+test("every event the store logs is one of §6.1's (task_status, proposal), with exactly its fields", WIN_DELEGATE, async () => {
   const SHAPES = { task_status: [["type", "status"], ["type", "status", "reason"]], proposal: [["type", "round", "base", "commit", "files"]] };
   const { root, dir } = fresh();
   const s = store(root);
@@ -369,7 +379,7 @@ test("every event the store logs is one of §6.1's (task_status, proposal), with
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("the log's bound is in UTF-8 bytes: multibyte text can't carry the log past it", async () => {
+test("the log's bound is in UTF-8 bytes: multibyte text can't carry the log past it", WIN_DELEGATE, async () => {
   const { root, dir } = fresh();
   const s = new TaskStore({ root, scope: "install-1", now: () => (clock += 1000), budget: { task: 512 * 2 ** 20, work: 256 * 2 ** 20, files: 2000, log: 1700, event: 256 * 1024, tasks: 64, total: 4096 * 2 ** 20, reserve: 1024 } }).init();
   const { task } = start(s);
@@ -379,7 +389,7 @@ test("the log's bound is in UTF-8 bytes: multibyte text can't carry the log past
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("propose refuses a working copy whose path set breaks the rules (.git, a reserved name, a colon), with nothing written", async () => {
+test("propose refuses a working copy whose path set breaks the rules (.git, a reserved name, a colon), with nothing written", WIN_DELEGATE, async () => {
   const cases = [["dotgit", (w) => { mkdirSync(join(w, ".git")); writeFileSync(join(w, ".git", "config"), "x"); }], ["dotgit-deep", (w) => { mkdirSync(join(w, "sub", ".GIT"), { recursive: true }); writeFileSync(join(w, "sub", ".GIT", "x"), "x"); }],
     ["reserved", (w) => writeFileSync(join(w, "CON.txt"), "x")], ["reserved-nul", (w) => writeFileSync(join(w, "nul"), "x")], ["trailing-dot", (w) => writeFileSync(join(w, "a."), "x")],
     ["colon", (w) => writeFileSync(join(w, "a:b"), "x")]];
@@ -408,7 +418,7 @@ function caseSensitive(dir) {
   try { return !existsSync(join(dir, probe.toLowerCase())); } finally { unlinkSync(join(dir, probe)); }
 }
 
-test("two names that differ only in case, in the working copy: refused where the task's volume can hold both; where it can't (one entry, the second write replacing the first), that one file is proposed with the final bytes", async () => {
+test("two names that differ only in case, in the working copy: refused where the task's volume can hold both; where it can't (one entry, the second write replacing the first), that one file is proposed with the final bytes", WIN_DELEGATE, async () => {
   const { root, dir } = fresh();
   const s = store(root);
   const { task } = start(s);
@@ -440,7 +450,7 @@ test("two names that differ only in case, in the working copy: refused where the
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("a proposal whose event would be over the per-event bound is refused before anything is recorded; no stub event", async () => {
+test("a proposal whose event would be over the per-event bound is refused before anything is recorded; no stub event", WIN_DELEGATE, async () => {
   const { root, dir } = fresh();
   const s = store(root);
   const { task } = start(s);
@@ -457,7 +467,7 @@ test("a proposal whose event would be over the per-event bound is refused before
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("recovery: a widened grant can't be smuggled in through a proposal's summary and an edited base in task.json", async () => {
+test("recovery: a widened grant can't be smuggled in through a proposal's summary and an edited base in task.json", WIN_DELEGATE, async () => {
   const { root, dir } = fresh();
   let s = store(root);
   const { task, base } = start(s);
@@ -477,7 +487,7 @@ test("recovery: a widened grant can't be smuggled in through a proposal's summar
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("recovery: the base must be a root commit, and the grant its message's own last line, exactly", async () => {
+test("recovery: the base must be a root commit, and the grant its message's own last line, exactly", WIN_DELEGATE, async () => {
   // (moving refs/heads/base too, to the proposal, which has a parent: refused as not the first commit)
   {
     const { root, dir } = fresh();
@@ -507,7 +517,7 @@ test("recovery: the base must be a root commit, and the grant its message's own 
   }
 });
 
-test("what the store sends is well-formed text: a file with NUL comes as base64, a failure reason has no NUL", async () => {
+test("what the store sends is well-formed text: a file with NUL comes as base64, a failure reason has no NUL", WIN_DELEGATE, async () => {
   const { root, dir } = fresh();
   let s = store(root);
   const { task, base } = s.start(checkRequest("tasks.start", { title: "t", prompt: "p", target: "local", run: false, docs: [{ path: "a.bin", kind: "file", content: { base64: Buffer.from("a\u0000b").toString("base64") } }] }));
@@ -523,7 +533,7 @@ test("what the store sends is well-formed text: a file with NUL comes as base64,
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("recovery: an edited intent can't widen the grant, or change anything its operation couldn't; the grant is checked again after", async () => {
+test("recovery: an edited intent can't widen the grant, or change anything its operation couldn't; the grant is checked again after", WIN_DELEGATE, async () => {
   // (the tamper: a ref-less intent whose set carries a widened grant, with a legal status event)
   const { root, dir } = fresh();
   let s = store(root);
@@ -556,7 +566,7 @@ test("recovery: an edited intent can't widen the grant, or change anything its o
   }
 });
 
-test("the grant is read only from the base commit's final trailer: a grant line in the prompt never counts", () => {
+test("the grant is read only from the base commit's final trailer: a grant line in the prompt never counts", WIN_DELEGATE, () => {
   // (the control: a widened grant line in the original prompt, then only task.json's grant edited to match it)
   const { root, dir } = fresh();
   let s = store(root);
@@ -574,7 +584,7 @@ test("the grant is read only from the base commit's final trailer: a grant line 
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("the final trailer itself must be the exact closed record, canonical: anything else fails the task", () => {
+test("the final trailer itself must be the exact closed record, canonical: anything else fails the task", WIN_DELEGATE, () => {
   const bad = [
     (g) => JSON.stringify({ ...g, extra: 1 }),                 // not closed
     (g) => JSON.stringify({ docs: g.docs, created: g.created, run: g.run, scope: g.scope }), // not canonical (key order)
@@ -603,7 +613,7 @@ test("the final trailer itself must be the exact closed record, canonical: anyth
   }
 });
 
-test("recovery: an intent is applied only if it is exactly what its operation writes for the task as it stands", async () => {
+test("recovery: an intent is applied only if it is exactly what its operation writes for the task as it stands", WIN_DELEGATE, async () => {
   // (each tamper starts from a task in proposal, with one round; every one must fail the task, never apply)
   const cases = {
     // (the reported probe: from proposal, a ref-less "merged" with no merge, mine, ledger or receipt)
@@ -641,7 +651,7 @@ test("recovery: an intent is applied only if it is exactly what its operation wr
   }
 });
 
-test("recovery: a genuine receipt intent, interrupted, is finished exactly as written", async () => {
+test("recovery: a genuine receipt intent, interrupted, is finished exactly as written", WIN_DELEGATE, async () => {
   const { root, dir } = fresh();
   let s = store(root);
   const { task } = start(s);
@@ -658,7 +668,7 @@ test("recovery: a genuine receipt intent, interrupted, is finished exactly as wr
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("a receipt's files in any order: recorded in the proposal's order; finished after a crash and a restart; the identical retry answered", async () => {
+test("a receipt's files in any order: recorded in the proposal's order; finished after a crash and a restart; the identical retry answered", WIN_DELEGATE, async () => {
   const { root, dir } = fresh();
   let s = store(root);
   const { task } = s.start(checkRequest("tasks.start", { title: "t", prompt: "p", target: "local", run: false, docs: [{ path: "a.py", kind: "file", content: "a = 1\n" }, { path: "b.py", kind: "file", content: "b = 1\n" }] }));

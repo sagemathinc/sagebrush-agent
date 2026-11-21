@@ -100,7 +100,8 @@ function agent(fakeEnv) {
     say: (text) => send({ jsonrpc: "2.0", method: "chat.message", params: { conversation: "c1", id: `m-${Math.random()}`, text, author: "person" } }),
     finished: () => events().filter((e) => e.type === "turn_finished"),
     until: async (f, what) => { const t = Date.now(); while (!f()) { if (Date.now() - t > 15000) throw new Error("timed out: " + what); await new Promise((r) => setTimeout(r, 10)); } },
-    kill: () => { p.kill("SIGKILL"); rmSync(runnerCwd, { recursive: true, force: true }); },
+    // (the folder goes once the child has exited: Windows won't remove the folder a live process is in)
+    kill: () => { try { p.kill("SIGKILL"); } catch {} const rm = () => rmSync(runnerCwd, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); if (p.exitCode !== null || p.signalCode !== null) rm(); else p.once("exit", rm); },
   };
 }
 

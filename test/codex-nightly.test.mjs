@@ -39,7 +39,7 @@ test("a check that can't run (the registry fails) is red, never silent", T, asyn
   assert.match(r.codex.problems[0], /couldn't run: HTTP 503/);
 });
 
-test("a red alerts (the command gets the message file); a green writes its report and alerts nobody; nothing shipped changes", T, async () => {
+test("a red alerts (the command gets the message file); a green writes its report and alerts nobody; nothing shipped changes", { ...T, ...(process.platform === "win32" ? { skip: "the nightly is a maintainer's POSIX job: its alert is a /bin/sh command line with the message file as $1" } : {}) }, async () => {
   const before = shipped();
   for (const [schema, red] of [[broken, true], [defs, false]]) {
     const out = mkdtempSync(join(tmpdir(), "nightly-"));

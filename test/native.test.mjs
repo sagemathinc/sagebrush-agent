@@ -58,7 +58,9 @@ function agent({ userMode, projectMode, localMode, configMode } = {}) {
   a.text = (conversation) => a.events(conversation).filter((e) => e.type === "text_delta").map((e) => e.text).join("");
   a.finished = (conversation, n = 1) => a.events(conversation).filter((e) => e.type === "turn_finished").length >= n;
   a.mode = () => a.lines.filter((m) => m.method === "agent.mode").map((m) => m.params.native);
-  a.kill = () => { try { p.kill("SIGKILL"); } catch {} rmSync(runnerCwd, { recursive: true, force: true }); };
+  // (the folder goes once the child has exited: Windows won't remove the folder a live process is in; retried, since
+  //  Windows can still hold it for a moment after the exit)
+  a.kill = () => { try { p.kill("SIGKILL"); } catch {} const rm = () => rmSync(runnerCwd, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); if (p.exitCode !== null || p.signalCode !== null) rm(); else p.once("exit", rm); };
   a.send({ relay: { start: { frame: F, protocol: 1, epoch: 0 } } });
   return a;
 }

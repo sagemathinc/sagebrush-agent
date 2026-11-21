@@ -12,6 +12,8 @@ import { AgentServer } from "../lib/server.mjs";
 import { TaskStore } from "../lib/tasks.mjs";
 import { TaskTurns, TASK_SERVER } from "../lib/task-turns.mjs";
 import { TaskRpc } from "../lib/task-rpc.mjs";
+// (Delegate is refused on Windows in this version: its rows here are declared skips there, never silent passes)
+const WIN_DELEGATE = process.platform === "win32" ? { skip: "Delegate refused on win32 in this version" } : {};
 
 const ORIGIN = "https://agents.sagebrush.cloud";
 const NB = JSON.stringify({ cells: [{ cell_type: "code", id: "a", metadata: {}, source: "x = 1", outputs: [], execution_count: null }], metadata: {}, nbformat: 4, nbformat_minor: 5 });
@@ -62,7 +64,7 @@ function page(port) {
 const START = { title: "Make x two", prompt: "x should be 2", target: "local", run: false, docs: [{ path: "a.ipynb", kind: "notebook", content: NB }] };
 const code = (a) => a.error?.data?.code;
 
-test("the hello offers delegate.1 over the loopback; without the Delegate switch every tasks request is refused forbidden", async () => {
+test("the hello offers delegate.1 over the loopback; without the Delegate switch every tasks request is refused forbidden", WIN_DELEGATE, async () => {
   const h = await setup();
   const p = page(h.port);
   await p.open;
@@ -85,7 +87,7 @@ test("the hello offers delegate.1 over the loopback; without the Delegate switch
   rmSync(h.dir, { recursive: true, force: true });
 });
 
-test("a task runs with no page: start, close the page, the proposal arrives meanwhile, a new page reads it and merges", async () => {
+test("a task runs with no page: start, close the page, the proposal arrives meanwhile, a new page reads it and merges", WIN_DELEGATE, async () => {
   let release;
   const gate = new Promise((r) => (release = r));
   const h = await setup({ gate });
@@ -121,7 +123,7 @@ test("a task runs with no page: start, close the page, the proposal arrives mean
   rmSync(h.dir, { recursive: true, force: true });
 });
 
-test("turning the Delegate switch off: the capability goes at once, the running turn stops, its task is interrupted (not closed)", async () => {
+test("turning the Delegate switch off: the capability goes at once, the running turn stops, its task is interrupted (not closed)", WIN_DELEGATE, async () => {
   const h = await setup({ gate: new Promise(() => {}) });
   const p = page(h.port);
   await p.open;
@@ -139,7 +141,7 @@ test("turning the Delegate switch off: the capability goes at once, the running 
   rmSync(h.dir, { recursive: true, force: true });
 });
 
-test("task.event goes only to a page holding the switch; stop and revoke act on the turn and the task", async () => {
+test("task.event goes only to a page holding the switch; stop and revoke act on the turn and the task", WIN_DELEGATE, async () => {
   const h = await setup({ gate: new Promise(() => {}) });
   const p = page(h.port);
   await p.open;
@@ -157,7 +159,7 @@ test("task.event goes only to a page holding the switch; stop and revoke act on 
   rmSync(h.dir, { recursive: true, force: true });
 });
 
-test("over the runner's stdio there are no tasks: no delegate.1, and requests are refused unavailable", async () => {
+test("over the runner's stdio there are no tasks: no delegate.1, and requests are refused unavailable", WIN_DELEGATE, async () => {
   const dir = mkdtempSync(join(tmpdir(), "sb-tsrv-"));
   const server = new AgentServer({ query: fakeQuery, log: () => {}, stdio: true });
   const store = new TaskStore({ root: join(dir, "tasks"), scope: "install-1" }).init();
@@ -167,7 +169,7 @@ test("over the runner's stdio there are no tasks: no delegate.1, and requests ar
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("a failure of the task host that isn't a refusal: answered unavailable, its detail only in the agent's log", async () => {
+test("a failure of the task host that isn't a refusal: answered unavailable, its detail only in the agent's log", WIN_DELEGATE, async () => {
   const h = await setup();
   const logged = [];
   h.server.log = (m) => logged.push(m);
@@ -186,7 +188,7 @@ test("a failure of the task host that isn't a refusal: answered unavailable, its
   rmSync(h.dir, { recursive: true, force: true });
 });
 
-test("a new pairing's first grant without delegate turns nothing off: the running task goes on, tasks.* is refused until the page turns the switch on, then its proposal is there", async () => {
+test("a new pairing's first grant without delegate turns nothing off: the running task goes on, tasks.* is refused until the page turns the switch on, then its proposal is there", WIN_DELEGATE, async () => {
   let release;
   const gate = new Promise((r) => (release = r));
   const h = await setup({ gate });
@@ -220,7 +222,7 @@ test("a new pairing's first grant without delegate turns nothing off: the runnin
   rmSync(h.dir, { recursive: true, force: true });
 });
 
-test("the switch off after a reconnect: on the new pairing, turned on then off, the old task's turn stops at once and its model's late work is refused", async () => {
+test("the switch off after a reconnect: on the new pairing, turned on then off, the old task's turn stops at once and its model's late work is refused", WIN_DELEGATE, async () => {
   let release;
   const gate = new Promise((r) => (release = r));
   const h = await setup({ gate });
@@ -253,7 +255,7 @@ test("the switch off after a reconnect: on the new pairing, turned on then off, 
   rmSync(h.dir, { recursive: true, force: true });
 });
 
-test("the pairing's revoke turns Delegate off: the running task is interrupted, also from a new pairing that never had the switch", async () => {
+test("the pairing's revoke turns Delegate off: the running task is interrupted, also from a new pairing that never had the switch", WIN_DELEGATE, async () => {
   for (const repair of [false, true]) {
     const h = await setup({ gate: new Promise(() => {}) });
     let p = page(h.port);

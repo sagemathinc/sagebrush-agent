@@ -10,12 +10,14 @@ import { fakeCreateServer, fakeQuery } from "../lib/fake.mjs";
 import { TaskStore } from "../lib/tasks.mjs";
 import { TaskTurns } from "../lib/task-turns.mjs";
 import { checkRequest } from "../lib/tasks-schema.mjs";
+// (Delegate is refused on Windows in this version: its rows here are declared skips there, never silent passes)
+const WIN_DELEGATE = process.platform === "win32" ? { skip: "Delegate refused on win32 in this version" } : {};
 
 const NB = JSON.stringify({ cells: [{ cell_type: "code", id: "a", metadata: {}, source: "x = 1", outputs: [], execution_count: null }], metadata: {}, nbformat: 4, nbformat_minor: 5 });
 const until = async (f, ms = 10000) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) throw new Error("timed out"); await new Promise((r) => setTimeout(r, 20)); } };
 
 for (const [what, docs, changed] of [["a notebook: a closing note added", [{ path: "a.ipynb", kind: "notebook", content: NB }], ["a.ipynb", "modified"]], ["no notebook: a note written", [{ path: "notes.md", kind: "file", content: "hi" }], ["fake-delegate.md", "added"]]]) {
-  test(`the fake model on a task's turn: ${what}, then a proposal`, async () => {
+  test(`the fake model on a task's turn: ${what}, then a proposal`, WIN_DELEGATE, async () => {
     const dir = mkdtempSync(join(tmpdir(), "sb-fake-task-"));
     try {
       const store = new TaskStore({ root: join(dir, "tasks"), scope: "install-1" }).init();

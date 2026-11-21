@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { conformTurnEvent, cut, pageId, split } from "../lib/turn-bounds.mjs";
 import { eventProblem } from "../lib/tasks.mjs";
+// (Delegate is refused on Windows in this version: its rows here are declared skips there, never silent passes)
+const WIN_DELEGATE = process.platform === "win32" ? { skip: "Delegate refused on win32 in this version" } : {};
 
 // ---- the page's check, ported line for line from web/workspace/tasks-schema.ts (TURN, turnEvent and their helpers:
 // keys, isObj, text, wellFormed, idStr, oneOf, int); each refusal throws, as the page's TaskShapeError does
@@ -128,7 +130,7 @@ test("an artifact of a kind the page doesn't show is not recorded, and the agent
   assert.match(logged[0], /"spreadsheet" isn't one the page shows: not recorded/);
 });
 
-test("a task's turn records its events conformed: a tool call whose id the page wouldn't take is recorded under its stable id", async () => {
+test("a task's turn records its events conformed: a tool call whose id the page wouldn't take is recorded under its stable id", WIN_DELEGATE, async () => {
   const { mkdtempSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");

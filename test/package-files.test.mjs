@@ -36,7 +36,9 @@ function reachable(start) {
 
 test("package: every file the bin reaches is in the published package (npm pack --dry-run)", () => {
   const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-  const out = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
+  // (npm on Windows is npm.cmd, which Node starts only through the shell; the arguments here are fixed)
+  const win = process.platform === "win32";
+  const out = JSON.parse(execFileSync(win ? "npm.cmd" : "npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], shell: win }));
   const packed = new Set(out[0].files.map((f) => f.path));
   const need = [...reachable(relative(root, join(root, pkg.bin["sagebrush-agent"])))];
   // (a folder a module reads by its URL ("./tzdata/zoneinfo/"): every file under it on disk must be packed)

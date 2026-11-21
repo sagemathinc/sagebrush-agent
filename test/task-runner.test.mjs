@@ -17,6 +17,10 @@ import { TaskRpc } from "../lib/task-rpc.mjs";
 import { TaskTurns, TASK_SERVER } from "../lib/task-turns.mjs";
 import { TaskStore } from "../lib/tasks.mjs";
 import { checkRequest } from "../lib/tasks-schema.mjs";
+// (Delegate is refused on Windows in this version: its rows here are declared skips there, never silent passes)
+const WIN_DELEGATE = process.platform === "win32" ? { skip: "Delegate refused on win32 in this version" } : {};
+// (procInfo reads /proc or ps; Windows has neither, and its identity source (GetProcessTimes) isn't wired while runs are off there)
+const WIN_PROCINFO = process.platform === "win32" ? { skip: "procInfo has no Windows source in this version (runs are off on win32)" } : {};
 
 const NB = JSON.stringify({ cells: [{ cell_type: "code", id: "a", metadata: {}, source: "x = 1", outputs: [], execution_count: null }], metadata: { kernelspec: { name: "python3", language: "python" } }, nbformat: 4, nbformat_minor: 5 });
 const until = async (f, what, ms = 10000) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) throw new Error(`timed out: ${what}`); await new Promise((r) => setTimeout(r, 5)); } };
@@ -86,7 +90,7 @@ function setup({ mode = "report", enabled = true, run = true, root = null, limit
   return { dir, fake, engine, store, runner, task, spawned, seen, done: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
-test("off in this version: RUNS_ENABLED is false, and the default runner refuses, saying why; so does a task started without runs", async () => {
+test("off in this version: RUNS_ENABLED is false, and the default runner refuses, saying why; so does a task started without runs", WIN_DELEGATE, async () => {
   assert.equal(RUNS_ENABLED, false);
   const h = setup({ enabled: undefined });
   const def = new TaskRunner({ store: h.store, pin: PIN, platform: "linux-x64" });
@@ -101,7 +105,7 @@ test("off in this version: RUNS_ENABLED is false, and the default runner refuses
   h.done(); noRun.done();
 });
 
-test("the fixed launch: exactly the plan's argv, the environment replaced whole, the notebook's folder, a private run tmp with the pinned zone data, removed after", T, async () => {
+test("the fixed launch: exactly the plan's argv, the environment replaced whole, the notebook's folder, a private run tmp with the pinned zone data, removed after", { ...T, ...WIN_DELEGATE }, async () => {
   const h = setup();
   const { exit, report } = await h.runner.run(h.task, "nb dir/a.ipynb");
   assert.equal(exit, 0);
@@ -126,7 +130,7 @@ test("the fixed launch: exactly the plan's argv, the environment replaced whole,
   h.done();
 });
 
-test("a link or special file in the copy before a run: refused, nothing started; a link the run leaves undoes the run, the copy as it was before", T, async () => {
+test("a link or special file in the copy before a run: refused, nothing started; a link the run leaves undoes the run, the copy as it was before", { ...T, ...WIN_DELEGATE }, async () => {
   const h = setup();
   symlinkSync("/etc/passwd", join(h.store.work(h.task), "planted"));
   await assert.rejects(h.runner.run(h.task, "nb dir/a.ipynb"), (e) => e.code === "bad_request" && /can't start from/.test(e.message));
@@ -143,7 +147,7 @@ test("a link or special file in the copy before a run: refused, nothing started;
   p.done();
 });
 
-test("Stop: the run's whole process group killed (a grandchild too), the exit waited for, and its changes undone", T, async () => {
+test("Stop: the run's whole process group killed (a grandchild too), the exit waited for, and its changes undone", { ...T, ...WIN_DELEGATE }, async () => {
   const h = setup({ mode: "hang" });
   const ac = new AbortController();
   const run = h.runner.run(h.task, "nb dir/a.ipynb", { signal: ac.signal });
@@ -157,7 +161,7 @@ test("Stop: the run's whole process group killed (a grandchild too), the exit wa
   h.done();
 });
 
-test("the wall bound kills a run that outlives its cells' time; too much output kills it too; a run with no report says why", T, async () => {
+test("the wall bound kills a run that outlives its cells' time; too much output kills it too; a run with no report says why", { ...T, ...WIN_DELEGATE }, async () => {
   const w = setup({ mode: "hang", limits: { marginMs: 100 } });
   await assert.rejects(w.runner.run(w.task, "nb dir/a.ipynb", { timeoutS: 1 }), (e) => /its time was up/.test(e.message));
   assert.equal(existsSync(join(w.store.work(w.task), "partial.txt")), false);
@@ -170,7 +174,7 @@ test("the wall bound kills a run that outlives its cells' time; too much output 
   n.done();
 });
 
-test("paths: a space works; a comma anywhere Deno must be granted makes runs unavailable, nothing started; a path outside the copy is refused", T, async () => {
+test("paths: a space works; a comma anywhere Deno must be granted makes runs unavailable, nothing started; a path outside the copy is refused", { ...T, ...WIN_DELEGATE }, async () => {
   const base = mkdtempSync(join(tmpdir(), "sb-runner-paths-"));
   const c = setup({ root: join(base, "with,comma", "tasks") });
   await assert.rejects(c.runner.run(c.task, "nb dir/a.ipynb"), (e) => e.code === "unavailable" && /comma/.test(e.message));
@@ -202,7 +206,7 @@ test("the zone data: copied only as pinned; a changed file or a link in the sour
   b.done();
 });
 
-test("in a turn: notebook_run gives the model the report; calls run one at a time (a write waits for the run); a Stop ends the turn only after the run's exit and undoing", T, async () => {
+test("in a turn: notebook_run gives the model the report; calls run one at a time (a write waits for the run); a Stop ends the turn only after the run's exit and undoing", { ...T, ...WIN_DELEGATE }, async () => {
   // (a model that calls notebook_run and, at once, a write; then proposes)
   const h = setup({ mode: "hang" });
   let writeDone = null, runResult = null;
@@ -248,7 +252,7 @@ test("in a turn: notebook_run gives the model the report; calls run one at a tim
   r.done();
 });
 
-test("leftovers of a crash during a run or an undo (run tmp folders, a half-built or dropped copy) are cleared when the store loads; other names are kept", () => {
+test("leftovers of a crash during a run or an undo (run tmp folders, a half-built or dropped copy) are cleared when the store loads; other names are kept", WIN_DELEGATE, () => {
   const dir = mkdtempSync(join(tmpdir(), "sb-runner-left-"));
   const store = new TaskStore({ root: join(dir, "tasks"), scope: "install-1" }).init();
   const task = store.start(checkRequest("tasks.start", { title: "t", prompt: "p", target: "local", run: true, docs: [{ path: "a.ipynb", kind: "notebook", content: NB }] })).task;
@@ -261,7 +265,7 @@ test("leftovers of a crash during a run or an undo (run tmp folders, a half-buil
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("a crash between an undo's two renames: at load the undo is finished (the copy as before the run, the unproposed edit kept); with only the run's copy, that is put back; never both deleted", async () => {
+test("a crash between an undo's two renames: at load the undo is finished (the copy as before the run, the unproposed edit kept); with only the run's copy, that is put back; never both deleted", WIN_DELEGATE, async () => {
   const dir = mkdtempSync(join(tmpdir(), "sb-runner-undo-"));
   const open = () => new TaskStore({ root: join(dir, "tasks"), scope: "install-1" }).init();
   let s = open();
@@ -291,7 +295,7 @@ test("a crash between an undo's two renames: at load the undo is finished (the c
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("the zone data is admitted as any write is: against the total as well as the task's budget, refused busy before any copy or start; a run's hold counts for every task until its tmp is gone", T, async () => {
+test("the zone data is admitted as any write is: against the total as well as the task's budget, refused busy before any copy or start; a run's hold counts for every task until its tmp is gone", { ...T, ...WIN_DELEGATE }, async () => {
   const h = setup();
   const zones = Object.values(PIN.tzdata.files).reduce((n, f) => n + f.size, 0);
   const all = () => h.store.list().tasks.reduce((n, t) => n + h.store.usage(t.task), 0);
@@ -331,7 +335,7 @@ const sleeper = () => {
 };
 const stopOwn = (pid) => { try { process.kill(-pid, "SIGKILL"); } catch {} };
 
-test("at load, a run left alive by an agent that died: killed by group only when its start time matches, waited for, the copy undone, its tmp and record removed", async () => {
+test("at load, a run left alive by an agent that died: killed by group only when its start time matches, waited for, the copy undone, its tmp and record removed", WIN_DELEGATE, async () => {
   const { procStart } = await import("../lib/proc-start.mjs");
   const f = deadAgentFixture();
   const snap = await f.s.snapshotWork(f.task);
@@ -351,7 +355,7 @@ test("at load, a run left alive by an agent that died: killed by group only when
   } finally { stopOwn(p.pid); rmSync(f.dir, { recursive: true, force: true }); }
 });
 
-test("at load, a recorded pid whose start time differs is another process now: never signalled; the run is over, so the copy is undone", async () => {
+test("at load, a recorded pid whose start time differs is another process now: never signalled; the run is over, so the copy is undone", WIN_DELEGATE, async () => {
   const f = deadAgentFixture();
   const snap = await f.s.snapshotWork(f.task);
   writeFileSync(join(f.s.work(f.task), "a.txt"), "CHANGED BY THE RUN");
@@ -365,7 +369,7 @@ test("at load, a recorded pid whose start time differs is another process now: n
   } finally { stopOwn(p.pid); rmSync(f.dir, { recursive: true, force: true }); }
 });
 
-test("at load, a run that can't be shown ended (still alive after the wait, or no start time recorded): the task is left as it is, served nothing, its record kept", async () => {
+test("at load, a run that can't be shown ended (still alive after the wait, or no start time recorded): the task is left as it is, served nothing, its record kept", WIN_DELEGATE, async () => {
   const { procStart } = await import("../lib/proc-start.mjs");
   const f = deadAgentFixture();
   const snap = await f.s.snapshotWork(f.task);
@@ -387,7 +391,7 @@ test("at load, a run that can't be shown ended (still alive after the wait, or n
   } finally { stopOwn(p.pid); rmSync(f.dir, { recursive: true, force: true }); }
 });
 
-test("each run asks for the disk again just before it writes anything: short of the task's remaining room plus 64 MB, refused busy, nothing started or copied", T, async () => {
+test("each run asks for the disk again just before it writes anything: short of the task's remaining room plus 64 MB, refused busy, nothing started or copied", { ...T, ...WIN_DELEGATE }, async () => {
   const h = setup();
   let free = 1e12, result;
   const query = ({ options }) => (async function* () {
@@ -406,7 +410,7 @@ test("each run asks for the disk again just before it writes anything: short of 
   h.done();
 });
 
-test("the watch covers the copy and the run's folder within the entry bound: a run past it is cut off, its group killed, and undone, with why", T, async () => {
+test("the watch covers the copy and the run's folder within the entry bound: a run past it is cut off, its group killed, and undone, with why", { ...T, ...WIN_DELEGATE }, async () => {
   const h = setup({ mode: "manyfiles" });
   const query = ({ options }) => (async function* () {
     await options.mcpServers[TASK_SERVER].handlers.notebook_run({ path: "nb dir/a.ipynb" });
@@ -421,7 +425,7 @@ test("the watch covers the copy and the run's folder within the entry bound: a r
   h.done();
 });
 
-test("the measure and the watch skip an entry that goes between its listing and its lstat (a run's scratch file come and gone), and still fail on any other error", async () => {
+test("the measure and the watch skip an entry that goes between its listing and its lstat (a run's scratch file come and gone), and still fail on any other error", WIN_DELEGATE, async () => {
   const dir = mkdtempSync(join(tmpdir(), "sb-runner-gone-"));
   const store = new TaskStore({ root: join(dir, "tasks"), scope: "install-1" }).init();
   const task = store.start(checkRequest("tasks.start", { title: "t", prompt: "p", target: "local", run: true, docs: [{ path: "a.txt", kind: "file", content: "x" }] })).task;
@@ -483,7 +487,7 @@ test("procInfo (Linux): gone only on a definite no-such-process; an unreadable o
   assert.ok(procInfo(1, "linux").unknown, "pid 1 is never ours to judge");
 });
 
-test("the run's identity can't be recorded once it has started (an EIO): the run doesn't go on: its group killed, waited for, its changes undone, reported failed", T, async () => {
+test("the run's identity can't be recorded once it has started (an EIO): the run doesn't go on: its group killed, waited for, its changes undone, reported failed", { ...T, ...WIN_DELEGATE }, async () => {
   const h = setup({ mode: "hang", limits: { marginMs: 2000 } });
   const write = h.store.writeRunRecord.bind(h.store);
   h.store.writeRunRecord = (task, rec) => { if (rec.pid !== null) throw Object.assign(new Error("EIO"), { code: "EIO" }); return write(task, rec); };
@@ -496,7 +500,7 @@ test("the run's identity can't be recorded once it has started (an EIO): the run
   h.done();
 });
 
-test("at load, a run recorded only before its start (the agent died between spawning it and recording it): unknown: failed, untouched, nothing signalled; deleting the task's folder discards it", async () => {
+test("at load, a run recorded only before its start (the agent died between spawning it and recording it): unknown: failed, untouched, nothing signalled; deleting the task's folder discards it", WIN_DELEGATE, async () => {
   const f = deadAgentFixture();
   const snap = await f.s.snapshotWork(f.task);
   writeFileSync(join(f.s.work(f.task), "a.txt"), "MAYBE A RUN'S");
@@ -528,7 +532,7 @@ test("procInfo on this computer: its own process is found (start time and group)
   assert.deepEqual(procInfo(Number(c.stdout)), { gone: true });
 });
 
-test("procInfo (macOS's answers, from a stand-in ps): gone only on ESRCH; a start time and group read; a ps that fails or prints nothing, or another error, is unknown", async () => {
+test("procInfo (macOS's answers, from a stand-in ps): gone only on ESRCH; a start time and group read; a ps that fails or prints nothing, or another error, is unknown", WIN_PROCINFO, async () => {
   const { procInfo } = await import("../lib/proc-start.mjs");
   const dir = mkdtempSync(join(tmpdir(), "sb-ps-"));
   // (a stand-in ps: prints what out.txt holds, and exits with code.txt's number)

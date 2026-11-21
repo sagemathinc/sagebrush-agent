@@ -4,6 +4,10 @@
 
 import { test } from "node:test";
 const T = { timeout: 20000 }; // (a row that hangs fails by name)
+// (Windows has no mode bits: there a cache's privacy is its folders' access list (win-acl.test.mjs), so the rows and
+//  cases about modes are POSIX's, declared as such)
+const POSIX_MODES = process.platform === "win32" ? { skip: "POSIX modes: on Windows the cache's privacy is its access list (win-acl rows)" } : {};
+const posixModes = process.platform !== "win32";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -92,9 +96,11 @@ test("first use: fetched from the pinned URL, unpacked, checked; a second start 
     const f = server({ [URL0]: GOOD });
     const r = await run(dir, pinFor(GOOD), f);
     assert.equal(r.bin, join(rootIn(dir), "9.9.9-linux-x64", "vendor/bin/codex"));
-    assert.equal(lstatSync(r.bin).mode & 0o777, 0o755);
-    assert.equal(lstatSync(join(r.dir, "LICENSE")).mode & 0o777, 0o644);
-    assert.equal(lstatSync(rootIn(dir)).mode & 0o777, 0o700);
+    if (posixModes) {
+      assert.equal(lstatSync(r.bin).mode & 0o777, 0o755);
+      assert.equal(lstatSync(join(r.dir, "LICENSE")).mode & 0o777, 0o644);
+      assert.equal(lstatSync(rootIn(dir)).mode & 0o777, 0o700);
+    }
     assert.deepEqual(f.calls, [URL0]);
     await run(dir, pinFor(GOOD), f);
     assert.equal(f.calls.length, 1, "no second download");
@@ -233,8 +239,10 @@ for (const [what, mutate] of [
   ["an extra file", (d) => writeFileSync(join(d, "vendor/bin/extra"), "x")],
   ["a file replaced by a symlink", (d) => { rmSync(join(d, "LICENSE")); symlinkSync("/etc/hostname", join(d, "LICENSE")); }],
   ["a directory replaced by a link to an identical copy (the walk mustn't follow it)", (d) => { const alt = `${d}-alt`; renameSync(join(d, "vendor"), alt); symlinkSync(alt, join(d, "vendor")); }],
-  ["the executable's mode", (d) => chmodSync(join(d, "vendor/bin/codex"), 0o644)],
-  ["a group-writable file", (d) => chmodSync(join(d, "LICENSE"), 0o664)],
+  ...(posixModes ? [
+    ["the executable's mode", (d) => chmodSync(join(d, "vendor/bin/codex"), 0o644)],
+    ["a group-writable file", (d) => chmodSync(join(d, "LICENSE"), 0o664)],
+  ] : []),
 ]) {
   test(`at start, the cached copy no longer matches (${what}): moved aside (never deleted), fetched once more`, T, async () => {
     const { dir, f, r } = await cached(mutate);
@@ -342,7 +350,7 @@ test("the shipped pin: five platforms, each an https registry.npmjs.org tarball 
 
 // ---- private modes and owners, whatever the umask; no write waits forever
 
-test("a cache directory others can read or write: refused, nothing fetched", T, async () => {
+test("a cache directory others can read or write: refused, nothing fetched", { ...T, ...POSIX_MODES }, async () => {
   for (const level of ["sagebrush-agent", "sagebrush-agent/codex"]) {
     const dir = scratch();
     try {
@@ -362,7 +370,7 @@ for (const [what, mutate] of [
   ["a special bit on the executable", (d) => chmodSync(join(d, "vendor/bin/codex"), 0o4755)],
   ["a file executable that shouldn't be", (d) => chmodSync(join(d, "LICENSE"), 0o755)],
 ]) {
-  test(`at start, ${what}: not used, moved aside, fetched once more`, T, async () => {
+  test(`at start, ${what}: not used, moved aside, fetched once more`, { ...T, ...POSIX_MODES }, async () => {
     const { dir, f } = await cached(mutate);
     try {
       const r = await run(dir, pinFor(GOOD), f);
@@ -373,7 +381,7 @@ for (const [what, mutate] of [
   });
 }
 
-test("written under a strict umask, the copy still has its exact modes (and is used at the next start)", T, async () => {
+test("written under a strict umask, the copy still has its exact modes (and is used at the next start)", { ...T, ...POSIX_MODES }, async () => {
   const dir = scratch();
   const was = process.umask(0o077);
   try {

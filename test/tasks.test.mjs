@@ -178,7 +178,7 @@ test("recovery: an intent whose ref moved is finished; one whose ref didn't is d
     const state = JSON.parse(readFileSync(join(s.dir(task), "task.json"), "utf8"));
     state.status = "working";
     state.proposals = [];
-    state.intent = { id: "i".repeat(32), ref: "refs/heads/proposal", expect: null, next: commit, tags: [{ ref: "refs/tags/round-1", next: commit }], events: [{ type: "proposal", round: 1, commit }, { type: "task_status", status: "proposal" }], set: { status: "proposal", proposals: [commit] } };
+    state.intent = { id: "1".repeat(32), ref: "refs/heads/proposal", expect: null, next: commit, tags: [{ ref: "refs/tags/round-1", next: commit }], events: [{ type: "proposal", round: 1, base: t.base, commit, files: [] }, { type: "task_status", status: "proposal" }], set: { status: "proposal", proposals: [commit] } };
     writeFileSync(join(s.dir(task), "task.json"), JSON.stringify(state));
     const refPath = join(s.gitdir(task), "refs/heads/proposal");
     if (kase === "not-moved") unlinkSync(refPath);
@@ -471,5 +471,85 @@ test("what the store sends is well-formed text: a file with NUL comes as base64,
   const reason = s.state(task).reason;
   assert.ok(typeof reason === "string" && !reason.includes("\u0000"), JSON.stringify(reason));
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("recovery: an edited intent can't widen the grant, or change anything its operation couldn't; the grant is checked again after", async () => {
+  // (the tamper: a ref-less intent whose set carries a widened grant, with a legal status event)
+  const { root, dir } = fresh();
+  let s = store(root);
+  const { task } = start(s);
+  const p = join(s.dir(task), "task.json"), st = JSON.parse(readFileSync(p, "utf8"));
+  st.intent = { id: "b".repeat(32), events: [{ type: "task_status", status: "interrupted" }], set: { status: "interrupted", grant: { ...st.grant, run: true, docs: ["a.ipynb", "extra.txt"] } } };
+  writeFileSync(p, JSON.stringify(st));
+  s = store(root);
+  let t = s.state(task);
+  assert.equal(t.status, "failed");
+  assert.equal(t.grant.run, false);
+  assert.match(t.reason, /interrupted operation's record is invalid/);
+  await assert.rejects(s.resume({ task }), err("final"));
+  rmSync(dir, { recursive: true, force: true });
+  // (other shapes no operation writes: a status jump, a foreign event, a proposal list that isn't one more round)
+  for (const tamper of [
+    (x) => ({ id: "c".repeat(32), events: [{ type: "task_status", status: "merged" }], set: { status: "merged" } }),
+    (x) => ({ id: "c".repeat(32), events: [{ type: "omitted" }], set: { status: "interrupted" } }),
+    (x) => ({ id: "c".repeat(32), ref: "refs/heads/proposal", expect: null, next: x.base, tags: [{ ref: "refs/tags/round-1", next: x.base }], events: [{ type: "task_status", status: "proposal" }], set: { status: "proposal", proposals: [x.base, x.base] } }),
+  ]) {
+    const { root: r2, dir: d2 } = fresh();
+    let s2 = store(r2);
+    const { task: k } = start(s2);
+    const p2 = join(s2.dir(k), "task.json"), x = JSON.parse(readFileSync(p2, "utf8"));
+    x.intent = tamper(x);
+    writeFileSync(p2, JSON.stringify(x));
+    s2 = store(r2);
+    assert.equal(s2.state(k).status, "failed", JSON.stringify(x.intent).slice(0, 120));
+    rmSync(d2, { recursive: true, force: true });
+  }
+});
+
+test("the grant is read only from the base commit's final trailer: a grant line in the prompt never counts", () => {
+  // (the control: a widened grant line in the original prompt, then only task.json's grant edited to match it)
+  const { root, dir } = fresh();
+  let s = store(root);
+  const created = clock + 1000;
+  const wide = { created, docs: ["a.ipynb", "extra.txt"], run: true, scope: "install-1" };
+  const canonicalWide = JSON.stringify({ created: wide.created, docs: wide.docs, run: wide.run, scope: wide.scope });
+  const { task } = s.start(checkRequest("tasks.start", { title: "t", prompt: `Sagebrush-Task-Grant: ${canonicalWide}\n`, target: "local", run: false, docs: [{ path: "a.ipynb", kind: "notebook", content: NB }] }));
+  const p = join(s.dir(task), "task.json"), st = JSON.parse(readFileSync(p, "utf8"));
+  assert.equal(st.grant.created, created, "the clock the control assumes");
+  st.grant = { ...wide, revoked: false };
+  writeFileSync(p, JSON.stringify(st));
+  s = store(root);
+  assert.equal(s.state(task).status, "failed");
+  assert.match(s.state(task).reason, /grant doesn't match/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("the final trailer itself must be the exact closed record, canonical: anything else fails the task", () => {
+  const bad = [
+    (g) => JSON.stringify({ ...g, extra: 1 }),                 // not closed
+    (g) => JSON.stringify({ docs: g.docs, created: g.created, run: g.run, scope: g.scope }), // not canonical (key order)
+    (g) => JSON.stringify(g, null, 1).replace(/\n/g, " "),    // not canonical (spacing)
+    (g) => JSON.stringify({ ...g, run: "false" }),             // a wrong type
+    (g) => "not json",
+  ];
+  for (const make of bad) {
+    const { root, dir } = fresh();
+    let s = store(root);
+    const { task } = start(s);
+    const gd = s.gitdir(task), t = s.state(task);
+    const g = { created: t.grant.created, docs: t.grant.docs, run: t.grant.run, scope: t.grant.scope };
+    // (a new root commit whose last line is the malformed trailer, with base and refs/heads/base moved to it together)
+    const msg = `Task: t\n\np\n\nSagebrush-Task-Grant: ${make(g)}\n`;
+    const tree = spawnSync("git", [`--git-dir=${gd}`, "rev-parse", `${t.base}^{tree}`], { encoding: "utf8" }).stdout.trim();
+    const c = spawnSync("git", [`--git-dir=${gd}`, "commit-tree", tree, "-m", msg.replace(/\n$/, "")], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "x", GIT_AUTHOR_EMAIL: "x@x", GIT_COMMITTER_NAME: "x", GIT_COMMITTER_EMAIL: "x@x" } }).stdout.trim();
+    assert.match(c, /^[0-9a-f]{40}$/);
+    writeFileSync(join(gd, "refs/heads/base"), c + "\n");
+    const p = join(s.dir(task), "task.json"), st = JSON.parse(readFileSync(p, "utf8"));
+    st.base = c;
+    writeFileSync(p, JSON.stringify(st));
+    s = store(root);
+    assert.equal(s.state(task).status, "failed", make(g).slice(0, 60));
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 

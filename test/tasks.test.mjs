@@ -608,3 +608,37 @@ test("recovery: a genuine receipt intent, interrupted, is finished exactly as wr
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("a receipt's files in any order: recorded in the proposal's order; finished after a crash and a restart; the identical retry answered", async () => {
+  const { root, dir } = fresh();
+  let s = store(root);
+  const { task } = s.start(checkRequest("tasks.start", { title: "t", prompt: "p", target: "local", run: false, docs: [{ path: "a.py", kind: "file", content: "a = 1\n" }, { path: "b.py", kind: "file", content: "b = 1\n" }] }));
+  writeFileSync(join(s.work(task), "a.py"), "a = 2\n");
+  writeFileSync(join(s.work(task), "b.py"), "b = 2\n");
+  const [prop] = await s.propose(task);
+  const f = (path, text) => ({ path, kind: "file", proposal_blob: blobId(Buffer.from(text)), mine: null, merged: null });
+  // (reversed: b.py first)
+  const req = checkRequest("tasks.merged", { task, proposal: prop.event.commit, seq: s.state(task).seq, merge_id: "a".repeat(32), files: [f("b.py", "b = 2\n"), f("a.py", "a = 2\n")] });
+  // (a crash right after the intent is written, then a restart: recovery rebuilds it and must find it exact)
+  const hit = await crashAt(1, () => s.merged(req));
+  assert.ok(hit);
+  s = store(root);
+  let t = s.state(task);
+  assert.equal(t.status, "merged", t.reason);
+  assert.deepEqual(t.receipt.files.map((x) => x.path), ["a.py", "b.py"]);
+  // (the identical retry, the request exactly as first sent: the same answer)
+  assert.deepEqual(await s.merged(req), { recorded: "receipt", commit: null });
+  // (and without a crash, on a fresh task: reversed order recorded at once)
+  rmSync(dir, { recursive: true, force: true });
+  const h2 = fresh();
+  s = store(h2.root);
+  const k = s.start(checkRequest("tasks.start", { title: "t", prompt: "p", target: "local", run: false, docs: [{ path: "a.py", kind: "file", content: "a = 1\n" }, { path: "b.py", kind: "file", content: "b = 1\n" }] })).task;
+  writeFileSync(join(s.work(k), "a.py"), "a = 2\n");
+  writeFileSync(join(s.work(k), "b.py"), "b = 2\n");
+  const [p2] = await s.propose(k);
+  assert.deepEqual(await s.merged(checkRequest("tasks.merged", { task: k, proposal: p2.event.commit, seq: s.state(k).seq, merge_id: "b".repeat(32), files: [f("b.py", "b = 2\n"), f("a.py", "a = 2\n")] })), { recorded: "receipt", commit: null });
+  s = store(h2.root);
+  t = s.state(k);
+  assert.equal(t.status, "merged");
+  rmSync(h2.dir, { recursive: true, force: true });
+});
+

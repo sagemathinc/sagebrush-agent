@@ -8,6 +8,8 @@ import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, re
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { fakeCreateServer } from "../lib/fake.mjs";
 import { RUNNER_PIN } from "../lib/runner-fetch.mjs";
 import { copyZones, RUNS_ENABLED, runArgv, runEnv, TaskRunner, TZ_SOURCE } from "../lib/task-runner.mjs";
@@ -246,5 +248,35 @@ test("leftovers of a crash during a run or an undo (run tmp folders, a half-buil
   assert.deepEqual(readdirSync(tmp).sort(), ["keep-me"]);
   assert.deepEqual(readdirSync(tdir).filter((n) => n.startsWith(".")).sort(), [".staging", ".work-not-ours"].filter((n) => existsSync(join(tdir, n))));
   assert.ok(existsSync(join(tdir, ".work-not-ours")));
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a crash between an undo's two renames: at load the undo is finished (the copy as before the run, the unproposed edit kept); with only the run's copy, that is put back; never both deleted", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sb-runner-undo-"));
+  const open = () => new TaskStore({ root: join(dir, "tasks"), scope: "install-1" }).init();
+  let s = open();
+  const { task } = s.start(checkRequest("tasks.start", { title: "t", prompt: "p", target: "local", run: true, docs: [{ path: "a.txt", kind: "file", content: "base" }] }));
+  await s.writeWork(task, "a.txt", Buffer.from("UNPROPOSED EDIT TO KEEP"));
+  const tree = await s.snapshotWork(task);
+  writeFileSync(join(s.work(task), "a.txt"), "PARTIAL RUN");
+  // (the crash: the first rename done and durable, the second never made)
+  const rename = fs.renameSync;
+  fs.renameSync = (a, b) => { const r = rename(a, b); if (a === s.work(task) && b.includes("/.dropped-")) throw new Error("crash"); return r; };
+  syncBuiltinESMExports();
+  try { await assert.rejects(s.restoreWork(task, tree), /crash/); } finally { fs.renameSync = rename; syncBuiltinESMExports(); }
+  assert.equal(existsSync(s.work(task)), false);
+  s = open();
+  assert.equal(readFileSync(join(s.work(task), "a.txt"), "utf8"), "UNPROPOSED EDIT TO KEEP");
+  assert.deepEqual(readdirSync(s.dir(task)).filter((n) => /^\.(work|dropped)-/.test(n)), [], "the run's copy dropped once the undo is finished");
+  // (only the run's copy left: put back, not deleted)
+  fs.renameSync(s.work(task), join(s.dir(task), ".dropped-0123456789ab"));
+  s = open();
+  assert.equal(readFileSync(join(s.work(task), "a.txt"), "utf8"), "UNPROPOSED EDIT TO KEEP");
+  assert.notEqual(s.state(task).status, "failed");
+  // (work/ not a plain folder: nothing is renamed over it, and the copies beside it are kept, never deleted)
+  fs.renameSync(s.work(task), join(s.dir(task), ".dropped-0123456789ab"));
+  writeFileSync(s.work(task), "not a folder");
+  s = open();
+  assert.ok(existsSync(join(s.dir(task), ".dropped-0123456789ab", "a.txt")), "the only copy kept");
   rmSync(dir, { recursive: true, force: true });
 });

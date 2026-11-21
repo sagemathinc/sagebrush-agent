@@ -1,5 +1,13 @@
 # sagebrush-agent changes
 
+## 0.8.1
+
+**macOS: the Delegate runner's environment, and tests that pass on a Mac.** Running code in Delegate is still not enabled in this version: `notebook_run` refuses, saying so.
+
+- **The runner's environment on macOS:** a run's environment is replaced whole, and on macOS it now also holds `__CF_USER_TEXT_ENCODING`, set by the runner from this account's uid (never taken from this agent's environment). Without it, macOS could add that variable inside a run by itself, so a run saw a variable the runner never gave it, some of the time.
+- **Names that differ only in case:** where a task's copy is on a volume that tells them apart, two such names are still refused when the task is proposed. On a volume that doesn't (macOS's default), the copy can only ever hold one of them, and that one file is what is proposed.
+- **Tests:** the suite now passes on macOS as well as on Linux. Three assumptions in the tests are fixed, none of them in the agent itself: a test waits until the agent has seen a page go before going on, a stand-in's process id is written whole before it is read, and the case test asks the volume rather than the platform.
+
 ## 0.8.0
 
 **Delegate: give Claude a task, close the tab, and review its proposal later.** It works over the loopback address only, and only while the page's grant has Delegate on, which is the person's own switch.

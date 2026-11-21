@@ -166,3 +166,22 @@ test("over the runner's stdio there are no tasks: no delegate.1, and requests ar
   assert.ok(!server.features().includes("delegate.1"));
   rmSync(dir, { recursive: true, force: true });
 });
+
+test("a failure of the task host that isn't a refusal: answered unavailable, its detail only in the agent's log", async () => {
+  const h = await setup();
+  const logged = [];
+  h.server.log = (m) => logged.push(m);
+  h.server.tasks.rpc.call = async () => { throw new Error("EIO: i/o error, open '/home/someone/.sagebrush/tasks/x/task.json'"); };
+  const p = page(h.port);
+  await p.open;
+  await p.hello(h.code);
+  p.notify("grant.changed", { folders: ["/"], write: true, delegate: true });
+  await new Promise((r) => setTimeout(r, 50));
+  const a = await p.call("tasks.list", {});
+  assert.equal(code(a), "unavailable");
+  assert.doesNotMatch(a.error.message, /EIO|\/home/);
+  assert.ok(logged.some((m) => /EIO/.test(m)));
+  p.ws.close();
+  await h.server.close();
+  rmSync(h.dir, { recursive: true, force: true });
+});

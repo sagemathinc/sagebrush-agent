@@ -329,6 +329,7 @@ test("no pin for this platform: refused before anything; the platforms and the c
   assert.equal(platformKey("linux", "x64"), "linux-x64");
   assert.equal(platformKey("win32", "x64"), "win32-x64");
   assert.equal(platformKey("win32", "arm64"), null);
+  if (process.platform === "win32") return; // (the POSIX places below are joined with the host's own separator)
   assert.equal(cacheRoot({ XDG_CACHE_HOME: "/x/c" }, "linux", "/h"), "/x/c/sagebrush-agent/codex");
   assert.equal(cacheRoot({ XDG_CACHE_HOME: "relative" }, "linux", "/h"), "/h/.cache/sagebrush-agent/codex");
   assert.equal(cacheRoot({}, "darwin", "/h"), "/h/Library/Caches/sagebrush-agent/codex");

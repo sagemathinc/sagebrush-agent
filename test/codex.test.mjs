@@ -430,7 +430,7 @@ test("approval_policy never: the thread asks for on-request (logged); a thread t
   }
 });
 
-test("SIGTERM: the agent ends Codex's app-server and exits 0", async () => {
+test("SIGTERM: the agent ends Codex's app-server and exits 0", { skip: process.platform === "win32" ? "Node can't send SIGTERM on Windows: kill() ends the process" : false }, async () => {
   const a = agent();
   try {
     a.grant({ native: true });

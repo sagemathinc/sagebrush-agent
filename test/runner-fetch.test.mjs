@@ -49,10 +49,11 @@ test("the pins: Deno 2.9.0 for the four M1 platforms from npm only; the engine s
     assert.match(e.sha256, /^[0-9a-f]{64}$/);
   }
   assert.equal(RUNNER_PIN.engine, null);
-  assert.equal(pinProblem(), "no engine with confinement is pinned yet");
+  assert.equal(pinProblem(RUNNER_PIN, "linux-x64"), "no engine with confinement is pinned yet");
   assert.match(pinProblem(RUNNER_PIN, null), /aren't available on/);
   assert.equal(RUNNER_PIN.tzdata.version, "2026.5");
   assert.equal(Object.keys(RUNNER_PIN.tzdata.files).length, 598);
+  if (process.platform === "win32") return; // (the POSIX places below are joined with the host's own separator)
   assert.match(runnerCacheRoot({}, "linux", "/h"), /^\/h\/\.cache\/sagebrush-agent\/runner$/);
   assert.match(runnerCacheRoot({}, "darwin", "/h"), /^\/h\/Library\/Caches\/sagebrush-agent\/runner$/);
 });

@@ -172,7 +172,10 @@ test("stdio: attached(n) with no detached(n) before it still ends the old bindin
   } finally { a.stopAnswering?.(); a.kill(); }
 });
 
-test("stdio: SIGINT stops the running turn and the agent stays up; SIGTERM stops the agent within the runner's 2 s", async () => {
+// (the runner's Stop: SIGINT on POSIX; on Windows, where Node can't send a child SIGINT (kill() ends it), the control line)
+const stopTurns = (a) => (process.platform === "win32" ? a.send({ relay: { stop: true } }) : a.p.kill("SIGINT"));
+
+test("stdio: SIGINT stops the running turn and the agent stays up; SIGTERM stops the agent within the runner's 2 s", { skip: process.platform === "win32" ? "Node can't send SIGINT or SIGTERM to a child on Windows (kill() ends it); the control-line row covers Stop there" : false }, async () => {
   const a = agent();
   try {
     await a.until(() => ready(a), "agent.ready");
@@ -187,6 +190,25 @@ test("stdio: SIGINT stops the running turn and the agent stays up; SIGTERM stops
     a.p.kill("SIGTERM");
     assert.deepEqual(await a.exited, { code: 0, sig: null });
     assert.ok(Date.now() - t < 2000, `stopped in ${Date.now() - t} ms`);
+  } finally { a.stopAnswering?.(); a.kill(); }
+});
+
+test("stdio: the runner's Stop as a control line, {relay: {stop: true}}: the running turn stops, the agent stays up; any other shape changes nothing", async () => {
+  const a = agent();
+  try {
+    await a.until(() => ready(a), "agent.ready");
+    a.answering(); a.grant(); a.say("c1", "slow");
+    await a.until(() => a.events().some((e) => e.type === "text_delta"), "the slow turn streaming");
+    // (not quite the line: ignored, as any relay line this agent doesn't know)
+    for (const relay of [{ stop: 1 }, { stop: "true" }, { stop: true, epoch: 0 }]) a.send({ relay });
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(finished(a, "c1"), false, "still running after lines that aren't the stop line");
+    a.send({ relay: { stop: true } });
+    await a.until(() => finished(a, "c1"), "the stopped turn's end");
+    assert.equal(a.events((p) => p.conversation === "c1").at(-1).outcome, "interrupted");
+    a.say("c2", "hello");
+    await a.until(() => finished(a, "c2"), "a turn after the stop line");
+    assert.equal(a.exit, null, "the agent stays up");
   } finally { a.stopAnswering?.(); a.kill(); }
 });
 
@@ -235,7 +257,7 @@ test("stdio: the caps: a fifth conversation waits for a running turn, and the 17
     const rej = a.find((m) => m.method === "chat.rejected" && m.params.id === "w-17").msg.params;
     assert.deepEqual(rej.reason, { code: "busy", message: TEXT.tooMany });
     assert.equal(a.events((p) => p.conversation === "w").length, 0, "the fifth conversation hasn't started");
-    a.p.kill("SIGINT"); // (the four stop; the waiting ones run, one at a time in their conversation)
+    stopTurns(a); // (the four stop; the waiting ones run, one at a time in their conversation)
     await a.until(() => a.events((p) => p.conversation === "w").length > 0, "the fifth conversation starting");
   } finally { a.stopAnswering?.(); a.kill(); }
 });

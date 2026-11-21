@@ -235,3 +235,16 @@ test("in a turn: notebook_run gives the model the report; calls run one at a tim
   assert.equal(r.seen().argv[r.seen().argv.indexOf("--timeout") + 1], "30");
   r.done();
 });
+
+test("leftovers of a crash during a run or an undo (run tmp folders, a half-built or dropped copy) are cleared when the store loads; other names are kept", () => {
+  const dir = mkdtempSync(join(tmpdir(), "sb-runner-left-"));
+  const store = new TaskStore({ root: join(dir, "tasks"), scope: "install-1" }).init();
+  const task = store.start(checkRequest("tasks.start", { title: "t", prompt: "p", target: "local", run: true, docs: [{ path: "a.ipynb", kind: "notebook", content: NB }] })).task;
+  const tdir = store.dir(task), tmp = store.runTmpRoot(task);
+  for (const d of [join(tmp, "run-0123456789ab"), join(tdir, ".work-0123456789ab"), join(tdir, ".dropped-0123456789ab"), join(tmp, "keep-me"), join(tdir, ".work-not-ours")]) mkdirSync(join(d, "x"), { recursive: true });
+  new TaskStore({ root: join(dir, "tasks"), scope: "install-1" }).init();
+  assert.deepEqual(readdirSync(tmp).sort(), ["keep-me"]);
+  assert.deepEqual(readdirSync(tdir).filter((n) => n.startsWith(".")).sort(), [".staging", ".work-not-ours"].filter((n) => existsSync(join(tdir, n))));
+  assert.ok(existsSync(join(tdir, ".work-not-ours")));
+  rmSync(dir, { recursive: true, force: true });
+});

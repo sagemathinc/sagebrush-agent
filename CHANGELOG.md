@@ -7,7 +7,7 @@
 - **Codex 0.171.0 and Claude Code 2.1.330:** the Codex this agent downloads and checks is now 0.171.0, on every platform, and the Claude Agent SDK is 0.3.330 (Claude Code 2.1.330). Each release of this agent now pins the latest Codex and Claude Code.
 - **Names that differ only in case or Unicode form:** task paths now use one collision key across platforms, whatever the volume: a letter written composed or decomposed is one name (é as one character, or as e plus its accent), and so are "ß", "ẞ", "SS" and "ss", as well as names that differ only in case. Such names are refused together wherever a task's set of paths is checked: its documents at the start, a write during a turn, and the working copy when it is proposed. Nothing the earlier rule refused is let through.
 - **Windows, groundwork:**
-  - The Codex download is checked and kept private by the folder's owner and access list, since Windows has no POSIX modes. It lives under `%LOCALAPPDATA%\sagebrush-agent`.
+  - The Codex download is checked and kept private by owner and access list, since Windows has no POSIX modes: the cache's folders and every folder and file in the download. A folder or file without a usable access list is never taken as private. It lives under `%LOCALAPPDATA%\sagebrush-agent`.
   - The processes this agent starts run in a Windows job object, so stopping them also ends anything they started, including processes whose parent has already gone.
   - A runner on Windows can stop the running turns with a control line, since it can't send a signal there.
   - A few file paths are now built in a way that works on Windows.

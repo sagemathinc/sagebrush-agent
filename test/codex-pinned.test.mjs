@@ -4,6 +4,8 @@
 // behind a stand-in for the pinned executable.
 import { test } from "node:test";
 const T = { timeout: 20000 }; // (a row that hangs fails by name)
+// (rows that run the "pinned" stand-in, a /bin/sh script: POSIX only; the real Codex row covers Windows)
+const TS = process.platform === "win32" ? { ...T, skip: "the pinned stand-in is a /bin/sh script: POSIX only" } : T;
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -61,7 +63,7 @@ function harness(locate, { generate = null, fakeEnv = {} } = {}) {
   };
 }
 
-test("the pinned Codex runs by its absolute path, for the self-test and the app-server; the `codex` on PATH never runs", T, async () => {
+test("the pinned Codex runs by its absolute path, for the self-test and the app-server; the `codex` on PATH never runs", TS, async () => {
   const h = harness((bin) => ({ bin, dir: "/x", version: CODEX_VERSION }));
   try {
     h.say("hello");
@@ -73,7 +75,7 @@ test("the pinned Codex runs by its absolute path, for the self-test and the app-
   } finally { await h.close(); }
 });
 
-test("the first download's progress: one line to the turn that asked, then the turn goes on", T, async () => {
+test("the first download's progress: one line to the turn that asked, then the turn goes on", TS, async () => {
   const h = harness((bin, { onProgress }) => { onProgress(16e6, 162475310); onProgress(32e6, 162475310); return { bin, dir: "/x", version: CODEX_VERSION }; });
   try {
     h.say("hello");
@@ -124,7 +126,7 @@ test("the backend closing aborts a download under way (the signal locate gets), 
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const within = async (f, ms, what) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) throw new Error(`not within ${ms} ms: ${what}`); await new Promise((r) => setTimeout(r, 10)); } };
 
-test("closing the agent during the schema probe: its process group is gone (by pid) within 2 s, nothing after initialize is sent", T, async () => {
+test("closing the agent during the schema probe: its process group is gone (by pid) within 2 s, nothing after initialize is sent", TS, async () => {
   // (the app-server takes 300 ms to end: closing must wait for the cancelled start's own cleanup)
   const h = harness((bin) => ({ bin, dir: "/x", version: CODEX_VERSION }), { generate: `echo $$ > "$PIDFILE"; (sleep 3; echo alive > "$MARK") & sleep 30; exit 0`, fakeEnv: { FAKE_CODEX_SLOW_EXIT: "1" } });
   h.say("hello");
@@ -161,7 +163,7 @@ test("a Stop during the download cancels it (locate's signal, within 2 s of the 
   } finally { await h.close(); }
 });
 
-test("a Stop while initialize goes unanswered: the app-server is ended (by pid) and nothing more is sent", T, async () => {
+test("a Stop while initialize goes unanswered: the app-server is ended (by pid) and nothing more is sent", TS, async () => {
   const h = harness((bin) => ({ bin, dir: "/x", version: CODEX_VERSION }), { fakeEnv: { FAKE_CODEX_HOLD_INIT: "1" } });
   try {
     h.say("hello");
@@ -192,7 +194,7 @@ test("two turns share a start: the first Stop doesn't cancel it, the last one do
   } finally { await h.close(); }
 });
 
-test("closing during the start with a Codex that ignores SIGTERM: within the one budget it's killed and reaped (by pid), and close() says so", T, async () => {
+test("closing during the start with a Codex that ignores SIGTERM: within the one budget it's killed and reaped (by pid), and close() says so", TS, async () => {
   const h = harness((bin) => ({ bin, dir: "/x", version: CODEX_VERSION }), { generate: `echo $$ > "$PIDFILE"; sleep 30; exit 0`, fakeEnv: { FAKE_CODEX_IGNORE_TERM: "1" } });
   h.say("hello");
   const pidFile = join(h.scratch, "probe.pid");

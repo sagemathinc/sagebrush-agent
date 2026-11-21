@@ -187,7 +187,7 @@ test("paths: a space works; a comma anywhere Deno must be granted makes runs una
   rmSync(base, { recursive: true, force: true });
 });
 
-test("the zone data: copied only as pinned; a changed file or a link in the source makes runs unavailable, nothing started; its bytes count in the task's budget", T, async () => {
+test("the zone data: copied only as pinned; a changed file or a link in the source makes runs unavailable, nothing started; its bytes count in the task's budget", { ...T, ...WIN_DELEGATE }, async () => {
   const src = mkdtempSync(join(tmpdir(), "sb-zones-"));
   cpSync(TZ_SOURCE, src, { recursive: true });
   writeFileSync(join(src, "Europe/Paris"), "not the pinned bytes");

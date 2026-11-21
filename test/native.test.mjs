@@ -32,7 +32,8 @@ function agent({ userMode, projectMode, localMode, configMode } = {}) {
   // (a configured folder of its own, as CLAUDE_CONFIG_DIR names one)
   const config = configMode ? join(runnerCwd, ".config-claude") : null;
   if (config) { mkdirSync(config); writeFileSync(join(config, "settings.json"), JSON.stringify({ permissions: { defaultMode: configMode } })); }
-  const env = { ...process.env, HOME: home, SAGEBRUSH_AGENT_FAKE: "1" };
+  // (the home is HOME on POSIX and USERPROFILE on Windows, where os.homedir() reads it)
+  const env = { ...process.env, HOME: home, USERPROFILE: home, SAGEBRUSH_AGENT_FAKE: "1" };
   delete env.CLAUDE_CONFIG_DIR;
   if (config) env.CLAUDE_CONFIG_DIR = config;
   const p = spawn(process.execPath, [BIN, "--stdio"], { cwd: runnerCwd, env, stdio: ["pipe", "pipe", "pipe"] });
@@ -281,7 +282,7 @@ test("native works in the runner's own folder; tools-only in the agent's own emp
     const t = await optionsFull(a, "c2", 1);
     assert.notEqual(t.cwd, a.runnerCwd);
     assert.match(t.cwd, /sagebrush-agent-/);
-  } finally { a.kill(); rmSync(a.runnerCwd, { recursive: true, force: true }); }
+  } finally { a.kill(); }
 });
 
 test("a native file by a relative name stays in the runner's folder after the agent stops; the runner's folder stays too", async () => {
@@ -296,7 +297,7 @@ test("a native file by a relative name stays in the runner's folder after the ag
     assert.equal(await a.exited, 0);
     assert.ok(existsSync(a.runnerCwd), "the runner's folder is still there");
     assert.equal(readFileSync(file, "utf8"), "made by the fake model\n");
-  } finally { a.kill(); rmSync(a.runnerCwd, { recursive: true, force: true }); }
+  } finally { a.kill(); }
 });
 
 test("tools-only: a file in the agent's own folder goes with it when the agent stops", async () => {
@@ -313,7 +314,7 @@ test("tools-only: a file in the agent's own folder goes with it when the agent s
     assert.equal(await a.exited, 0);
     assert.ok(!existsSync(own), "the agent's own folder is removed");
     assert.ok(!existsSync(join(a.runnerCwd, "scratch.txt")));
-  } finally { a.kill(); rmSync(a.runnerCwd, { recursive: true, force: true }); }
+  } finally { a.kill(); }
 });
 
 test("a conversation goes on in its own folder only: after the mode changes, a new session starts", async () => {
@@ -326,7 +327,7 @@ test("a conversation goes on in its own folder only: after the mode changes, a n
     const t = await optionsFull(a, "c1", 3);
     assert.equal(t.resumed, false, "tools-only after native: a new session, not the other folder's");
     assert.equal((await optionsFull(a, "c1", 4)).resumed, true, "tools-only again: resumed");
-  } finally { a.kill(); rmSync(a.runnerCwd, { recursive: true, force: true }); }
+  } finally { a.kill(); }
 });
 
 test("native over the runner: the mode the SDK's resolver and the CLI's filter give for the runner's folder (one agent per case)", async () => {

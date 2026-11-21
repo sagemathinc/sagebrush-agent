@@ -157,6 +157,9 @@ import { chmodSync as chmod2 } from "node:fs";
 const script = (body) => { const d = mkdtempSync(join(tmpdir(), "probe-")); const f = join(d, "codex"); writeFileSync(f, `#!/bin/sh\n${body}\n`); chmod2(f, 0o755); return f; };
 
 test("the probe's failures are fixed words: an exit, a schema it can't read, not found; never its output", T, async () => {
+  // (on Windows, through the job helper: a program that can't be started is said as "it couldn't start"; the /bin/sh
+  //  stand-ins below are POSIX only)
+  if (process.platform === "win32") return void (await assert.rejects(generateSchemas(["C:\\nonexistent\\codex.exe"]), (e) => e.message === "it couldn't start"));
   await assert.rejects(generateSchemas([script("echo 'SECRET in stderr' >&2; exit 7")]), (e) => e.message === "exit 7");
   await assert.rejects(generateSchemas([script('for a; do [ "$p" = --out ] && o=$a; p=$a; done; echo "{SECRET not json" > "$o/codex_app_server_protocol.schemas.json"; exit 0')]), (e) => e.message === "its protocol couldn't be read");
   await assert.rejects(generateSchemas(["/nonexistent/codex"]), (e) => e.message === "it wasn't found");

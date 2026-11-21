@@ -262,7 +262,9 @@ test("stdio: the caps: a fifth conversation waits for a running turn, and the 17
   } finally { a.stopAnswering?.(); a.kill(); }
 });
 
-test("stdio: a page that stops reading: the turn is stopped at the 2F bound and the page is told once, from the reserve", async () => {
+// (on Windows, Node writes to a stdout pipe synchronously: a reader that stops reading blocks the write itself and the
+//  queue never fills, so the 2F bound can't trigger there; measured on Windows, a known gap, not a silent pass)
+test("stdio: a page that stops reading: the turn is stopped at the 2F bound and the page is told once, from the reserve", { skip: process.platform === "win32" ? "Windows: stdout to a pipe is synchronous, so a stalled reader blocks the write and the 2F queue bound never triggers (a known gap)" : false }, async () => {
   const a = agent();
   try {
     await a.until(() => ready(a), "agent.ready");

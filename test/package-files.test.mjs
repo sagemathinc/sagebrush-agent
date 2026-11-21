@@ -26,7 +26,7 @@ function reachable(start) {
       ...src.matchAll(/new URL\(\s*["'](\.{1,2}\/[^"']+)["']\s*,\s*import\.meta\.url\s*\)/g),
     ].map((m) => m[1]);
     for (const r of refs) {
-      const t = normalize(join(dirname(f), r));
+      const t = normalize(join(dirname(f), r)).replaceAll("\\", "/");
       if (t.startsWith("test/") || t.startsWith("..")) continue;
       if (existsSync(join(root, t))) todo.push(t);
     }
@@ -40,7 +40,7 @@ test("package: every file the bin reaches is in the published package (npm pack 
   const win = process.platform === "win32";
   const out = JSON.parse(execFileSync(win ? "npm.cmd" : "npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], shell: win }));
   const packed = new Set(out[0].files.map((f) => f.path));
-  const need = [...reachable(relative(root, join(root, pkg.bin["sagebrush-agent"])))];
+  const need = [...reachable(relative(root, join(root, pkg.bin["sagebrush-agent"])).replaceAll("\\", "/"))];
   // (a folder a module reads by its URL ("./tzdata/zoneinfo/"): every file under it on disk must be packed)
   const under = (d) => readdirSync(join(root, d), { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? under(`${d}${e.name}/`) : [`${d}${e.name}`]));
   const missing = need.flatMap((f) => (f.endsWith("/") ? under(f) : [f])).filter((f) => !packed.has(f));

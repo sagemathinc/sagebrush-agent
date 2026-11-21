@@ -35,7 +35,9 @@ for (const [version, bin] of bins.length ? bins : [["(none given)", null]]) {
       const t = Date.now();
       while (!events().some((e) => e.type === "turn_finished")) { if (Date.now() - t > 45000) throw new Error("no end"); await new Promise((r) => setTimeout(r, 20)); }
       const err = events().find((e) => e.type === "turn_error");
-      assert.deepEqual(err, { type: "turn_error", code: "unauthorized", message: CODEX_TEXT.notLoggedIn }, "the step after initialize and the self-test");
+      // (on Windows this version refuses Codex right after initialize: nothing else is sent)
+      if (process.platform === "win32") assert.deepEqual(err, { type: "turn_error", code: "codex_platform", message: CODEX_TEXT.windows }, "Codex on Windows: refused after initialize");
+      else assert.deepEqual(err, { type: "turn_error", code: "unauthorized", message: CODEX_TEXT.notLoggedIn }, "the step after initialize and the self-test");
     } finally {
       input.end();
       await server.close().catch(() => {});

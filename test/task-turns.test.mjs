@@ -406,6 +406,27 @@ test("no-follow for the SDK's paths: a link at sdk/ never becomes the SDK's fold
   h.done();
 });
 
+test("every way a turn ends closes the SDK's query: after a proposal its cleanup runs exactly once, before the turn's place is freed", async () => {
+  let cleanups = 0, cleanedBeforeFree = null;
+  const h = hostWith(perCall([(o) => (async function* () {
+    try {
+      yield { type: "system", subtype: "init", session_id: "s", tools: [], mcp_servers: [] };
+      await o.mcpServers[TASK_SERVER].handlers.propose({ summary: "done" });
+      yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "proposed" }] }, parent_tool_use_id: null };
+      yield { type: "result", subtype: "success", is_error: false, result: "ok", usage: { input_tokens: 1, output_tokens: 1 } };
+    } finally {
+      cleanups++;
+    }
+  })()]));
+  const { task } = await h.rpc.call("tasks.start", h.req());
+  h.turns.running.get(task).done.then(() => { cleanedBeforeFree = cleanups; });
+  await until(() => h.store.state(task).status === "proposal" && !h.turns.isRunning(task), "the proposal, the turn over");
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(cleanups, 1);
+  assert.equal(cleanedBeforeFree, 1);
+  h.done();
+});
+
 test("the installation id: made once, private, kept; a file that isn't one is refused", async () => {
   const { installationId } = await import("../lib/installation.mjs");
   const home = mkdtempSync(join(tmpdir(), "sb-inst-"));

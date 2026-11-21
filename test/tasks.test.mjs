@@ -9,7 +9,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { chmodSync, existsSync, linkSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TaskStore } from "../lib/tasks.mjs";
+import { TaskStore, buildIntent } from "../lib/tasks.mjs";
 import { checkRequest, TaskError } from "../lib/tasks-schema.mjs";
 import { blobId, casRef, readRef, RefConflict } from "../lib/task-git.mjs";
 import { pathProblem, pathSetProblem } from "../lib/task-paths.mjs";
@@ -178,7 +178,7 @@ test("recovery: an intent whose ref moved is finished; one whose ref didn't is d
     const state = JSON.parse(readFileSync(join(s.dir(task), "task.json"), "utf8"));
     state.status = "working";
     state.proposals = [];
-    state.intent = { id: "1".repeat(32), ref: "refs/heads/proposal", expect: null, next: commit, tags: [{ ref: "refs/tags/round-1", next: commit }], events: [{ type: "proposal", round: 1, base: t.base, commit, files: [] }, { type: "task_status", status: "proposal" }], set: { status: "proposal", proposals: [commit] } };
+    state.intent = buildIntent(s.gitdir(task), state, "propose", "1".repeat(32), { commit });
     writeFileSync(join(s.dir(task), "task.json"), JSON.stringify(state));
     const refPath = join(s.gitdir(task), "refs/heads/proposal");
     if (kase === "not-moved") unlinkSync(refPath);
@@ -491,8 +491,8 @@ test("recovery: an edited intent can't widen the grant, or change anything its o
   // (other shapes no operation writes: a status jump, a foreign event, a proposal list that isn't one more round)
   for (const tamper of [
     (x) => ({ id: "c".repeat(32), events: [{ type: "task_status", status: "merged" }], set: { status: "merged" } }),
-    (x) => ({ id: "c".repeat(32), events: [{ type: "omitted" }], set: { status: "interrupted" } }),
-    (x) => ({ id: "c".repeat(32), ref: "refs/heads/proposal", expect: null, next: x.base, tags: [{ ref: "refs/tags/round-1", next: x.base }], events: [{ type: "task_status", status: "proposal" }], set: { status: "proposal", proposals: [x.base, x.base] } }),
+    (x) => ({ id: "c".repeat(32), op: "status", args: { op: "stop" }, events: [{ type: "omitted" }], set: { status: "interrupted" } }),
+    (x) => ({ id: "c".repeat(32), op: "propose", args: { commit: x.base }, ref: "refs/heads/proposal", expect: null, next: x.base, tags: [{ ref: "refs/tags/round-1", next: x.base }], events: [{ type: "task_status", status: "proposal" }], set: { status: "proposal", proposals: [x.base, x.base] } }),
   ]) {
     const { root: r2, dir: d2 } = fresh();
     let s2 = store(r2);
@@ -551,5 +551,60 @@ test("the final trailer itself must be the exact closed record, canonical: anyth
     assert.equal(s.state(task).status, "failed", make(g).slice(0, 60));
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("recovery: an intent is applied only if it is exactly what its operation writes for the task as it stands", async () => {
+  // (each tamper starts from a task in proposal, with one round; every one must fail the task, never apply)
+  const cases = {
+    // (the reported probe: from proposal, a ref-less "merged" with no merge, mine, ledger or receipt)
+    "bare merged": (x, c) => ({ id: "d".repeat(32), events: [{ type: "task_status", status: "merged" }], set: { status: "merged" } }),
+    "status op that can't run from proposal": (x, c) => ({ id: "d".repeat(32), op: "status", args: { op: "stop" }, events: [{ type: "task_status", status: "interrupted", reason: "stopped by the person" }], set: { status: "interrupted", reason: "stopped by the person" } }),
+    "proposal with a negative round": (x, c) => ({ ...c.prop, events: [{ ...c.prop.events[0], round: -1 }, c.prop.events[1]] }),
+    "proposal whose files aren't its commit's": (x, c) => ({ ...c.prop, events: [{ ...c.prop.events[0], files: [{ path: "x", kind: "file", change: "added", base_blob: null, blob: "e".repeat(40) }] }, c.prop.events[1]] }),
+    "receipt with a wrong answer": (x, c) => ({ ...c.receipt, ledger: { ...c.receipt.ledger, answer: { recorded: "merge", commit: x.base } } }),
+    "receipt whose files carry an extra field": (x, c) => ({ ...c.receipt, args: { ...c.receipt.args, files: c.receipt.args.files.map((f) => ({ ...f, extra: 1 })) } }),
+    "status change with a reason that isn't well formed": (x, c) => ({ id: "d".repeat(32), op: "status", args: { op: "close" }, events: [{ type: "task_status", status: "closed", reason: "a\u0000" }], set: { status: "closed", reason: "a\u0000" } }),
+    "close with a reason other than its own": (x, c) => ({ id: "d".repeat(32), op: "status", args: { op: "close" }, events: [{ type: "task_status", status: "closed", reason: "x".repeat(600) }], set: { status: "closed", reason: "x".repeat(600) } }),
+  };
+  for (const [name, tamper] of Object.entries(cases)) {
+    const { root, dir } = fresh();
+    let s = store(root);
+    const { task } = start(s);
+    writeFileSync(join(s.work(task), "a.ipynb"), NB2);
+    const [ev] = await s.propose(task);
+    const p = join(s.dir(task), "task.json"), x = JSON.parse(readFileSync(p, "utf8"));
+    // (genuine intents to start from, built by the store's own builders: a next round's shape, and a receipt)
+    const gd = s.gitdir(task);
+    const pre = { ...x, status: "working", proposals: [] };
+    const c = {
+      prop: buildIntent(gd, pre, "propose", "d".repeat(32), { commit: ev.event.commit }),
+      receipt: buildIntent(gd, x, "receipt", "d".repeat(32), { merge_id: "7".repeat(32), hash: "8".repeat(64), files: [{ path: "a.ipynb", proposal_blob: blobId(Buffer.from(NB2)), mine: "not sent", merged: "absent" }] }),
+    };
+    x.intent = tamper(x, c);
+    writeFileSync(p, JSON.stringify(x));
+    s = store(root);
+    const t = s.state(task);
+    assert.equal(t.status, "failed", name);
+    assert.equal(t.merged, null, name);
+    assert.deepEqual(t.mines, [], name);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("recovery: a genuine receipt intent, interrupted, is finished exactly as written", async () => {
+  const { root, dir } = fresh();
+  let s = store(root);
+  const { task } = start(s);
+  writeFileSync(join(s.work(task), "a.ipynb"), NB2);
+  await s.propose(task);
+  const p = join(s.dir(task), "task.json"), x = JSON.parse(readFileSync(p, "utf8"));
+  x.intent = buildIntent(s.gitdir(task), x, "receipt", "9".repeat(32), { merge_id: "7".repeat(32), hash: "8".repeat(64), files: [{ path: "a.ipynb", proposal_blob: blobId(Buffer.from(NB2)), mine: "not sent", merged: "absent" }] });
+  writeFileSync(p, JSON.stringify(x));
+  s = store(root);
+  const t = s.state(task);
+  assert.equal(t.status, "merged");
+  assert.equal(t.receipt.merge_id, "7".repeat(32));
+  assert.deepEqual(t.ledger["7".repeat(32)].answer, { recorded: "receipt", commit: null });
+  rmSync(dir, { recursive: true, force: true });
 });
 

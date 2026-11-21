@@ -38,6 +38,7 @@
     "lib/installation.mjs",
     "lib/task-runner.mjs",
     "lib/runner-fetch.mjs",
+    "lib/proc-start.mjs",
     "lib/runner-pin.json",
     "lib/tzdata/",
     "README.md",

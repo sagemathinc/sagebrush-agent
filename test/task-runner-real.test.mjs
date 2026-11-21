@@ -121,3 +121,49 @@ test("planted config, import maps and lock files in the copy and above it change
     rmSync(base, { recursive: true, force: true });
   }
 });
+
+test("the agent killed mid-run: the run ends with it (its input closed), and the next start undoes the copy, removes the run's folder and record, the task interrupted", T, async () => {
+  const { spawn } = await import("node:child_process");
+  const { readdirSync } = await import("node:fs");
+  const h = setup(["open('partial.txt', 'w').write('half')\nprint('started', flush=True)", "while True:\n    pass"]);
+  const lib = new URL("../lib/", import.meta.url).href;
+  const agent = join(h.dir, "agent.mjs");
+  writeFileSync(agent, `
+import { TaskStore } from "${lib}tasks.mjs";
+import { TaskRunner } from "${lib}task-runner.mjs";
+import { RUNNER_PIN } from "${lib}runner-fetch.mjs";
+import { platformKey } from "${lib}codex-fetch.mjs";
+const store = new TaskStore({ root: ${JSON.stringify(h.store.root)}, scope: "install-1", transcripts: ${JSON.stringify(join(h.dir, "projects"))} }).init();
+const runner = new TaskRunner({ store, enabled: true, pin: { ...RUNNER_PIN, engine: { version: "local", entry: "engine", files: {} } }, platform: platformKey(), ensure: async () => ({ deno: ${JSON.stringify(DENO)}, engine: ${JSON.stringify(ENGINE)} }) });
+// (a store that loads a working task marks it interrupted, as after any restart: resumed, as the person would)
+await store.resume({ task: ${JSON.stringify(h.task)} });
+await runner.run(${JSON.stringify(h.task)}, "nb/a.ipynb");
+`);
+  const a = spawn(process.execPath, [agent], { stdio: ["ignore", "ignore", "pipe"] });
+  let agentErr = "";
+  a.stderr.on("data", (d) => { agentErr += d; });
+  const record = join(h.store.dir(h.task), "run.json");
+  const t = Date.now();
+  let pid = null;
+  while (Date.now() - t < 60000) {
+    try { pid = JSON.parse(readFileSync(record, "utf8")).pid; } catch {}
+    if (pid && existsSync(join(h.store.work(h.task), "nb/partial.txt"))) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  const aliveP = (p) => { try { process.kill(p, 0); return true; } catch { return false; } };
+  try {
+    assert.ok(pid && aliveP(pid), `the run started, its pid recorded (agent: ${agentErr.slice(-800)})`);
+    a.kill("SIGKILL");
+    const k = Date.now();
+    while (aliveP(pid) && Date.now() - k < 10000) await new Promise((r) => setTimeout(r, 50));
+    assert.equal(aliveP(pid), false, "the run ended with its agent");
+    const s2 = new TaskStore({ root: h.store.root, scope: "install-1", transcripts: join(h.dir, "projects") }).init();
+    assert.equal(s2.state(h.task).status, "interrupted");
+    assert.equal(existsSync(join(s2.work(h.task), "nb/partial.txt")), false, "the run's changes undone");
+    assert.equal(existsSync(record), false);
+    assert.deepEqual(readdirSync(join(s2.dir(h.task), "tmp")), []);
+  } finally {
+    if (pid) try { process.kill(-pid, "SIGKILL"); } catch {}
+    h.done();
+  }
+});

@@ -44,6 +44,7 @@ else if (ctl.mode === "hang") {
 }
 else if (ctl.mode === "plant") { fs.symlinkSync("/etc/passwd", path.join(work, "evil")); process.stdout.write(JSON.stringify(report)); }
 else if (ctl.mode === "big") { const s = "x".repeat(65536); for (let i = 0; i < 200; i++) process.stdout.write(s); setInterval(() => {}, 1000); }
+else if (ctl.mode === "manyfiles") { for (let i = 0; i < ctl.files; i++) fs.writeFileSync(path.join(runTmp, "f" + i), ""); fs.writeFileSync(path.join(work, "partial.txt"), "half done"); setInterval(() => {}, 1000); }
 else if (ctl.mode === "noreport") { process.stderr.write("sagebrush notebook run: refused\n"); process.exit(2); }
 `;
 
@@ -63,7 +64,7 @@ function setup({ mode = "report", enabled = true, run = true, root = null, limit
   const fake = join(dir, "fake");
   mkdirSync(fake);
   writeFileSync(join(fake, "deno.cjs"), FAKE);
-  writeFileSync(join(fake, "control.json"), JSON.stringify({ mode, runtime: RUNTIME?.kind }));
+  writeFileSync(join(fake, "control.json"), JSON.stringify({ mode, runtime: RUNTIME?.kind, files: 2000 }));
   const engine = join(dir, "engine", "dist", "sagebrush.cjs");
   mkdirSync(join(dir, "engine", "dist"), { recursive: true });
   writeFileSync(engine, "// the engine stand-in: never run here\n");
@@ -101,7 +102,7 @@ test("the fixed launch: exactly the plan's argv, the environment replaced whole,
   assert.deepEqual(s.argv, runArgv({ engine: h.engine, work, runTmp, notebook: join(work, "nb dir/a.ipynb"), timeoutS: 300 }));
   assert.deepEqual(s.argv, ["run", "--no-prompt", "--no-config", "--no-lock", "--no-remote", "--no-npm", "--cached-only", "--no-code-cache",
     `--allow-read=${work},${runTmp},${h.engine}`, `--allow-write=${work},${runTmp}`, "--allow-env", "--deny-net", "--deny-run", "--deny-ffi", "--deny-sys",
-    h.engine, "notebook", "run", join(work, "nb dir/a.ipynb"), "--json", "--write", "--timeout", "300", "--confine", work, "--confine", runTmp]);
+    h.engine, "notebook", "run", join(work, "nb dir/a.ipynb"), "--json", "--write", "--timeout", "300", "--confine", work, "--confine", runTmp, "--until-stdin-ends"]);
   // (the environment: exactly these keys, nothing of this process's)
   assert.deepEqual(Object.keys(h.spawned[0].opts.env).sort(), ["DENO_DIR", "HOME", "NO_COLOR", "PYTHONTZPATH", "TMPDIR", "TZ", "TZDIR"]);
   assert.deepEqual(h.spawned[0].opts.env, runEnv({ work, runTmp }));
@@ -303,4 +304,127 @@ test("the zone data is admitted as any write is: against the total as well as th
   assert.equal((await h.runner.run(h.task, "nb dir/a.ipynb")).exit, 0);
   assert.equal(h.store.held.size, 0);
   h.done();
+});
+
+// ---- an agent that died with a run alive: recovery at the next load (the backstop; the lifeline is the real rows')
+function deadAgentFixture(signal) {
+  const dir = mkdtempSync(join(tmpdir(), "sb-runner-dead-"));
+  const open = (more = {}) => new TaskStore({ root: join(dir, "tasks"), scope: "install-1", ...more }).init();
+  const s = open();
+  const { task } = s.start(checkRequest("tasks.start", { title: "t", prompt: "p", target: "local", run: true, docs: [{ path: "a.txt", kind: "file", content: "base" }] }));
+  return { dir, open, s, task };
+}
+// (a stand-in for a run whose agent is gone: started by a parent that exits at once, so, as a real orphan, it is no
+//  child of this test (a killed child of ours would linger unreaped); the leader of its own process group)
+const sleeper = () => {
+  const r = spawnSync(process.execPath, ["-e", "const c = require('child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' }); c.unref(); process.stdout.write(String(c.pid))"], { encoding: "utf8" });
+  return { pid: Number(r.stdout) };
+};
+const stopOwn = (pid) => { try { process.kill(-pid, "SIGKILL"); } catch {} };
+
+test("at load, a run left alive by an agent that died: killed by group only when its start time matches, waited for, the copy undone, its tmp and record removed", async () => {
+  const { procStart } = await import("../lib/proc-start.mjs");
+  const f = deadAgentFixture();
+  const snap = await f.s.snapshotWork(f.task);
+  writeFileSync(join(f.s.work(f.task), "a.txt"), "CHANGED BY THE RUN");
+  const tmp = join(f.s.runTmpRoot(f.task), "run-0123456789ab");
+  mkdirSync(tmp);
+  const p = sleeper();
+  await until(() => procStart(p.pid), "the stand-in started");
+  try {
+    f.s.writeRunRecord(f.task, { v: 1, tmp: "run-0123456789ab", snapshot: snap, pid: p.pid, start: procStart(p.pid) });
+    const s2 = f.open();
+    assert.equal(alive(p.pid), false, "killed");
+    assert.equal(readFileSync(join(s2.work(f.task), "a.txt"), "utf8"), "base");
+    assert.equal(existsSync(tmp), false);
+    assert.equal(existsSync(join(s2.dir(f.task), "run.json")), false);
+    assert.equal(s2.state(f.task).status, "interrupted");
+  } finally { stopOwn(p.pid); rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test("at load, a recorded pid whose start time differs is another process now: never signalled; the run is over, so the copy is undone", async () => {
+  const f = deadAgentFixture();
+  const snap = await f.s.snapshotWork(f.task);
+  writeFileSync(join(f.s.work(f.task), "a.txt"), "CHANGED BY THE RUN");
+  const p = sleeper();
+  try {
+    await until(() => alive(p.pid), "the stand-in started");
+    f.s.writeRunRecord(f.task, { v: 1, tmp: "run-0123456789ab", snapshot: snap, pid: p.pid, start: "linux:1" });
+    const s2 = f.open();
+    assert.equal(alive(p.pid), true, "not signalled");
+    assert.equal(readFileSync(join(s2.work(f.task), "a.txt"), "utf8"), "base");
+  } finally { stopOwn(p.pid); rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test("at load, a run that can't be shown ended (still alive after the wait, or no start time recorded): the task is left as it is, served nothing, its record kept", async () => {
+  const { procStart } = await import("../lib/proc-start.mjs");
+  const f = deadAgentFixture();
+  const snap = await f.s.snapshotWork(f.task);
+  writeFileSync(join(f.s.work(f.task), "a.txt"), "CHANGED BY THE RUN");
+  const p = sleeper();
+  try {
+    await until(() => procStart(p.pid), "the stand-in started");
+    for (const [start, more] of [[procStart(p.pid), { signal: () => {}, runGoneMs: 200 }], [null, {}]]) {
+      f.s.writeRunRecord(f.task, { v: 1, tmp: "run-0123456789ab", snapshot: snap, pid: p.pid, start });
+      const s2 = f.open(more);
+      assert.equal(s2.state(f.task).status, "failed");
+      assert.match(s2.state(f.task).reason, /still running|may still be running/);
+      assert.deepEqual(s2.get({ task: f.task, after: 0 }).events, [], "no events served");
+      await assert.rejects(s2.resume({ task: f.task }), (e) => e.code === "final");
+      assert.equal(readFileSync(join(s2.work(f.task), "a.txt"), "utf8"), "CHANGED BY THE RUN", "nothing touched");
+      assert.ok(existsSync(join(s2.dir(f.task), "run.json")));
+      assert.equal(alive(p.pid), true);
+    }
+  } finally { stopOwn(p.pid); rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test("each run asks for the disk again just before it writes anything: short of the task's remaining room plus 64 MB, refused busy, nothing started or copied", T, async () => {
+  const h = setup();
+  let free = 1e12, result;
+  const query = ({ options }) => (async function* () {
+    free = 100 * 1024 * 1024; // (above the watch's 64 MB floor, below the room the task may still use plus 64 MB)
+    result = await options.mcpServers[TASK_SERVER].handlers.notebook_run({ path: "nb dir/a.ipynb" });
+    yield { type: "result", subtype: "success", is_error: false, result: "ok", usage: {} };
+  })();
+  const turns = new TaskTurns({ store: h.store, query, createServer: fakeCreateServer, free: () => free, runner: h.runner, limits: { pollMs: 10 } });
+  turns.begin(h.task, "start");
+  await until(() => result, "the call answered");
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /not enough free disk space/);
+  assert.equal(h.spawned.length, 0);
+  const tmp = join(h.store.dir(h.task), "tmp");
+  assert.ok(!existsSync(tmp) || readdirSync(tmp).length === 0, "nothing made for the run");
+  h.done();
+});
+
+test("the watch covers the copy and the run's folder within the entry bound: a run past it is cut off, its group killed, and undone, with why", T, async () => {
+  const h = setup({ mode: "manyfiles" });
+  const query = ({ options }) => (async function* () {
+    await options.mcpServers[TASK_SERVER].handlers.notebook_run({ path: "nb dir/a.ipynb" });
+    yield { type: "result", subtype: "success", is_error: false, result: "ok", usage: {} };
+  })();
+  const turns = new TaskTurns({ store: h.store, query, createServer: fakeCreateServer, free: () => 1e12, runner: h.runner, limits: { pollMs: 10, transcriptEntries: 1000 } });
+  turns.begin(h.task, "start");
+  await until(() => h.store.state(h.task).status === "interrupted" && !turns.isRunning(h.task), "cut off");
+  assert.match(h.store.state(h.task).reason, /more than 1000 files/);
+  assert.equal(existsSync(join(h.store.work(h.task), "partial.txt")), false);
+  assert.deepEqual(readdirSync(join(h.store.dir(h.task), "tmp")), []);
+  h.done();
+});
+
+test("the measure and the watch skip an entry that goes between its listing and its lstat (a run's scratch file come and gone), and still fail on any other error", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sb-runner-gone-"));
+  const store = new TaskStore({ root: join(dir, "tasks"), scope: "install-1" }).init();
+  const task = store.start(checkRequest("tasks.start", { title: "t", prompt: "p", target: "local", run: true, docs: [{ path: "a.txt", kind: "file", content: "x" }] })).task;
+  writeFileSync(join(store.work(task), "gone.txt"), "here when listed");
+  const lstat = fs.lstatSync;
+  const as = (code) => { fs.lstatSync = (p, ...a) => { if (String(p).endsWith("gone.txt")) throw Object.assign(new Error(code), { code }); return lstat(p, ...a); }; syncBuiltinESMExports(); };
+  try {
+    as("ENOENT");
+    assert.notEqual(store.usage(task), null, "gone: not counted, still measured");
+    assert.equal(store.runTreesProblem(task, 20000), null);
+    as("EACCES");
+    assert.equal(store.usage(task), null, "any other error: not measured");
+    assert.match(store.runTreesProblem(task, 20000), /EACCES|can't/);
+  } finally { fs.lstatSync = lstat; syncBuiltinESMExports(); rmSync(dir, { recursive: true, force: true }); }
 });

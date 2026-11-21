@@ -1,5 +1,19 @@
 # sagebrush-agent changes
 
+## 0.8.2
+
+**Newer Codex and Claude Code, names that are one name on a Mac, and the groundwork for Windows.** Running code in Delegate is still not enabled in this version: `notebook_run` refuses, saying so.
+
+- **Codex 0.171.0 and Claude Code 2.1.330:** the Codex this agent downloads and checks is now 0.171.0, on every platform, and the Claude Agent SDK is 0.3.330 (Claude Code 2.1.330). Each release of this agent now pins the latest Codex and Claude Code.
+- **Names that differ only in case or Unicode form:** a volume that ignores case also treats a composed and a decomposed letter as one name (é and é), and "ß", "ẞ", "SS" and "ss" as one. Such names are now refused together wherever a task's set of paths is checked: its documents at the start, a write during a turn, and the working copy when it is proposed. Nothing the earlier rule refused is let through.
+- **Windows, groundwork:**
+  - The Codex download is checked and kept private by the folder's owner and access list, since Windows has no POSIX modes. It lives under `%LOCALAPPDATA%\sagebrush-agent`.
+  - The processes this agent starts run in a Windows job object, so stopping them also ends anything they started, including processes whose parent has already gone.
+  - A runner on Windows can stop the running turns with a control line, since it can't send a signal there.
+  - A few file paths are now built in a way that works on Windows.
+  - Delegate stays off on Windows in this version, and says why.
+- **Tests:** the suite runs on Windows. The rows that can't apply there (Delegate, POSIX modes, signals) are declared skips with their reasons, never silent passes.
+
 ## 0.8.1
 
 **macOS: the Delegate runner's environment, and tests that pass on a Mac.** Running code in Delegate is still not enabled in this version: `notebook_run` refuses, saying so.

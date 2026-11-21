@@ -7,7 +7,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { aclVerdict, powershellPath, TRUSTED, windowsPrivateProblem } from "../lib/win-acl.mjs";
+import { aclVerdict, daclState, powershellPath, TRUSTED, windowsPrivateProblem } from "../lib/win-acl.mjs";
 import { cacheRoot, CodexFetchError, platformKey, privateDirs as codexPrivateDirs, treeMatches } from "../lib/codex-fetch.mjs";
 import { privateDirs as runnerPrivateDirs, runnerCacheRoot } from "../lib/runner-fetch.mjs";
 
@@ -15,7 +15,7 @@ const ME = "S-1-5-21-1111111111-2222222222-3333333333-1001";
 const OTHER = "S-1-5-21-1111111111-2222222222-3333333333-1002";
 const allow = (sid, extra = {}) => ({ sid, type: "Allow", rights: 2032127, inheritOnly: false, ...extra });
 // (what a folder under %LOCALAPPDATA% has by default: this account, SYSTEM and Administrators, inherited)
-const DEFAULT = { owner: ME, rules: [allow(ME), allow(TRUSTED.SYSTEM), allow(TRUSTED.ADMINISTRATORS)] };
+const DEFAULT = { owner: ME, dacl: `D:AI(A;OICIID;FA;;;${ME})(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)`, rules: [allow(ME), allow(TRUSTED.SYSTEM), allow(TRUSTED.ADMINISTRATORS)] };
 
 test("the verdict: only this account, SYSTEM and Administrators may hold access; the owner is this account or Administrators", () => {
   assert.equal(aclVerdict(DEFAULT, ME), null);
@@ -42,6 +42,25 @@ test("the verdict: anything that isn't read as expected is a problem, never a pa
   ]) assert.match(aclVerdict(item, user) ?? "", /couldn't be read|owned by/, what);
 });
 
+test("the verdict: a null or absent DACL (everyone may do anything) is never private, whatever the rules list says", () => {
+  assert.equal(daclState(DEFAULT.dacl), "present");
+  assert.equal(daclState("D:"), "present", "an empty DACL: no one but the owner's implicit rights");
+  assert.equal(daclState("D:NO_ACCESS_CONTROL"), "null");
+  assert.equal(daclState("D:PNO_ACCESS_CONTROL"), "null");
+  assert.equal(daclState(""), "absent");
+  for (const x of [undefined, null, 7, "O:BA", "S:(AU;SA;FA;;;WD)"]) assert.equal(daclState(x), "unreadable", String(x));
+  // (as Get-Acl reads a null DACL: no rules at all; it must not pass as "nothing granted")
+  for (const dacl of ["D:NO_ACCESS_CONTROL", "", undefined, "garbage"]) {
+    for (const rules of [[], DEFAULT.rules]) assert.ok(aclVerdict({ owner: ME, dacl, rules }, ME), `${dacl} with ${rules.length} rules`);
+  }
+  assert.match(aclVerdict({ owner: ME, dacl: "D:NO_ACCESS_CONTROL", rules: [] }, ME), /a null access list, so anyone may use it/);
+  assert.match(aclVerdict({ owner: ME, dacl: "", rules: [] }, ME), /no access list, so anyone may use it/);
+  assert.equal(aclVerdict({ owner: ME, dacl: "D:P", rules: [] }, ME), null, "a present, empty DACL grants no one");
+  // (through the reader: an answer without the dacl field, as before this check, is refused)
+  assert.ok(windowsPrivateProblem(["C:\\cache"], { run: () => ({ status: 0, stdout: JSON.stringify({ user: ME, items: [{ path: "C:\\cache", owner: ME, rules: [] }] }) }) }));
+  assert.match(windowsPrivateProblem(["C:\\cache"], { run: () => ({ status: 0, stdout: JSON.stringify({ user: ME, items: [{ path: "C:\\cache", owner: ME, dacl: "D:NO_ACCESS_CONTROL", rules: [] }] }) }) }), /^C:\\cache: it has a null access list/);
+});
+
 // (a stand-in for spawnSync: records the call, answers as Get-Acl's script would)
 const fake = (answer) => { const calls = []; const run = (cmd, args, opts) => { calls.push({ cmd, args, opts }); return typeof answer === "function" ? answer(JSON.parse(opts.input)) : answer; }; return { run, calls }; };
 const ok = (paths, items) => ({ status: 0, stdout: JSON.stringify({ user: ME, items: items ?? paths.map((path) => ({ path, ...DEFAULT })) }) });
@@ -56,6 +75,7 @@ test("the reader: Windows PowerShell by its absolute System32 path (never PATH),
   assert.match(script, /Get-Acl -LiteralPath \$p/);
   assert.match(script, /GetAccessRules\(\$true, \$true, \$sid\)/);
   assert.match(script, /GetOwner\(\$sid\)/);
+  assert.match(script, /GetSecurityDescriptorSddlForm\(\[System\.Security\.AccessControl\.AccessControlSections\]::Access\)/);
   assert.deepEqual(JSON.parse(f.calls[0].opts.input), ["C:\\a\\sagebrush-agent", "C:\\a\\sagebrush-agent\\codex"]);
   // (%SystemRoot% that isn't a drive's absolute path: C:\Windows, never a relative or odd one)
   for (const SystemRoot of [undefined, "Windows", "\\\\server\\share", "C:\\x\"&calc"]) assert.equal(powershellPath({ SystemRoot }), "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", String(SystemRoot));
@@ -63,9 +83,9 @@ test("the reader: Windows PowerShell by its absolute System32 path (never PATH),
 
 test("the reader: a folder that isn't private is named; every failure to read is a problem", () => {
   const paths = ["C:\\a", "C:\\a\\b"];
-  assert.match(windowsPrivateProblem(paths, { run: fake(ok(paths, [{ path: paths[0], ...DEFAULT }, { path: paths[1], owner: ME, rules: [...DEFAULT.rules, allow("S-1-1-0")] }])).run }), /^C:\\a\\b: it gives access to S-1-1-0$/);
+  assert.match(windowsPrivateProblem(paths, { run: fake(ok(paths, [{ path: paths[0], ...DEFAULT }, { path: paths[1], ...DEFAULT, rules: [...DEFAULT.rules, allow("S-1-1-0")] }])).run }), /^C:\\a\\b: it gives access to S-1-1-0$/);
   // (PowerShell's ConvertTo-Json writes a one-element list, and one rule, as a bare object: still read)
-  assert.equal(windowsPrivateProblem(["C:\\a"], { run: fake({ status: 0, stdout: JSON.stringify({ user: ME, items: { path: "C:\\a", owner: ME, rules: allow(ME) } }) }).run }), null);
+  assert.equal(windowsPrivateProblem(["C:\\a"], { run: fake({ status: 0, stdout: JSON.stringify({ user: ME, items: { path: "C:\\a", owner: ME, dacl: DEFAULT.dacl, rules: allow(ME) } }) }).run }), null);
   for (const [what, answer] of [
     ["PowerShell missing", { error: Object.assign(new Error("spawn"), { code: "ENOENT" }) }], ["a timeout", { error: Object.assign(new Error("t"), { code: "ETIMEDOUT" }) }],
     ["an exit code", { status: 1, stdout: "" }], ["not JSON", { status: 0, stdout: "Get-Acl : Access is denied" }], ["an answer missing", ok(paths, [{ path: paths[0], ...DEFAULT }])],
@@ -99,21 +119,33 @@ test("codex-fetch on Windows: win32-x64 is a platform, the cache under %LOCALAPP
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
-test("treeMatches on Windows: sizes, sha256, kinds and nothing extra, without the POSIX modes", () => {
+test("treeMatches on Windows: sizes, sha256, kinds and nothing extra, without the POSIX modes; every folder and file private by its own access list", () => {
   const d = mkdtempSync(join(tmpdir(), "sb-wintree-"));
   try {
-    mkdirSync(join(d, "bin"), { mode: 0o755 });
+    mkdirSync(join(d, "bin", "res"), { recursive: true, mode: 0o755 });
     writeFileSync(join(d, "bin", "codex.exe"), "MZ");
+    writeFileSync(join(d, "bin", "res", "rg.exe"), "RG");
     chmodSync(join(d, "bin", "codex.exe"), 0o666);
-    const files = { "bin/codex.exe": { size: 2, sha256: createHash("sha256").update("MZ").digest("hex"), exec: true } };
+    const sha = (t) => createHash("sha256").update(t).digest("hex");
+    const files = { "bin/codex.exe": { size: 2, sha256: sha("MZ"), exec: true }, "bin/res/rg.exe": { size: 2, sha256: sha("RG"), exec: true } };
     chmodSync(d, 0o777);
-    assert.equal(treeMatches(d, files, { platform: "win32" }), true);
-    assert.equal(treeMatches(d, files, { platform: "linux" }), false, "on POSIX the modes still count");
+    const seen = [];
+    const acl = (paths) => { seen.push(paths); return null; };
+    assert.equal(treeMatches(d, files, { platform: "win32", acl }), true);
+    // (one read, for the tree's own folder, each folder in it and each file: a parent's list says nothing of a child's)
+    assert.equal(seen.length, 1);
+    assert.deepEqual(seen[0], [d, join(d, "bin"), join(d, "bin", "res"), join(d, "bin", "codex.exe"), join(d, "bin", "res", "rg.exe")]);
+    // (a permissive descendant, the root and its parents private: not a match)
+    for (const bad of seen[0]) {
+      assert.equal(treeMatches(d, files, { platform: "win32", acl: (paths) => (paths.includes(bad) ? `${bad}: it gives access to S-1-1-0` : null) }), false, bad);
+    }
+    assert.equal(treeMatches(d, files, { platform: "win32", acl: () => "its access list couldn't be read" }), false, "unreadable: no match");
+    assert.equal(treeMatches(d, files, { platform: "linux", acl: () => { throw new Error("not on POSIX"); } }), false, "on POSIX the modes still count, and no ACL is read");
     writeFileSync(join(d, "bin", "extra.dll"), "x");
-    assert.equal(treeMatches(d, files, { platform: "win32" }), false, "nothing extra");
+    assert.equal(treeMatches(d, files, { platform: "win32", acl }), false, "nothing extra");
     rmSync(join(d, "bin", "extra.dll"));
     writeFileSync(join(d, "bin", "codex.exe"), "MX");
-    assert.equal(treeMatches(d, files, { platform: "win32" }), false, "other bytes");
+    assert.equal(treeMatches(d, files, { platform: "win32", acl }), false, "other bytes");
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
 
@@ -126,5 +158,28 @@ test("on Windows: a new folder under %LOCALAPPDATA% is private by its real acces
     const g = spawnSync(join(process.env.SystemRoot, "System32", "icacls.exe"), [d, "/grant", "*S-1-1-0:(OI)(CI)R"], { encoding: "utf8" });
     assert.equal(g.status, 0, g.stderr);
     assert.match(windowsPrivateProblem([d]) ?? "", /gives access to S-1-1-0/);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+const ps = (script) => spawnSync(powershellPath(), ["-NoProfile", "-NonInteractive", "-Command", "-"], { input: script, encoding: "utf8" });
+test("on Windows: a folder given a null DACL (everyone may do anything) isn't private", WIN, () => {
+  const d = mkdtempSync(join(process.env.LOCALAPPDATA, "sb-winacl-null-"));
+  try {
+    assert.equal(windowsPrivateProblem([d]), null);
+    const r = ps(`$a = Get-Acl -LiteralPath '${d}'; $a.SetSecurityDescriptorSddlForm('D:NO_ACCESS_CONTROL', [System.Security.AccessControl.AccessControlSections]::Access); Set-Acl -LiteralPath '${d}' -AclObject $a\n`);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(windowsPrivateProblem([d]), "a null DACL is refused");
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
+test("on Windows: a file in a private folder, given its own grant to Everyone, fails the tree check", WIN, () => {
+  const d = mkdtempSync(join(process.env.LOCALAPPDATA, "sb-wintree-"));
+  try {
+    mkdirSync(join(d, "bin"));
+    writeFileSync(join(d, "bin", "codex.exe"), "MZ");
+    const files = { "bin/codex.exe": { size: 2, sha256: createHash("sha256").update("MZ").digest("hex"), exec: true } };
+    assert.equal(treeMatches(d, files), true);
+    const g = spawnSync(join(process.env.SystemRoot, "System32", "icacls.exe"), [join(d, "bin", "codex.exe"), "/grant", "*S-1-1-0:(M)"], { encoding: "utf8" });
+    assert.equal(g.status, 0, g.stderr);
+    assert.equal(windowsPrivateProblem([d, join(d, "bin")]), null, "its folders are still private");
+    assert.equal(treeMatches(d, files), false, "the file's own grant fails the tree");
   } finally { rmSync(d, { recursive: true, force: true }); }
 });

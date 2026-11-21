@@ -385,3 +385,20 @@ test("propose refuses a working copy whose path set breaks the rules (.git, a re
   }
 });
 
+test("a proposal whose event would be over the per-event bound is refused before anything is recorded; no stub event", async () => {
+  const { root, dir } = fresh();
+  const s = store(root);
+  const { task } = start(s);
+  // (900 valid names of about 200 bytes each: within the file and size budgets, but the proposal's file list is over 256 KiB)
+  for (let i = 0; i < 900; i++) writeFileSync(join(s.work(task), `${String(i).padStart(4, "0")}-${"n".repeat(190)}.txt`), "x");
+  const seq = s.state(task).seq;
+  await assert.rejects(s.propose(task), (e) => e.code === "too_large" && /too many files to describe/.test(e.message));
+  const t = s.state(task);
+  assert.equal(t.status, "working");
+  assert.equal(t.intent, null);
+  assert.equal(t.seq, seq);
+  assert.equal(readRef(s.gitdir(task), "refs/heads/proposal"), null);
+  assert.ok(!readFileSync(join(s.dir(task), "log.jsonl"), "utf8").includes("omitted"));
+  rmSync(dir, { recursive: true, force: true });
+});
+

@@ -20,6 +20,7 @@
 // `codex` on PATH), as `codex app-server` with that computer's Codex login and
 // settings: only over the runner, and only for a connection with shell and files on.
 
+import { fileURLToPath } from "node:url";
 import { AgentServer, DEFAULT_ORIGINS, TEXT } from "../lib/server.mjs";
 import { stdinChunks } from "../lib/stdio.mjs";
 
@@ -86,7 +87,7 @@ if (stdio) {
     const { CodexBackend } = await import("../lib/codex.mjs");
     // (the fake app-server, for tests: chosen only by SAGEBRUSH_AGENT_FAKE=1, like the fake model)
     // (the real one: the pinned Codex, fetched and checked by the backend, never `codex` from PATH)
-    const command = process.env.SAGEBRUSH_AGENT_FAKE === "1" ? [process.execPath, new URL("../lib/fake-codex.mjs", import.meta.url).pathname] : null;
+    const command = process.env.SAGEBRUSH_AGENT_FAKE === "1" ? [process.execPath, fileURLToPath(new URL("../lib/fake-codex.mjs", import.meta.url))] : null;
     server.backend = new CodexBackend(server, { command });
   }
   let stopping = false;

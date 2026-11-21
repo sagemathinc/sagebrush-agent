@@ -10,11 +10,12 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 import { tarSink } from "../lib/codex-fetch.mjs";
 
 const PLATFORMS = { "linux-x64": "x86_64-unknown-linux-musl", "linux-arm64": "aarch64-unknown-linux-musl", "darwin-x64": "x86_64-apple-darwin", "darwin-arm64": "aarch64-apple-darwin", "win32-x64": "x86_64-pc-windows-msvc" };
-const PIN_FILE = resolve(new URL("../lib/codex-pin.json", import.meta.url).pathname);
+const PIN_FILE = fileURLToPath(new URL("../lib/codex-pin.json", import.meta.url));
 
 export function checkOut(out) {
   const target = resolve(out);

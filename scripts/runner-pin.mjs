@@ -13,12 +13,13 @@ import { createHash } from "node:crypto";
 import { copyFileSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 import { tarSink } from "../lib/codex-fetch.mjs";
 
 // (this computer's platform as the pin names it -> Deno's npm package for it)
 export const DENO_PACKAGES = { "linux-x64": "@deno/linux-x64-glibc", "linux-arm64": "@deno/linux-arm64-glibc", "darwin-x64": "@deno/darwin-x64", "darwin-arm64": "@deno/darwin-arm64" };
-const PIN_FILE = resolve(new URL("../lib/runner-pin.json", import.meta.url).pathname);
+const PIN_FILE = fileURLToPath(new URL("../lib/runner-pin.json", import.meta.url));
 const TZ_DIR = resolve(new URL("../lib/tzdata", import.meta.url).pathname);
 
 export function checkOut(out) {

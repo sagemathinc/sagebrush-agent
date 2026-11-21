@@ -248,6 +248,12 @@ test("the schema: closed objects, the value rules, the bounds", () => {
   refused("nope.method", {});
   for (const p of ["/abs", "a/../b", "a//b", "C:x", "a\\b", ".git/x", "x/.GIT", "con", "nul.txt", "a.", "", "a\u0000b"]) assert.ok(pathProblem(p), p);
   assert.equal(pathProblem("dir/notebook.ipynb"), null);
+  // (well-formed text, as the page requires: a lone surrogate in a path, a title, a prompt or content is refused; a pair is fine)
+  assert.ok(pathProblem("a\ud800.txt") && pathProblem("a\udc00.txt"));
+  assert.equal(pathProblem("a\ud83d\ude00.txt"), null);
+  refused("tasks.start", { ...ok, title: "t\ud800" });
+  refused("tasks.start", { ...ok, prompt: "\udfff" });
+  refused("tasks.start", { ...ok, docs: [{ path: "a.ipynb", kind: "notebook", content: "{\ud800}" }] });
   assert.ok(pathSetProblem(["A.txt", "a.txt"]));
   assert.ok(pathSetProblem(["a", "a/b"]));
 });

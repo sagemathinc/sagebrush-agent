@@ -7,7 +7,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { aclVerdict, daclState, powershellPath, TRUSTED, windowsPrivateProblem } from "../lib/win-acl.mjs";
+import { aclVerdict, daclState, powershellEnv, powershellPath, TRUSTED, windowsPrivateProblem } from "../lib/win-acl.mjs";
 import { cacheRoot, CodexFetchError, platformKey, privateDirs as codexPrivateDirs, treeMatches } from "../lib/codex-fetch.mjs";
 import { privateDirs as runnerPrivateDirs, runnerCacheRoot } from "../lib/runner-fetch.mjs";
 
@@ -67,7 +67,7 @@ const ok = (paths, items) => ({ status: 0, stdout: JSON.stringify({ user: ME, it
 
 test("the reader: Windows PowerShell by its absolute System32 path (never PATH), the script encoded, the paths on stdin; one call for all", () => {
   const f = fake((paths) => ok(paths));
-  assert.equal(windowsPrivateProblem(["C:\\a\\sagebrush-agent", "C:\\a\\sagebrush-agent\\codex"], { run: f.run, env: { SystemRoot: "D:\\WINDOWS" } }), null);
+  assert.equal(windowsPrivateProblem(["C:\\a\\sagebrush-agent", "C:\\a\\sagebrush-agent\\codex"], { run: f.run, env: { SystemRoot: "D:\\WINDOWS", PSModulePath: "C:\\Program Files\\PowerShell\\7\\Modules", X: "1" } }), null);
   assert.equal(f.calls.length, 1);
   assert.equal(f.calls[0].cmd, "D:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
   assert.deepEqual(f.calls[0].args.slice(0, 5), ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand"]);
@@ -75,10 +75,20 @@ test("the reader: Windows PowerShell by its absolute System32 path (never PATH),
   assert.match(script, /Get-Acl -LiteralPath \$p/);
   assert.match(script, /GetAccessRules\(\$true, \$true, \$sid\)/);
   assert.match(script, /GetOwner\(\$sid\)/);
+  // (the paths unrolled: Windows PowerShell 5.1's ConvertFrom-Json gives a JSON list as one object; seen on Windows)
+  assert.match(script, /\| ConvertFrom-Json \| ForEach-Object \{ \$_ \}\)/);
+  // (without the caller's PSModulePath: started from PowerShell 7, Windows PowerShell couldn't load Get-Acl; seen on Windows)
+  assert.deepEqual(f.calls[0].opts.env, { SystemRoot: "D:\\WINDOWS", X: "1" });
   assert.match(script, /GetSecurityDescriptorSddlForm\(\[System\.Security\.AccessControl\.AccessControlSections\]::Access\)/);
   assert.deepEqual(JSON.parse(f.calls[0].opts.input), ["C:\\a\\sagebrush-agent", "C:\\a\\sagebrush-agent\\codex"]);
   // (%SystemRoot% that isn't a drive's absolute path: C:\Windows, never a relative or odd one)
   for (const SystemRoot of [undefined, "Windows", "\\\\server\\share", "C:\\x\"&calc"]) assert.equal(powershellPath({ SystemRoot }), "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", String(SystemRoot));
+});
+
+test("powershellEnv: the environment without PSModulePath, in any letter case; the rest kept, the original unchanged", () => {
+  const env = { Path: "C:\\x", PSModulePath: "a", psmodulepath: "b", SystemRoot: "C:\\Windows" };
+  assert.deepEqual(powershellEnv(env), { Path: "C:\\x", SystemRoot: "C:\\Windows" });
+  assert.equal(env.PSModulePath, "a");
 });
 
 test("the reader: a folder that isn't private is named; every failure to read is a problem", () => {
@@ -160,7 +170,7 @@ test("on Windows: a new folder under %LOCALAPPDATA% is private by its real acces
     assert.match(windowsPrivateProblem([d]) ?? "", /gives access to S-1-1-0/);
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
-const ps = (script) => spawnSync(powershellPath(), ["-NoProfile", "-NonInteractive", "-Command", "-"], { input: script, encoding: "utf8" });
+const ps = (script) => spawnSync(powershellPath(), ["-NoProfile", "-NonInteractive", "-Command", "-"], { input: script, env: powershellEnv(), encoding: "utf8" });
 test("on Windows: a folder given a null DACL (everyone may do anything) isn't private", WIN, () => {
   const d = mkdtempSync(join(process.env.LOCALAPPDATA, "sb-winacl-null-"));
   try {

@@ -62,7 +62,7 @@ test("the command line is fixed: the target's file, argv, folder and environment
 test("jobSpawn: Windows PowerShell by its absolute path, the script encoded, the caller's stdio and folder, the target's environment in the spec", () => {
   const calls = [];
   const fake = (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { pid: 1 }; };
-  const helperEnv = { SystemRoot: "C:\\Windows", Path: "C:\\Windows\\System32", SECRET_OF_AGENT: "x" };
+  const helperEnv = { SystemRoot: "C:\\Windows", Path: "C:\\Windows\\System32", SECRET_OF_AGENT: "x", PSModulePath: "C:\\Program Files\\PowerShell\\7\\Modules" };
   jobSpawn("C:\\c\\codex.exe", ["app-server", "--x y"], { cwd: "C:\\run", env: { CODEX_HOME: "C:\\u\\.codex", Path: "C:\\c" }, stdio: ["pipe", "pipe", "pipe"] }, { spawnFn: fake, env: helperEnv });
   const [c] = calls;
   assert.equal(c.cmd, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
@@ -71,7 +71,8 @@ test("jobSpawn: Windows PowerShell by its absolute path, the script encoded, the
   assert.equal(c.opts.cwd, "C:\\run");
   assert.equal(c.opts.windowsHide, true);
   const { [SPEC_VAR]: _, ...own } = c.opts.env;
-  assert.deepEqual(own, helperEnv, "the helper's own environment is this process's, plus the spec");
+  const { PSModulePath: _p, ...expected } = helperEnv;
+  assert.deepEqual(own, expected, "the helper's own environment is this process's without PSModulePath, plus the spec");
   assert.ok(!(SPEC_VAR in helperEnv), "the agent's own environment object isn't changed");
   const spec = specOf(c.opts.env);
   assert.deepEqual(spec, { file: "C:\\c\\codex.exe", args: ["app-server", "--x y"], cwd: "C:\\run", keys: ["CODEX_HOME", "Path"], values: ["C:\\u\\.codex", "C:\\c"], parent: process.pid });

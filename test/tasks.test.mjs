@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { TaskStore, buildIntent, canonical } from "../lib/tasks.mjs";
 import { checkRequest, TaskError } from "../lib/tasks-schema.mjs";
 import { blobId, casRef, readRef, RefConflict } from "../lib/task-git.mjs";
-import { pathProblem, pathSetProblem, privateDirProblem } from "../lib/task-paths.mjs";
+import { nameKey, pathProblem, pathSetProblem, privateDirProblem } from "../lib/task-paths.mjs";
 // (Delegate is refused on Windows in this version: its rows here are declared skips there, never silent passes)
 const WIN_DELEGATE = process.platform === "win32" ? { skip: "Delegate refused on win32 in this version" } : {};
 
@@ -282,6 +282,56 @@ test("the schema: closed objects, the value rules, the bounds", () => {
   assert.ok(checkRequest("tasks.start", { ...ok, docs: [{ path: "a.txt", kind: "file", content: { base64: Buffer.from("a\u0000b").toString("base64") } }] }));
   assert.ok(pathSetProblem(["A.txt", "a.txt"]));
   assert.ok(pathSetProblem(["a", "a/b"]));
+});
+
+test("one name, as a volume that ignores case and Unicode form sees it: NFC, lower case, then full case folding; such twins are refused wherever a path set is checked", WIN_DELEGATE, async () => {
+  // (the same name: é composed and decomposed (APFS treats them as one), with case on top, "ß" and "SS", the final
+  //  sigma, the Kelvin sign and "k", a folded ".git")
+  const twins = [["caf\u00e9.txt", "cafe\u0301.txt"], ["CAF\u00c9.txt", "cafe\u0301.TXT"], ["stra\u00dfe.md", "STRASSE.md"], ["\u1e9e.txt", "\u00df.txt"], ["\u1e9e.txt", "SS.txt"], ["\u1e9e.txt", "ss.txt"], ["\u039f\u0394\u039f\u03a3", "\u03bf\u03b4\u03bf\u03c3"], ["\u212a.txt", "k.txt"], ["\ufb01le.txt", "FILE.txt"]];
+  for (const [a, b] of twins) {
+    assert.equal(nameKey(a), nameKey(b), `${a} and ${b}: one key`);
+    assert.match(pathSetProblem([a, b]) ?? "", /two paths name the same file, ignoring case and Unicode form/, `${a} and ${b}`);
+  }
+  // (a folder and a file, in different forms of one name)
+  assert.match(pathSetProblem(["caf\u00e9/a.txt", "cafe\u0301"]) ?? "", /a path is also another's folder/);
+  assert.match(pathSetProblem(["CAFE\u0301/a.txt", "caf\u00e9/b.txt", "Caf\u00e9"]) ?? "", /a path is also another's folder/);
+  // (.git in any case or form is still refused; other names stay apart)
+  assert.ok(pathProblem("sub/.GIT/x"));
+  assert.equal(pathSetProblem(["caf\u00e9.txt", "cafe.txt", "a/b.txt", "a/c.txt", "\u00e9t\u00e9/x.md"]), null);
+  // (inbound: a task's documents with two forms of one name are refused before anything is made)
+  const doc = (path) => ({ path, kind: "file", content: "x" });
+  for (const pair of [["caf\u00e9.txt", "CAFE\u0301.txt"], ["\u00df.txt", "\u1e9e.txt"]]) {
+    assert.throws(() => checkRequest("tasks.start", { title: "t", prompt: "p", target: "local", run: false, docs: pair.map(doc) }), (e) => e.code === "bad_request" && /same file/.test(e.message), pair.join(" "));
+  }
+  // (in a turn: a write whose name is another form of a file already in the copy is refused, nothing written)
+  const { root, dir } = fresh();
+  const s = store(root);
+  const { task } = start(s);
+  await s.writeWork(task, "caf\u00e9.txt", Buffer.from("one"));
+  await assert.rejects(s.writeWork(task, "CAFE\u0301.txt", Buffer.from("two")), (e) => e.code === "bad_request" && /same file/.test(e.message));
+  assert.deepEqual(fs.readdirSync(s.work(task)).filter((n) => nameKey(n) === nameKey("caf\u00e9.txt")), ["caf\u00e9.txt"]);
+  assert.equal(readFileSync(join(s.work(task), "caf\u00e9.txt"), "utf8"), "one");
+  await s.writeWork(task, "\u00df.txt", Buffer.from("sharp"));
+  await assert.rejects(s.writeWork(task, "\u1e9e.txt", Buffer.from("capital")), (e) => e.code === "bad_request" && /same file/.test(e.message));
+  assert.deepEqual(fs.readdirSync(s.work(task)).filter((n) => nameKey(n) === "ss.txt"), ["\u00df.txt"]);
+  assert.equal(readFileSync(join(s.work(task), "\u00df.txt"), "utf8"), "sharp");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("every name the old rule refused (equal lower case) the new one refuses: over every Unicode scalar, the same lower case means the same key", () => {
+  // (each scalar alone, grouped by its lower case: within a group, one key; and the key is a key: nameKey(nameKey(x)))
+  const byLower = new Map(), apart = [], notKey = [];
+  for (let cp = 0; cp <= 0x10ffff; cp++) {
+    if (cp >= 0xd800 && cp <= 0xdfff) continue;
+    const c = String.fromCodePoint(cp), k = nameKey(c), lower = c.toLowerCase();
+    const first = byLower.get(lower);
+    if (first === undefined) byLower.set(lower, k);
+    else if (first !== k) apart.push(cp.toString(16));
+    if (nameKey(k) !== k) notKey.push(cp.toString(16));
+  }
+  assert.deepEqual(apart, [], "scalars with one lower case but two keys");
+  assert.deepEqual(notKey, [], "keys that aren't their own key");
+  assert.match(pathSetProblem(["\u00df.txt", "\u1e9e.txt"]) ?? "", /same file/);
 });
 
 // (a crash at the k-th durable rename of an operation: fs.renameSync throws right after the rename has happened)

@@ -144,8 +144,7 @@ ${why} To connect a page, open:
 The code works once, for 5 minutes. A page that reconnects by itself doesn't need it.
 `);
 };
-// (not while stopping: closing the page's socket on the way out is no page going away)
-server.onPageGone = () => { if (!server.closing) fresh("The page disconnected; Claude's turns go on."); };
+server.onPageGone = () => fresh("The page disconnected; Claude's turns go on.");
 
 const stop = async () => {
   console.error("stopping: deleting this run's transcripts ...");

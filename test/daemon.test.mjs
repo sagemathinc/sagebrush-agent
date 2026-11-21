@@ -454,12 +454,7 @@ test("the command line: when the page goes away, a fresh one-time link is printe
     const p5 = page(first.port);
     const r5 = await p5.open.then(() => "open", (e) => String(e?.message ?? e));
     assert.match(r5, /409/, "a second page while one is paired: refused (409)");
-    // stopping while a page is paired: its socket closing on the way out prints no new link
-    await new Promise((r) => setTimeout(r, 200));
-    const n = links().length;
-    c.kill("SIGTERM");
-    await new Promise((r) => c.once("exit", r));
-    assert.equal(links().length, n, "stopping, with a page paired, prints no new link");
+    p4.ws.close();
     assert.match(out, /^The code works once, for 5 minutes; a new one is printed here each time the page goes away\.$/m);
     assert.doesNotMatch(out, /press Enter/);
   } finally {
@@ -474,6 +469,23 @@ test("the instructions: a notebook that runs by itself isn't run again; the Run 
     assert.match(t, /read it back for its outputs.{0,60}rather than running it again/, name);
     assert.match(t, /click ▶ \(Run\) beside the cell/, name);
   }
+});
+
+test("the page going away is said (onPageGone) when it disconnects, never while the agent stops", async () => {
+  const { server, port, code } = await start();
+  let gone = 0;
+  server.onPageGone = () => gone++;
+  const p = page(port);
+  await p.open;
+  const r = await p.hello({ code });
+  p.ws.close();
+  await until(() => gone === 1);
+  const q = page(port);
+  await q.open;
+  assert.ok((await q.hello({ session: r.result.session })).result);
+  await server.close(); // (with q paired: its socket closes on the way out)
+  await new Promise((res) => setTimeout(res, 100));
+  assert.equal(gone, 1, "stopping, with a page paired, says no page went away");
 });
 
 test("a malformed frame before the hello closes only that socket", async () => {

@@ -15,7 +15,7 @@ const GRANT = { folders: ["/"], write: true, expires: null };
 const NB = { mode: "python", cells: [{ id: "a", code: "1+1", outputs: [{ output_type: "execute_result", data: { "text/plain": "2" }, execution_count: 1 }], n: 1 }, { id: "b", type: "markdown", code: "# t" }] };
 
 // A fake page: one notebook at /n.ipynb (ref R1), and whether it offers notebook.edit.
-async function paired({ features = true, editFails = 0 } = {}) {
+async function paired({ features = true, editFails = 0, grant = GRANT } = {}) {
   const server = new AgentServer({ query: fakeQuery, log: () => {} });
   server.createServer = fakeCreateServer;
   const port = await server.listen();
@@ -40,7 +40,7 @@ async function paired({ features = true, editFails = 0 } = {}) {
   });
   await new Promise((r, j) => { ws.on("open", r); ws.on("error", j); });
   const h = await new Promise((resolve) => { hello = resolve; ws.send(JSON.stringify({ jsonrpc: "2.0", id: "p1", method: "hello", params: { protocol: 1, code, page: { origin: ORIGIN, path: "/agents/" } } })); });
-  ws.send(JSON.stringify({ jsonrpc: "2.0", method: "grant.changed", params: GRANT }));
+  ws.send(JSON.stringify({ jsonrpc: "2.0", method: "grant.changed", params: grant }));
   if (features) ws.send(JSON.stringify({ jsonrpc: "2.0", method: "page.features", params: { features: ["notebook.edit"] } }));
   await until(() => server.binding?.grant && (!features || server.binding.features));
   const c = {};
@@ -135,6 +135,25 @@ test("E12 (helper): with such a page, write_notebook only creates: an existing p
   const made = await p.tools().handlers.workspace_write_notebook({ path: "/m.ipynb", mode: "python", cells: [{ type: "code", source: "x" }] });
   assert.equal(made.isError, undefined);
   } finally { await p.close(); }
+});
+
+test("A2 (0.7.8): a new notebook that runs once by itself in the page says so in the answer, so it isn't run a second time", async () => {
+  const say = /runs once by itself in the page now: read it back with workspace_read for its outputs .*don't run it again unless you need to/;
+  for (const [name, grant, features, want] of [
+    ["everything and May run code, a page that edits by cell", { folders: ["/"], write: true, run: true, expires: null }, true, true],
+    ["everything and May run code, a page without notebook.edit", { folders: ["/"], write: true, run: true, expires: null }, false, true],
+    ["no May run code", { folders: ["/"], write: true, expires: null }, true, false],
+    ["some folders only", { folders: ["/m.ipynb", "/a"], write: true, run: true, expires: null }, true, false],
+  ]) {
+    const p = await paired({ grant, features });
+    try {
+      const made = await p.tools().handlers.workspace_write_notebook({ path: "/m.ipynb", mode: "python", cells: [{ type: "code", source: "x" }] });
+      assert.equal(made.isError, undefined, name);
+      assert.equal(made.content.some((c) => say.test(c.text)), want, name);
+      const refused = await p.tools().handlers.workspace_write_notebook({ path: "/n.ipynb", mode: "python", cells: [{ type: "code", source: "x" }], ...(features ? {} : {}) });
+      assert.ok(!refused.content.some((c) => say.test(c.text)), name + ": never on a refusal");
+    } finally { await p.close(); }
+  }
 });
 
 test("E22h: an edit the page refuses leaves the held read in place: the same base edits again", async () => {

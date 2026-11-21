@@ -379,10 +379,10 @@ test("the log's bound is in UTF-8 bytes: multibyte text can't carry the log past
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("propose refuses a working copy whose path set breaks the rules (.git, a reserved name, a case collision), with nothing written", async () => {
+test("propose refuses a working copy whose path set breaks the rules (.git, a reserved name, a colon), with nothing written", async () => {
   const cases = [["dotgit", (w) => { mkdirSync(join(w, ".git")); writeFileSync(join(w, ".git", "config"), "x"); }], ["dotgit-deep", (w) => { mkdirSync(join(w, "sub", ".GIT"), { recursive: true }); writeFileSync(join(w, "sub", ".GIT", "x"), "x"); }],
     ["reserved", (w) => writeFileSync(join(w, "CON.txt"), "x")], ["reserved-nul", (w) => writeFileSync(join(w, "nul"), "x")], ["trailing-dot", (w) => writeFileSync(join(w, "a."), "x")],
-    ["case", (w) => { writeFileSync(join(w, "X.txt"), "1"); writeFileSync(join(w, "x.txt"), "2"); }], ["colon", (w) => writeFileSync(join(w, "a:b"), "x")]];
+    ["colon", (w) => writeFileSync(join(w, "a:b"), "x")]];
   for (const [name, plant] of cases) {
     const { root, dir } = fresh();
     const s = store(root);
@@ -399,6 +399,45 @@ test("propose refuses a working copy whose path set breaks the rules (.git, a re
     assert.equal(spawnSync("git", [`--git-dir=${s.gitdir(task)}`, "count-objects", "-v"], { encoding: "utf8" }).stdout, before.objects, `${name}: no object written`);
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// (whether `dir`'s volume tells names apart by case: a probe file written in one case, looked for in the other)
+function caseSensitive(dir) {
+  const probe = `.sb-Case-Probe-${Math.random().toString(36).slice(2, 10)}`;
+  writeFileSync(join(dir, probe), "");
+  try { return !existsSync(join(dir, probe.toLowerCase())); } finally { unlinkSync(join(dir, probe)); }
+}
+
+test("two names that differ only in case, in the working copy: refused where the task's volume can hold both; where it can't (one entry, the second write replacing the first), that one file is proposed with the final bytes", async () => {
+  const { root, dir } = fresh();
+  const s = store(root);
+  const { task } = start(s);
+  const w = s.work(task);
+  writeFileSync(join(w, "a.ipynb"), NB2);
+  writeFileSync(join(w, "X.txt"), "1");
+  writeFileSync(join(w, "x.txt"), "2");
+  if (caseSensitive(w)) {
+    const before = { seq: s.state(task).seq, objects: spawnSync("git", [`--git-dir=${s.gitdir(task)}`, "count-objects", "-v"], { encoding: "utf8" }).stdout };
+    await assert.rejects(s.propose(task), (e) => e.code === "bad_request" && /path that can't be proposed/.test(e.message));
+    const t = s.state(task);
+    assert.equal(t.status, "working");
+    assert.deepEqual(t.proposals, []);
+    assert.equal(t.seq, before.seq, "no event");
+    assert.equal(readRef(s.gitdir(task), "refs/heads/proposal"), null);
+    assert.equal(spawnSync("git", [`--git-dir=${s.gitdir(task)}`, "count-objects", "-v"], { encoding: "utf8" }).stdout, before.objects, "no object written");
+  } else {
+    // (a case-insensitive volume, macOS's default: the copy holds one entry, named as first written, with the second
+    //  write's bytes; there is no collision to refuse, and that one file is what is proposed)
+    const entries = fs.readdirSync(w).filter((n) => n.toLowerCase() === "x.txt");
+    assert.equal(entries.length, 1, `one entry: ${entries}`);
+    assert.equal(readFileSync(join(w, entries[0]), "utf8"), "2");
+    const [prop] = await s.propose(task);
+    const commit = prop.event.commit;
+    assert.deepEqual(s.diff({ task, commit }).files.filter((f) => f.path.toLowerCase() === "x.txt").map((f) => [f.path, f.change]), [[entries[0], "added"]]);
+    assert.equal(git(s.dir(task), "show", `${commit}:${entries[0]}`).stdout, "2");
+    assert.equal(s.file({ task, commit, path: entries[0] }).content, "2");
+  }
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test("a proposal whose event would be over the per-event bound is refused before anything is recorded; no stub event", async () => {

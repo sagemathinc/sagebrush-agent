@@ -363,3 +363,25 @@ test("the log's bound is in UTF-8 bytes: multibyte text can't carry the log past
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("propose refuses a working copy whose path set breaks the rules (.git, a reserved name, a case collision), with nothing written", async () => {
+  const cases = [["dotgit", (w) => { mkdirSync(join(w, ".git")); writeFileSync(join(w, ".git", "config"), "x"); }], ["dotgit-deep", (w) => { mkdirSync(join(w, "sub", ".GIT"), { recursive: true }); writeFileSync(join(w, "sub", ".GIT", "x"), "x"); }],
+    ["reserved", (w) => writeFileSync(join(w, "CON.txt"), "x")], ["reserved-nul", (w) => writeFileSync(join(w, "nul"), "x")], ["trailing-dot", (w) => writeFileSync(join(w, "a."), "x")],
+    ["case", (w) => { writeFileSync(join(w, "X.txt"), "1"); writeFileSync(join(w, "x.txt"), "2"); }], ["colon", (w) => writeFileSync(join(w, "a:b"), "x")]];
+  for (const [name, plant] of cases) {
+    const { root, dir } = fresh();
+    const s = store(root);
+    const { task } = start(s);
+    writeFileSync(join(s.work(task), "a.ipynb"), NB2);
+    plant(s.work(task));
+    const before = { seq: s.state(task).seq, objects: spawnSync("git", [`--git-dir=${s.gitdir(task)}`, "count-objects", "-v"], { encoding: "utf8" }).stdout };
+    await assert.rejects(s.propose(task), (e) => e.code === "bad_request" && /path that can't be proposed/.test(e.message), name);
+    const t = s.state(task);
+    assert.equal(t.status, "working", name);
+    assert.deepEqual(t.proposals, [], name);
+    assert.equal(t.seq, before.seq, `${name}: no event`);
+    assert.equal(readRef(s.gitdir(task), "refs/heads/proposal"), null, name);
+    assert.equal(spawnSync("git", [`--git-dir=${s.gitdir(task)}`, "count-objects", "-v"], { encoding: "utf8" }).stdout, before.objects, `${name}: no object written`);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+

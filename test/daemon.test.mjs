@@ -446,6 +446,9 @@ test("the command line: when the page goes away, a fresh one-time link is printe
     const p3 = page(first.port);
     await p3.open;
     const old = await p3.hello({ code: second.code });
+    // (the page's dialog reads "wrong or expired code" to say a code is spent (web/workspace/agent-ui.ts): that part of the
+    //  wording is a contract, pinned here exactly)
+    assert.equal(old.error?.data?.message, "a wrong or expired code: use the newest link sagebrush-agent printed in its terminal");
     assert.ok(old.error && /use the newest link sagebrush-agent printed/.test(old.error.data.message) && !/start sagebrush-agent again/.test(old.error.data.message), "the second link's code, replaced by the third, is refused, with where a new one comes from");
     const p4 = page(first.port);
     await p4.open;

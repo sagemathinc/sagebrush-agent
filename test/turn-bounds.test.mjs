@@ -6,13 +6,26 @@ import { test } from "node:test";
 import { conformTurnEvent, cut, pageId, split } from "../lib/turn-bounds.mjs";
 import { eventProblem } from "../lib/tasks.mjs";
 
-// ---- the page's check, re-implemented from web/workspace/tasks-schema.ts
+// ---- the page's check, ported line for line from web/workspace/tasks-schema.ts (TURN, turnEvent and their helpers:
+// keys, isObj, text, wellFormed, idStr, oneOf, int); each refusal throws, as the page's TaskShapeError does
+const bad = (m) => { throw new Error(m); };
+const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
+function keys(v, want, what, optional = []) {
+  if (!isObj(v)) return bad(`${what} isn't an object`);
+  for (const k of Object.keys(v)) if (!want.includes(k) && !optional.includes(k)) bad(`${what}: unknown field ${JSON.stringify(k.slice(0, 40))}`);
+  for (const k of want) if (!Object.hasOwn(v, k)) bad(`${what}: missing ${k}`);
+  return v;
+}
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+const wellFormed = (v, what) => (LONE_SURROGATE.test(v) || v.includes("\u0000") ? bad(`${what} isn't well-formed text`) : v);
+const text = (v, max, what) => (typeof v === "string" && Buffer.byteLength(v) <= max ? wellFormed(v, what) : bad(`${what} isn't text of at most ${max} bytes`));
+const int = (v, min, what) => (typeof v === "number" && Number.isSafeInteger(v) && v >= min ? v : bad(`${what} isn't an integer of at least ${min}`));
 const SHORT = 400, ID = 128, BIG = 4 * 2 ** 20, TEXT = 192 * 1024;
-const NOT_WELL = /\u0000|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
-const T = (max) => (v) => typeof v === "string" && Buffer.byteLength(v) <= max && !NOT_WELL.test(v);
-const I = (v) => typeof v === "string" && v.length >= 1 && v.length <= ID && /^[\x21-\x7e]+$/.test(v);
-const N = (v) => Number.isSafeInteger(v) && v >= 0;
-const oneOf = (set) => (v) => set.includes(v);
+const idStr = (v, what) => (typeof v === "string" && v.length >= 1 && v.length <= ID && /^[\x21-\x7e]+$/.test(v) ? v : bad(`${what} isn't an id`));
+const oneOf = (v, set, what) => (set.includes(v) ? v : bad(`${what} isn't one of ${set.join(", ")}`));
+const T = (max) => (v, what) => text(v, max, what);
+const N = (v, what) => int(v, 0, what);
+const I = idStr;
 const PAGE_TURN = {
   turn_started: [{}, {}],
   turn_state: [{ state: T(SHORT) }, {}],
@@ -22,23 +35,41 @@ const PAGE_TURN = {
   thinking_delta: [{ text: T(TEXT) }, {}],
   tool_call_started: [{ call: I, tool: T(SHORT) }, { name: T(SHORT), summary: T(SHORT) }],
   tool_output: [{ call: I, text: T(TEXT) }, {}],
-  tool_call_finished: [{ call: I, status: T(SHORT), duration_ms: N }, { summary: T(SHORT), body: T(BIG), body_cut: (v) => v === true, diff: () => true }],
-  attention: [{ id: I, kind: T(SHORT), state: oneOf(["open", "approved", "denied"]), title: T(SHORT) }, { summary: T(SHORT), detail: T(64 * 1024), instance: I }],
-  artifact: [{ id: I, kind: oneOf(["markdown", "code", "diff", "notebook", "board"]), title: T(SHORT), body: T(BIG) }, { lang: T(64), path: T(1024) }],
-  turn_usage: [{ usage: (v) => !!v && N(v.input_tokens) && N(v.output_tokens) && Object.keys(v).length === 2 }, {}],
+  tool_call_finished: [
+    { call: I, status: T(SHORT), duration_ms: N },
+    {
+      summary: T(SHORT), body: T(BIG), body_cut: (v, w) => (v === true ? v : bad(`${w} isn't true`)),
+      diff: (v, w) => { const o = keys(v, ["path", "before", "after"], w); return { path: text(o.path, 1024, `${w}.path`), before: text(o.before, BIG, `${w}.before`), after: text(o.after, BIG, `${w}.after`) }; },
+    },
+  ],
+  attention: [{ id: I, kind: T(SHORT), state: (v, w) => oneOf(v, ["open", "approved", "denied"], w), title: T(SHORT) }, { summary: T(SHORT), detail: T(64 * 1024), instance: I }],
+  artifact: [{ id: I, kind: (v, w) => oneOf(v, ["markdown", "code", "diff", "notebook", "board"], w), title: T(SHORT), body: T(BIG) }, { lang: T(64), path: T(1024) }],
+  turn_usage: [{ usage: (v, w) => { const o = keys(v, ["input_tokens", "output_tokens"], w); return { input_tokens: int(o.input_tokens, 0, `${w}.input_tokens`), output_tokens: int(o.output_tokens, 0, `${w}.output_tokens`) }; } }, {}],
   turn_info: [{}, { model: T(SHORT), effort: T(64) }],
   turn_error: [{ code: T(64), message: T(64 * 1024) }, {}],
-  turn_finished: [{ outcome: oneOf(["completed", "interrupted", "error"]) }, { code: T(64) }],
+  turn_finished: [{ outcome: (v, w) => oneOf(v, ["completed", "interrupted", "error"], w) }, { code: T(64) }],
 };
-function pageAccepts(e) {
-  const k = PAGE_TURN[e.type];
-  if (!k) return false;
-  const [req, opt] = k;
-  for (const key of Object.keys(e)) if (key !== "type" && !(key in req) && !(key in opt) && key !== "turn_id") return false;
-  for (const [key, f] of Object.entries(req)) if (!(key in e) || !f(e[key])) return false;
-  for (const [key, f] of Object.entries(opt)) if (key in e && !f(e[key])) return false;
-  return e.turn_id === undefined || I(e.turn_id);
+function turnEvent(v, what) {
+  const [req, opt] = PAGE_TURN[v.type];
+  const o = keys(v, ["type", ...Object.keys(req)], what, [...Object.keys(opt), "turn_id"]);
+  const out = { type: o.type };
+  for (const [k, f] of Object.entries(req)) out[k] = f(o[k], `${what}.${k}`);
+  for (const [k, f] of Object.entries(opt)) if (o[k] !== undefined) out[k] = f(o[k], `${what}.${k}`);
+  if (o.turn_id !== undefined) out.turn_id = idStr(o.turn_id, `${what}.turn_id`);
+  return out;
 }
+const pageAccepts = (e) => { if (!isObj(e) || !Object.hasOwn(PAGE_TURN, e.type)) return false; try { turnEvent(e, "event"); return true; } catch { return false; } };
+
+test("the copied check is the page's own, not a looser one: a tool call's diff is a closed {path, before, after} of bounded, well-formed text; usage is a closed pair", () => {
+  const fin = (diff) => ({ type: "tool_call_finished", call: "c1", status: "ok", duration_ms: 1, diff });
+  for (const diff of [null, "oops", {}, { path: "p", before: "a", after: "b", extra: true }, { path: "p", before: "a" }, { path: "p", before: "a", after: 42 }, { path: "p\u0000", before: "a", after: "b" }]) {
+    assert.equal(pageAccepts(fin(diff)), false, JSON.stringify(diff));
+  }
+  assert.equal(pageAccepts(fin({ path: "p", before: "a", after: "b" })), true);
+  assert.equal(pageAccepts({ type: "turn_usage", usage: { input_tokens: 1, output_tokens: 2, extra: 3 } }), false);
+  assert.equal(pageAccepts({ type: "turn_usage", usage: Object.create({ input_tokens: 1, output_tokens: 2 }) }), false);
+  assert.equal(pageAccepts({ type: "turn_usage", usage: { input_tokens: 1, output_tokens: 2 } }), true);
+});
 
 const long = (n, ch = "é") => ch.repeat(n);
 const wide = "日本語".repeat(70000); // (3-byte characters: about 615 KB)

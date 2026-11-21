@@ -247,3 +247,14 @@ test("a task failed while its records were checked stays failed and unserved aft
   assert.throws(() => s.get({ task: c.task, after: 0 }), (e) => e.code === "conflict");
   done(c);
 });
+
+test("H2 quota, one live store: a task's copy grown after its start is counted at the next admission, not a stale size", () => {
+  const budget = { task: 512 * 2 ** 20, work: 256 * 2 ** 20, files: 2000, log: 16 * 2 ** 20, event: 256 * 1024, tasks: 64, total: 3 * 2 ** 20, reserve: 2 ** 20 };
+  const dir = mkdtempSync(join(tmpdir(), "sb-rec-")), root = join(dir, "tasks");
+  const s = new TaskStore({ root, scope: "probe", budget }).init();
+  const tiny = (name) => s.start(checkRequest("tasks.start", { title: "t", prompt: "", target: "local", run: false, docs: [{ path: `${name}.txt`, kind: "file", content: "x" }] }));
+  const a = tiny("a").task;
+  writeFileSync(join(s.work(a), "large.txt"), "x".repeat(1500 * 1024));
+  assert.throws(() => tiny("b"), (e) => e.code === "busy");
+  rmSync(dir, { recursive: true, force: true });
+});

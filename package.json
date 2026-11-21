@@ -36,6 +36,10 @@
     "lib/task-turns.mjs",
     "lib/task-rpc.mjs",
     "lib/installation.mjs",
+    "lib/task-runner.mjs",
+    "lib/runner-fetch.mjs",
+    "lib/runner-pin.json",
+    "lib/tzdata/",
     "README.md",
     "npm-shrinkwrap.json"
   ],

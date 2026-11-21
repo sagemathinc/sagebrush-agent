@@ -3,7 +3,7 @@
 // left lib/turn-info.mjs out, so the installed agent couldn't start). Checked against `npm pack --dry-run`'s own list.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, join, relative, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,7 +39,10 @@ test("package: every file the bin reaches is in the published package (npm pack 
   const out = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
   const packed = new Set(out[0].files.map((f) => f.path));
   const need = [...reachable(relative(root, join(root, pkg.bin["sagebrush-agent"])))];
-  const missing = need.filter((f) => !packed.has(f));
+  // (a folder a module reads by its URL ("./tzdata/zoneinfo/"): every file under it on disk must be packed)
+  const under = (d) => readdirSync(join(root, d), { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? under(`${d}${e.name}/`) : [`${d}${e.name}`]));
+  const missing = need.flatMap((f) => (f.endsWith("/") ? under(f) : [f])).filter((f) => !packed.has(f));
   assert.deepEqual(missing, [], `not in the package: ${missing.join(", ")}`);
   assert.ok(need.includes("lib/turn-info.mjs") && need.includes("lib/server.mjs"), `the walk reaches the modules (${need.length} files)`);
+  assert.ok(need.includes("lib/tzdata/zoneinfo/") && under("lib/tzdata/zoneinfo/").length === 598, "the runner's zone data, every file");
 });

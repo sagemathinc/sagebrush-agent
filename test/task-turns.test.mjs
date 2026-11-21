@@ -112,7 +112,7 @@ test("the tools stay in the copy and its rules: running code is refused for now;
   const finished = h.store.get({ task, after: 0 }).events.filter((e) => e.event.type === "tool_call_finished").map((e) => [e.event.status, e.event.body]);
   assert.equal(finished.length, 7);
   for (const [status, body] of finished) assert.equal(status, "error", body);
-  assert.match(finished[0][1], /running code isn't available/);
+  assert.match(finished[0][1], /Running code isn't available for Delegate on this computer: runs are turned off in this version/);
   assert.ok(!existsSync(join(h.dir, "tasks", "escape.txt")));
   h.done();
 });

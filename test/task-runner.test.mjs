@@ -428,3 +428,81 @@ test("the measure and the watch skip an entry that goes between its listing and 
     assert.match(store.runTreesProblem(task, 20000), /EACCES|can't/);
   } finally { fs.lstatSync = lstat; syncBuiltinESMExports(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("at load, a run whose process can't be told apart (its /proc entry unreadable): never taken as ended; the task left as it is, its record kept", async () => {
+  const { procStart } = await import("../lib/proc-start.mjs");
+  const f = deadAgentFixture();
+  const snap = await f.s.snapshotWork(f.task);
+  writeFileSync(join(f.s.work(f.task), "a.txt"), "RUN STILL ACTIVE");
+  const p = sleeper();
+  const read = fs.readFileSync;
+  try {
+    await until(() => procStart(p.pid), "the stand-in started");
+    f.s.writeRunRecord(f.task, { v: 1, tmp: "run-0123456789ab", snapshot: snap, pid: p.pid, start: procStart(p.pid) });
+    fs.readFileSync = function (path, ...a) { if (String(path) === `/proc/${p.pid}/stat`) throw Object.assign(new Error("EACCES"), { code: "EACCES" }); return read.call(this, path, ...a); };
+    syncBuiltinESMExports();
+    const s2 = f.open();
+    fs.readFileSync = read;
+    syncBuiltinESMExports();
+    assert.equal(s2.state(f.task).status, "failed");
+    assert.match(s2.state(f.task).reason, /may still be running \(its \/proc entry can't be read \(EACCES\)\)/);
+    assert.equal(readFileSync(join(s2.work(f.task), "a.txt"), "utf8"), "RUN STILL ACTIVE", "nothing touched");
+    assert.ok(existsSync(join(s2.dir(f.task), "run.json")));
+    assert.equal(alive(p.pid), true, "not signalled");
+  } finally { fs.readFileSync = read; syncBuiltinESMExports(); stopOwn(p.pid); rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test("procInfo: gone only on a definite no-such-process; an unreadable or unparsable entry is unknown, never gone", async () => {
+  const { procInfo } = await import("../lib/proc-start.mjs");
+  const c = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" });
+  assert.deepEqual(procInfo(Number(c.stdout), "linux"), { gone: true }, "a process that has exited and been reaped");
+  const me = procInfo(process.pid, "linux");
+  assert.match(me.start, /^linux:\d+$/);
+  assert.equal(me.pgid > 0, true);
+  const read = fs.readFileSync;
+  try {
+    for (const [code, body] of [["EACCES", null], ["EIO", null], [null, "garbage without fields"]]) {
+      fs.readFileSync = function (path, ...a) { if (String(path) === `/proc/${process.pid}/stat`) { if (code) throw Object.assign(new Error(code), { code }); return body; } return read.call(this, path, ...a); };
+      syncBuiltinESMExports();
+      const r = procInfo(process.pid, "linux");
+      assert.ok(r.unknown && !r.gone, `${code ?? "unparsable"}: ${JSON.stringify(r)}`);
+    }
+  } finally { fs.readFileSync = read; syncBuiltinESMExports(); }
+  assert.ok(procInfo(1, "linux").unknown, "pid 1 is never ours to judge");
+});
+
+test("the run's identity can't be recorded once it has started (an EIO): the run doesn't go on: its group killed, waited for, its changes undone, reported failed", T, async () => {
+  const h = setup({ mode: "hang", limits: { marginMs: 2000 } });
+  const write = h.store.writeRunRecord.bind(h.store);
+  h.store.writeRunRecord = (task, rec) => { if (rec.pid !== null) throw Object.assign(new Error("EIO"), { code: "EIO" }); return write(task, rec); };
+  // (a short wall bound: a run that went on regardless would end by it, with another reason)
+  await assert.rejects(h.runner.run(h.task, "nb dir/a.ipynb", { timeoutS: 1 }), (e) => e.code === "unavailable" && /the run failed: couldn't record the run; its changes were undone/.test(e.message));
+  const g = existsSync(join(h.fake, "grandchild")) ? Number(readFileSync(join(h.fake, "grandchild"), "utf8")) : null;
+  if (g) await until(() => !alive(g), "the run's group gone", 3000);
+  assert.equal(existsSync(join(h.store.work(h.task), "partial.txt")), false, "undone");
+  assert.equal(existsSync(join(h.store.dir(h.task), "run.json")), false, "settled: no record left");
+  h.done();
+});
+
+test("at load, a run recorded only before its start (the agent died between spawning it and recording it): unknown: failed, untouched, nothing signalled; deleting the task's folder discards it", async () => {
+  const f = deadAgentFixture();
+  const snap = await f.s.snapshotWork(f.task);
+  writeFileSync(join(f.s.work(f.task), "a.txt"), "MAYBE A RUN'S");
+  mkdirSync(join(f.s.runTmpRoot(f.task), "run-0123456789ab"));
+  f.s.writeRunRecord(f.task, { v: 1, tmp: "run-0123456789ab", snapshot: snap, pid: null, start: null });
+  const signals = [];
+  const s2 = f.open({ signal: (...a) => signals.push(a) });
+  assert.equal(s2.state(f.task).status, "failed");
+  assert.match(s2.state(f.task).reason, /may have started.*delete the task's folder/);
+  assert.equal(readFileSync(join(s2.work(f.task), "a.txt"), "utf8"), "MAYBE A RUN'S", "not put back");
+  assert.ok(existsSync(join(s2.runTmpRoot(f.task), "run-0123456789ab")), "its tmp kept");
+  assert.ok(existsSync(join(s2.dir(f.task), "run.json")));
+  assert.deepEqual(signals, []);
+  await assert.rejects(s2.resume({ task: f.task }), (e) => e.code === "final");
+  // (the person's way out: the task's folder deleted; the next start doesn't know it, and signals nothing)
+  rmSync(s2.dir(f.task), { recursive: true, force: true });
+  const s3 = f.open({ signal: (...a) => signals.push(a) });
+  assert.equal(s3.list().tasks.some((t) => t.task === f.task), false);
+  assert.deepEqual(signals, []);
+  rmSync(f.dir, { recursive: true, force: true });
+});

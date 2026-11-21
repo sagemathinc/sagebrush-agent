@@ -127,7 +127,7 @@ Sagebrush agent: Claude on this computer, waiting for your Sagebrush page.
   Open:  ${page}?pair=${code}&port=${p}
   (or enter code ${code} and port ${p} in the page)
 
-The code works once, for 5 minutes; press Enter here for a new one. Claude uses your own
+The code works once, for 5 minutes${process.stdin.isTTY ? "; press Enter here for a new one" : ""}. Claude uses your own
 Claude login, and only the workspace files you allow in the page. Press Ctrl+C to stop
 (this run's conversation transcripts are deleted then).
 `);
@@ -141,13 +141,18 @@ ${why} To connect a page, open:
   ${page}?pair=${c}&port=${p}
   (or enter code ${c} and port ${p} in the page)
 
-The code works once, for 5 minutes; press Enter here for a new one. A page that reconnects by itself doesn't need it.
+The code works once, for 5 minutes${process.stdin.isTTY ? "; press Enter here for a new one" : ""}. A page that reconnects by itself doesn't need it.
 `);
 };
-server.onPageGone = () => fresh("The page disconnected; Claude's turns go on.");
+// (not while stopping: closing the page's socket on the way out is no page going away)
+server.onPageGone = () => { if (!server.closing) fresh("The page disconnected; Claude's turns go on."); };
 if (process.stdin.isTTY) {
+  // (run in the background (&), a terminal read would stop the process with SIGTTIN: ignored, so the read fails
+  //  instead, and that failure is ignored too; the turns go on)
+  process.on("SIGTTIN", () => {});
+  process.stdin.on("error", () => {});
   process.stdin.setEncoding("utf8");
-  process.stdin.on("data", (d) => { if (/\n/.test(d)) fresh("A new link."); });
+  process.stdin.on("data", (d) => { if (/\n/.test(d) && !server.closing) fresh("A new link."); });
 }
 const stop = async () => {
   console.error("stopping: deleting this run's transcripts ...");

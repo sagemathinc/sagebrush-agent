@@ -282,6 +282,8 @@ test("two sockets let in before either hello: only the first to pair counts", as
   assert.ok(h.result.session);
   const r = await b.hello({ session: h.result.session });
   assert.equal(r.error.data.code, "refused");
+  // (said as another page, never as a wrong or spent code (A5): the page then waits for the other page, not a new code)
+  assert.equal(r.error.data.message, "another page is paired with this agent");
   await b.closed;
   a.ws.close();
   await server.close();
@@ -439,14 +441,25 @@ test("the command line: when the page goes away, a fresh one-time link is printe
     assert.ok((await p2.hello({ session })).result, "the session reconnects");
     p2.ws.close();
     await until(() => links().length >= 3, 10000);
-    // the newest code pairs a page; a spent one doesn't
+    // the newest code pairs a page; an earlier printed code, replaced by a newer one, doesn't, and its refusal says where
+    // a new code comes from, never a restart
     const p3 = page(first.port);
     await p3.open;
-    assert.ok((await p3.hello({ code: first.code })).error, "the first, spent code is refused");
+    const old = await p3.hello({ code: second.code });
+    assert.ok(old.error && /press Enter in sagebrush-agent's terminal for a new one/.test(old.error.data.message) && !/start sagebrush-agent again/.test(old.error.data.message), "the second link's code, replaced by the third, is refused, with where a new one comes from");
     const p4 = page(first.port);
     await p4.open;
     assert.ok((await p4.hello({ code: links().at(-1).code })).result, "the newest code pairs");
+    // another page while one is paired: refused at the upgrade (409), before any code is looked at
+    const p5 = page(first.port);
+    const r5 = await p5.open.then(() => "open", (e) => String(e?.message ?? e));
+    assert.match(r5, /409/, "a second page while one is paired: refused (409)");
     p4.ws.close();
+    // stopping: no new link is printed for the page's socket closing on the way out
+    const n = links().length;
+    c.kill("SIGTERM");
+    await new Promise((r) => c.once("exit", r));
+    assert.equal(links().length, n, "stopping prints no new link");
   } finally {
     c.kill("SIGKILL");
   }

@@ -138,7 +138,7 @@ test("E12 (helper): with such a page, write_notebook only creates: an existing p
 });
 
 test("A2 (0.7.8): a new notebook that runs once by itself in the page says so in the answer, so it isn't run a second time", async () => {
-  const say = /runs once by itself in the page now: read it back with workspace_read for its outputs .*don't run it again unless you need to/;
+  const say = /runs once by itself there now: read it back with workspace_read for its outputs .*before running it yourself/;
   for (const [name, grant, features, want] of [
     ["everything and May run code, a page that edits by cell", { folders: ["/"], write: true, run: true, expires: null }, true, true],
     ["everything and May run code, a page without notebook.edit", { folders: ["/"], write: true, run: true, expires: null }, false, true],
@@ -150,7 +150,7 @@ test("A2 (0.7.8): a new notebook that runs once by itself in the page says so in
       const made = await p.tools().handlers.workspace_write_notebook({ path: "/m.ipynb", mode: "python", cells: [{ type: "code", source: "x" }] });
       assert.equal(made.isError, undefined, name);
       assert.equal(made.content.some((c) => say.test(c.text)), want, name);
-      const refused = await p.tools().handlers.workspace_write_notebook({ path: "/n.ipynb", mode: "python", cells: [{ type: "code", source: "x" }], ...(features ? {} : {}) });
+      const refused = await p.tools().handlers.workspace_write_notebook({ path: "/n.ipynb", mode: "python", cells: [{ type: "code", source: "x" }] });
       assert.ok(!refused.content.some((c) => say.test(c.text)), name + ": never on a refusal");
     } finally { await p.close(); }
   }

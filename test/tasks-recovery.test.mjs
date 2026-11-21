@@ -9,7 +9,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync,
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TaskStore } from "../lib/tasks.mjs";
+import { TaskStore, canonical } from "../lib/tasks.mjs";
 import { checkRequest } from "../lib/tasks-schema.mjs";
 import * as git from "../lib/task-git.mjs";
 
@@ -21,7 +21,7 @@ function fresh() {
   const { task } = s.start(checkRequest("tasks.start", { title: "test", prompt: "", target: "local", run: false, docs: [{ path: "a.txt", kind: "file", content: "base" }] }));
   return { dir, root, s, task, tdir: s.dir(task), state: join(s.dir(task), "task.json"), log: join(s.dir(task), "log.jsonl") };
 }
-const edit = (c, f) => { const t = JSON.parse(readFileSync(c.state, "utf8")); f(t); writeFileSync(c.state, JSON.stringify(t)); };
+const edit = (c, f) => { const t = JSON.parse(readFileSync(c.state, "utf8")); f(t); writeFileSync(c.state, canonical(t)); };
 const done = (c) => rmSync(c.dir, { recursive: true, force: true });
 const failedKept = (c, s) => {
   assert.equal(s.state(c.task).status, "failed");
@@ -94,7 +94,7 @@ test("H3: the log is checked whole: a bad event, a repeated or skipped seq, unkn
   };
   for (const [name, line] of Object.entries(lines)) {
     const c = fresh();
-    writeFileSync(c.log, readFileSync(c.log, "utf8") + JSON.stringify(line) + "\n");
+    writeFileSync(c.log, readFileSync(c.log, "utf8") + canonical(line) + "\n");
     const s = open(c.root);
     assert.equal(s.state(c.task).status, "failed", name);
     assert.throws(() => s.get({ task: c.task, after: 0 }), (e) => e.code === "conflict", name);
@@ -116,7 +116,7 @@ test("H3: an interrupted operation whose events were only partly logged is compl
   edit(c, (x) => { x.intent = intent; });
   git.casRef(gd, intent.ref, intent.expect, intent.next);
   // (the first event logged, the second torn)
-  writeFileSync(c.log, readFileSync(c.log, "utf8") + JSON.stringify({ seq: 2, at: new Date().toISOString(), event: intent.events[0], intent: intent.id }) + '\n{"seq":3');
+  writeFileSync(c.log, readFileSync(c.log, "utf8") + canonical({ seq: 2, at: new Date().toISOString(), event: intent.events[0], intent: intent.id }) + '\n{"seq":3');
   const s = open(c.root);
   assert.equal(s.state(c.task).status, "proposal");
   const evs = s.get({ task: c.task, after: 0 }).events;
@@ -161,4 +161,89 @@ test("H5: a short write is continued, no progress is an error with nothing ackno
     syncBuiltinESMExports();
     try { await assert.rejects(c.s.stop({ task: c.task }), /EIO/); } finally { fs.fsyncSync = fsync; syncBuiltinESMExports(); }
     done(c); }
+});
+
+test("H2 quota: a broken task's storage still counts, measured from disk; a task whose storage can't be measured blocks new starts", () => {
+  const budget = { task: 512 * 2 ** 20, work: 256 * 2 ** 20, files: 2000, log: 16 * 2 ** 20, event: 256 * 1024, tasks: 64, total: 2 * 2 ** 20, reserve: 1024 };
+  const big = "x".repeat(1100 * 1024);
+  const startBig = (s) => s.start(checkRequest("tasks.start", { title: "t", prompt: "", target: "local", run: false, docs: [{ path: "a.txt", kind: "file", content: big }] }));
+  // (one task, then its task.json made unreadable: reopened, it is broken, yet its folder still counts)
+  { const dir = mkdtempSync(join(tmpdir(), "sb-rec-")), root = join(dir, "tasks");
+    let s = new TaskStore({ root, scope: "probe", budget }).init();
+    const { task } = startBig(s);
+    writeFileSync(join(s.dir(task), "task.json"), "{");
+    s = new TaskStore({ root, scope: "probe", budget }).init();
+    assert.equal(s.state(task).status, "failed");
+    assert.throws(() => startBig(s), (e) => e.code === "busy");
+    rmSync(dir, { recursive: true, force: true }); }
+  // (a kept task whose folder can't be read: its use is unknown, so nothing new is admitted)
+  { const dir = mkdtempSync(join(tmpdir(), "sb-rec-")), root = join(dir, "tasks");
+    let s = new TaskStore({ root, scope: "probe", budget }).init();
+    const { task } = s.start(checkRequest("tasks.start", { title: "t", prompt: "", target: "local", run: false, docs: [{ path: "a.txt", kind: "file", content: "a" }] }));
+    fs.chmodSync(join(s.dir(task), "work"), 0o000);
+    try {
+      s = new TaskStore({ root, scope: "probe", budget }).init();
+      assert.throws(() => s.start(checkRequest("tasks.start", { title: "t", prompt: "", target: "local", run: false, docs: [{ path: "b.txt", kind: "file", content: "b" }] })), (e) => e.code === "busy" && /can't be measured/.test(e.message));
+    } finally { fs.chmodSync(join(s.dir(task), "work"), 0o700); }
+    rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("H3: every logged proposal is exactly its commit's, rebuilt from git: a changed round number or a changed file entry fails the task", async () => {
+  for (const tamper of [(ev) => { ev.round = 999; }, (ev) => { ev.files[0].change = "added"; }]) {
+    const c = fresh();
+    await withProposal(c);
+    const lines = readFileSync(c.log, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    const k = lines.findIndex((l) => l.event.type === "proposal");
+    tamper(lines[k].event);
+    writeFileSync(c.log, lines.map((l) => canonical(l)).join("\n") + "\n");
+    const s = open(c.root);
+    assert.equal(s.state(c.task).status, "failed");
+    assert.match(s.state(c.task).reason, /round 1's event isn't its commit's/);
+    // (and nothing is served from its records: no event list carrying the changed event, no diff, no file)
+    assert.throws(() => s.get({ task: c.task, after: 0 }), (e) => e.code === "conflict");
+    assert.throws(() => s.diff({ task: c.task, commit: JSON.parse(readFileSync(c.state, "utf8")).proposals[0] }), (e) => e.code === "conflict");
+    done(c);
+  }
+});
+
+test("H3: a record that isn't in the exact form the store writes (a repeated key, reordered keys, extra spacing) isn't one of its records", () => {
+  // (in the log)
+  for (const bad of [(l) => l.replace('"seq":1', '"seq":1,"seq":1'), (l) => l.replace("{", "{ "), (l) => { const o = JSON.parse(l); return JSON.stringify({ seq: o.seq, at: o.at, event: o.event }); }]) {
+    const c = fresh();
+    const [first, ...rest] = readFileSync(c.log, "utf8").split("\n");
+    writeFileSync(c.log, [bad(first), ...rest].join("\n"));
+    const s = open(c.root);
+    assert.equal(s.state(c.task).status, "failed");
+    done(c);
+  }
+  // (in task.json: a repeated key)
+  { const c = fresh(); const raw = readFileSync(c.state, "utf8"); writeFileSync(c.state, raw.replace('"title":"test"', '"title":"test","title":"other"'));
+    const s = open(c.root); assert.equal(s.state(c.task).status, "failed"); done(c); }
+});
+
+test("H4: an objects fan-out folder that is a link isn't read through; a FIFO at task.json doesn't stall the store", async () => {
+  { const c = fresh(); const gd = join(c.tdir, "git"); const base = readFileSync(join(gd, "refs", "heads", "base"), "utf8").trim();
+    const fan = join(gd, "objects", base.slice(0, 2)), moved = join(c.dir, "fan-outside");
+    renameSync(fan, moved); symlinkSync(moved, fan);
+    const s = open(c.root); assert.equal(s.state(c.task).status, "failed"); done(c); }
+  { const c = fresh(); unlinkSync(c.state);
+    const { spawnSync } = await import("node:child_process");
+    spawnSync("mkfifo", [c.state]);
+    const t0 = Date.now(); const s = open(c.root);
+    assert.ok(Date.now() - t0 < 5000);
+    assert.equal(s.state(c.task).status, "failed"); done(c); }
+});
+
+test("a task failed while its records were checked stays failed and unserved after another restart, its state file still its schema's", async () => {
+  const c = fresh();
+  await withProposal(c);
+  const lines = readFileSync(c.log, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  lines.find((l) => l.event.type === "proposal").event.round = 999;
+  writeFileSync(c.log, lines.map((l) => canonical(l)).join("\n") + "\n");
+  open(c.root);
+  const s = open(c.root);
+  assert.equal(s.state(c.task).status, "failed");
+  assert.ok(!Object.hasOwn(JSON.parse(readFileSync(c.state, "utf8")), "unserved"));
+  assert.throws(() => s.get({ task: c.task, after: 0 }), (e) => e.code === "conflict");
+  done(c);
 });

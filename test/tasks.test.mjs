@@ -9,7 +9,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { chmodSync, existsSync, linkSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TaskStore, buildIntent } from "../lib/tasks.mjs";
+import { TaskStore, buildIntent, canonical } from "../lib/tasks.mjs";
 import { checkRequest, TaskError } from "../lib/tasks-schema.mjs";
 import { blobId, casRef, readRef, RefConflict } from "../lib/task-git.mjs";
 import { pathProblem, pathSetProblem } from "../lib/task-paths.mjs";
@@ -183,7 +183,7 @@ test("recovery: an intent whose ref moved is finished; one whose ref didn't is d
     const logPath = join(s.dir(task), "log.jsonl");
     writeFileSync(logPath, readFileSync(logPath, "utf8").split("\n")[0] + "\n");
     state.seq = 1;
-    writeFileSync(join(s.dir(task), "task.json"), JSON.stringify(state));
+    writeFileSync(join(s.dir(task), "task.json"), canonical(state));
     const refPath = join(s.gitdir(task), "refs/heads/proposal");
     if (kase === "not-moved") { unlinkSync(refPath); unlinkSync(join(s.gitdir(task), "refs/tags/round-1")); }
     if (kase === "third") writeFileSync(refPath, t.base + "\n");
@@ -202,7 +202,7 @@ test("recovery: a grant edited in task.json doesn't match the base commit's, and
   const { task } = start(s);
   const p = join(s.dir(task), "task.json"), st = JSON.parse(readFileSync(p, "utf8"));
   st.grant.run = true;
-  writeFileSync(p, JSON.stringify(st));
+  writeFileSync(p, canonical(st));
   s = store(root);
   assert.equal(s.state(task).status, "failed");
   assert.match(s.state(task).reason, /grant doesn't match/);
@@ -429,7 +429,7 @@ test("recovery: a widened grant can't be smuggled in through a proposal's summar
   const p = join(s.dir(task), "task.json"), st = JSON.parse(readFileSync(p, "utf8"));
   st.base = ev.event.commit;
   st.grant = { ...wide, revoked: false };
-  writeFileSync(p, JSON.stringify(st));
+  writeFileSync(p, canonical(st));
   s = store(root);
   const t = s.state(task);
   assert.equal(t.status, "failed");
@@ -449,7 +449,7 @@ test("recovery: the base must be a root commit, and the grant its message's own 
     writeFileSync(join(s.gitdir(task), "refs/heads/base"), ev.event.commit + "\n");
     const p = join(s.dir(task), "task.json"), st = JSON.parse(readFileSync(p, "utf8"));
     st.base = ev.event.commit;
-    writeFileSync(p, JSON.stringify(st));
+    writeFileSync(p, canonical(st));
     s = store(root);
     assert.equal(s.state(task).status, "failed");
     assert.match(s.state(task).reason, /isn't the task's first commit/);
@@ -476,7 +476,7 @@ test("what the store sends is well-formed text: a file with NUL comes as base64,
   // (a failure whose cause carries a NUL: the reason sent is scrubbed)
   const p = join(s.dir(task), "task.json"), st = JSON.parse(readFileSync(p, "utf8"));
   st.grant.run = true;
-  writeFileSync(p, JSON.stringify(st));
+  writeFileSync(p, canonical(st));
   writeFileSync(join(s.gitdir(task), "refs/heads/base"), "zz\u0000\n");
   s = store(root);
   const reason = s.state(task).reason;
@@ -491,7 +491,7 @@ test("recovery: an edited intent can't widen the grant, or change anything its o
   const { task } = start(s);
   const p = join(s.dir(task), "task.json"), st = JSON.parse(readFileSync(p, "utf8"));
   st.intent = { id: "b".repeat(32), events: [{ type: "task_status", status: "interrupted" }], set: { status: "interrupted", grant: { ...st.grant, run: true, docs: ["a.ipynb", "extra.txt"] } } };
-  writeFileSync(p, JSON.stringify(st));
+  writeFileSync(p, canonical(st));
   s = store(root);
   let t = s.state(task);
   assert.equal(t.status, "failed");
@@ -510,7 +510,7 @@ test("recovery: an edited intent can't widen the grant, or change anything its o
     const { task: k } = start(s2);
     const p2 = join(s2.dir(k), "task.json"), x = JSON.parse(readFileSync(p2, "utf8"));
     x.intent = tamper(x);
-    writeFileSync(p2, JSON.stringify(x));
+    writeFileSync(p2, canonical(x));
     s2 = store(r2);
     assert.equal(s2.state(k).status, "failed", JSON.stringify(x.intent).slice(0, 120));
     rmSync(d2, { recursive: true, force: true });
@@ -528,7 +528,7 @@ test("the grant is read only from the base commit's final trailer: a grant line 
   const p = join(s.dir(task), "task.json"), st = JSON.parse(readFileSync(p, "utf8"));
   assert.equal(st.grant.created, created, "the clock the control assumes");
   st.grant = { ...wide, revoked: false };
-  writeFileSync(p, JSON.stringify(st));
+  writeFileSync(p, canonical(st));
   s = store(root);
   assert.equal(s.state(task).status, "failed");
   assert.match(s.state(task).reason, /grant doesn't match/);
@@ -557,7 +557,7 @@ test("the final trailer itself must be the exact closed record, canonical: anyth
     writeFileSync(join(gd, "refs/heads/base"), c + "\n");
     const p = join(s.dir(task), "task.json"), st = JSON.parse(readFileSync(p, "utf8"));
     st.base = c;
-    writeFileSync(p, JSON.stringify(st));
+    writeFileSync(p, canonical(st));
     s = store(root);
     assert.equal(s.state(task).status, "failed", make(g).slice(0, 60));
     rmSync(dir, { recursive: true, force: true });
@@ -592,7 +592,7 @@ test("recovery: an intent is applied only if it is exactly what its operation wr
       receipt: buildIntent(gd, x, "receipt", "d".repeat(32), { merge_id: "7".repeat(32), hash: "8".repeat(64), files: [{ path: "a.ipynb", proposal_blob: blobId(Buffer.from(NB2)), mine: "not sent", merged: "absent" }] }),
     };
     x.intent = tamper(x, c);
-    writeFileSync(p, JSON.stringify(x));
+    writeFileSync(p, canonical(x));
     s = store(root);
     const t = s.state(task);
     assert.equal(t.status, "failed", name);
@@ -610,7 +610,7 @@ test("recovery: a genuine receipt intent, interrupted, is finished exactly as wr
   await s.propose(task);
   const p = join(s.dir(task), "task.json"), x = JSON.parse(readFileSync(p, "utf8"));
   x.intent = buildIntent(s.gitdir(task), x, "receipt", "9".repeat(32), { merge_id: "7".repeat(32), hash: "8".repeat(64), files: [{ path: "a.ipynb", proposal_blob: blobId(Buffer.from(NB2)), mine: "not sent", merged: "absent" }] });
-  writeFileSync(p, JSON.stringify(x));
+  writeFileSync(p, canonical(x));
   s = store(root);
   const t = s.state(task);
   assert.equal(t.status, "merged");

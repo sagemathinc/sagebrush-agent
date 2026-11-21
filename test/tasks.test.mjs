@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { TaskStore, buildIntent, canonical } from "../lib/tasks.mjs";
 import { checkRequest, TaskError } from "../lib/tasks-schema.mjs";
 import { blobId, casRef, readRef, RefConflict } from "../lib/task-git.mjs";
-import { pathProblem, pathSetProblem } from "../lib/task-paths.mjs";
+import { nameKey, pathProblem, pathSetProblem } from "../lib/task-paths.mjs";
 
 const NB = JSON.stringify({ cells: [{ cell_type: "code", id: "a", metadata: {}, source: "x = 1", outputs: [], execution_count: null }], metadata: { sagebrush: { seed: "0".repeat(64) } }, nbformat: 4, nbformat_minor: 5 });
 const NB2 = NB.replace("x = 1", "x = 2");
@@ -272,6 +272,34 @@ test("the schema: closed objects, the value rules, the bounds", () => {
   assert.ok(checkRequest("tasks.start", { ...ok, docs: [{ path: "a.txt", kind: "file", content: { base64: Buffer.from("a\u0000b").toString("base64") } }] }));
   assert.ok(pathSetProblem(["A.txt", "a.txt"]));
   assert.ok(pathSetProblem(["a", "a/b"]));
+});
+
+test("one name, as a volume that ignores case and Unicode form sees it: NFC, then full case folding; such twins are refused wherever a path set is checked", async () => {
+  // (the same name: é composed and decomposed (APFS treats them as one), with case on top, "ß" and "SS", the final
+  //  sigma, the Kelvin sign and "k", a folded ".git")
+  const twins = [["caf\u00e9.txt", "cafe\u0301.txt"], ["CAF\u00c9.txt", "cafe\u0301.TXT"], ["stra\u00dfe.md", "STRASSE.md"], ["\u039f\u0394\u039f\u03a3", "\u03bf\u03b4\u03bf\u03c3"], ["\u212a.txt", "k.txt"], ["\ufb01le.txt", "FILE.txt"]];
+  for (const [a, b] of twins) {
+    assert.equal(nameKey(a), nameKey(b), `${a} and ${b}: one key`);
+    assert.match(pathSetProblem([a, b]) ?? "", /two paths name the same file, ignoring case and Unicode form/, `${a} and ${b}`);
+  }
+  // (a folder and a file, in different forms of one name)
+  assert.match(pathSetProblem(["caf\u00e9/a.txt", "cafe\u0301"]) ?? "", /a path is also another's folder/);
+  assert.match(pathSetProblem(["CAFE\u0301/a.txt", "caf\u00e9/b.txt", "Caf\u00e9"]) ?? "", /a path is also another's folder/);
+  // (.git in any case or form is still refused; other names stay apart)
+  assert.ok(pathProblem("sub/.GIT/x"));
+  assert.equal(pathSetProblem(["caf\u00e9.txt", "cafe.txt", "a/b.txt", "a/c.txt", "\u00e9t\u00e9/x.md"]), null);
+  // (inbound: a task's documents with two forms of one name are refused before anything is made)
+  const doc = (path) => ({ path, kind: "file", content: "x" });
+  assert.throws(() => checkRequest("tasks.start", { title: "t", prompt: "p", target: "local", run: false, docs: [doc("caf\u00e9.txt"), doc("CAFE\u0301.txt")] }), (e) => e.code === "bad_request" && /same file/.test(e.message));
+  // (in a turn: a write whose name is another form of a file already in the copy is refused, nothing written)
+  const { root, dir } = fresh();
+  const s = store(root);
+  const { task } = start(s);
+  await s.writeWork(task, "caf\u00e9.txt", Buffer.from("one"));
+  await assert.rejects(s.writeWork(task, "CAFE\u0301.txt", Buffer.from("two")), (e) => e.code === "bad_request" && /same file/.test(e.message));
+  assert.deepEqual(fs.readdirSync(s.work(task)).filter((n) => nameKey(n) === nameKey("caf\u00e9.txt")), ["caf\u00e9.txt"]);
+  assert.equal(readFileSync(join(s.work(task), "caf\u00e9.txt"), "utf8"), "one");
+  rmSync(dir, { recursive: true, force: true });
 });
 
 // (a crash at the k-th durable rename of an operation: fs.renameSync throws right after the rename has happened)

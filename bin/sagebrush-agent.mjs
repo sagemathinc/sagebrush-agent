@@ -115,12 +115,17 @@ const server = new AgentServer({ port, origins, query, deleteSession });
 server.createServer = createServer;
 // Delegate tasks (design/workspace-agent-protocol.md §6), over this loopback pairing only: on where the tasks folder
 // (~/.sagebrush/tasks) can be used, else off, saying why.  The page shows Delegate only under the person's own switch.
-try {
+// (with the fake model, for tests: only in the folder SAGEBRUSH_TASKS_HOME names, else off; never the real home)
+const fakeHome = process.env.SAGEBRUSH_AGENT_FAKE === "1" ? process.env.SAGEBRUSH_TASKS_HOME || null : undefined;
+if (fakeHome !== null) try {
   const { TaskStore } = await import("../lib/tasks.mjs");
-  const { TaskTurns } = await import("../lib/task-turns.mjs");
+  const { TaskTurns, claudeProjects } = await import("../lib/task-turns.mjs");
   const { TaskRpc } = await import("../lib/task-rpc.mjs");
   const { installationId } = await import("../lib/installation.mjs");
-  const store = new TaskStore({ scope: installationId() }).init();
+  const { join } = await import("node:path");
+  const store = fakeHome
+    ? new TaskStore({ root: join(fakeHome, ".sagebrush", "tasks"), scope: installationId(fakeHome), transcripts: claudeProjects({ CLAUDE_CONFIG_DIR: join(fakeHome, ".claude") }) }).init()
+    : new TaskStore({ scope: installationId(), transcripts: claudeProjects() }).init();
   const turns = new TaskTurns({ store, query, createServer, log: (m) => console.error(m) });
   server.setTasks({ store, turns, rpc: new TaskRpc({ store, turns }) });
 } catch (e) {

@@ -2,12 +2,14 @@
 // work/ only, through the store; scripted with a fake model that calls the real tool handlers, as the SDK would.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskStore } from "../lib/tasks.mjs";
 import { TaskTurns, TASK_SERVER } from "../lib/task-turns.mjs";
 import { checkRequest } from "../lib/tasks-schema.mjs";
+import { blobId } from "../lib/task-git.mjs";
+import { TaskRpc } from "../lib/task-rpc.mjs";
 import { fakeCreateServer } from "../lib/fake.mjs";
 
 const NB = JSON.stringify({ cells: [{ cell_type: "code", id: "a", metadata: {}, source: "x = 1", outputs: [], execution_count: null }], metadata: {}, nbformat: 4, nbformat_minor: 5 });
@@ -36,11 +38,11 @@ function scripted(steps, seen = []) {
     })();
   };
 }
-function setup({ steps, limits } = {}) {
+function setup({ steps, limits, free } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "sb-turns-"));
-  const store = new TaskStore({ root: join(dir, "tasks"), scope: "install-1" }).init();
+  const store = new TaskStore({ root: join(dir, "tasks"), scope: "install-1", transcripts: join(dir, "projects") }).init();
   const seen = [];
-  const turns = new TaskTurns({ store, query: scripted(steps ?? [], seen), createServer: fakeCreateServer, ...(limits ? { limits } : {}) });
+  const turns = new TaskTurns({ store, query: scripted(steps ?? [], seen), createServer: fakeCreateServer, ...(limits ? { limits } : {}), ...(free ? { free } : {}) });
   const start = () => store.start(checkRequest("tasks.start", { title: "Make x two", prompt: "x should be 2", target: "local", run: false, docs: [{ path: "a.ipynb", kind: "notebook", content: NB }] })).task;
   const types = (task) => store.get({ task, after: 0 }).events.map((e) => e.event.type);
   return { dir, store, turns, seen, start, types, done: () => rmSync(dir, { recursive: true, force: true }) };
@@ -142,6 +144,113 @@ test("a stop is bounded: a model that ignores the abort can't hold it; the task 
   await h.turns.stop(task);
   assert.ok(Date.now() - t0 < 2000);
   assert.deepEqual(await h.store.stop({ task }), { status: "interrupted" });
+  h.done();
+});
+
+// (a transcript of `n` bytes where the SDK would keep this task's)
+const transcript = (store, task, n) => { const d = store.transcriptDir(task); mkdirSync(d, { recursive: true }); writeFileSync(join(d, "s.jsonl"), Buffer.alloc(n, 0x61)); return d; };
+
+test("the transcript: in the folder Claude Code names after the task's sdk/, counted in the task's use, deleted at Merge, Close and revoke, and at load for a task already final", async () => {
+  const h = setup({ steps: [["workspace_write_notebook", { path: "a.ipynb", mode: "python", cells: [{ type: "code", source: "x = 2" }] }], ["propose", { summary: "x is two" }]] });
+  const [m, c, r] = [h.start(), h.start(), h.start()];
+  assert.equal(h.store.transcriptDir(m), join(h.dir, "projects", h.store.sdk(m).replace(/[^A-Za-z0-9]/g, "-")));
+  const before = h.store.usage(m);
+  const dm = transcript(h.store, m, 5000), dc = transcript(h.store, c, 10), dr = transcript(h.store, r, 10);
+  assert.equal(h.store.usage(m), before + 5000);
+  h.turns.begin(m, "start");
+  await until(() => h.store.state(m).status === "proposal" && !h.turns.isRunning(m), "the proposal");
+  const t = h.store.state(m), commit = t.proposals[0], bytes = h.store.file({ task: m, commit, path: "a.ipynb" }).content;
+  await h.store.merged(checkRequest("tasks.merged", { task: m, proposal: commit, seq: t.seq, merge_id: "7".repeat(32), files: [{ path: "a.ipynb", kind: "notebook", proposal_blob: blobId(Buffer.from(bytes)), mine: { blob: blobId(Buffer.from(NB)), content: NB }, merged: { blob: blobId(Buffer.from(bytes)), content: bytes } }] }));
+  assert.equal(existsSync(dm), false, "merged");
+  await h.store.close(checkRequest("tasks.close", { task: c, seq: h.store.state(c).seq, proposal: null }));
+  assert.equal(existsSync(dc), false, "closed");
+  await h.store.revoke(checkRequest("tasks.revoke", { task: r }));
+  assert.equal(existsSync(dr), false, "revoked");
+  // (one written after the task was final, as a crash between the two would leave it: deleted when the store loads)
+  transcript(h.store, c, 10);
+  new TaskStore({ root: join(h.dir, "tasks"), scope: "install-1", transcripts: join(h.dir, "projects") }).init();
+  assert.equal(existsSync(h.store.transcriptDir(c)), false, "at load");
+  h.done();
+});
+
+test("a link where the transcript goes is never followed or deleted: the task's use can't be measured, so nothing new is admitted", async () => {
+  const h = setup();
+  const task = h.start();
+  const outside = join(h.dir, "outside");
+  mkdirSync(outside);
+  writeFileSync(join(outside, "keep"), "k");
+  mkdirSync(join(h.dir, "projects"), { recursive: true });
+  symlinkSync(outside, h.store.transcriptDir(task));
+  assert.equal(h.store.usage(task), null);
+  assert.throws(() => h.turns.admit(task), (e) => e.code === "busy");
+  await h.store.close(checkRequest("tasks.close", { task, seq: h.store.state(task).seq, proposal: null }));
+  assert.ok(existsSync(join(outside, "keep")));
+  assert.ok(existsSync(h.store.transcriptDir(task)));
+  h.done();
+});
+
+test("a transcript growing past its bound mid-turn: the turn is interrupted then, not after, saying why", async () => {
+  let grew = false;
+  const h = setup({ limits: { transcript: 4096, pollMs: 20 }, steps: [async (o) => {
+    transcript(h.store, o.cwd.split("/").at(-2), 8192);
+    grew = true;
+    await new Promise((r) => o.abortController.signal.addEventListener("abort", r));
+  }, ["propose", { summary: "never" }]] });
+  const task = h.start();
+  h.turns.begin(task, "start");
+  await until(() => h.store.state(task).status === "interrupted", "interrupted");
+  assert.ok(grew);
+  assert.match(h.store.state(task).reason, /transcript passed/);
+  assert.equal(h.store.state(task).proposals.length, 0);
+  h.done();
+});
+
+test("free disk: start, Ask and Resume refused busy (nothing recorded) without the remaining budget plus headroom; a turn stops when free space falls below the headroom", async () => {
+  let free = 0;
+  const h = setup({ free: () => free, limits: { pollMs: 20 }, steps: [async (o) => {
+    free = 1024; // (the disk fills while the turn runs)
+    await new Promise((r) => o.abortController.signal.addEventListener("abort", r));
+  }] });
+  const rpc = new TaskRpc({ store: h.store, turns: h.turns });
+  const startReq = { title: "t", prompt: "p", target: "local", run: false, docs: [{ path: "a.ipynb", kind: "notebook", content: NB }] };
+  await assert.rejects(rpc.call("tasks.start", startReq), (e) => e.code === "busy" && /free disk space/.test(e.message));
+  assert.equal(h.store.list().tasks.length, 0);
+  free = 2 * 1024 ** 3;
+  const { task } = await rpc.call("tasks.start", startReq);
+  await until(() => h.store.state(task).status === "interrupted", "interrupted");
+  assert.match(h.store.state(task).reason, /disk is almost full/);
+  const seq = h.store.state(task).seq;
+  await assert.rejects(rpc.call("tasks.resume", { task }), (e) => e.code === "busy");
+  assert.equal(h.store.state(task).status, "interrupted");
+  assert.equal(h.store.state(task).seq, seq);
+  h.done();
+});
+
+test("free disk: an Ask is refused busy, nothing recorded, when the disk is short; the proposal stays as it was", async () => {
+  let free = 2 * 1024 ** 3;
+  const h = setup({ free: () => free, steps: [["propose", { summary: "s" }]] });
+  const rpc = new TaskRpc({ store: h.store, turns: h.turns });
+  const task = h.start();
+  h.turns.begin(task, "start");
+  await until(() => h.store.state(task).status === "proposal" && !h.turns.isRunning(task), "the proposal");
+  const t = h.store.state(task);
+  free = 0;
+  await assert.rejects(rpc.call("tasks.ask", { task, proposal: t.proposals[0], seq: t.seq, note: "more", current: [] }), (e) => e.code === "busy");
+  assert.deepEqual(h.store.state(task), t);
+  h.done();
+});
+
+test("each tool call checks the task first: once the task isn't working, a call is refused and changes nothing", async () => {
+  let result;
+  const h = setup({ steps: [async () => { await h.store.stop({ task: h.task }); }, async (o) => {
+    result = await o.mcpServers[TASK_SERVER].handlers.workspace_write({ path: "late.txt", text: "x" });
+  }] });
+  h.task = h.start();
+  h.turns.begin(h.task, "start");
+  await until(() => result !== undefined, "the late call");
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /turn is over/);
+  assert.equal(existsSync(join(h.store.work(h.task), "late.txt")), false);
   h.done();
 });
 

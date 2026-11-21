@@ -43,6 +43,22 @@ Options: `--port N` (default: a free port) and `--origin ORIGIN` (another allowe
 
 Press Ctrl+C to stop.
 
+## Delegate: a task Claude works on with the page closed
+
+Delegate works over the loopback address only, and only while the page's grant has Delegate on (the person's own switch). The page hands Claude a task: a title, what to do, and a copy of the documents chosen for it. Claude works on that copy on this computer, with no page and no workspace calls. The person can close the tab and come back later.
+- **Where a task lives:** in `~/.sagebrush/tasks/<id>/`, a private folder (0700). Inside are the copy (`work/`), its history as a local git repository (`git/`, read it with `git --git-dir=<id>/git --work-tree=<id>/work log --all`), the task's events and its state. The task's grant, fixed when it starts, is recorded in its first commit. `~/.sagebrush/installation` holds this computer's id, which each task's grant is tied to. Delegate isn't available on Windows yet.
+- **What Claude can do:** list, read and write the files of its copy (`workspace_list`, `workspace_read`, `workspace_write`, `workspace_write_notebook`), then propose it (`propose`). Nothing else: no shell, no files of this computer, no web, no settings, and no tool but these. Running code isn't available for delegated tasks yet: `notebook_run` refuses and says so.
+- **What the person does, in the page:** see the proposal as a difference from what Claude started with, then Merge it, Close the task, or Ask for changes (Claude works again on the same copy). Stop ends Claude's turn; Resume carries on an interrupted task; Revoke closes it for good. The merge is done in the page: the agent only records what the page reports. Claude never merges, closes or answers for the person.
+- **A turn that ends without a proposal** leaves the task interrupted, with the reason. So does stopping the agent, or turning Delegate off: a task that was working is interrupted, not closed, and only a Resume carries it on.
+- **Limits:**
+  - at most 4 tasks working at once (more wait, at most 16), each turn at most 24 hours;
+  - each task at most 512 MB on disk, of which the copy is at most 256 MB and 2,000 files, the event log at most 16 MB, and Claude's transcript at most 64 MB;
+  - at most 64 tasks and 4 GB in all.
+  - A start, an Ask or a Resume is refused while the disk has less free than the task's remaining room plus 64 MB.
+  - While a turn runs, its transcript, the task's size and the free space are checked every half second. A turn past a limit is interrupted then, with the reason. Between two checks a turn can write a little past a limit: the 64 MB of free space kept is for that.
+- **What is kept on disk:** the SDK keeps each task's transcript under `~/.claude/projects/`, in the folder named after the task's `sdk/` folder. It is deleted when the task is merged or closed. The task's own folder stays until you delete it.
+- **What leaves your computer:** the task's conversation goes to Anthropic through the SDK, as with any Claude session. That includes the files of the copy that Claude reads. Nothing else goes anywhere.
+
 ## With `sagebrush remote`
 
 `sagebrush remote --serve-agents --agent-cmd "npx -y <the tarball's URL> --stdio"` runs it as the runner's child. The page reaches it through the runner, one message per line on stdin and stdout, so it listens on no port and prints no link.
@@ -68,6 +84,6 @@ Press Ctrl+C to stop.
 - If Codex stops (or doesn't end a reply within 10 seconds of a Stop), the next message starts a new Codex conversation, which doesn't remember the earlier replies.
 - What leaves the computer: the conversation, and what Codex reads, goes to the model provider in their Codex settings (OpenAI unless they changed it), as with any Codex session.
 
-In both modes, at most 4 chats run at once (a fifth waits its turn) and at most 16 messages wait; a seventeenth is refused, and the page says so. `SAGEBRUSH_AGENT_FAKE=1`, set where you start it, runs a scripted fake model instead of Claude, for tests.
+In both modes, at most 4 chats run at once (a fifth waits its turn) and at most 16 messages wait; a seventeenth is refused, and the page says so. `SAGEBRUSH_AGENT_FAKE=1`, set where you start it, runs a scripted fake model instead of Claude, for tests. With it, Delegate keeps its tasks only under the folder `SAGEBRUSH_TASKS_HOME` names, and is off without it.
 
 Release: the tarball is published at an immutable, versioned URL with its SHA-256; a change means a new version and a new review.

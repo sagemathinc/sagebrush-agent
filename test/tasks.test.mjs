@@ -179,9 +179,13 @@ test("recovery: an intent whose ref moved is finished; one whose ref didn't is d
     state.status = "working";
     state.proposals = [];
     state.intent = buildIntent(s.gitdir(task), state, "propose", "1".repeat(32), { commit });
+    // (the log rewound with it: only the start's event, as it was when the intent was written)
+    const logPath = join(s.dir(task), "log.jsonl");
+    writeFileSync(logPath, readFileSync(logPath, "utf8").split("\n")[0] + "\n");
+    state.seq = 1;
     writeFileSync(join(s.dir(task), "task.json"), JSON.stringify(state));
     const refPath = join(s.gitdir(task), "refs/heads/proposal");
-    if (kase === "not-moved") unlinkSync(refPath);
+    if (kase === "not-moved") { unlinkSync(refPath); unlinkSync(join(s.gitdir(task), "refs/tags/round-1")); }
     if (kase === "third") writeFileSync(refPath, t.base + "\n");
     s = store(root);
     const after = s.state(task);
@@ -211,10 +215,17 @@ test("the tasks folder: refused when it is open to others or a link; a start tha
   chmodSync(root, 0o755);
   assert.throws(() => store(root), err("unavailable"));
   chmodSync(root, 0o700);
-  const half = join(root, "a".repeat(32));
+  // (a start never finished is in .staging/, and only that is removed; a task folder whose state can't be read is
+  //  kept, failed, never deleted)
+  const half = join(root, ".staging", "a".repeat(32));
   mkdirSync(half, { mode: 0o700 });
-  store(root);
+  const unreadable = join(root, "b".repeat(32));
+  mkdirSync(join(unreadable, "work"), { mode: 0o700, recursive: true });
+  writeFileSync(join(unreadable, "work", "keep.txt"), "keep");
+  const s2 = store(root);
   assert.ok(!existsSync(half));
+  assert.equal(readFileSync(join(unreadable, "work", "keep.txt"), "utf8"), "keep");
+  assert.equal(s2.state("b".repeat(32)).status, "failed");
   const link = join(dir, "linked");
   symlinkSync(root, link);
   assert.throws(() => store(link), err("unavailable"));

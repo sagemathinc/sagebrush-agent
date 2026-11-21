@@ -30,7 +30,7 @@ test("a task end to end through frames: start, the scripted proposal, diff, file
   assert.match(f.result.content, /Proposed by the stand-in agent/);
   const m = await host.handle(req("tasks.merged", { task: s.result.task, proposal: prop.commit, seq: g.result.task.seq, merge_id: "9".repeat(32), files: [{ path: "a.ipynb", kind: "notebook", proposal_blob: f.result.blob, mine: { blob: blobId(Buffer.from(NB)), content: NB }, merged: { blob: f.result.blob, content: f.result.content } }] }));
   assert.equal(m.result.recorded, "merge");
-  assert.deepEqual(seen, ["task_status", "proposal", "task_status", "merged", "task_status"]);
+  assert.deepEqual(seen, ["task_status", "proposal", "task_status", "task_status"]);
   rmSync(dir, { recursive: true, force: true });
 });
 

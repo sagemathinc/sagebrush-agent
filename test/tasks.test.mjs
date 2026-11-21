@@ -4,6 +4,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { chmodSync, existsSync, linkSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -249,3 +251,109 @@ test("the schema: closed objects, the value rules, the bounds", () => {
   assert.ok(pathSetProblem(["A.txt", "a.txt"]));
   assert.ok(pathSetProblem(["a", "a/b"]));
 });
+
+// (a crash at the k-th durable rename of an operation: fs.renameSync throws right after the rename has happened)
+async function crashAt(k, f) {
+  const rename = fs.renameSync;
+  let n = 0;
+  fs.renameSync = function (a, b) { const v = rename(a, b); if (++n === k) throw new Error(`simulated crash after rename ${k} (${b.split("/").slice(-2).join("/")})`); return v; };
+  syncBuiltinESMExports();
+  try { await f(); return false; } catch (e) { if (!/simulated crash/.test(e.message)) throw e; return true; } finally { fs.renameSync = rename; syncBuiltinESMExports(); }
+}
+
+test("merged: a crash after each durable step, then a restart and the identical retry: always merged, both refs, one answer", async () => {
+  let crashed = 0;
+  for (let k = 1; ; k++) {
+    const { root, dir } = fresh();
+    let s = store(root);
+    const { task } = start(s);
+    writeFileSync(join(s.work(task), "a.ipynb"), NB2);
+    const [prop] = await s.propose(task);
+    const req = checkRequest("tasks.merged", { task, proposal: prop.event.commit, seq: s.state(task).seq, merge_id: "4".repeat(32), files: [{ path: "a.ipynb", kind: "notebook", proposal_blob: blobId(Buffer.from(NB2)), mine: { blob: blobId(Buffer.from(NB)), content: NB }, merged: { blob: blobId(Buffer.from(NB2)), content: NB2 } }] });
+    const hit = await crashAt(k, () => s.merged(req));
+    if (!hit) { rmSync(dir, { recursive: true, force: true }); break; }
+    crashed++;
+    s = store(root);
+    const answer = await s.merged(req);
+    assert.equal(answer.recorded, "merge", `crash ${k}`);
+    const t = s.state(task);
+    assert.equal(t.status, "merged", `crash ${k}`);
+    assert.equal(readRef(s.gitdir(task), "refs/heads/merged"), answer.commit, `crash ${k}`);
+    assert.equal(readRef(s.gitdir(task), "refs/heads/mine-1"), t.mines[0], `crash ${k}`);
+    assert.deepEqual(await s.merged(req), answer, `crash ${k}: the retry's answer again`);
+    assert.equal(git(s.dir(task), "fsck", "--strict").status, 0);
+    rmSync(dir, { recursive: true, force: true });
+  }
+  assert.ok(crashed >= 4, `crashed at ${crashed} steps`);
+});
+
+test("propose and ask: a crash after each durable step, then a restart: the round is whole or absent, never half", async () => {
+  for (const op of ["propose", "ask"]) {
+    let crashed = 0;
+    for (let k = 1; ; k++) {
+      const { root, dir } = fresh();
+      let s = store(root);
+      const { task } = start(s);
+      writeFileSync(join(s.work(task), "a.ipynb"), NB2);
+      let prop;
+      if (op === "ask") [prop] = await s.propose(task);
+      const run = op === "propose" ? () => s.propose(task) : () => s.ask(checkRequest("tasks.ask", { task, proposal: prop.event.commit, seq: s.state(task).seq, note: "n", current: [{ path: "a.ipynb", kind: "notebook", content: NB }] }));
+      const hit = await crashAt(k, run);
+      if (!hit) { rmSync(dir, { recursive: true, force: true }); break; }
+      crashed++;
+      s = store(root);
+      const t = s.state(task), gd = s.gitdir(task);
+      if (op === "propose") {
+        const ref = readRef(gd, "refs/heads/proposal");
+        assert.ok((ref === null && t.proposals.length === 0) || (ref === t.proposals[0] && readRef(gd, "refs/tags/round-1") === ref), `propose crash ${k}`);
+      } else {
+        const ref = readRef(gd, "refs/heads/mine-1");
+        assert.ok((ref === null && t.mines.length === 0 && t.status === "proposal") || (ref === t.mines[0] && t.status !== "proposal"), `ask crash ${k}: ${t.status} ${ref}`);
+      }
+      assert.equal(t.intent, null);
+      rmSync(dir, { recursive: true, force: true });
+    }
+    assert.ok(crashed >= 3, `${op}: crashed at ${crashed} steps`);
+  }
+});
+
+
+test("every event the store logs is one of §6.1's (task_status, proposal), with exactly its fields", async () => {
+  const SHAPES = { task_status: [["type", "status"], ["type", "status", "reason"]], proposal: [["type", "round", "base", "commit", "files"]] };
+  const { root, dir } = fresh();
+  const s = store(root);
+  const seen = [];
+  s.onEvent((e) => seen.push(e.event));
+  const one = start(s), two = start(s);
+  for (const { task } of [one, two]) writeFileSync(join(s.work(task), "a.ipynb"), NB2);
+  const [p1] = await s.propose(one.task);
+  await s.ask(checkRequest("tasks.ask", { task: one.task, proposal: p1.event.commit, seq: s.state(one.task).seq, note: "n", current: [{ path: "a.ipynb", kind: "notebook", content: NB }] }));
+  const [p1b] = await s.propose(one.task);
+  const pb = blobId(Buffer.from(NB2));
+  await s.merged(checkRequest("tasks.merged", { task: one.task, proposal: p1b.event.commit, seq: s.state(one.task).seq, merge_id: "5".repeat(32), files: [{ path: "a.ipynb", kind: "notebook", proposal_blob: pb, mine: { blob: blobId(Buffer.from(NB)), content: NB }, merged: { blob: pb, content: NB2 } }] }));
+  const [p2] = await s.propose(two.task);
+  await s.merged(checkRequest("tasks.merged", { task: two.task, proposal: p2.event.commit, seq: s.state(two.task).seq, merge_id: "6".repeat(32), files: [{ path: "a.ipynb", kind: "notebook", proposal_blob: pb, mine: null, merged: { absent: true } }] }));
+  for (const e of seen) {
+    const shapes = SHAPES[e.type];
+    assert.ok(shapes, `an event type outside §6.1: ${e.type}`);
+    assert.ok(shapes.some((k) => JSON.stringify(Object.keys(e).sort()) === JSON.stringify([...k].sort())), `${e.type}: fields ${Object.keys(e)}`);
+  }
+  for (const t of ["task_status", "proposal"]) assert.ok(seen.some((e) => e.type === t), t);
+  // (a receipt is kept in the task's control state, and the Ask's note in its mine commit: neither is an event)
+  const receipt = s.state(two.task).receipt;
+  assert.deepEqual(Object.keys(receipt.files[0]).sort(), ["merged", "mine", "path", "proposal_blob"]);
+  assert.deepEqual([receipt.files[0].mine, receipt.files[0].merged], ["not sent", "absent"]);
+  assert.match(git(s.dir(one.task), "log", "-1", "--format=%B", "refs/heads/mine-1").stdout, /\n\nn\n/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("the log's bound is in UTF-8 bytes: multibyte text can't carry the log past it", async () => {
+  const { root, dir } = fresh();
+  const s = new TaskStore({ root, scope: "install-1", now: () => (clock += 1000), budget: { task: 512 * 2 ** 20, work: 256 * 2 ** 20, files: 2000, log: 1700, event: 256 * 1024, tasks: 64, total: 4096 * 2 ** 20, reserve: 1024 } }).init();
+  const { task } = start(s);
+  for (let i = 0; i < 8; i++) writeFileSync(join(s.work(task), `${"漢".repeat(20)}${i}.txt`), "x");
+  await assert.rejects(s.propose(task), err("busy"));
+  assert.ok(readFileSync(join(s.dir(task), "log.jsonl")).length <= 1700);
+  rmSync(dir, { recursive: true, force: true });
+});
+

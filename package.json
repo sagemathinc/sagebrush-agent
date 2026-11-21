@@ -18,6 +18,7 @@
     "lib/codex.mjs",
     "lib/codex-turns.mjs",
     "lib/codex-fetch.mjs",
+    "lib/win-acl.mjs",
     "lib/codex-pin.json",
     "lib/codex-selftest.mjs",
     "lib/codex-contract.json",

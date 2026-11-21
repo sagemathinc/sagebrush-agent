@@ -319,7 +319,8 @@ test("no pin for this platform: refused before anything; the platforms and the c
   await refused(ensureCodex({ root: "/nonexistent", platform: null, pin: pinFor(GOOD) }), "codex_platform");
   await refused(ensureCodex({ root: "/nonexistent", platform: "darwin-arm64", pin: pinFor(GOOD) }), "codex_platform");
   assert.equal(platformKey("linux", "x64"), "linux-x64");
-  assert.equal(platformKey("win32", "x64"), null);
+  assert.equal(platformKey("win32", "x64"), "win32-x64");
+  assert.equal(platformKey("win32", "arm64"), null);
   assert.equal(cacheRoot({ XDG_CACHE_HOME: "/x/c" }, "linux", "/h"), "/x/c/sagebrush-agent/codex");
   assert.equal(cacheRoot({ XDG_CACHE_HOME: "relative" }, "linux", "/h"), "/h/.cache/sagebrush-agent/codex");
   assert.equal(cacheRoot({}, "darwin", "/h"), "/h/Library/Caches/sagebrush-agent/codex");

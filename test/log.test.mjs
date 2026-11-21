@@ -172,7 +172,7 @@ test("resume: live events carry their number; a page that comes back gets the me
   assert.deepEqual(live, live.map((_, i) => i + 2));
   a.ws.close();
   await a.closed;
-  await new Promise((r) => setTimeout(r, 50));
+  await until(() => server.sock === null); // (the agent has seen the page go: its close can come after the page's side)
 
   const b = page(port);
   await b.open;

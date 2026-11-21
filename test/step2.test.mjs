@@ -10,6 +10,16 @@ import { AgentServer, sameGrant, scopeOf } from "../lib/server.mjs";
 
 const ORIGIN = "https://agents.sagebrush.cloud";
 
+// (test-only timestamps, for a failure's diagnosis: what the agent logs and what the fake pages see, in order; a test
+//  that fails prints its trace)
+const trace = [];
+const t0 = performance.now();
+const mark = (what) => trace.push(`${(performance.now() - t0).toFixed(1).padStart(9)} ms  ${what}`);
+const traced = (name, fn) => test(name, async (t) => {
+  trace.length = 0;
+  try { await fn(t); } catch (e) { t.diagnostic(`trace:\n${trace.join("\n")}`); throw e; }
+});
+
 // A scripted model: its prompt is steps separated by ";": "wait NAME" (until the test opens that gate), "list"
 // (workspace_list, its outcome said as text), "run" (workspace_run_notebook), "edit" (workspace_edit_notebook, from a
 // read the test puts in the conversation), "ask" (removing a workspace file, through the permission callback, its verdict
@@ -19,7 +29,7 @@ const gate = (name) => {
   let open;
   const p = new Promise((r) => (open = r));
   gates.set(name, { p, open });
-  return () => open();
+  return () => { mark(`test: gate ${name} opened`); open(); };
 };
 function scriptedQuery({ prompt, options }) {
   const tools = options.mcpServers.sagebrush_page.handlers;
@@ -38,12 +48,15 @@ function scriptedQuery({ prompt, options }) {
     yield { type: "system", subtype: "init", session_id: `s-${Math.random().toString(36).slice(2)}`, model: "fake", tools: [] };
     for (const step of (await promptText(prompt)).split(";").map((x) => x.trim())) {
       const [cmd, arg] = step.split(" ");
+      if (cmd !== "wait") mark(`model: ${cmd}`);
       if (cmd === "wait") await Promise.race([gates.get(arg).p, aborted()]);
       else if (cmd === "list") {
         const r = await tools.workspace_list({ folder: "/" });
+        mark(`model: list -> ${r.isError ? r.content[0].text : "ok"}`);
         yield* say(`LIST ${r.isError ? r.content[0].text : "ok"}`);
       } else if (cmd === "run") {
         const r = await tools.workspace_run_notebook({ path: "/a.ipynb" });
+        mark(`model: run -> ${r.isError ? r.content[0].text : "ok"}`);
         yield* say(`RUN ${r.isError ? r.content[0].text : "ok"}`);
       } else if (cmd === "edit") {
         const r = await tools.workspace_edit_notebook({ path: "/n.ipynb", base: 3, set: [{ id: "c1", source: "x = 1" }] });
@@ -59,7 +72,7 @@ function scriptedQuery({ prompt, options }) {
 }
 
 async function start(opts = {}) {
-  const server = new AgentServer({ query: scriptedQuery, log: () => {}, ...opts });
+  const server = new AgentServer({ query: scriptedQuery, log: (m) => mark(`agent: ${m}`), ...opts });
   server.createServer = fakeCreateServer;
   const port = await server.listen();
   return { server, port, code: server.newCode() };
@@ -75,6 +88,7 @@ function page(port, { hold = false } = {}) {
     if (m.id === "p1") return onHello?.(m);
     msgs.push(m);
     if (typeof m.id === "string" && m.method) {
+      mark(`page: got ${m.method}`);
       requests.push(m);
       if (hold) return;
       ws.send(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: m.method === "workspace.list" ? { entries: [] } : {} }));
@@ -86,14 +100,14 @@ function page(port, { hold = false } = {}) {
   });
   const notify = (method, params) => ws.send(JSON.stringify({ jsonrpc: "2.0", method, params }));
   const open = new Promise((resolve, reject) => { ws.on("open", resolve); ws.on("error", reject); });
-  const closed = new Promise((resolve) => ws.on("close", resolve));
+  const closed = new Promise((resolve) => ws.on("close", () => { mark("page: its socket closed (the page's side)"); resolve(); }));
   return { ws, msgs, requests, hello, notify, open, closed };
 }
 
 const until = async (f, ms = 8000) => {
   const t = Date.now();
   while (!f()) {
-    if (Date.now() - t > ms) throw new Error("timed out");
+    if (Date.now() - t > ms) throw new Error(`timed out (${ms} ms)`);
     await new Promise((r) => setTimeout(r, 20));
   }
 };
@@ -102,6 +116,16 @@ const G1 = { folders: ["/"], write: true, run: false, expires: null, id: "grant-
 const logOf = (server, conversation) => server.logs.since(conversation, 0).events;
 const texts = (server, conversation) => logOf(server, conversation).filter((e) => e.method === "turn.event" && e.params.event.type === "text_delta").map((e) => e.params.event.text).join("");
 const finished = (server, conversation) => logOf(server, conversation).filter((e) => e.method === "turn.event" && e.params.event.type === "turn_finished").map((e) => e.params.event.outcome);
+
+// The page goes, and the agent has seen it go. The page's side of the socket closes before the agent's close handler has
+// necessarily run (macOS's order: seen on m1, a few ms apart), and a call the model makes in between still goes to that
+// page and fails as one in flight when the page goes (D4), not as a call that waits for a page.
+async function detach(a, server) {
+  a.ws.close();
+  await a.closed;
+  await until(() => server.sock === null);
+  mark("test: the agent has seen the page go");
+}
 
 async function paired(port, code, grant = G1) {
   const a = page(port);
@@ -118,7 +142,7 @@ async function again(port, session, grant = G1, opts) {
   return b;
 }
 
-test("sameGrant: the same id, and no wider; a scope is frozen at the turn's start", () => {
+traced("sameGrant: the same id, and no wider; a scope is frozen at the turn's start", () => {
   const start = scopeOf({ id: "g", folders: ["/notes"], write: false, run: false });
   assert.equal(sameGrant(start, { id: "g", folders: ["/notes"], write: false }), true);
   assert.equal(sameGrant(start, { id: "g", folders: ["/notes/sub"], write: false }), true); // (narrower)
@@ -132,19 +156,17 @@ test("sameGrant: the same id, and no wider; a scope is frozen at the turn's star
   assert.ok(Object.isFrozen(start) && Object.isFrozen(start.folders));
 });
 
-test("detached mid-turn: the turn goes on, a call waits for the page, and the page back with the same grant carries it", async () => {
+traced("detached mid-turn: the turn goes on, a call waits for the page, and the page back with the same grant carries it", async () => {
   const { server, port, code } = await start();
   const openA = gate("A1");
   const { a, session } = await paired(port, code);
   a.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "wait A1; list" });
   await until(() => server.counters().running === 1);
-  a.ws.close();
-  await a.closed;
+  await detach(a, server);
   await new Promise((r) => setTimeout(r, 100));
   assert.equal(server.counters().running, 1, "the turn goes on without a page");
   openA(); // (the model calls workspace_list now: no page holds the grant, so it waits)
-  await new Promise((r) => setTimeout(r, 150));
-  assert.equal(server.waiterCount, 1, "the call waits for a page");
+  await until(() => server.waiterCount === 1);
   const b = await again(port, session);
   await until(() => finished(server, "c1").length === 1);
   assert.deepEqual(finished(server, "c1"), ["completed"]);
@@ -155,17 +177,16 @@ test("detached mid-turn: the turn goes on, a call waits for the page, and the pa
   server.close();
 });
 
-test("the page back with another grant, a wider one, or a revoke: the turn ends, its waiting call refused", async () => {
+traced("the page back with another grant, a wider one, or a revoke: the turn ends, its waiting call refused", async () => {
   for (const [what, next] of [["another id", { ...G1, id: "grant-two" }], ["wider (run newly on)", { ...G1, run: true }], ["a revoke", {}]]) {
     const { server, port, code } = await start();
     const openA = gate("A2");
     const { a, session } = await paired(port, code, { ...G1, run: false });
     a.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "wait A2; list" });
     await until(() => server.counters().running === 1);
-    a.ws.close();
-    await a.closed;
+    await detach(a, server);
     openA();
-    await new Promise((r) => setTimeout(r, 100));
+    await until(() => server.waiterCount === 1); // (the call waits for a page before the page comes back)
     const b = await again(port, session, next);
     await until(() => finished(server, "c1").length === 1);
     assert.deepEqual(finished(server, "c1"), ["interrupted"], what);
@@ -176,14 +197,13 @@ test("the page back with another grant, a wider one, or a revoke: the turn ends,
   }
 });
 
-test("no page in time: the call is refused as the page being closed; the turn itself goes on and ends as the model says", async () => {
+traced("no page in time: the call is refused as the page being closed; the turn itself goes on and ends as the model says", async () => {
   const { server, port, code } = await start({ rebindWaitMs: 300 });
   const openA = gate("A3");
   const { a } = await paired(port, code);
   a.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "wait A3; list" });
   await until(() => server.counters().running === 1);
-  a.ws.close();
-  await a.closed;
+  await detach(a, server);
   openA();
   await until(() => finished(server, "c1").length === 1, 5000);
   assert.deepEqual(finished(server, "c1"), ["completed"]);
@@ -192,7 +212,7 @@ test("no page in time: the call is refused as the page being closed; the turn it
   server.close();
 });
 
-test("a call in flight when the page goes: it fails then, and never comes back through the next page (D4)", async () => {
+traced("a call in flight when the page goes: it fails then, and never comes back through the next page (D4)", async () => {
   const { server, port, code } = await start();
   const a = page(port, { hold: true });
   await a.open;
@@ -213,15 +233,14 @@ test("a call in flight when the page goes: it fails then, and never comes back t
   server.close();
 });
 
-test("the grant's expiry and the turn's limit end a detached turn on the agent's own clock (D2)", async () => {
+traced("the grant's expiry and the turn's limit end a detached turn on the agent's own clock (D2)", async () => {
   for (const [what, opts, grant] of [["expiry", {}, { ...G1, expires: Date.now() + 400 }], ["the turn's limit", { turnMaxMs: 400 }, G1]]) {
     const { server, port, code } = await start(opts);
     gate("A4");
     const { a } = await paired(port, code, grant);
     a.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "wait A4; list" });
     await until(() => server.counters().running === 1);
-    a.ws.close();
-    await a.closed;
+    await detach(a, server);
     await until(() => finished(server, "c1").length === 1, 5000);
     assert.deepEqual(finished(server, "c1"), ["interrupted"], what);
     assert.equal(server.links.size, 0, `${what}: the turn's link is gone`);
@@ -229,7 +248,7 @@ test("the grant's expiry and the turn's limit end a detached turn on the agent's
   }
 });
 
-test("queued messages wait while no page is there and start only under their grant (D7); another grant rejects them", async () => {
+traced("queued messages wait while no page is there and start only under their grant (D7); another grant rejects them", async () => {
   for (const [what, next, starts] of [["the same grant", G1, true], ["another grant", { ...G1, id: "grant-two" }, false]]) {
     const { server, port, code } = await start();
     const openA = gate("A5");
@@ -237,8 +256,7 @@ test("queued messages wait while no page is there and start only under their gra
     a.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "wait A5" });
     a.notify("chat.message", { conversation: "c1", id: "u2", author: "person", text: "list" });
     await until(() => server.counters().running === 1 && server.counters().queued === 1);
-    a.ws.close();
-    await a.closed;
+    await detach(a, server);
     openA();
     await until(() => finished(server, "c1").length === 1);
     await new Promise((r) => setTimeout(r, 150));
@@ -257,14 +275,13 @@ test("queued messages wait while no page is there and start only under their gra
   }
 });
 
-test("an open card across a detach: answered from the page back with the same grant (D6)", async () => {
+traced("an open card across a detach: answered from the page back with the same grant (D6)", async () => {
   const { server, port, code } = await start();
   const { a, session } = await paired(port, code);
   a.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "ask" });
   await until(() => server.permissions.size === 1);
   const [id] = [...server.permissions.keys()];
-  a.ws.close();
-  await a.closed;
+  await detach(a, server);
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(server.permissions.size, 1, "the card stays open while no page is there");
   const b = await again(port, session);
@@ -276,7 +293,7 @@ test("an open card across a detach: answered from the page back with the same gr
   server.close();
 });
 
-test("a replay names the conversation's running turn; and a turn under a grant without an id ends with its page, as before", async () => {
+traced("a replay names the conversation's running turn; and a turn under a grant without an id ends with its page, as before", async () => {
   {
     const { server, port, code } = await start();
     gate("A6");
@@ -305,14 +322,13 @@ test("a replay names the conversation's running turn; and a turn under a grant w
   }
 });
 
-test("Stop while a call waits for the page: the wait ends with the turn, nothing left waiting", async () => {
+traced("Stop while a call waits for the page: the wait ends with the turn, nothing left waiting", async () => {
   const { server, port, code } = await start();
   const openA = gate("A8");
   const { a, session } = await paired(port, code);
   a.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "wait A8; list" });
   await until(() => server.counters().running === 1);
-  a.ws.close();
-  await a.closed;
+  await detach(a, server);
   openA();
   await until(() => server.waiterCount === 1);
   // (the person's Stop, from a page that paired again without its grant yet: Stop is the paired page's to send)
@@ -326,14 +342,13 @@ test("Stop while a call waits for the page: the wait ends with the turn, nothing
   server.close();
 });
 
-test("a card asked while no page is there: it waits in the log, and the page back with the grant answers it", async () => {
+traced("a card asked while no page is there: it waits in the log, and the page back with the grant answers it", async () => {
   const { server, port, code } = await start();
   const openA = gate("A9");
   const { a, session } = await paired(port, code);
   a.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "wait A9; ask" });
   await until(() => server.counters().running === 1);
-  a.ws.close();
-  await a.closed;
+  await detach(a, server);
   openA();
   await until(() => server.permissions.size === 1);
   assert.ok(logOf(server, "c1").some((e) => e.method === "turn.event" && e.params.event.type === "attention" && e.params.event.state === "open"), "the card is in the conversation's log");
@@ -360,15 +375,14 @@ async function leftTurn({ port, code, server }) {
   a.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "wait B1; run; edit" });
   await until(() => server.counters().running === 1);
   server.conversations.get("c1").reads.set("/n.ipynb", new Map([[3, { ref: "r1", hashes: new Map([["c1", "h1"]]) }]]));
-  a.ws.close();
-  await a.closed;
+  await detach(a, server);
   openA();
   await until(() => server.waiterCount === 1);
   return session;
 }
 const sentTo = (b, method) => b.requests.filter((r) => r.method === method);
 
-test("A2-1 split frame: page.features, a 100 ms gap, then grant.changed: the adopted turn's run and edit carry the turn", async () => {
+traced("A2-1 split frame: page.features, a 100 ms gap, then grant.changed: the adopted turn's run and edit carry the turn", async () => {
   const { server, port, code } = await start();
   const session = await leftTurn({ port, code, server });
   const b = await again(port, session, null);
@@ -385,7 +399,7 @@ test("A2-1 split frame: page.features, a 100 ms gap, then grant.changed: the ado
   server.close();
 });
 
-test("A2-1 reverse order: grant.changed before page.features: the adopted turn's run and edit are refused, nothing sent", async () => {
+traced("A2-1 reverse order: grant.changed before page.features: the adopted turn's run and edit are refused, nothing sent", async () => {
   const { server, port, code } = await start();
   const session = await leftTurn({ port, code, server });
   const b = await again(port, session, G1);
@@ -400,7 +414,7 @@ test("A2-1 reverse order: grant.changed before page.features: the adopted turn's
   server.close();
 });
 
-test("an adopted turn on a page without run.context and edit.turn: both refused, nothing sent", async () => {
+traced("an adopted turn on a page without run.context and edit.turn: both refused, nothing sent", async () => {
   const { server, port, code } = await start();
   const session = await leftTurn({ port, code, server });
   const b = await again(port, session, null);
@@ -413,7 +427,7 @@ test("an adopted turn on a page without run.context and edit.turn: both refused,
   server.close();
 });
 
-test("a turn that never left its page, on that same page (no run.context, no edit.turn): it runs and edits as before, a grant refresh included", async () => {
+traced("a turn that never left its page, on that same page (no run.context, no edit.turn): it runs and edits as before, a grant refresh included", async () => {
   const { server, port, code } = await start();
   const openA = gate("B1");
   const { a } = await paired(port, code);
@@ -433,7 +447,7 @@ test("a turn that never left its page, on that same page (no run.context, no edi
   server.close();
 });
 
-test("a turn whose grant ends with a card open: the card is resolved (denied) and none is left open", async () => {
+traced("a turn whose grant ends with a card open: the card is resolved (denied) and none is left open", async () => {
   const { server, port, code } = await start();
   const { a } = await paired(port, code);
   a.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "ask" });
@@ -448,7 +462,7 @@ test("a turn whose grant ends with a card open: the card is resolved (denied) an
   server.close();
 });
 
-test("edit.turn: notebook.edit carries the turn's id only to a page that said edit.turn, decided on the page it goes to", async () => {
+traced("edit.turn: notebook.edit carries the turn's id only to a page that said edit.turn, decided on the page it goes to", async () => {
   for (const [what, features, has] of [["a page that offers edit.turn", ["notebook.edit", "edit.turn"], true], ["a page that doesn't", ["notebook.edit"], false]]) {
     const server = new AgentServer({ log: () => {} });
     const binding = { grant: { folders: ["/"], write: true }, features };

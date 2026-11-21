@@ -262,6 +262,7 @@ test("a disconnect cancels the work; the page that comes back with the session d
   await until(() => p.events.some((e) => e.event.type === "attention" && e.event.state === "open"));
   p.ws.close();
   await p.closed;
+  await until(() => server.sock === null); // (the agent has seen the page go: its close can come after the page's side)
   const q = page(port);
   await q.open;
   assert.ok((await q.hello({ session: h.result.session })).result);

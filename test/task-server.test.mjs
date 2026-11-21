@@ -23,7 +23,9 @@ function taskModel(gate) {
     const tools = options.mcpServers[TASK_SERVER].handlers;
     return (async function* () {
       yield { type: "system", subtype: "init", session_id: "fake-task", tools: [], mcp_servers: [] };
-      if (gate) await gate;
+      // (the gate, or the turn's abort, as the SDK heeds it)
+      if (gate) await Promise.race([gate, new Promise((r) => options.abortController.signal.addEventListener("abort", r, { once: true }))]);
+      if (options.abortController.signal.aborted) return;
       await tools.workspace_write_notebook({ path: "a.ipynb", mode: "python", cells: [{ type: "code", source: "x = 2" }] });
       await tools.propose({ summary: "x is two" });
       yield { type: "result", subtype: "success", is_error: false, result: "ok", usage: {} };
@@ -43,18 +45,19 @@ async function setup({ gate } = {}) {
 }
 function page(port) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/sagebrush`, { origin: ORIGIN });
-  const answers = new Map(), events = [];
+  const answers = new Map(), events = [], answersNull = [];
   let n = 1;
   ws.on("message", (d) => {
     const m = JSON.parse(d.toString());
     if (m.method === "task.event") return events.push(m.params);
     if (typeof m.id === "string" && ("result" in m || "error" in m)) answers.get(m.id)?.(m);
+    if (m.id === null && "error" in m) answersNull.shift()?.(m);
   });
   const call = (method, params, id = `p${++n}`) => new Promise((resolve) => { answers.set(id, resolve); ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params })); });
   const hello = (code) => call("hello", { protocol: 1, page: { origin: ORIGIN, path: "/agents/" }, code }, "p1");
   const notify = (method, params) => ws.send(JSON.stringify({ jsonrpc: "2.0", method, params }));
   const open = new Promise((resolve, reject) => { ws.on("open", resolve); ws.on("error", reject); });
-  return { ws, call, hello, notify, open, events };
+  return { ws, call, hello, notify, open, events, answersNull };
 }
 const START = { title: "Make x two", prompt: "x should be 2", target: "local", run: false, docs: [{ path: "a.ipynb", kind: "notebook", content: NB }] };
 const code = (a) => a.error?.data?.code;
@@ -72,7 +75,10 @@ test("the hello offers delegate.1 over the loopback; without the Delegate switch
   p.notify("grant.changed", { folders: ["/"], write: true, delegate: true });
   await new Promise((r) => setTimeout(r, 50));
   assert.deepEqual((await p.call("tasks.list", {})).result, { tasks: [] });
-  assert.equal(code(await p.call("tasks.list", {}, "x7")), "bad_request", "an id that isn't p<n>");
+  // (an id that isn't p<n>: refused, answered with id null, since it can't be the page's own)
+  const nullAnswer = new Promise((resolve) => p.answersNull.push(resolve));
+  p.ws.send(JSON.stringify({ jsonrpc: "2.0", id: "x7", method: "tasks.list", params: {} }));
+  assert.equal(code(await nullAnswer), "bad_request");
   assert.equal(code(await p.call("tasks.nope", {})), "bad_request");
   p.ws.close();
   await h.server.close();

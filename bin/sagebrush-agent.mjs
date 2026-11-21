@@ -113,6 +113,19 @@ await listenLoopback();
 async function listenLoopback() {
 const server = new AgentServer({ port, origins, query, deleteSession });
 server.createServer = createServer;
+// Delegate tasks (design/workspace-agent-protocol.md §6), over this loopback pairing only: on where the tasks folder
+// (~/.sagebrush/tasks) can be used, else off, saying why.  The page shows Delegate only under the person's own switch.
+try {
+  const { TaskStore } = await import("../lib/tasks.mjs");
+  const { TaskTurns } = await import("../lib/task-turns.mjs");
+  const { TaskRpc } = await import("../lib/task-rpc.mjs");
+  const { installationId } = await import("../lib/installation.mjs");
+  const store = new TaskStore({ scope: installationId() }).init();
+  const turns = new TaskTurns({ store, query, createServer, log: (m) => console.error(m) });
+  server.setTasks({ store, turns, rpc: new TaskRpc({ store, turns }) });
+} catch (e) {
+  console.error(`Delegate tasks are off on this computer: ${e?.message ?? e}`);
+}
 const p = await server.listen();
 const code = server.newCode();
 // SAGEBRUSH_AGENT_PAGE changes only the printed link, never the allowed origins.

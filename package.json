@@ -33,6 +33,9 @@
     "lib/task-git.mjs",
     "lib/task-paths.mjs",
     "lib/fake-tasks.mjs",
+    "lib/task-turns.mjs",
+    "lib/task-rpc.mjs",
+    "lib/installation.mjs",
     "README.md",
     "npm-shrinkwrap.json"
   ],

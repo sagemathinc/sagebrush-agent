@@ -132,3 +132,28 @@ test("stop: a running turn ends at once, interrupted; at most `running` turns at
   await until(() => h.store.state(b).status === "proposal", "b ran after a");
   h.done();
 });
+
+test("a stop is bounded: a model that ignores the abort can't hold it; the task is still stopped", async () => {
+  const h = setup({ steps: [async () => { await new Promise(() => {}); }], limits: { running: 4, queued: 16, turnMs: 60000, readBytes: 1024, stopMs: 200 } });
+  const task = h.start();
+  h.turns.begin(task, "start");
+  await until(() => h.turns.isRunning(task), "running");
+  const t0 = Date.now();
+  await h.turns.stop(task);
+  assert.ok(Date.now() - t0 < 2000);
+  assert.deepEqual(await h.store.stop({ task }), { status: "interrupted" });
+  h.done();
+});
+
+test("the installation id: made once, private, kept; a file that isn't one is refused", async () => {
+  const { installationId } = await import("../lib/installation.mjs");
+  const home = mkdtempSync(join(tmpdir(), "sb-inst-"));
+  const a = installationId(home), b = installationId(home);
+  assert.match(a, /^[0-9a-f]{32}$/);
+  assert.equal(a, b);
+  const { writeFileSync, statSync } = await import("node:fs");
+  assert.equal(statSync(join(home, ".sagebrush")).mode & 0o077, 0);
+  writeFileSync(join(home, ".sagebrush", "installation"), "not an id\n");
+  assert.throws(() => installationId(home));
+  rmSync(home, { recursive: true, force: true });
+});

@@ -429,7 +429,10 @@ test("the measure and the watch skip an entry that goes between its listing and 
   } finally { fs.lstatSync = lstat; syncBuiltinESMExports(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("at load, a run whose process can't be told apart (its /proc entry unreadable): never taken as ended; the task left as it is, its record kept", async () => {
+// (rows that stand in an unreadable /proc entry: Linux only; macOS's answers come from ps, the rows after them)
+const LINUX = process.platform === "linux" ? {} : { skip: "/proc is Linux's" };
+
+test("at load, a run whose process can't be told apart (its /proc entry unreadable): never taken as ended; the task left as it is, its record kept", LINUX, async () => {
   const { procStart } = await import("../lib/proc-start.mjs");
   const f = deadAgentFixture();
   const snap = await f.s.snapshotWork(f.task);
@@ -452,7 +455,7 @@ test("at load, a run whose process can't be told apart (its /proc entry unreadab
   } finally { fs.readFileSync = read; syncBuiltinESMExports(); stopOwn(p.pid); rmSync(f.dir, { recursive: true, force: true }); }
 });
 
-test("procInfo: gone only on a definite no-such-process; an unreadable or unparsable entry is unknown, never gone", async () => {
+test("procInfo (Linux): gone only on a definite no-such-process; an unreadable or unparsable entry is unknown, never gone", LINUX, async () => {
   const { procInfo } = await import("../lib/proc-start.mjs");
   const c = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" });
   assert.deepEqual(procInfo(Number(c.stdout), "linux"), { gone: true }, "a process that has exited and been reaped");
@@ -505,4 +508,37 @@ test("at load, a run recorded only before its start (the agent died between spaw
   assert.equal(s3.list().tasks.some((t) => t.task === f.task), false);
   assert.deepEqual(signals, []);
   rmSync(f.dir, { recursive: true, force: true });
+});
+
+test("procInfo on this computer: its own process is found (start time and group); a process that has exited and been reaped is gone", { skip: ["linux", "darwin"].includes(process.platform) ? false : "Linux and macOS only" }, async () => {
+  const { procInfo } = await import("../lib/proc-start.mjs");
+  const me = procInfo(process.pid);
+  assert.match(me.start ?? "", new RegExp(`^${process.platform}:`));
+  assert.ok(me.pgid > 0);
+  const c = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" });
+  assert.deepEqual(procInfo(Number(c.stdout)), { gone: true });
+});
+
+test("procInfo (macOS's answers, from a stand-in ps): gone only on ESRCH; a start time and group read; a ps that fails or prints nothing, or another error, is unknown", async () => {
+  const { procInfo } = await import("../lib/proc-start.mjs");
+  const dir = mkdtempSync(join(tmpdir(), "sb-ps-"));
+  // (a stand-in ps: prints what out.txt holds, and exits with code.txt's number)
+  const ps = join(dir, "ps");
+  writeFileSync(ps, `#!/bin/sh\ncat "${dir}/out.txt"\nexit "$(cat "${dir}/code.txt")"\n`);
+  chmodSync(ps, 0o755);
+  const say = (out, code = 0) => { writeFileSync(join(dir, "out.txt"), out); writeFileSync(join(dir, "code.txt"), String(code)); };
+  const kill = (code) => () => { if (code) throw Object.assign(new Error(code), { code }); };
+  try {
+    say("  4242 Sat Nov 21 05:12:03 2026\n");
+    assert.deepEqual(procInfo(4321, "darwin", { ps, kill: kill(null) }), { start: "darwin:Sat Nov 21 05:12:03 2026", pgid: 4242 });
+    assert.deepEqual(procInfo(4321, "darwin", { ps, kill: kill("EPERM") }), { start: "darwin:Sat Nov 21 05:12:03 2026", pgid: 4242 }, "another account's process is there: still asked");
+    assert.deepEqual(procInfo(4321, "darwin", { ps, kill: kill("ESRCH") }), { gone: true });
+    for (const [out, code, why] of [["", 0, "nothing printed"], ["  4242 Sat Nov 21 05:12:03 2026\n", 1, "ps failed"], ["garbage\n", 0, "unparsable"]]) {
+      say(out, code);
+      const r = procInfo(4321, "darwin", { ps, kill: kill(null) });
+      assert.ok(r.unknown && !r.gone, `${why}: ${JSON.stringify(r)}`);
+    }
+    assert.ok(procInfo(4321, "darwin", { ps, kill: kill("EINVAL") }).unknown, "an error other than ESRCH or EPERM: unknown");
+    assert.ok(procInfo(4321, "darwin", { ps: join(dir, "no-such-ps"), kill: kill(null) }).unknown, "no ps at all: unknown");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

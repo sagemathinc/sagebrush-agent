@@ -280,3 +280,27 @@ test("a crash between an undo's two renames: at load the undo is finished (the c
   assert.ok(existsSync(join(s.dir(task), ".dropped-0123456789ab", "a.txt")), "the only copy kept");
   rmSync(dir, { recursive: true, force: true });
 });
+
+test("the zone data is admitted as any write is: against the total as well as the task's budget, refused busy before any copy or start; a run's hold counts for every task until its tmp is gone", T, async () => {
+  const h = setup();
+  const zones = Object.values(PIN.tzdata.files).reduce((n, f) => n + f.size, 0);
+  const all = () => h.store.list().tasks.reduce((n, t) => n + h.store.usage(t.task), 0);
+  h.store.budget = { ...h.store.budget, total: all() + Math.floor(zones / 2) };
+  await assert.rejects(h.runner.run(h.task, "nb dir/a.ipynb"), (e) => e.code === "busy" && /tasks' storage budget/.test(e.message));
+  assert.equal(h.spawned.length, 0);
+  assert.deepEqual(readdirSync(join(h.store.dir(h.task), "tmp")), [], "nothing copied, the tmp removed");
+  assert.equal(h.store.held.size, 0);
+  // (a hold, as a run has while its zone data is on disk: another task's write past the total is refused until it goes)
+  h.store.budget = { ...h.store.budget, total: 4096 * 1024 * 1024 };
+  const other = h.store.start(checkRequest("tasks.start", { title: "o", prompt: "p", target: "local", run: true, docs: [{ path: "x.txt", kind: "file", content: "x" }] })).task;
+  h.store.budget = { ...h.store.budget, total: all() + zones + 1024 };
+  const release = h.store.reserveRun(h.task, zones);
+  await assert.rejects(h.store.writeWork(other, "big.txt", Buffer.alloc(4096)), (e) => e.code === "busy");
+  release();
+  await h.store.writeWork(other, "big.txt", Buffer.alloc(4096));
+  // (a run that goes through holds nothing after)
+  h.store.budget = { ...h.store.budget, total: 4096 * 1024 * 1024 };
+  assert.equal((await h.runner.run(h.task, "nb dir/a.ipynb")).exit, 0);
+  assert.equal(h.store.held.size, 0);
+  h.done();
+});

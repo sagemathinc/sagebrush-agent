@@ -186,7 +186,7 @@ test("a failure of the task host that isn't a refusal: answered unavailable, its
   rmSync(h.dir, { recursive: true, force: true });
 });
 
-test("the switch off after a reconnect: a new page's grant without delegate stops the old task's turn at once, and its model's late work is refused; a disconnect alone changes nothing", async () => {
+test("a new pairing's first grant without delegate turns nothing off: the running task goes on, tasks.* is refused until the page turns the switch on, then its proposal is there", async () => {
   let release;
   const gate = new Promise((r) => (release = r));
   const h = await setup({ gate });
@@ -200,10 +200,46 @@ test("the switch off after a reconnect: a new page's grant without delegate stop
   p.ws.close();
   await new Promise((r) => setTimeout(r, 100));
   assert.ok(h.turns.isRunning(task), "a page going away leaves the task running");
-  assert.equal(h.store.state(task).status, "working");
+  // (the page again, paired with a new code: its first grant has the switch off, as a new pairing starts)
   p = page(h.port);
   await p.open;
   await p.hello(h.server.newCode());
+  p.notify("grant.changed", { folders: ["/"], write: true });
+  await new Promise((r) => setTimeout(r, 100));
+  assert.ok(h.turns.isRunning(task), "still running after the new pairing's grant");
+  assert.equal(h.store.state(task).status, "working");
+  assert.equal(code(await p.call("tasks.list", {})), "forbidden", "no tasks.* without the switch");
+  release();
+  await until(() => h.store.state(task).status === "proposal", "the proposal, while the page has the switch off");
+  p.notify("grant.changed", { folders: ["/"], write: true, delegate: true });
+  await new Promise((r) => setTimeout(r, 50));
+  const got = await p.call("tasks.get", { task, after: 0 });
+  assert.ok(got.result.events.some((e) => e.event.type === "proposal"));
+  p.ws.close();
+  await h.server.close();
+  rmSync(h.dir, { recursive: true, force: true });
+});
+
+test("the switch off after a reconnect: on the new pairing, turned on then off, the old task's turn stops at once and its model's late work is refused", async () => {
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const h = await setup({ gate });
+  let p = page(h.port);
+  await p.open;
+  await p.hello(h.code);
+  p.notify("grant.changed", { folders: ["/"], write: true, delegate: true });
+  await new Promise((r) => setTimeout(r, 50));
+  const { task } = (await p.call("tasks.start", START)).result;
+  await until(() => h.turns.isRunning(task), "running");
+  p.ws.close();
+  await until(() => !h.server.sock, "the page gone");
+  p = page(h.port);
+  await p.open;
+  await p.hello(h.server.newCode());
+  p.notify("grant.changed", { folders: ["/"], write: true });
+  p.notify("grant.changed", { folders: ["/"], write: true, delegate: true });
+  await new Promise((r) => setTimeout(r, 100));
+  assert.ok(h.turns.isRunning(task));
   p.notify("grant.changed", { folders: ["/"], write: true, delegate: false });
   await until(() => h.store.state(task).status === "interrupted" && !h.turns.isRunning(task), "switched off");
   assert.match(h.store.state(task).reason, /switch was turned off|turn was stopped/);
@@ -215,4 +251,34 @@ test("the switch off after a reconnect: a new page's grant without delegate stop
   p.ws.close();
   await h.server.close();
   rmSync(h.dir, { recursive: true, force: true });
+});
+
+test("the pairing's revoke turns Delegate off: the running task is interrupted, also from a new pairing that never had the switch", async () => {
+  for (const repair of [false, true]) {
+    const h = await setup({ gate: new Promise(() => {}) });
+    let p = page(h.port);
+    await p.open;
+    await p.hello(h.code);
+    p.notify("grant.changed", { folders: ["/"], write: true, delegate: true });
+    await new Promise((r) => setTimeout(r, 50));
+    const { task } = (await p.call("tasks.start", START)).result;
+    await until(() => h.turns.isRunning(task), "running");
+    if (repair) {
+      p.ws.close();
+      await until(() => !h.server.sock, "the page gone");
+      p = page(h.port);
+      await p.open;
+      await p.hello(h.server.newCode());
+      p.notify("grant.changed", { folders: ["/"], write: true });
+      await new Promise((r) => setTimeout(r, 100));
+      assert.ok(h.turns.isRunning(task), "the new pairing's grant left it running");
+    }
+    p.notify("grant.changed", {});
+    await until(() => h.store.state(task).status === "interrupted" && !h.turns.isRunning(task), `revoked (re-paired: ${repair})`);
+    assert.match(h.store.state(task).reason, /switch was turned off|turn was stopped/);
+    assert.equal(code(await p.call("tasks.list", {})), "forbidden");
+    p.ws.close();
+    await h.server.close();
+    rmSync(h.dir, { recursive: true, force: true });
+  }
 });

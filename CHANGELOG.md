@@ -4,7 +4,7 @@
 
 **Delegate: give Claude a task, close the tab, and review its proposal later.** It works over the loopback address only, and only while the page's grant has Delegate on, which is the person's own switch.
 
-- **A task** is a title, what to do, and a copy of the documents chosen for it. Claude works on that copy on this computer, with no page and no workspace calls, then proposes the result.
+- **A task** is a title, what to do, and a copy of the documents chosen for it. Claude works on that copy on this computer, with no page and no workspace calls, then proposes the result. Closing the tab, or reopening the page and pairing again, leaves the tasks running; turning the switch off, or revoking the pairing, interrupts them.
 - **The page and this agent:** with this version, the Agents page has the Delegate switch (and, when turning it off, the option to close the tasks). There, the person starts tasks, follows them, and sees a proposal as a difference from what Claude started with. This agent also supports, through the protocol, Merge, Close, Ask for changes (Claude's next turn gets the request exactly as written), Stop, Resume and Revoke; the page offers them in a later version. A merge is done in the page: the agent only records what the page reports.
 - **Where tasks live:** each task is a private folder under `~/.sagebrush/tasks/`, with its own local git history, its events and its state. The task's grant is fixed when it starts and recorded in its first commit. After a crash or restart, an interrupted operation is finished or undone where its records allow it; where they don't, the task is left failed and untouched for the person. A task that was working is left interrupted until the person resumes it.
 - **Limits:**

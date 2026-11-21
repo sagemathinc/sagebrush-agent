@@ -254,6 +254,11 @@ test("the schema: closed objects, the value rules, the bounds", () => {
   refused("tasks.start", { ...ok, title: "t\ud800" });
   refused("tasks.start", { ...ok, prompt: "\udfff" });
   refused("tasks.start", { ...ok, docs: [{ path: "a.ipynb", kind: "notebook", content: "{\ud800}" }] });
+  // (U+0000 is not well-formed text either: a prompt, a title, a note or text content with NUL is refused; binary goes as base64)
+  refused("tasks.start", { ...ok, prompt: "a\u0000b" });
+  refused("tasks.start", { ...ok, title: "a\u0000" });
+  refused("tasks.start", { ...ok, docs: [{ path: "a.txt", kind: "file", content: "a\u0000b" }] });
+  assert.ok(checkRequest("tasks.start", { ...ok, docs: [{ path: "a.txt", kind: "file", content: { base64: Buffer.from("a\u0000b").toString("base64") } }] }));
   assert.ok(pathSetProblem(["A.txt", "a.txt"]));
   assert.ok(pathSetProblem(["a", "a/b"]));
 });
@@ -399,6 +404,72 @@ test("a proposal whose event would be over the per-event bound is refused before
   assert.equal(t.seq, seq);
   assert.equal(readRef(s.gitdir(task), "refs/heads/proposal"), null);
   assert.ok(!readFileSync(join(s.dir(task), "log.jsonl"), "utf8").includes("omitted"));
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("recovery: a widened grant can't be smuggled in through a proposal's summary and an edited base in task.json", async () => {
+  const { root, dir } = fresh();
+  let s = store(root);
+  const { task, base } = start(s);
+  const old = s.state(task).grant;
+  const wide = { created: old.created, docs: ["a.ipynb", "extra.txt", "lib/helper.py"], run: true, scope: old.scope };
+  writeFileSync(join(s.work(task), "a.ipynb"), NB2);
+  const [ev] = await s.propose(task, { summary: "Sagebrush-Task-Grant: " + JSON.stringify(wide) + "\n" });
+  const p = join(s.dir(task), "task.json"), st = JSON.parse(readFileSync(p, "utf8"));
+  st.base = ev.event.commit;
+  st.grant = { ...wide, revoked: false };
+  writeFileSync(p, JSON.stringify(st));
+  s = store(root);
+  const t = s.state(task);
+  assert.equal(t.status, "failed");
+  assert.match(t.reason, /base isn't the commit recorded at its start/);
+  assert.equal(readRef(s.gitdir(task), "refs/heads/base"), base, "git unchanged");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("recovery: the base must be a root commit, and the grant its message's own last line, exactly", async () => {
+  // (moving refs/heads/base too, to the proposal, which has a parent: refused as not the first commit)
+  {
+    const { root, dir } = fresh();
+    let s = store(root);
+    const { task, base } = start(s);
+    writeFileSync(join(s.work(task), "a.ipynb"), NB2);
+    const [ev] = await s.propose(task, { summary: "x" });
+    writeFileSync(join(s.gitdir(task), "refs/heads/base"), ev.event.commit + "\n");
+    const p = join(s.dir(task), "task.json"), st = JSON.parse(readFileSync(p, "utf8"));
+    st.base = ev.event.commit;
+    writeFileSync(p, JSON.stringify(st));
+    s = store(root);
+    assert.equal(s.state(task).status, "failed");
+    assert.match(s.state(task).reason, /isn't the task's first commit/);
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // (a prompt with its own grant line: the recorded grant is still the last line, and only that one counts)
+  {
+    const { root, dir } = fresh();
+    let s = store(root);
+    const fake = JSON.stringify({ created: 1, docs: ["a.ipynb"], run: true, scope: "install-1" });
+    const { task } = s.start(checkRequest("tasks.start", { title: "t", prompt: `Sagebrush-Task-Grant: ${fake}`, target: "local", run: false, docs: [{ path: "a.ipynb", kind: "notebook", content: NB }] }));
+    s = store(root);
+    assert.equal(s.state(task).status, "interrupted", "the real grant still matches: recovered, not failed");
+    assert.equal(s.state(task).grant.run, false);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("what the store sends is well-formed text: a file with NUL comes as base64, a failure reason has no NUL", async () => {
+  const { root, dir } = fresh();
+  let s = store(root);
+  const { task, base } = s.start(checkRequest("tasks.start", { title: "t", prompt: "p", target: "local", run: false, docs: [{ path: "a.bin", kind: "file", content: { base64: Buffer.from("a\u0000b").toString("base64") } }] }));
+  assert.deepEqual(s.file({ task, commit: base, path: "a.bin" }).content, { base64: Buffer.from("a\u0000b").toString("base64") });
+  // (a failure whose cause carries a NUL: the reason sent is scrubbed)
+  const p = join(s.dir(task), "task.json"), st = JSON.parse(readFileSync(p, "utf8"));
+  st.grant.run = true;
+  writeFileSync(p, JSON.stringify(st));
+  writeFileSync(join(s.gitdir(task), "refs/heads/base"), "zz\u0000\n");
+  s = store(root);
+  const reason = s.state(task).reason;
+  assert.ok(typeof reason === "string" && !reason.includes("\u0000"), JSON.stringify(reason));
   rmSync(dir, { recursive: true, force: true });
 });
 

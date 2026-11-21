@@ -78,7 +78,7 @@ test("codexVersion reads the userAgent's version; the version run is the pinned 
   assert.equal(codexVersion("codex_cli_rs/0.166.0"), "0.166.0");
   for (const s of ["", "no-version", "x/ (y)", null, undefined]) assert.equal(codexVersion(s), null, JSON.stringify(s));
   assert.equal(CODEX_VERSION, PIN.version);
-  assert.equal(CODEX_VERSION, "0.159.2");
+  assert.equal(CODEX_VERSION, "0.171.0");
 });
 
 test("--codex without --stdio is refused at the start (exit 2), naming the runner", () => {

@@ -26,9 +26,10 @@ const branchOf = (defs, union, method) => {
 };
 const itemOf = (defs, type) => (defs.ThreadItem.oneOf ?? defs.ThreadItem.anyOf).find((b) => (b.properties?.type?.enum ?? []).includes(type));
 
-test("real Codex 0.159.2 and 0.163.0 output both pass", () => {
+test("real Codex 0.159.2, 0.163.0 and 0.171.0 (the pinned one) output all pass", () => {
   assert.deepEqual(checkContract(fixture("0.159.2")), []);
   assert.deepEqual(checkContract(fixture("0.163.0")), []);
+  assert.deepEqual(checkContract(fixture("0.171.0")), []);
 });
 
 // Each row breaks one thing the agent relies on; the self-test names it.

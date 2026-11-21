@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { AgentServer } from "../lib/server.mjs";
-import { CodexBackend, CODEX_TEXT } from "../lib/codex.mjs";
+import { CodexBackend, CODEX_TEXT, CODEX_VERSION } from "../lib/codex.mjs";
 import { fakeCreateServer } from "../lib/fake.mjs";
 
 const F = 64 * 1024;
@@ -61,7 +61,7 @@ function scriptedChild({ answer, ignoreTerm = false } = {}) {
 let threads = 0;
 function defaultAnswer(m) {
   switch (m.method) {
-    case "initialize": return { userAgent: "sagebrush-agent/0.159.2 (Test; x86_64)", platformFamily: "unix", platformOs: "linux" };
+    case "initialize": return { userAgent: `sagebrush-agent/${CODEX_VERSION} (Test; x86_64)`, platformFamily: "unix", platformOs: "linux" };
     case "account/read": return { account: { type: "chatgpt" }, requiresOpenaiAuth: true };
     case "config/read": return { config: {} };
     case "thread/start": return { thread: { id: `thr-${++threads}`, ephemeral: true }, approvalPolicy: "on-request" };

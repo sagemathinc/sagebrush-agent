@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { AgentServer } from "../lib/server.mjs";
-import { CodexBackend, CODEX_TEXT } from "../lib/codex.mjs";
+import { CodexBackend, CODEX_TEXT, CODEX_VERSION } from "../lib/codex.mjs";
 import { CodexFetchError } from "../lib/codex-fetch.mjs";
 import { fakeCreateServer } from "../lib/fake.mjs";
 
@@ -62,7 +62,7 @@ function harness(locate, { generate = null, fakeEnv = {} } = {}) {
 }
 
 test("the pinned Codex runs by its absolute path, for the self-test and the app-server; the `codex` on PATH never runs", T, async () => {
-  const h = harness((bin) => ({ bin, dir: "/x", version: "0.159.2" }));
+  const h = harness((bin) => ({ bin, dir: "/x", version: CODEX_VERSION }));
   try {
     h.say("hello");
     await h.until(() => h.finished().length, "the turn");
@@ -74,7 +74,7 @@ test("the pinned Codex runs by its absolute path, for the self-test and the app-
 });
 
 test("the first download's progress: one line to the turn that asked, then the turn goes on", T, async () => {
-  const h = harness((bin, { onProgress }) => { onProgress(16e6, 162475310); onProgress(32e6, 162475310); return { bin, dir: "/x", version: "0.159.2" }; });
+  const h = harness((bin, { onProgress }) => { onProgress(16e6, 162475310); onProgress(32e6, 162475310); return { bin, dir: "/x", version: CODEX_VERSION }; });
   try {
     h.say("hello");
     await h.until(() => h.finished().length, "the turn");
@@ -126,7 +126,7 @@ const within = async (f, ms, what) => { const t = Date.now(); while (!f()) { if 
 
 test("closing the agent during the schema probe: its process group is gone (by pid) within 2 s, nothing after initialize is sent", T, async () => {
   // (the app-server takes 300 ms to end: closing must wait for the cancelled start's own cleanup)
-  const h = harness((bin) => ({ bin, dir: "/x", version: "0.159.2" }), { generate: `echo $$ > "$PIDFILE"; (sleep 3; echo alive > "$MARK") & sleep 30; exit 0`, fakeEnv: { FAKE_CODEX_SLOW_EXIT: "1" } });
+  const h = harness((bin) => ({ bin, dir: "/x", version: CODEX_VERSION }), { generate: `echo $$ > "$PIDFILE"; (sleep 3; echo alive > "$MARK") & sleep 30; exit 0`, fakeEnv: { FAKE_CODEX_SLOW_EXIT: "1" } });
   h.say("hello");
   const pidFile = join(h.scratch, "probe.pid");
   await within(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").trim(), 10000, "the probe started");
@@ -162,7 +162,7 @@ test("a Stop during the download cancels it (locate's signal, within 2 s of the 
 });
 
 test("a Stop while initialize goes unanswered: the app-server is ended (by pid) and nothing more is sent", T, async () => {
-  const h = harness((bin) => ({ bin, dir: "/x", version: "0.159.2" }), { fakeEnv: { FAKE_CODEX_HOLD_INIT: "1" } });
+  const h = harness((bin) => ({ bin, dir: "/x", version: CODEX_VERSION }), { fakeEnv: { FAKE_CODEX_HOLD_INIT: "1" } });
   try {
     h.say("hello");
     await within(() => h.rec().some((m) => m.method === "initialize"), 10000, "initialize sent");
@@ -193,7 +193,7 @@ test("two turns share a start: the first Stop doesn't cancel it, the last one do
 });
 
 test("closing during the start with a Codex that ignores SIGTERM: within the one budget it's killed and reaped (by pid), and close() says so", T, async () => {
-  const h = harness((bin) => ({ bin, dir: "/x", version: "0.159.2" }), { generate: `echo $$ > "$PIDFILE"; sleep 30; exit 0`, fakeEnv: { FAKE_CODEX_IGNORE_TERM: "1" } });
+  const h = harness((bin) => ({ bin, dir: "/x", version: CODEX_VERSION }), { generate: `echo $$ > "$PIDFILE"; sleep 30; exit 0`, fakeEnv: { FAKE_CODEX_IGNORE_TERM: "1" } });
   h.say("hello");
   const pidFile = join(h.scratch, "probe.pid");
   await within(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").trim(), 10000, "the probe started");

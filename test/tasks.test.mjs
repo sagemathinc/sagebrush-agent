@@ -852,3 +852,30 @@ test("reason codes: stop and recovery carry theirs; an interrupt carries the hos
   assert.equal(s2.state(t).reasonCode, undefined);
   rmSync(h2.dir, { recursive: true, force: true });
 });
+
+// (a reason code belongs to an interrupted task only, in its state as in its log)
+test("reason codes: a state with a code on a task that isn't interrupted is refused, the task failed; an interrupted one loads", WIN_DELEGATE, async () => {
+  const { root, dir } = fresh();
+  let s = store(root);
+  const a = start(s).task, b = start(s).task;
+  await s.stop({ task: b });
+  await s.resume({ task: b });
+  await s.stop({ task: b });
+  // (a: working, with a code written in: failed; b: interrupted with its code: loads as it was)
+  const p = join(s.dir(a), "task.json"), x = JSON.parse(readFileSync(p, "utf8"));
+  x.reasonCode = "stopped";
+  writeFileSync(p, canonical(x));
+  s = store(root);
+  assert.equal(s.state(a).status, "failed");
+  assert.match(s.state(a).reason, /reason code/);
+  assert.deepEqual([s.state(b).status, s.state(b).reasonCode], ["interrupted", "stopped"]);
+  // (an interrupted task failed on load drops its code, in memory and on disk, so its saved state stays one the loader takes)
+  const q = join(s.dir(b), "task.json"), y = JSON.parse(readFileSync(q, "utf8"));
+  y.grant.run = true;
+  writeFileSync(q, canonical(y));
+  s = store(root);
+  assert.deepEqual([s.state(b).status, s.state(b).reasonCode], ["failed", undefined]);
+  assert.match(s.state(b).reason, /grant doesn't match/);
+  assert.ok(!Object.hasOwn(JSON.parse(readFileSync(q, "utf8")), "reasonCode"));
+  rmSync(dir, { recursive: true, force: true });
+});

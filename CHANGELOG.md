@@ -1,5 +1,13 @@
 # sagebrush-agent changes
 
+## 0.8.7
+
+**A Delegate task's brief, drafted from the Pair chat.** Running code in Delegate is still not enabled in this version.
+
+- **Drafting a brief (`chat.brief`):** when the person delegates from a Pair chat, the Agents page can ask the agent to draft the task's brief from that conversation: a title, then the Goal, the Decisions made, the Files named and when it's Done. The person edits it before starting the task. The task itself still starts fresh, with only the brief and its documents.
+- **How it is drafted:** by the chat's own Claude session, in a copy of it that has no tools of any kind and one turn. The chat itself is unchanged, nothing shows in it, and the copy isn't kept. It needs the Delegate switch on, and a chat Claude runs (not Codex).
+- **Its limits:** a title of at most 200 characters and a brief of at most 8 KiB (a longer one is cut, and says so). A draft stops after 60 seconds, or when the person stops it, and while one is being written that chat takes no new message. A draft counts against the agent's limit on turns running at once.
+
 ## 0.8.6
 
 **A launch for the Sagebrush desktop app.** Nothing changes for `npx` or `sagebrush remote`: without the new option, the agent starts, pairs and runs as before. Running code in Delegate is still not enabled in this version.

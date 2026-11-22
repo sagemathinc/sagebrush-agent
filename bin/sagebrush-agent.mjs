@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import { AgentServer, DEFAULT_ORIGINS, TEXT } from "../lib/server.mjs";
 import { stdinChunks } from "../lib/stdio.mjs";
 import { pairOrigin, readPairLine } from "../lib/pair-stdin.mjs";
+import { stdioOutput } from "../lib/stdout-thread.mjs";
 
 // An exact http(s) origin, like https://example.org or http://127.0.0.1:8000: no path, no wildcard.
 function exactOrigin(s) {
@@ -120,6 +121,9 @@ if (stdio) {
     const command = process.env.SAGEBRUSH_AGENT_FAKE === "1" ? [process.execPath, fileURLToPath(new URL("../lib/fake-codex.mjs", import.meta.url))] : null;
     server.backend = new CodexBackend(server, { command });
   }
+  // (stdout: on Windows, a thread does the writes, so a runner that stops reading never blocks this process:
+  //  lib/stdout-thread.mjs; elsewhere process.stdout itself)
+  const output = stdioOutput();
   let stopping = false;
   const stop = async (code = 0) => {
     if (stopping) return;
@@ -127,14 +131,16 @@ if (stdio) {
     let problems;
     try { problems = await server.close(); } catch (e) { problems = [String(e?.message ?? e)]; }
     for (const p of problems) console.error(p);
+    // (what the thread still holds is written first, waiting at most 500 ms for a runner that stopped reading)
+    await output.flush?.(500);
     process.exit(problems.length ? 1 : code);
   };
   const fatal = (text) => { console.error(text); stop(1); };
   // (a runner that went away: nothing more can be written)
-  process.stdout.on("error", () => stop(0));
+  output.on("error", () => stop(0));
   process.on("SIGINT", () => server.stopTurns());
   process.once("SIGTERM", () => stop(0));
-  await server.serveStdio({ input: stdinChunks(), output: process.stdout, fatal });
+  await server.serveStdio({ input: stdinChunks(), output, fatal });
   if (!server.stdioStarted) fatal(TEXT.badStart);
   else stop(0);
 } else if (pairStdin) {

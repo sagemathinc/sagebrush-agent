@@ -1,5 +1,12 @@
 # sagebrush-agent changes
 
+## 0.8.10
+
+**The printed link opens the page you named with --origin.** Running code in Delegate is still not enabled in this version.
+
+- **One --origin, its own link:** started with exactly one `--origin`, such as `--origin https://dev.sagebrush.space`, the agent now prints a link to that site's Agents page (`<origin>/agents/`). Before, it always printed a sagebrush.space link unless `SAGEBRUSH_AGENT_PAGE` was set.
+- **What stays the same:** `SAGEBRUSH_AGENT_PAGE` still sets the link's page when it is set. With no `--origin`, or more than one, the link opens sagebrush.space; with more than one, the agent also says how to choose the page. Neither the link nor `SAGEBRUSH_AGENT_PAGE` changes which pages may connect.
+
 ## 0.8.9
 
 **A brief asked right after a turn waits for it.** Running code in Delegate is still not enabled in this version.

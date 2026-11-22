@@ -269,6 +269,10 @@ test("a native turn, then the same grant id with native off: the turn ends; a st
   p.notify("grant.changed", { ...G1, native: false });
   await until(() => finished(server, "c1").length === 1);
   assert.deepEqual(finished(server, "c1"), ["interrupted"]);
+  // (the turn is over for the page before its query has closed: a steer sent in between finds it still running and
+  //  is queued "ended", not "idle"; wait for the old turn to be gone entirely, so the receipt says only what this row
+  //  pins, that the steer never entered it)
+  await until(() => server.counters().running === 0);
   p.notify("chat.message", { conversation: "c1", id: "u2", author: "person", text: "after", steer: true });
   await until(() => finished(server, "c1").length === 2);
   assert.deepEqual(receipts(p.msgs, "u2"), ["queued:idle"], "it never entered the old turn");

@@ -61,6 +61,9 @@ function models() {
       yield { type: "system", subtype: "init", session_id: session, model: "fake", tools: [] };
       if (m.hold) await Promise.race([m.hold, new Promise((r) => options.abortController.signal.addEventListener("abort", r, { once: true }))]);
       yield { type: "result", subtype: "success", is_error: false, result: "ok", usage: { input_tokens: 1, output_tokens: 1 }, session_id: session };
+      // ("close slowly": the result is out (the page sees the turn finished), then the stream stays open until
+      //  m.closing is released: the turn is still closing)
+      if (/^close slowly$/.test(text)) await new Promise((r) => { m.closeRelease = r; });
     })();
   };
   m.deleteSession = async (id, opts) => { m.deleted.push({ id, dir: opts?.dir }); throw new Error(`session ${id} not found`); };
@@ -549,4 +552,96 @@ test("stuck SDK work holds a place until it settles (not until its fork is delet
     for (const r of releases.splice(0)) r();
     rmSync(server.cwd, { recursive: true, force: true });
   }
+});
+
+test("a brief waits for a finished turn still closing, holding the conversation: then drafts; Cancel, a rebind or its bound end the wait", WIN_DELEGATE, async () => {
+  const h = await setup({ briefMs: 1500 });
+  try {
+    const { p } = await ready(h);
+    const closing = async () => {
+      p.say("c1", "close slowly");
+      await until(() => p.finished("c1") >= 2 && h.m.closeRelease, "the turn finished for the page, still closing");
+      assert.ok(h.server.conversations.get("c1").running, "the turn is still running");
+    };
+    // (1. it waits, then drafts: and while it waits, a message to the conversation is busy)
+    await closing();
+    let answer = null;
+    const pending = p.call("chat.brief", { conversation: "c1" }).then((a) => { answer = a; });
+    await until(() => h.server.conversations.get("c1").drafting, "the conversation held");
+    p.say("c1", "Slipping in?", "m-slip");
+    await until(() => p.rejected.some((r) => r.id === "m-slip"), "the message refused");
+    assert.equal(p.rejected.find((r) => r.id === "m-slip").reason.code, "busy");
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(answer, null, "no answer while the turn closes");
+    assert.equal(h.m.drafts.length, 0, "no draft started yet");
+    h.m.closeRelease();
+    h.m.closeRelease = null;
+    await pending;
+    assert.equal(answer.result?.title, "Plot the partial sums", JSON.stringify(answer));
+    assert.equal(h.m.drafts.length, 1);
+    assert.equal(h.server.conversations.get("c1").drafting, null);
+    // (2. Cancel during the wait: stopped, the hold given up, no draft)
+    await closing();
+    const c2 = p.call("chat.brief", { conversation: "c1" });
+    await until(() => h.server.conversations.get("c1").drafting, "held");
+    p.notify("chat.brief_cancel", { conversation: "c1" });
+    assert.equal(code(await c2), "stopped");
+    assert.equal(h.server.conversations.get("c1").drafting, null);
+    assert.equal(h.m.drafts.length, 1, "no new draft");
+    h.m.closeRelease(); h.m.closeRelease = null;
+    await until(() => !h.server.conversations.get("c1").running, "the turn closed");
+    // (3. the bound passes during the wait: failed, with the timeout words)
+    await closing();
+    const c3 = await p.call("chat.brief", { conversation: "c1" });
+    assert.equal(code(c3), "failed");
+    assert.equal(c3.error.message, "the draft took more than 60 seconds, so it was stopped");
+    assert.equal(h.server.conversations.get("c1").drafting, null);
+    h.m.closeRelease(); h.m.closeRelease = null;
+    await until(() => !h.server.conversations.get("c1").running, "the turn closed");
+    // (4. a turn not yet finished: still busy at once)
+    let go;
+    h.m.hold = new Promise((r) => { go = r; });
+    p.say("c1", "Another.");
+    await until(() => h.server.conversations.get("c1").running, "running, not finished");
+    assert.equal(code(await p.call("chat.brief", { conversation: "c1" })), "busy");
+    go(); h.m.hold = null;
+    await until(() => !h.server.conversations.get("c1").running, "ended");
+    // (5. a rebind during the wait: no answer, the hold given up)
+    await closing();
+    let rebound = false;
+    p.call("chat.brief", { conversation: "c1" }).then(() => { rebound = true; });
+    await until(() => h.server.conversations.get("c1").drafting, "held");
+    p.notify("grant.changed", { folders: ["/notes"], write: false, delegate: true });
+    await until(() => !h.server.conversations.get("c1").drafting, "the hold given up");
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(rebound, false, "no answer after a rebind");
+    h.m.closeRelease(); h.m.closeRelease = null;
+  } finally { await h.done(); }
+});
+
+test("after the wait the conversation is checked again: a steer the closing turn left queued makes the brief busy, the hold given back", WIN_DELEGATE, async () => {
+  // (direct, as the closing turn's finally does it: steers it never took go back into the queue, to run next)
+  let started = 0;
+  const frames = [];
+  const server = new AgentServer({ log() {}, deleteSession: async () => {}, query: () => { started++; return (async function* () {})(); } });
+  try {
+    const ws = { send: (x) => frames.push(JSON.parse(x)) };
+    server.tasks = {};
+    server.sock = ws;
+    server.binding = { ws, grant: { delegate: true }, gen: 1 };
+    let closed;
+    const c = { sessionId: "11111111-1111-4111-8111-111111111111", queue: [], running: { finished: () => true, done: new Promise((r) => { closed = r; }) } };
+    server.conversations.set("c1", c);
+    const answered = server.brief(ws, { id: "p2", params: { conversation: "c1" } });
+    await until(() => c.drafting, "held while the turn closes");
+    c.queue.unshift({ conversation: "c1", id: "s1", text: "a steer", author: "person" });
+    c.running = null;
+    closed();
+    await answered;
+    assert.equal(frames[0]?.error?.data?.code, "busy");
+    assert.equal(frames[0].error.message, "this conversation is busy: try again after its turn or draft ends");
+    assert.equal(c.drafting, null, "the hold given back");
+    assert.equal(started, 0, "no draft started");
+    assert.equal(server.runningCount, 0);
+  } finally { rmSync(server.cwd, { recursive: true, force: true }); }
 });

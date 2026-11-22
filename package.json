@@ -16,6 +16,7 @@
     "lib/task-notebook-edit.mjs",
     "lib/canon.mjs",
     "lib/stdio.mjs",
+    "lib/pair-stdin.mjs",
     "lib/fake.mjs",
     "lib/codex.mjs",
     "lib/codex-turns.mjs",

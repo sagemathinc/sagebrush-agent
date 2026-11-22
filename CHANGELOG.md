@@ -1,5 +1,12 @@
 # sagebrush-agent changes
 
+## 0.8.8
+
+**A Pair turn that hangs now ends for the page.** Running code in Delegate is still not enabled in this version.
+
+- **Stop ends a turn, even a stuck one:** if Claude Code stops answering in the middle of a Pair turn, the person's Stop (or the workspace access ending, a turn's time limit, or the agent stopping) now ends the turn for the page at once, and the chat can go on. Before, such a turn showed as running for good, and Stop didn't end it.
+- **What stays counted:** if that turn's Claude Code work doesn't end, the agent reports that, and the turn keeps its place among the turns the agent runs at once (at most 4) until the work ends. So a stuck turn never lets the agent start more than its limits allow.
+
 ## 0.8.7
 
 **A Delegate task's brief, drafted from the Pair chat.** Running code in Delegate is still not enabled in this version.

@@ -102,10 +102,11 @@ test("on from this version: RUNS_ENABLED is true; a runner turned off, or a task
   // (no engine pinned; a platform with no Deno pinned)
   assert.equal(new TaskRunner({ store: h.store, enabled: true, pin: { ...PIN, engine: null }, platform: "linux-x64" }).problem(h.task), "no engine with confinement is pinned yet");
   assert.match(new TaskRunner({ store: h.store, enabled: true, pin: PIN, platform: null }).problem(h.task), /runs aren't available on/);
-  // (Linux only for now: a platform the pins have but RUN_PLATFORMS doesn't, macOS, refuses, saying so)
-  assert.deepEqual(RUN_PLATFORMS, ["linux-x64", "linux-arm64"]);
-  for (const p of ["darwin-arm64", "darwin-x64"]) assert.equal(new TaskRunner({ store: h.store, pin: PIN, platform: p }).problem(h.task), `runs aren't available on ${p} in this version (Linux only, for now)`);
-  assert.equal(new TaskRunner({ store: h.store, pin: PIN, platform: "linux-arm64" }).problem(h.task), null);
+  // (Linux and macOS: the platforms the pins have and RUN_PLATFORMS names; another platform the pins had but the list
+  //  didn't would refuse, saying so)
+  assert.deepEqual(RUN_PLATFORMS, ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"]);
+  for (const p of ["darwin-arm64", "darwin-x64", "linux-arm64"]) assert.equal(new TaskRunner({ store: h.store, pin: PIN, platform: p }).problem(h.task), null, p);
+  assert.equal(new TaskRunner({ store: h.store, pin: PIN, platform: "darwin-arm64", runPlatforms: ["linux-x64"] }).problem(h.task), "runs aren't available on darwin-arm64 in this version");
   assert.equal(h.spawned.length + noRun.spawned.length, 0);
   h.done(); noRun.done();
 });
@@ -680,8 +681,10 @@ test("no signal once the run's leader is reaped: a run that ends by itself signa
 
 // (SEC H1, second round: libuv reaps every exited child before it runs their exit callbacks, so in one child's
 //  callback another can be reaped while Node still shows it running: only its identity, read with the signal, decides)
-test("signalRun: a leader is signalled only while it is still the run's own (its recorded start time, leading its group, read with the signal)", { skip: process.platform === "linux" ? false : "Linux: runs are on there only" }, async () => {
-  const { procStart } = await import("../lib/proc-start.mjs");
+test("signalRun: a leader is signalled only while it is still the run's own (its recorded start time, leading its group, read with the signal)", { skip: ["linux", "darwin"].includes(process.platform) ? false : "runs are on Linux and macOS only" }, async () => {
+  const { procStart, procInfo } = await import("../lib/proc-start.mjs");
+  // (reaped: Linux has no /proc entry for it; macOS's kill(pid, 0) says no such process)
+  const reaped = (pid) => (process.platform === "linux" ? !existsSync(`/proc/${pid}`) : procInfo(pid).gone === true);
   // (1) two children that exit together: in the first one's exit callback the second is already reaped though its
   //  exitCode and signalCode are still null; signalRun signals nothing
   const sent = [];
@@ -691,8 +694,8 @@ test("signalRun: a leader is signalled only while it is still the run's own (its
   const aStart = procStart(a.pid), bStart = procStart(b.pid);
   assert.ok(aStart && bStart, "both recorded at their spawn");
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500); // (both exit while the loop waits: one batch)
-  const seen = await new Promise((resolve) => a.on("exit", () => resolve({ fields: [b.exitCode, b.signalCode], proc: existsSync(`/proc/${b.pid}`), sent: signalRun(b.pid, bStart, { kill }) })));
-  if (seen.fields[0] === null && seen.fields[1] === null) assert.equal(seen.proc, false, "a child Node still shows running, already reaped: its /proc entry is gone");
+  const seen = await new Promise((resolve) => a.on("exit", () => resolve({ fields: [b.exitCode, b.signalCode], reaped: reaped(b.pid), sent: signalRun(b.pid, bStart, { kill }) })));
+  if (seen.fields[0] === null && seen.fields[1] === null) assert.equal(seen.reaped, true, "a child Node still shows running, already reaped: the system has no such process");
   assert.equal(seen.sent, false);
   assert.deepEqual(sent, [], "the reaped child's number never signalled");
   await new Promise((r) => (b.exitCode !== null || b.signalCode !== null ? r() : b.on("exit", r)));

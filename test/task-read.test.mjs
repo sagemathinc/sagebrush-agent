@@ -63,3 +63,22 @@ test("Delegate's read: cell and from only for notebooks; a long text file is cut
   assert.match(bad.content[0].text, /^refused: cell and from are for notebooks \(\.ipynb\) only$/);
   assert.equal(long.content[0].text, `${"z".repeat(1000)}\n[cut: notes.md is 5000 bytes; a read returns at most 1000, so only its start is shown]`);
 });
+
+test("Delegate's read of a hostile notebook (the oversize fixture as an .ipynb): whole, from and cell each bounded at 48 KiB, valid JSON, the same as the shared format gives", WIN_DELEGATE, async () => {
+  const { readFileSync } = await import("node:fs");
+  const big = JSON.parse(readFileSync(new URL("./fixtures/nb-read/oversize.json", import.meta.url), "utf8"));
+  const ipynb = JSON.stringify({ cells: big.cells.map((c) => ({ cell_type: c.type === "markdown" ? "markdown" : "code", id: c.id, metadata: {}, source: c.code, ...(c.type === "markdown" ? {} : { outputs: c.outputs ?? [], execution_count: null }) })), metadata: { kernelspec: { name: "python3" } }, nbformat: 4, nbformat_minor: 5 });
+  const calls = [{ path: "big.ipynb" }, { path: "big.ipynb", from: 1 }, { path: "big.ipynb", from: 3 }, { path: "big.ipynb", cell: 0 }, { path: "big.ipynb", cell: 1 }, { path: "big.ipynb", cell: 3 }, { path: "big.ipynb", cell: 4 }];
+  const got = await reads([{ path: "big.ipynb", kind: "notebook", content: ipynb }], calls);
+  const doc = ipynbDoc(ipynb);
+  for (const [i, c] of calls.entries()) {
+    const t = got[i].content[0].text;
+    assert.equal(t, notebookRead(doc, c), JSON.stringify(c));
+    assert.ok(Buffer.byteLength(t) <= 49152, `${JSON.stringify(c)}: ${Buffer.byteLength(t)}`);
+    JSON.parse(t);
+  }
+  const whole = JSON.parse(got[0].content[0].text);
+  assert.equal(whole.cells[0].cut, true, "the escaped first cell cut to fit");
+  assert.match(whole.note, /Cells 1-4 not shown: read them with \{path, from: 1\}\./);
+  assert.ok(JSON.parse(got[4].content[0].text).cell.outputs_not_shown > 0, "a cell's outputs left out are counted");
+});

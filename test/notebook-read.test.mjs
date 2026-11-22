@@ -11,12 +11,28 @@ const file = (name) => readFileSync(new URL(name, FIX), "utf8");
 const sha = (name) => createHash("sha256").update(readFileSync(new URL(name, FIX))).digest("hex");
 const doc = JSON.parse(file("notebook.json"));
 const path = "notes/fixture.ipynb";
+const OVERSIZE = [["read", {}], ["from-1", { from: 1 }], ["from-2", { from: 2 }], ["from-3", { from: 3 }], ["cell-0", { cell: 0 }], ["cell-1", { cell: 1 }], ["cell-2", { cell: 2 }], ["cell-3", { cell: 3 }], ["cell-4", { cell: 4 }]];
 
 test("the fixture is the shared one, byte for byte", () => {
   assert.deepEqual(["notebook.json", "expected-read.json", "expected-from.json", "expected-cell-1.json", "expected-cell-3.json"].map(sha), [
     "e3389bdca56e634c3a6a2848f5f0768a0f4f03e4b938bab5e35115f1aeb6eb81", "d0a817d6cdd983dd0a79a7477aa1eb7a63cd6bd40f710bdfc76b8e7cd4679800",
     "d52ef4ccc37bdb269aa59e7183e0eaff17e46e1fc5f704a2830eff5ea21a284b", "76b585b6a19d708350e2274ddb83542d72d31a9e740b59ef00cda2e847bb8563",
     "00b0ec21acf19241da3455ad35f61f378553adcd2d6d4e945b02a36a874f0b16"]);
+});
+
+test("v2's oversize fixture is the shared one, byte for byte", () => {
+  assert.deepEqual(["oversize.json", ...OVERSIZE.map(([n]) => `expected-oversize-${n}.json`)].map(sha).map((h) => h.slice(0, 16)), [
+    "c8700055c5b410b8", "e1eba1ccdea47612", "443fef404fbefeeb", "79f6109cb80c3388", "265185a8dbf798d1",
+    "3abac03647384f05", "9b09e6ce3f768ae7", "babd1e80796b37b9", "39d21a1370def99f", "6964f88bd266ed27"]);
+});
+
+test("v2: the oversize document's nine reads give the fixture's exact bytes, each within 48 KiB as serialized", () => {
+  const big = JSON.parse(file("oversize.json"));
+  for (const [name, o] of OVERSIZE) {
+    const got = notebookRead(big, { path: "notes/oversize.ipynb", ...o });
+    assert.equal(got, file(`expected-oversize-${name}.json`), name);
+    assert.ok(Buffer.byteLength(got) <= READ_LIMITS.total, `${name}: ${Buffer.byteLength(got)} bytes`);
+  }
 });
 
 test("the four reads give the fixture's exact bytes: the whole notebook, from cell 10, cell 1 and cell 3", () => {

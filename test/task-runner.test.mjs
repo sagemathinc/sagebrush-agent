@@ -689,11 +689,11 @@ test("signalRun: a leader is signalled only while it is still the run's own (its
   //  exitCode and signalCode are still null; signalRun signals nothing
   const sent = [];
   const kill = (p, sig) => sent.push([p, sig]);
-  const a = spawn("/bin/true", [], { stdio: "ignore", detached: true });
-  const b = spawn("/bin/true", [], { stdio: "ignore", detached: true });
+  const a = spawn(process.execPath, ["-e", ""], { stdio: "ignore", detached: true });
+  const b = spawn(process.execPath, ["-e", ""], { stdio: "ignore", detached: true });
   const aStart = procStart(a.pid), bStart = procStart(b.pid);
   assert.ok(aStart && bStart, "both recorded at their spawn");
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500); // (both exit while the loop waits: one batch)
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500); // (both exit while the loop waits: one batch)
   const seen = await new Promise((resolve) => a.on("exit", () => resolve({ fields: [b.exitCode, b.signalCode], reaped: reaped(b.pid), sent: signalRun(b.pid, bStart, { kill }) })));
   if (seen.fields[0] === null && seen.fields[1] === null) assert.equal(seen.reaped, true, "a child Node still shows running, already reaped: the system has no such process");
   assert.equal(seen.sent, false);

@@ -1,5 +1,13 @@
 # sagebrush-agent changes
 
+## 0.8.13
+
+**A Delegate task can run code, on Linux, and you can tell a running task something without starting it over.**
+
+- **Running code in a Delegate task, on Linux:** a task started with "May run code" runs its notebooks with a pinned Deno (2.9.6) and a pinned Sagebrush engine (0.10.3), fetched once and checked file by file. A run reads and writes only the task's copy and a private scratch folder, with no network, no programs started, no native code and none of the agent's environment. macOS and Windows still say running code isn't available there. The agent offers `delegate.run` to the page only where a task's notebooks can actually run, and the task's instructions to Claude say whether running code is available.
+- **Stopping a run:** Stop, a run's time limit or too much output stops it only through its process's identity, never a process number that may have been reused.
+- **Resume with a note:** `tasks.resume` takes an optional `note`. The resumed turn's instructions carry it exactly as written, as an Ask's note is, and Claude carries on from its copy as it left it. Without a note, Resume works as before.
+
 ## 0.8.12
 
 **Coming back to the page never needs a restart.** Running code in Delegate is still not enabled in this version.

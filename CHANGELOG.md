@@ -1,5 +1,13 @@
 # sagebrush-agent changes
 
+## 0.8.14
+
+**A Delegate task runs code on macOS too, and a task that stops says why.**
+
+- **Running code on macOS:** as on Linux, a task started with "May run code" runs its notebooks with the pinned Deno and engine, and the agent offers `delegate.run` there. Before stopping a run, the runner checks the process's start time and process group with `ps`, as it reads `/proc` on Linux. Windows still says running code isn't available there.
+- **Why a task stopped:** a task the agent leaves interrupted now carries a code with its reason: `no_proposal`, `unproposable`, `stopped`, `switched_off`, `limit`, `failed` or `restarted`. It goes on the `task_status` event, and as `reason` and `reason_code` in the entries of `tasks.list` and `tasks.get` while the task is interrupted. Only a page that announces `tasks.reason` gets these fields; any other page gets exactly the shapes it got before. Resuming a task clears them.
+- **Claude's words, not an error:** when Claude ends a turn with a result it marks as an error, its text is now shown as an ordinary message, and the error is a fixed line, "Claude ended the turn with an error".
+
 ## 0.8.13
 
 **A Delegate task can run code, on Linux, and you can tell a running task something without starting it over.**

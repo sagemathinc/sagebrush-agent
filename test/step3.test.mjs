@@ -95,6 +95,8 @@ const texts = (server, c) => logOf(server, c).filter((e) => e.method === "turn.e
 const finished = (server, c) => logOf(server, c).filter((e) => e.method === "turn.event" && e.params.event.type === "turn_finished").map((e) => e.params.event.outcome);
 const started = (server, c) => logOf(server, c).filter((e) => e.method === "turn.event" && e.params.event.type === "turn_started").length;
 const receipts = (msgs, id) => msgs.filter((m) => m.method === "chat.receipt" && m.params.id === id).map((m) => m.params.state + (m.params.reason ? `:${m.params.reason}` : ""));
+// (what the page has received, not what the server has logged: a frame the server sent may still be on its way)
+const pageFinished = (msgs, c) => msgs.filter((m) => m.method === "turn.event" && m.params.conversation === c && m.params.event.type === "turn_finished").length;
 
 test("the hello offers chat.steer", async () => {
   const { server, port, code } = await start();
@@ -161,9 +163,13 @@ test("a steer with no turn running: queued (idle), and it starts a turn; without
   const p = await paired(port, code);
   p.notify("chat.message", { conversation: "c1", id: "u1", author: "person", text: "hello", steer: true });
   await until(() => finished(server, "c1").length === 1);
+  // (the page's own copy, once it has the turn's end: the receipt went out before the turn started)
+  await until(() => pageFinished(p.msgs, "c1") === 1);
   assert.deepEqual(receipts(p.msgs, "u1"), ["queued:idle"]);
   p.notify("chat.message", { conversation: "c1", id: "u2", author: "person", text: "again" });
   await until(() => finished(server, "c1").length === 2);
+  // (no receipt for u2, checked once the page has everything up to that turn's end)
+  await until(() => pageFinished(p.msgs, "c1") === 2);
   assert.deepEqual(receipts(p.msgs, "u2"), []);
   p.ws.close();
   server.close();

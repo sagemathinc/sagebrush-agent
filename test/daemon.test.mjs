@@ -474,12 +474,17 @@ test("the command line: when the page goes away, a fresh one-time link is printe
     const p4 = page(first.port);
     await p4.open;
     assert.ok((await p4.hello({ code: links().at(-1).code })).result, "the newest code pairs");
-    // another page while one is paired: refused at the upgrade (409), before any code is looked at
+    // another page while one is paired: refused "busy" at its hello, before any code is looked at (#1620: a browser
+    // can't read an upgrade's 409); a code it carries isn't spent
+    const spare = links().length;
     const p5 = page(first.port);
-    const r5 = await p5.open.then(() => "open", (e) => String(e?.message ?? e));
-    assert.match(r5, /409/, "a second page while one is paired: refused (409)");
+    await p5.open;
+    const r5 = await p5.hello({ code: links().at(-1).code });
+    assert.deepEqual([r5.error?.data?.code, r5.error?.data?.reason, r5.error?.data?.message], ["refused", "busy", "another page is paired with this agent"], "a second page while one is paired: busy");
+    await p5.closed;
+    assert.equal(links().length, spare, "no new link for a refused second page");
     p4.ws.close();
-    assert.match(out, /^The code works once, for 5 minutes; a new one is printed here each time the page goes away\.$/m);
+    assert.match(out, /^The code works once, for 5 minutes; a new one is printed here each time the page goes away, or the last one expires unused\.$/m);
     assert.doesNotMatch(out, /press Enter/);
   } finally {
     c.kill("SIGKILL");
@@ -573,4 +578,105 @@ test("changing an existing file without base is refused with how to do it; the p
 
   p.ws.close();
   await server.close();
+});
+
+// (#1620: the agent's side of coming back to the same running agent with no terminal)
+test("the session contract: a page's session pairs again however often it goes and comes, while the process runs, until another code pairs", async () => {
+  const { server, port, code } = await start();
+  const a = page(port);
+  await a.open;
+  const session = (await a.hello({ code })).result.session;
+  assert.match(session, /^[A-Za-z0-9_-]{43}$/);
+  a.ws.close();
+  await a.closed;
+  for (let k = 0; k < 3; k++) {
+    const q = page(port);
+    await q.open;
+    const r = await q.hello({ session });
+    assert.ok(r.result, `return ${k}`);
+    assert.equal(r.result.session, undefined, "a session hello mints no new session");
+    q.ws.close();
+    await q.closed;
+  }
+  // (another code pairs: the old session is unknown from then on, and says so)
+  const b = page(port);
+  await b.open;
+  assert.ok((await b.hello({ code: server.newCode() })).result.session);
+  b.ws.close();
+  await b.closed;
+  const c = page(port);
+  await c.open;
+  const r = await c.hello({ session });
+  assert.equal(r.error.data.code, "refused");
+  assert.equal(r.error.data.reason, "unknown-session");
+  assert.match(r.error.data.message, /doesn't know that session/);
+  await server.close();
+});
+
+test("a refused hello says which case it is: busy, unknown-session or bad-code; code and message as before", async () => {
+  const { server, port, code } = await start();
+  // (no session held yet: any session is unknown)
+  const u = page(port);
+  await u.open;
+  const ru = await u.hello({ session: "x".repeat(43) });
+  assert.deepEqual([ru.error.data.code, ru.error.data.reason], ["refused", "unknown-session"]);
+  // (a wrong code, and a hello with neither: bad-code, with the message it always had)
+  for (const params of [{ code: "WRONGCODE" }, {}]) {
+    const w = page(port);
+    await w.open;
+    const rw = await w.hello(params);
+    assert.deepEqual([rw.error.data.code, rw.error.data.reason], ["refused", "bad-code"], JSON.stringify(params));
+    assert.match(rw.error.data.message, /a wrong or expired code: use the newest link sagebrush-agent printed in its terminal/);
+  }
+  // (paired: a second page, connecting now, with the right session, a fresh code or a wrong one, is busy; the code isn't
+  //  spent: once the first page goes, it still pairs)
+  const a = page(port);
+  await a.open;
+  const session = (await a.hello({ code })).result.session;
+  const fresh = server.newCode();
+  for (const params of [{ session }, { code: fresh }, { code: "WRONGCODE" }]) {
+    const b = page(port);
+    await b.open;
+    const rb = await b.hello(params);
+    assert.deepEqual([rb.error.data.code, rb.error.data.reason, rb.error.data.message], ["refused", "busy", "another page is paired with this agent"], JSON.stringify(Object.keys(params)));
+    await b.closed;
+  }
+  a.ws.close();
+  await a.closed;
+  const c = page(port);
+  await c.open;
+  assert.ok((await c.hello({ code: fresh })).result, "the code a busy refusal carried is still good");
+  c.ws.close();
+  await server.close();
+});
+
+test("a code that expires while no page is paired is replaced and handed on; a paired page stops it; the newest code always pairs", async () => {
+  const renewed = [];
+  const { server, port } = await start({ codeTtlMs: 150 });
+  server.onCodeRenewed = (c) => renewed.push(c);
+  const first = server.newCode();
+  await until(() => renewed.length >= 2, 3000);
+  assert.equal(new Set([first, ...renewed]).size, renewed.length + 1, "each code new");
+  // (an expired one is refused, bad-code; the newest pairs)
+  const old = page(port);
+  await old.open;
+  assert.equal((await old.hello({ code: first })).error.data.reason, "bad-code");
+  const a = page(port);
+  await a.open;
+  const r = await a.hello({ code: renewed.at(-1) });
+  assert.ok(r.result, JSON.stringify(r.error));
+  // (paired: no code made while it lasts)
+  const n = renewed.length;
+  await new Promise((res) => setTimeout(res, 500));
+  assert.equal(renewed.length, n, "no renewal while a page is paired");
+  // (the page goes; the bin's fresh link (newCode) starts it again)
+  a.ws.close();
+  await a.closed;
+  server.newCode();
+  await until(() => renewed.length >= n + 1, 3000);
+  // (closing the agent stops it)
+  await server.close();
+  const m = renewed.length;
+  await new Promise((res) => setTimeout(res, 400));
+  assert.equal(renewed.length, m, "no renewal after close");
 });

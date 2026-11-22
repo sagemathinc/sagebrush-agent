@@ -12,7 +12,7 @@ import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { fakeCreateServer } from "../lib/fake.mjs";
 import { RUNNER_PIN } from "../lib/runner-fetch.mjs";
-import { cfUserTextEncoding, copyZones, RUN_PLATFORMS, RUNS_ENABLED, runArgv, runEnv, TaskRunner, TZ_SOURCE } from "../lib/task-runner.mjs";
+import { cfUserTextEncoding, copyZones, RUN_LIMITS as RUN_LIMITS_FOR_TEST, RUN_PLATFORMS, RUNS_ENABLED, runArgv, runEnv, TaskRunner, TZ_SOURCE } from "../lib/task-runner.mjs";
 import { TaskRpc } from "../lib/task-rpc.mjs";
 import { TaskTurns, TASK_SERVER } from "../lib/task-turns.mjs";
 import { TaskStore } from "../lib/tasks.mjs";
@@ -576,5 +576,82 @@ test("on macOS the run's __CF_USER_TEXT_ENCODING is the runner's own, from the u
     for (const uid of [null, -1, 1.5, "501"]) assert.throws(() => runEnv(at, { platform: "darwin", uid }), /uid/, String(uid));
   } finally {
     if (before === undefined) delete process.env.__CF_USER_TEXT_ENCODING; else process.env.__CF_USER_TEXT_ENCODING = before;
+  }
+});
+
+// (SEC H1: the run's group was signalled after Node had reaped its leader, by a number that may then be anyone's)
+test("no signal once the run's leader is reaped: a run that ends by itself signals nothing; after its exit a stop, the time bound or too much output signal nothing; before it, a stop signals its group once", { ...T, ...WIN_DELEGATE, skip: process.platform === "win32" ? "POSIX process groups" : T.skip }, async () => {
+  const { EventEmitter } = await import("node:events");
+  const { PassThrough } = await import("node:stream");
+  const realKill = process.kill;
+  const calls = [];
+  // (group signals recorded, never sent; any other kill goes through)
+  process.kill = function (pid, sig) { if (typeof pid === "number" && pid < 0) { calls.push([pid, sig]); return true; } return realKill.call(process, pid, sig); };
+  const holders = [];
+  try {
+    // (1) a real run to its end, then the turn's stop after it: nothing signalled
+    const h = setup({ mode: "report" });
+    const ac = new AbortController();
+    await h.runner.run(h.task, "nb dir/a.ipynb", { signal: ac.signal });
+    ac.abort();
+    assert.deepEqual(calls, [], "a run that ended by itself: no group signalled, before or after its close");
+    h.done();
+    // (2) a child that exits first; then, before its close: the turn's stop, output past its bound and the time bound
+    const scripted = (limits) => {
+      const g = setup({ mode: "report", limits });
+      // (a real process lends its pid, so the run can be recorded; its events are scripted here)
+      const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      holders.push(holder);
+      const child = Object.assign(new EventEmitter(), { pid: holder.pid, exitCode: null, signalCode: null, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill() {} });
+      const runner = new TaskRunner({ store: g.store, enabled: true, pin: PIN, platform: "linux-x64", ensure: async () => ({ deno: process.execPath, engine: g.engine }), spawnFn: () => child, limits: { ...RUN_LIMITS_FOR_TEST, ...limits } });
+      return { g, child, runner, holder };
+    };
+    // (2a) the turn's stop and the time bound after the exit: nothing signalled, and the run isn't said stopped or out
+    //  of time: both were disarmed when ownership ended
+    const a = scripted({ marginMs: 0 });
+    const stop = new AbortController();
+    const ran = a.runner.run(a.g.task, "nb dir/a.ipynb", { signal: stop.signal, timeoutS: 1 }).catch((e) => e);
+    await until(() => a.child.listenerCount("close") > 0, "the run started");
+    a.child.exitCode = 0;
+    a.child.emit("exit", 0, null);
+    stop.abort();
+    await new Promise((r) => setTimeout(r, 1300)); // (past the time bound, 1 s plus no margin)
+    a.child.stdout.end(); a.child.stderr.end();
+    a.child.emit("close", 0, null);
+    const res = await ran;
+    assert.deepEqual(calls, [], "after the leader's exit: no group signalled by a stop or the time bound");
+    assert.doesNotMatch(String(res?.message ?? JSON.stringify(res)), /turn was stopped|time was up/, "disarmed at the exit: not said stopped or out of time");
+    a.g.done();
+    // (2b) output past its bound after the exit: counted against the run, never signalled
+    const c = scripted({ stdout: 8 });
+    const ranC = c.runner.run(c.g.task, "nb dir/a.ipynb").catch((e) => e);
+    await until(() => c.child.listenerCount("close") > 0, "the run started");
+    c.child.exitCode = 0;
+    c.child.emit("exit", 0, null);
+    c.child.stdout.write(Buffer.alloc(64, 0x61));
+    await new Promise((r) => setTimeout(r, 50));
+    c.child.stdout.end(); c.child.stderr.end();
+    c.child.emit("close", 0, null);
+    await ranC;
+    assert.deepEqual(calls, [], "after the leader's exit: too much output signals no group");
+    c.g.done();
+    // (3) the control: a stop while the leader hasn't exited signals its group, once
+    const b = scripted({});
+    const stop2 = new AbortController();
+    const ran2 = b.runner.run(b.g.task, "nb dir/a.ipynb", { signal: stop2.signal }).catch((e) => e);
+    await until(() => b.child.listenerCount("close") > 0, "the run started");
+    stop2.abort();
+    assert.deepEqual(calls, [[-b.holder.pid, "SIGKILL"]], "a stop before the exit: its group, once");
+    b.child.signalCode = "SIGKILL";
+    b.child.emit("exit", null, "SIGKILL");
+    stop2.abort();
+    b.child.stdout.end(); b.child.stderr.end();
+    b.child.emit("close", null, "SIGKILL");
+    await ran2;
+    assert.equal(calls.length, 1, "nothing more after its exit");
+    b.g.done();
+  } finally {
+    process.kill = realKill;
+    for (const x of holders) x.kill("SIGKILL");
   }
 });

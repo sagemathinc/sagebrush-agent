@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { TaskStore } from "../lib/tasks.mjs";
 import { TaskTurns, TASK_SERVER } from "../lib/task-turns.mjs";
 import { checkRequest } from "../lib/tasks-schema.mjs";
-import { blobId } from "../lib/task-git.mjs";
+import { blobId, readCommit } from "../lib/task-git.mjs";
 import { TaskRpc } from "../lib/task-rpc.mjs";
 import { fakeCreateServer } from "../lib/fake.mjs";
 // (Delegate is refused on Windows in this version: its rows here are declared skips there, never silent passes)
@@ -113,6 +113,55 @@ test("a proposal whose call id isn't known still ends its turn (no call is inven
   // (the turn's only end is the host's, at its end without a proposal; never a "completed" from the refused propose)
   assert.deepEqual(gev.filter((e) => e.type === "turn_finished").map((e) => e.outcome), ["completed"]);
   assert.equal(g.store.state(g.task).status, "interrupted");
+  g.done();
+});
+
+// (#1621: a turn that ended with changes in the copy but no propose call left them unproposed, the task interrupted)
+test("a turn that completes with changes but no propose call: its copy is proposed for it, saying so", WIN_DELEGATE, async () => {
+  const h = setup({ steps: [["workspace_write", { path: "notes.md", text: "# x is two\n" }]] });
+  const task = h.start();
+  h.turns.begin(task, "start");
+  await until(() => !h.turns.isRunning(task), "the turn over");
+  const t = h.store.state(task);
+  assert.equal(t.status, "proposal", t.reason);
+  assert.deepEqual(h.store.diff({ task, commit: t.proposals[0] }).files.map((f) => [f.path, f.change]), [["notes.md", "added"]]);
+  assert.match(readCommit(h.store.gitdir(task), t.proposals[0]).message, /Proposed automatically: Claude's turn ended with changes in the copy but without calling propose\./);
+  // (the turn's own end first, recorded while it worked; then the proposal)
+  const ty = h.types(task);
+  assert.deepEqual(ty.slice(-3), ["turn_finished", "proposal", "task_status"], ty.join(","));
+  h.done();
+});
+
+test("no proposal is made for it when the copy didn't change, when the turn didn't complete, or when the store refuses it", WIN_DELEGATE, async () => {
+  // (a turn that fails after writing: interrupted, nothing proposed)
+  const fails = (o) => (async function* () {
+    yield { type: "system", subtype: "init", session_id: "s", tools: [], mcp_servers: [] };
+    await o.mcpServers[TASK_SERVER].handlers.workspace_write({ path: "notes.md", text: "half\n" });
+    yield { type: "result", subtype: "error_during_execution", is_error: true, result: "", usage: { input_tokens: 1, output_tokens: 1 } };
+  })();
+  const h = hostWith(perCall([fails]));
+  const { task } = await h.rpc.call("tasks.start", h.req());
+  await until(() => h.store.state(task).status === "interrupted", "interrupted");
+  assert.equal(h.store.state(task).proposals.length, 0);
+  assert.match(h.store.state(task).reason, /ended without a proposal/);
+  h.done();
+  // (a stopped turn, with a change made: interrupted as stopped, nothing proposed)
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const writesThenWaits = (o) => (async function* () {
+    yield { type: "system", subtype: "init", session_id: "s", tools: [], mcp_servers: [] };
+    await o.mcpServers[TASK_SERVER].handlers.workspace_write({ path: "notes.md", text: "half\n" });
+    await gate;
+    yield { type: "result", subtype: "success", is_error: false, result: "ok", usage: { input_tokens: 1, output_tokens: 1 } };
+  })();
+  const g = hostWith(perCall([writesThenWaits]));
+  const k = (await g.rpc.call("tasks.start", g.req())).task;
+  await until(() => existsSync(join(g.store.work(k), "notes.md")), "the change");
+  await g.rpc.call("tasks.stop", { task: k });
+  release();
+  await until(() => !g.turns.isRunning(k), "the turn over");
+  assert.equal(g.store.state(k).status, "interrupted");
+  assert.equal(g.store.state(k).proposals.length, 0);
   g.done();
 });
 

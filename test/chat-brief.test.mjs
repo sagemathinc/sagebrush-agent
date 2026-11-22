@@ -35,6 +35,12 @@ function models() {
     if (options.forkSession) {
       const rec = { options, prompt };
       m.drafts.push(rec);
+      // (a stuck model: its next() and return() never settle, whatever the abort says; `stuckAfterInit` yields the
+      //  init first)
+      if (m.draft.stuck) {
+        let first = !!m.draft.stuckAfterInit;
+        return { [Symbol.asyncIterator]() { return this; }, next() { if (first) { first = false; return Promise.resolve({ done: false, value: { type: "system", subtype: "init", session_id: options.sessionId, tools: [] } }); } return new Promise(() => {}); }, return() { m.returnsAsked = (m.returnsAsked ?? 0) + 1; return new Promise(() => {}); } };
+      }
       return (async function* () {
         rec.text = await promptText(prompt);
         const d = m.draft;
@@ -61,11 +67,12 @@ function models() {
   return m;
 }
 
-async function setup({ tasks = true, backend = false, briefMs } = {}) {
+async function setup({ tasks = true, backend = false, briefMs, retireTimeoutMs, deleteSession } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "sb-brief-"));
   const m = models();
+  if (deleteSession) m.deleteSession = deleteSession(m);
   const logs = [];
-  const server = new AgentServer({ query: m.query, deleteSession: m.deleteSession, log: (s) => logs.push(String(s)), ...(briefMs ? { briefMs } : {}) });
+  const server = new AgentServer({ query: m.query, deleteSession: m.deleteSession, log: (s) => logs.push(String(s)), ...(briefMs ? { briefMs } : {}), ...(retireTimeoutMs ? { retireTimeoutMs } : {}) });
   server.createServer = fakeCreateServer;
   if (tasks) {
     const store = new TaskStore({ root: join(dir, "tasks"), scope: "install-1" }).init();
@@ -188,7 +195,7 @@ test("bad requests: an id that isn't p<n>, params other than exactly {conversati
   } finally { await h.done(); }
 });
 
-test("not_found, unavailable (no grant; no session yet) and busy (a turn running; a draft running; the turn quota full)", WIN_DELEGATE, async () => {
+test("not_found, unavailable (no grant; no Delegate switch; no session yet) and busy (a turn running; a draft running; the turn quota full)", WIN_DELEGATE, async () => {
   const h = await setup();
   try {
     // (no grant: nothing to draft for)
@@ -198,6 +205,12 @@ test("not_found, unavailable (no grant; no session yet) and busy (a turn running
     const a0 = await p0.call("chat.brief", { conversation: "c1" });
     assert.equal(code(a0), "unavailable");
     assert.equal(a0.error.message, "the page has no grant: grant access, then ask again");
+    // (a grant without the Delegate switch: a Pair grant isn't enough, as for tasks.start)
+    p0.notify("grant.changed", { folders: ["/"], write: true });
+    await until(() => h.server.binding?.grant, "a Pair grant");
+    const a1 = await p0.call("chat.brief", { conversation: "c1" });
+    assert.equal(code(a1), "unavailable");
+    assert.equal(a1.error.message, "Delegate tasks aren't allowed for this page: turn on \"Allow Delegate tasks on this computer\", then ask again");
     p0.ws.close();
     await until(() => !h.server.sock, "the first page gone");
     h.code = h.server.newCode();
@@ -216,7 +229,7 @@ test("not_found, unavailable (no grant; no session yet) and busy (a turn running
     await until(() => h.server.conversations.get("c1").running, "c1's turn running");
     const a3 = await p.call("chat.brief", { conversation: "c1" });
     assert.equal(code(a3), "busy");
-    assert.equal(a3.error.message, "a turn is running in this conversation: wait for it, or Stop it");
+    assert.equal(a3.error.message, "this conversation is busy: try again after its turn or draft ends");
     // (the turn quota: three more conversations running make four, RUNNING_MAX; a brief elsewhere waits its turn)
     for (const c of ["c3", "c4", "c5"]) p.say(c, "Hello.");
     await until(() => h.server.counters().running === 4, "four turns running");
@@ -421,4 +434,69 @@ test("the fake model's draft: the Goal is the person's first message, Decision: 
   for await (const m of draft) msgs.push(m);
   assert.equal(msgs[0].session_id, "f-1");
   assert.equal(msgs.at(-1).result, text);
+});
+
+test("a stuck model (next() and return() never settle, the abort ignored): its bound still answers failed, frees its place and retires the fork; Cancel answers stopped", WIN_DELEGATE, async () => {
+  const h = await setup({ briefMs: 200, retireTimeoutMs: 100 });
+  try {
+    const { p } = await ready(h);
+    for (const stuckAfterInit of [false, true]) {
+      h.m.draft = { stuck: true, stuckAfterInit };
+      const t0 = Date.now();
+      const a = await p.call("chat.brief", { conversation: "c1" });
+      assert.equal(code(a), "failed", `stuckAfterInit ${stuckAfterInit}`);
+      assert.equal(a.error.message, "the draft took more than 60 seconds, so it was stopped");
+      assert.ok(Date.now() - t0 < 2000, `answered within the bound and the close timeout (${Date.now() - t0} ms)`);
+      assert.equal(h.server.counters().running, 0);
+      assert.equal(h.server.conversations.get("c1").drafting, null);
+      await until(() => h.m.deleted.some((d) => d.id === h.m.drafts.at(-1).options.sessionId), "the fork's deletion");
+    }
+    assert.equal(h.m.returnsAsked, 2, "the iterator was closed each time");
+    // (Cancel on a stuck draft: stopped, at once, not after the bound)
+    h.m.draft = { stuck: true };
+    const h2 = await setup({ briefMs: 60000, retireTimeoutMs: 100 });
+    try {
+      const r = await ready(h2);
+      h2.m.draft = { stuck: true, stuckAfterInit: true };
+      const pending = r.p.call("chat.brief", { conversation: "c1" });
+      await until(() => h2.server.conversations.get("c1").drafting, "the draft running");
+      const t0 = Date.now();
+      r.p.notify("chat.brief_cancel", { conversation: "c1" });
+      assert.equal(code(await pending), "stopped");
+      assert.ok(Date.now() - t0 < 2000, `${Date.now() - t0} ms`);
+      assert.equal(h2.server.counters().running, 0);
+      // (and the conversation goes on)
+      r.p.say("c1", "Next.");
+      await until(() => r.p.finished("c1") === 2, "the next turn");
+    } finally { await h2.done(); }
+  } finally { await h.done(); }
+});
+
+test("forks' deletions share RETIRING_MAX: with deletions that never settle, at most 8 are under way and the ninth draft is busy; nothing is logged for a fork with no transcript", WIN_DELEGATE, async () => {
+  let launched = 0;
+  const h = await setup({ retireTimeoutMs: 30, deleteSession: (m) => async (id, opts) => { launched++; m.deleted.push({ id, dir: opts?.dir }); return new Promise(() => {}); } });
+  try {
+    const { p } = await ready(h);
+    let ok = 0, busy = null;
+    for (let i = 0; i < 50; i++) {
+      const a = await p.call("chat.brief", { conversation: "c1" });
+      if (a.result) { ok++; continue; }
+      busy = a;
+      break;
+    }
+    assert.equal(ok, 8, "eight drafts, each leaving an unsettled deletion");
+    assert.equal(code(busy), "busy");
+    assert.equal(busy.error.message, "the agent is running as many turns as it can: ask again in a moment");
+    await until(() => launched === 8, "the eight deletions launched, one after another");
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(launched, 8, "never more than RETIRING_MAX under way");
+    assert.equal(h.server.counters().retiring, 8);
+    assert.equal(h.server.counters().running, 0);
+    // (a chat message waits too: it starts no turn while retirement is full)
+    p.say("c1", "Waiting.");
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(p.finished("c1"), 1);
+    // (no fork had a transcript: nothing about one was logged)
+    assert.deepEqual(h.logs.filter((l) => /transcript|fork/.test(l)), []);
+  } finally { await h.done(); }
 });

@@ -10,8 +10,8 @@ import { TEXT } from "../lib/server.mjs";
 const BIN = fileURLToPath(new URL("../bin/sagebrush-agent.mjs", import.meta.url));
 const F = 64 * 1024; // (the smallest frame the agent accepts: the edges are cheap to reach)
 
-function agent({ frame = F, start = true } = {}) {
-  const p = spawn(process.execPath, [BIN, "--stdio"], { env: { ...process.env, SAGEBRUSH_AGENT_FAKE: "1" }, stdio: ["pipe", "pipe", "pipe"] });
+function agent({ frame = F, start = true, env = {} } = {}) {
+  const p = spawn(process.execPath, [BIN, "--stdio"], { env: { ...process.env, SAGEBRUSH_AGENT_FAKE: "1", ...env }, stdio: ["pipe", "pipe", "pipe"] });
   const a = { p, lines: [], raw: [], err: "", exit: null, waiters: [] };
   let buf = "";
   p.stdout.on("data", (d) => {
@@ -262,31 +262,63 @@ test("stdio: the caps: a fifth conversation waits for a running turn, and the 17
   } finally { a.stopAnswering?.(); a.kill(); }
 });
 
-// (on Windows, Node writes to a stdout pipe synchronously: a reader that stops reading blocks the write itself and the
-//  queue never fills, so the 2F bound can't trigger there; measured on Windows, a known gap, not a silent pass)
-test("stdio: a page that stops reading: the turn is stopped at the 2F bound and the page is told once, from the reserve", { skip: process.platform === "win32" ? "Windows: stdout to a pipe is synchronous, so a stalled reader blocks the write and the 2F queue bound never triggers (a known gap)" : false }, async () => {
-  const a = agent();
-  try {
-    await a.until(() => ready(a), "agent.ready");
-    a.answering(); a.grant();
-    a.p.stdout.pause();
-    a.say("c1", "flood 200");
-    await new Promise((r) => setTimeout(r, 1500)); // (time for the agent to fill its queue; the row's verdict comes from the lines below)
-    a.p.stdout.resume();
-    await a.until(() => finished(a, "c1"), "the stopped turn's end");
-    const ev = a.events((p) => p.conversation === "c1");
-    const err = ev.find((e) => e.type === "turn_error");
-    assert.equal(err?.message, TEXT.notReading);
-    // (after the notice, the turn's only event is its end; nothing of the stopped turn follows it)
-    const at = ev.indexOf(err);
-    assert.deepEqual(ev.slice(at + 1).map((e) => [e.type, e.outcome]), [["turn_finished", "error"]]);
-    await new Promise((r) => setTimeout(r, 300));
-    assert.equal(a.events((p) => p.conversation === "c1").length, ev.length, "nothing more for that turn");
-    assert.ok(ev.filter((e) => e.type === "text_delta").length < 200, "the flood was cut short");
-    a.say("c2", "hello");
-    await a.until(() => finished(a, "c2"), "a turn afterwards");
-  } finally { a.stopAnswering?.(); a.kill(); }
-});
+// (on Windows, Node writes to a stdout pipe synchronously: a reader that stops reading would block the write itself,
+//  and with it the agent's whole event loop. There the agent writes stdout from a thread (lib/stdout-thread.mjs), so
+//  the queue fills and the 2F bound stops the turn as elsewhere. The row runs with that thread on every platform, and
+//  with process.stdout where its pipe writes don't block.)
+const OUTPUTS = process.platform === "win32" ? ["thread"] : ["stream", "thread"];
+for (const out of OUTPUTS) {
+  test(`stdio (stdout: ${out}): a page that stops reading: the turn is stopped at the 2F bound and the page is told once, from the reserve`, async () => {
+    const a = agent({ env: { SAGEBRUSH_AGENT_STDOUT: out } });
+    try {
+      await a.until(() => ready(a), "agent.ready");
+      a.answering(); a.grant();
+      a.p.stdout.pause();
+      a.say("c1", "flood 200");
+      await new Promise((r) => setTimeout(r, 1500)); // (time for the agent to fill its queue; the row's verdict comes from the lines below)
+      a.p.stdout.resume();
+      await a.until(() => finished(a, "c1"), "the stopped turn's end");
+      const ev = a.events((p) => p.conversation === "c1");
+      const err = ev.find((e) => e.type === "turn_error");
+      assert.equal(err?.message, TEXT.notReading);
+      // (after the notice, the turn's only event is its end; nothing of the stopped turn follows it)
+      const at = ev.indexOf(err);
+      assert.deepEqual(ev.slice(at + 1).map((e) => [e.type, e.outcome]), [["turn_finished", "error"]]);
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(a.events((p) => p.conversation === "c1").length, ev.length, "nothing more for that turn");
+      assert.ok(ev.filter((e) => e.type === "text_delta").length < 200, "the flood was cut short");
+      a.say("c2", "hello");
+      await a.until(() => finished(a, "c2"), "a turn afterwards");
+    } finally { a.stopAnswering?.(); a.kill(); }
+  });
+}
+
+// (the agent keeps working while the page doesn't read: lines from the runner are handled at once, not when the page
+//  reads again. The proof is on stderr, which the page's stall doesn't touch: a line that isn't an object is logged
+//  there while stdout is still paused. Then a Stop and another conversation's message, sent during the stall, are
+//  answered once the page reads again.)
+for (const out of OUTPUTS) {
+  test(`stdio (stdout: ${out}): while the page doesn't read, the runner's lines are still handled at once`, async () => {
+    const a = agent({ env: { SAGEBRUSH_AGENT_STDOUT: out } });
+    try {
+      await a.until(() => ready(a), "agent.ready");
+      a.answering(); a.grant();
+      a.p.stdout.pause();
+      a.say("c1", "flood 200");
+      await new Promise((r) => setTimeout(r, 500)); // (the flood is under way and stdout is stalled)
+      const before = a.err.split(TEXT.notObject).length;
+      a.write("[]");
+      await a.until(() => a.err.split(TEXT.notObject).length > before, "the line handled while stdout is stalled", 5000);
+      a.send({ relay: { stop: true } });
+      a.say("c2", "hello");
+      a.p.stdout.resume();
+      await a.until(() => finished(a, "c1"), "the first turn's end");
+      await a.until(() => finished(a, "c2"), "the second conversation's turn");
+      assert.equal(a.events((p) => p.conversation === "c2").at(-1).outcome, "completed");
+      assert.equal(a.exit, null, "the agent is still running");
+    } finally { a.stopAnswering?.(); a.kill(); }
+  });
+}
 
 test("the fake model: imported only with SAGEBRUSH_AGENT_FAKE=1, and nothing on the wire can select it", () => {
   const read = (p) => readFileSync(fileURLToPath(new URL(p, import.meta.url)), "utf8");

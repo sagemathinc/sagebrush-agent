@@ -200,6 +200,9 @@ if (appCode) {
   process.once("SIGTERM", () => stop("end"));
   return;
 }
+// (#1620: a code that expires while no page is paired is replaced, and its link printed on one line: the newest link
+//  printed always works. Set before the first code, whose expiry starts it)
+server.onCodeRenewed = (c) => console.log(`The last code expired unused. To connect a page, open:  ${page}?pair=${c}&port=${p}`);
 const code = server.newCode();
 // The printed link: SAGEBRUSH_AGENT_PAGE if it is set; else, with exactly one --origin, that origin's /agents/; else
 // sagebrush.space's. Either changes only the printed link, never the allowed origins.
@@ -215,7 +218,7 @@ Sagebrush agent: Claude on this computer, waiting for your Sagebrush page.
   Open:  ${page}?pair=${code}&port=${p}
   (or enter code ${code} and port ${p} in the page)
 ${pageEnv === undefined && given.length > 1 ? "  (with more than one --origin this link opens sagebrush.space: set SAGEBRUSH_AGENT_PAGE to choose the page)\n" : ""}
-The code works once, for 5 minutes; a new one is printed here each time the page goes away.
+The code works once, for 5 minutes; a new one is printed here each time the page goes away, or the last one expires unused.
 Claude uses your own Claude login, and only the workspace files you allow in the page.
 Press Ctrl+C to stop (this run's conversation transcripts are deleted then).
 `);

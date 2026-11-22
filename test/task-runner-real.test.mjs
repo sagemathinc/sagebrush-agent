@@ -147,7 +147,7 @@ import { TaskRunner } from "${lib}task-runner.mjs";
 import { RUNNER_PIN } from "${lib}runner-fetch.mjs";
 import { platformKey } from "${lib}codex-fetch.mjs";
 const store = new TaskStore({ root: ${JSON.stringify(h.store.root)}, scope: "install-1", transcripts: ${JSON.stringify(join(h.dir, "projects"))} }).init();
-const runner = new TaskRunner({ store, enabled: true, pin: { ...RUNNER_PIN, engine: { version: "local", entry: "engine", files: {} } }, platform: platformKey(), ensure: async () => ({ deno: ${JSON.stringify(DENO)}, engine: ${JSON.stringify(ENGINE)} }) });
+const runner = new TaskRunner({ store, enabled: true, pin: { ...RUNNER_PIN, engine: { version: "local", entry: "engine", files: {} } }, platform: platformKey(), runPlatforms: [platformKey()], ensure: async () => ({ deno: ${JSON.stringify(DENO)}, engine: ${JSON.stringify(ENGINE)} }) });
 // (a store that loads a working task marks it interrupted, as after any restart: resumed, as the person would)
 await store.resume({ task: ${JSON.stringify(h.task)} });
 await runner.run(${JSON.stringify(h.task)}, "nb/a.ipynb");

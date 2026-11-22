@@ -219,6 +219,25 @@ test("recovery: a grant edited in task.json doesn't match the base commit's, and
   rmSync(dir, { recursive: true, force: true });
 });
 
+// (a task failed in place keeps its failure's reason through the next loads: its state's seq is its log's)
+test("recovery: a task failed on load reads the same failure on the next loads, its state and log in step", WIN_DELEGATE, () => {
+  const { root, dir } = fresh();
+  let s = store(root);
+  const { task } = start(s);
+  const p = join(s.dir(task), "task.json"), st = JSON.parse(readFileSync(p, "utf8"));
+  st.grant.run = true;
+  writeFileSync(p, canonical(st));
+  for (let k = 0; k < 3; k++) {
+    s = store(root);
+    assert.equal(s.state(task).status, "failed");
+    assert.match(s.state(task).reason, /grant doesn't match/, `load ${k + 1}`);
+    const log = readFileSync(join(s.dir(task), "log.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(JSON.parse(readFileSync(p, "utf8")).seq, log.at(-1).seq, `load ${k + 1}`);
+    assert.deepEqual(log.at(-1).event, { type: "task_status", status: "failed", reason: s.state(task).reason });
+  }
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("the tasks folder: refused when it is open to others or a link; a start that never finished is removed", WIN_DELEGATE, () => {
   const { root, dir } = fresh();
   store(root);
@@ -851,4 +870,31 @@ test("reason codes: stop and recovery carry theirs; an interrupt carries the hos
   assert.equal(s2.state(t).reason, "an old reason");
   assert.equal(s2.state(t).reasonCode, undefined);
   rmSync(h2.dir, { recursive: true, force: true });
+});
+
+// (a reason code belongs to an interrupted task only, in its state as in its log)
+test("reason codes: a state with a code on a task that isn't interrupted is refused, the task failed; an interrupted one loads", WIN_DELEGATE, async () => {
+  const { root, dir } = fresh();
+  let s = store(root);
+  const a = start(s).task, b = start(s).task;
+  await s.stop({ task: b });
+  await s.resume({ task: b });
+  await s.stop({ task: b });
+  // (a: working, with a code written in: failed; b: interrupted with its code: loads as it was)
+  const p = join(s.dir(a), "task.json"), x = JSON.parse(readFileSync(p, "utf8"));
+  x.reasonCode = "stopped";
+  writeFileSync(p, canonical(x));
+  s = store(root);
+  assert.equal(s.state(a).status, "failed");
+  assert.match(s.state(a).reason, /reason code/);
+  assert.deepEqual([s.state(b).status, s.state(b).reasonCode], ["interrupted", "stopped"]);
+  // (an interrupted task failed on load drops its code, in memory and on disk, so its saved state stays one the loader takes)
+  const q = join(s.dir(b), "task.json"), y = JSON.parse(readFileSync(q, "utf8"));
+  y.grant.run = true;
+  writeFileSync(q, canonical(y));
+  s = store(root);
+  assert.deepEqual([s.state(b).status, s.state(b).reasonCode], ["failed", undefined]);
+  assert.match(s.state(b).reason, /grant doesn't match/);
+  assert.ok(!Object.hasOwn(JSON.parse(readFileSync(q, "utf8")), "reasonCode"));
+  rmSync(dir, { recursive: true, force: true });
 });

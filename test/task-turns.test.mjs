@@ -33,7 +33,8 @@ function scripted(steps, seen = []) {
         yield { type: "stream_event", parent_tool_use_id: null, event: { type: "content_block_start", index: i, content_block: { type: "tool_use", id, name: `mcp__${TASK_SERVER}__${name}`, input: {} } } };
         yield { type: "stream_event", parent_tool_use_id: null, event: { type: "content_block_delta", index: i, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } } };
         yield { type: "stream_event", parent_tool_use_id: null, event: { type: "content_block_stop", index: i } };
-        const r = allowed.behavior === "allow" ? await tools[name](input) : { content: [{ type: "text", text: allowed.message }], isError: true };
+        // (the handler's extra, as the pinned Claude Code passes it: the call's tool_use id in _meta)
+        const r = allowed.behavior === "allow" ? await tools[name](input, { _meta: { "claudecode/toolUseId": id } }) : { content: [{ type: "text", text: allowed.message }], isError: true };
         yield { type: "user", parent_tool_use_id: null, message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: r.content, is_error: !!r.isError }] } };
       }
       yield { type: "result", subtype: "success", is_error: false, result: "ok", usage: { input_tokens: 1, output_tokens: 1 } };
@@ -64,6 +65,55 @@ test("a turn edits the task's copy and proposes: the round's diff, the turn's ev
   assert.ok(ty.includes("turn_started") && ty.includes("tool_call_started") && ty.includes("tool_call_finished") && ty.includes("proposal"), ty.join(","));
   assert.equal(ty.at(-1), "task_status");
   h.done();
+});
+
+// (#1610: after "Proposal ready" the propose call kept spinning and the task's turn never ended: the proposal left the
+//  task not working, so nothing after it was recorded, neither the call's result nor the turn's end)
+test("a proposal closes its turn in the log: the propose call finished, then the turn's end, recorded with the proposal itself", WIN_DELEGATE, async () => {
+  const h = setup({ steps: [["workspace_read", { path: "a.ipynb" }], ["propose", { summary: "as it was" }]] });
+  const task = h.start();
+  h.turns.begin(task, "start");
+  await until(() => h.store.state(task).status === "proposal", "the proposal");
+  await until(() => !h.turns.isRunning(task), "the turn over");
+  const ev = h.store.get({ task, after: 0 }).events.map((e) => e.event);
+  // (every call the turn started is finished, the propose call too, with its own answer)
+  const started = ev.filter((e) => e.type === "tool_call_started").map((e) => e.call);
+  const finished = new Map(ev.filter((e) => e.type === "tool_call_finished").map((e) => [e.call, e]));
+  assert.deepEqual(started, ["toolu_0", "toolu_1"]);
+  assert.deepEqual(started.filter((c) => !finished.has(c)), [], "a call left running");
+  assert.equal(finished.get("toolu_1").status, "ok");
+  assert.match(finished.get("toolu_1").body, /^proposed/);
+  // (the turn ends once, completed, before the proposal's own events, which stay last)
+  const ends = ev.filter((e) => e.type === "turn_finished");
+  assert.deepEqual(ends.map((e) => e.outcome), ["completed"]);
+  const ty = ev.map((e) => e.type);
+  assert.deepEqual(ty.slice(-4), ["tool_call_finished", "turn_finished", "proposal", "task_status"], ty.join(","));
+  h.done();
+});
+
+test("a proposal whose call id isn't known still ends its turn (no call is invented); a refused proposal ends nothing", WIN_DELEGATE, async () => {
+  // (the handler called with no extra: the turn's end only, with the proposal)
+  const h = hostWith(perCall([proposes()]));
+  const { task } = await h.rpc.call("tasks.start", h.req());
+  await until(() => h.store.state(task).status === "proposal", "the proposal");
+  await until(() => !h.turns.isRunning(task), "the turn over");
+  const ev = h.store.get({ task, after: 0 }).events.map((e) => e.event);
+  assert.deepEqual(ev.filter((e) => e.type === "turn_finished").map((e) => e.outcome), ["completed"]);
+  assert.equal(ev.filter((e) => e.type === "tool_call_finished").length, 0);
+  h.done();
+  // (a proposal the store refuses (a path it can't propose): the turn goes on, nothing ended, the call answered as refused)
+  const g = setup({ steps: [async () => symlinkSync("a.ipynb", join(g.store.work(g.task), "link.ipynb")), ["propose", { summary: "no" }], ["propose", { summary: "again" }]] });
+  g.task = g.start();
+  g.turns.begin(g.task, "start");
+  await until(() => !g.turns.isRunning(g.task), "the turn over");
+  const gev = g.store.get({ task: g.task, after: 0 }).events.map((e) => e.event);
+  assert.equal(gev.filter((e) => e.type === "proposal").length, 0);
+  const gf = gev.filter((e) => e.type === "tool_call_finished");
+  assert.deepEqual(gf.map((e) => e.status), ["error", "error"], JSON.stringify(gf));
+  // (the turn's only end is the host's, at its end without a proposal; never a "completed" from the refused propose)
+  assert.deepEqual(gev.filter((e) => e.type === "turn_finished").map((e) => e.outcome), ["completed"]);
+  assert.equal(g.store.state(g.task).status, "interrupted");
+  g.done();
 });
 
 test("the SDK runs with no settings, no native tools, only the task's server, in the task's own sdk folder; other tools are refused", WIN_DELEGATE, async () => {

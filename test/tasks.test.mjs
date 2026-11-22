@@ -701,6 +701,66 @@ test("recovery: an intent is applied only if it is exactly what its operation wr
   }
 });
 
+// (#1610: a proposal carries its turn's last events, the propose call's answer and the turn's end, in its own intent)
+const TURN_END = [{ type: "tool_call_finished", call: "toolu_9", status: "ok", duration_ms: 3, body: "proposed: the person will review it" }, { type: "turn_finished", outcome: "completed" }];
+
+test("propose with its turn's end: a crash after each durable step, then a restart: the round and the turn's end whole, before the proposal, or both absent", WIN_DELEGATE, async () => {
+  let crashed = 0;
+  for (let k = 1; ; k++) {
+    const { root, dir } = fresh();
+    let s = store(root);
+    const { task } = start(s);
+    writeFileSync(join(s.work(task), "a.ipynb"), NB2);
+    const hit = await crashAt(k, () => s.propose(task, { summary: "s", events: TURN_END }));
+    s = store(root);
+    const t = s.state(task), ty = s.get({ task, after: 0 }).events.map((e) => e.event.type);
+    if (t.proposals.length) {
+      // (whole: the turn's two events, then the proposal and its status, each once, at the log's end)
+      assert.deepEqual(ty.slice(-4), ["tool_call_finished", "turn_finished", "proposal", "task_status"], `crash ${k}: ${ty}`);
+      assert.equal(ty.filter((x) => x === "turn_finished").length, 1, `crash ${k}`);
+      assert.equal(t.status, "proposal", `crash ${k}`);
+    } else {
+      assert.ok(!ty.includes("turn_finished") && !ty.includes("proposal"), `crash ${k}: ${ty}`);
+    }
+    assert.equal(t.intent, null);
+    rmSync(dir, { recursive: true, force: true });
+    if (!hit) break;
+    crashed++;
+  }
+  assert.ok(crashed >= 3, `crashed at ${crashed} steps`);
+});
+
+test("propose with its turn's end: only a call's ok answer then a completed end are taken; a recorded intent whose turn events were edited fails the task", WIN_DELEGATE, async () => {
+  // (the store refuses anything else, before writing anything)
+  for (const bad of [[TURN_END[1], TURN_END[0]], [{ ...TURN_END[1], outcome: "error" }], [{ ...TURN_END[0], status: "error" }, TURN_END[1]], [{ type: "text_delta", message: "m", revision: 1, text: "x" }, TURN_END[1]], [TURN_END[0], TURN_END[1], TURN_END[1]], "x"]) {
+    const { root, dir } = fresh();
+    const s = store(root);
+    const { task } = start(s);
+    writeFileSync(join(s.work(task), "a.ipynb"), NB2);
+    const before = s.get({ task, after: 0 }).events.length;
+    await assert.rejects(Promise.resolve().then(() => s.propose(task, { events: bad })), /a proposal carries at most/, JSON.stringify(bad));
+    assert.equal(s.state(task).status, "working");
+    assert.equal(s.get({ task, after: 0 }).events.length, before);
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // (a genuine intent with the turn's end, edited on disk to another outcome: the task fails, nothing applied)
+  const { root, dir } = fresh();
+  let s = store(root);
+  const { task } = start(s);
+  writeFileSync(join(s.work(task), "a.ipynb"), NB2);
+  const [ev] = await s.propose(task);
+  const p = join(s.dir(task), "task.json"), x = JSON.parse(readFileSync(p, "utf8"));
+  const pre = { ...x, status: "working", proposals: [] };
+  const genuine = buildIntent(s.gitdir(task), pre, "propose", "d".repeat(32), { commit: ev.event.commit, turn: TURN_END });
+  assert.deepEqual(genuine.events.slice(0, 2), TURN_END);
+  const forged = { ...genuine, args: { ...genuine.args, turn: [TURN_END[0], { ...TURN_END[1], outcome: "error" }] }, events: [TURN_END[0], { ...TURN_END[1], outcome: "error" }, ...genuine.events.slice(2)] };
+  x.intent = forged;
+  writeFileSync(p, canonical(x));
+  s = store(root);
+  assert.equal(s.state(task).status, "failed");
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("recovery: a genuine receipt intent, interrupted, is finished exactly as written", WIN_DELEGATE, async () => {
   const { root, dir } = fresh();
   let s = store(root);

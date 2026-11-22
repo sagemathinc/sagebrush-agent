@@ -19,9 +19,15 @@
 // runs Codex there instead: one pinned release, fetched and checked (never the
 // `codex` on PATH), as `codex app-server` with that computer's Codex login and
 // settings: only over the runner, and only for a connection with shell and files on.
+//
+//   sagebrush-agent --pair-stdin --origin http://127.0.0.1:<port> --port 0
+//
+// is how the desktop app starts it (lib/pair-stdin.mjs): the app's own page is the only origin, the app hands the one-time
+// code over stdin, and the agent prints only {"v":1,"listening":<port>} on stdout. The end of stdin stops it.
 
 import { AgentServer, DEFAULT_ORIGINS, TEXT } from "../lib/server.mjs";
 import { stdinChunks } from "../lib/stdio.mjs";
+import { pairOrigin, readPairLine } from "../lib/pair-stdin.mjs";
 
 // An exact http(s) origin, like https://example.org or http://127.0.0.1:8000: no path, no wildcard.
 function exactOrigin(s) {
@@ -39,19 +45,42 @@ let port = 0;
 let stdio = false;
 let codex = false;
 let loopbackFlags = false;
-const origins = [...DEFAULT_ORIGINS];
+let pairStdin = false;
+let portGiven = null;
+const given = [];
 for (let i = 0; i < args.length; i++) {
-  if (args[i] === "--port") { port = Number(args[++i]); loopbackFlags = true; }
-  else if (args[i] === "--origin") { origins.push(exactOrigin(String(args[++i]))); loopbackFlags = true; }
+  if (args[i] === "--port") { portGiven = String(args[++i]); port = Number(portGiven); loopbackFlags = true; }
+  else if (args[i] === "--origin") { given.push(String(args[++i])); loopbackFlags = true; }
+  else if (args[i] === "--pair-stdin") pairStdin = true;
   else if (args[i] === "--stdio") stdio = true;
   else if (args[i] === "--codex") codex = true;
   else if (args[i] === "--help" || args[i] === "-h") {
-    console.log("usage: sagebrush-agent [--port N] [--origin https://...]\n       sagebrush-agent [--codex] --stdio   (run by sagebrush remote --serve-agents)");
+    console.log("usage: sagebrush-agent [--port N] [--origin https://...]\n       sagebrush-agent [--codex] --stdio   (run by sagebrush remote --serve-agents)\n       sagebrush-agent --pair-stdin --origin http://127.0.0.1:<port> --port 0   (run by the desktop app)");
     process.exit(0);
   } else {
     console.error(`unknown argument: ${args[i]}`);
     process.exit(2);
   }
+}
+// (--pair-stdin: exactly the app page's origin, http://127.0.0.1:<port>, never the default ones; the port the app
+//  passes is 0, so the agent picks a free one and reports it; nothing else on the command line)
+let origins;
+if (pairStdin) {
+  if (stdio || codex) {
+    console.error("--pair-stdin can't be used with --stdio or --codex");
+    process.exit(2);
+  }
+  if (given.length !== 1 || !pairOrigin(given[0])) {
+    console.error("--pair-stdin needs exactly one --origin http://127.0.0.1:<port>");
+    process.exit(2);
+  }
+  if (portGiven !== "0") {
+    console.error("--pair-stdin needs --port 0");
+    process.exit(2);
+  }
+  origins = [given[0]];
+} else {
+  origins = [...DEFAULT_ORIGINS, ...given.map(exactOrigin)];
 }
 if (codex && !stdio) {
   console.error("--codex works only with --stdio: Codex is run by sagebrush remote --serve-agents, with shell and files on");
@@ -106,11 +135,22 @@ if (stdio) {
   await server.serveStdio({ input: stdinChunks(), output: process.stdout, fatal });
   if (!server.stdioStarted) fatal(TEXT.badStart);
   else stop(0);
+} else if (pairStdin) {
+  // (the code first: a launch without a valid line never listens)
+  let stopAfter = null;
+  let code;
+  try {
+    code = await readPairLine(process.stdin, { onAfter: (why) => stopAfter ? stopAfter(why) : process.exit(1) });
+  } catch (e) {
+    console.error(`--pair-stdin: ${e.message}`);
+    process.exit(2);
+  }
+  await listenLoopback({ appCode: code, onStop: (f) => { stopAfter = f; } });
 } else {
 await listenLoopback();
 }
 
-async function listenLoopback() {
+async function listenLoopback({ appCode = null, onStop = null } = {}) {
 const server = new AgentServer({ port, origins, query, deleteSession });
 server.createServer = createServer;
 // Delegate tasks (design/workspace-agent-protocol.md §6), over this loopback pairing only: on where the tasks folder
@@ -133,7 +173,25 @@ if (fakeHome !== null) try {
 } catch (e) {
   console.error(`Delegate tasks are off on this computer: ${e?.message ?? e}`);
 }
+if (appCode) server.setAppCode(appCode);
 const p = await server.listen();
+if (appCode) {
+  // (the one stdout line, before anything else; then stdout carries nothing: the app reads only that line, and
+  //  everything else this process says goes to stderr, which the app keeps out of its general log)
+  process.stdout.write(JSON.stringify({ v: 1, listening: p }) + "\n");
+  console.log = console.error;
+  const stop = async (why) => {
+    console.error(why === "data" ? "stopping: unexpected input on stdin" : "stopping: the app is gone");
+    let problems;
+    try { problems = await server.close(); } catch (e) { problems = [String(e?.message ?? e)]; }
+    for (const q of problems) console.error(`  ${q}`);
+    process.exit(problems.length || why === "data" ? 1 : 0);
+  };
+  onStop(stop);
+  process.once("SIGINT", () => stop("end"));
+  process.once("SIGTERM", () => stop("end"));
+  return;
+}
 const code = server.newCode();
 // SAGEBRUSH_AGENT_PAGE changes only the printed link, never the allowed origins.
 const page = (process.env.SAGEBRUSH_AGENT_PAGE ?? "https://sagebrush.space/agents/").replace(/\/?$/, "/");

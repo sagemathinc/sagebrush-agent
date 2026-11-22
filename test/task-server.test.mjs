@@ -284,3 +284,30 @@ test("the pairing's revoke turns Delegate off: the running task is interrupted, 
     rmSync(h.dir, { recursive: true, force: true });
   }
 });
+
+test("delegate.run: offered only where a task's notebooks can run here (runs on, this platform's pins); the task's system prompt says which", WIN_DELEGATE, async () => {
+  const { TaskRunner } = await import("../lib/task-runner.mjs");
+  const { RUN_FEATURE } = await import("../lib/server.mjs");
+  const { taskSystem } = await import("../lib/task-turns.mjs");
+  assert.equal(RUN_FEATURE, "delegate.run");
+  const dir = mkdtempSync(join(tmpdir(), "sb-tsrv-"));
+  const offer = (runner, stdio = false) => {
+    const server = new AgentServer({ query: fakeQuery, log: () => {}, stdio });
+    const store = new TaskStore({ root: join(dir, `tasks-${Math.random().toString(36).slice(2)}`), scope: "install-1" }).init();
+    const turns = new TaskTurns({ store, query: taskModel(), createServer: fakeCreateServer, runner: runner?.(store) ?? null });
+    server.setTasks({ store, turns, rpc: new TaskRpc({ store, turns }) });
+    return server.features();
+  };
+  const linux = (store) => new TaskRunner({ store, platform: "linux-x64" });
+  assert.ok(offer(linux).includes("delegate.run"), "runs on, pins for this platform");
+  assert.ok(offer(linux).includes("delegate.1"));
+  assert.ok(!offer((store) => new TaskRunner({ store, enabled: false, platform: "linux-x64" })).includes("delegate.run"), "runs off");
+  assert.ok(!offer((store) => new TaskRunner({ store, platform: null })).includes("delegate.run"), "no pins for this platform");
+  assert.ok(!offer(null).includes("delegate.run"), "no runner");
+  assert.ok(!offer(linux, true).includes("delegate.run"), "never over the runner's stdio, where there are no tasks");
+  // (the prompt: what it says about running code follows whether this task can run it)
+  assert.match(taskSystem(true), /You can run a notebook of your copy with notebook_run to check your work: its code reads and writes only your copy, with no network\./);
+  assert.doesNotMatch(taskSystem(true), /isn't available/);
+  assert.match(taskSystem(false), /Running code isn't available for this task: check your work by reading it\./);
+  rmSync(dir, { recursive: true, force: true });
+});

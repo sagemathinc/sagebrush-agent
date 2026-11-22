@@ -90,16 +90,17 @@ function setup({ mode = "report", enabled = true, run = true, root = null, limit
   return { dir, fake, engine, store, runner, task, spawned, seen, done: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
-test("off in this version: RUNS_ENABLED is false, and the default runner refuses, saying why; so does a task started without runs", WIN_DELEGATE, async () => {
-  assert.equal(RUNS_ENABLED, false);
+test("on from this version: RUNS_ENABLED is true; a runner turned off, or a task started without runs, refuses, saying why", WIN_DELEGATE, async () => {
+  assert.equal(RUNS_ENABLED, true);
   const h = setup({ enabled: undefined });
-  const def = new TaskRunner({ store: h.store, pin: PIN, platform: "linux-x64" });
-  assert.equal(def.problem(h.task), "runs are turned off in this version");
-  await assert.rejects(def.run(h.task, "nb dir/a.ipynb"), (e) => e.code === "unavailable" && /Running code isn't available for Delegate on this computer: runs are turned off/.test(e.message));
+  assert.equal(new TaskRunner({ store: h.store, pin: PIN, platform: "linux-x64" }).problem(h.task), null, "the default runner, with the pins and a task allowing runs");
+  const off = new TaskRunner({ store: h.store, enabled: false, pin: PIN, platform: "linux-x64" });
+  assert.equal(off.problem(h.task), "runs are turned off in this version");
+  await assert.rejects(off.run(h.task, "nb dir/a.ipynb"), (e) => e.code === "unavailable" && /Running code isn't available for Delegate on this computer: runs are turned off/.test(e.message));
   const noRun = setup({ run: false });
   assert.equal(noRun.runner.problem(noRun.task), "this task wasn't started with running code allowed");
-  // (no engine pinned yet; a platform with no Deno pinned)
-  assert.equal(new TaskRunner({ store: h.store, enabled: true, platform: "linux-x64" }).problem(h.task), "no engine with confinement is pinned yet");
+  // (no engine pinned; a platform with no Deno pinned)
+  assert.equal(new TaskRunner({ store: h.store, enabled: true, pin: { ...PIN, engine: null }, platform: "linux-x64" }).problem(h.task), "no engine with confinement is pinned yet");
   assert.match(new TaskRunner({ store: h.store, enabled: true, pin: PIN, platform: null }).problem(h.task), /runs aren't available on/);
   assert.equal(h.spawned.length + noRun.spawned.length, 0);
   h.done(); noRun.done();

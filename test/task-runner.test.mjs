@@ -12,7 +12,7 @@ import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { fakeCreateServer } from "../lib/fake.mjs";
 import { RUNNER_PIN } from "../lib/runner-fetch.mjs";
-import { cfUserTextEncoding, copyZones, RUN_LIMITS as RUN_LIMITS_FOR_TEST, RUN_PLATFORMS, RUNS_ENABLED, runArgv, runEnv, TaskRunner, TZ_SOURCE } from "../lib/task-runner.mjs";
+import { cfUserTextEncoding, copyZones, RUN_LIMITS as RUN_LIMITS_FOR_TEST, RUN_PLATFORMS, RUNS_ENABLED, runArgv, runEnv, signalRun, TaskRunner, TZ_SOURCE } from "../lib/task-runner.mjs";
 import { TaskRpc } from "../lib/task-rpc.mjs";
 import { TaskTurns, TASK_SERVER } from "../lib/task-turns.mjs";
 import { TaskStore } from "../lib/tasks.mjs";
@@ -600,7 +600,7 @@ test("no signal once the run's leader is reaped: a run that ends by itself signa
     const scripted = (limits) => {
       const g = setup({ mode: "report", limits });
       // (a real process lends its pid, so the run can be recorded; its events are scripted here)
-      const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true });
       holders.push(holder);
       const child = Object.assign(new EventEmitter(), { pid: holder.pid, exitCode: null, signalCode: null, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill() {} });
       const runner = new TaskRunner({ store: g.store, enabled: true, pin: PIN, platform: "linux-x64", ensure: async () => ({ deno: process.execPath, engine: g.engine }), spawnFn: () => child, limits: { ...RUN_LIMITS_FOR_TEST, ...limits } });
@@ -650,8 +650,61 @@ test("no signal once the run's leader is reaped: a run that ends by itself signa
     await ran2;
     assert.equal(calls.length, 1, "nothing more after its exit");
     b.g.done();
+    // (4) the leader reaped while its exitCode and signalCode still say it runs (libuv's batch): a stop then signals
+    //  nothing, its identity being gone
+    const d = scripted({});
+    const stop4 = new AbortController();
+    const ran4 = d.runner.run(d.g.task, "nb dir/a.ipynb", { signal: stop4.signal }).catch((e) => e);
+    await until(() => d.child.listenerCount("close") > 0, "the run started");
+    const reaped = new Promise((r) => d.holder.on("exit", r));
+    realKill.call(process, d.holder.pid, "SIGKILL");
+    await reaped;
+    assert.equal(existsSync(`/proc/${d.holder.pid}`), process.platform === "linux" ? false : existsSync(`/proc/${d.holder.pid}`), "reaped");
+    const before = calls.length;
+    stop4.abort();
+    assert.equal(calls.length, before, "a reaped leader's number is never signalled, though Node's fields still say running");
+    d.child.signalCode = "SIGKILL";
+    d.child.emit("exit", null, "SIGKILL");
+    d.child.stdout.end(); d.child.stderr.end();
+    d.child.emit("close", null, "SIGKILL");
+    await ran4;
+    d.g.done();
   } finally {
     process.kill = realKill;
     for (const x of holders) x.kill("SIGKILL");
   }
+});
+
+// (SEC H1, second round: libuv reaps every exited child before it runs their exit callbacks, so in one child's
+//  callback another can be reaped while Node still shows it running: only its identity, read with the signal, decides)
+test("signalRun: a leader is signalled only while it is still the run's own (its recorded start time, leading its group, read with the signal)", { skip: process.platform === "linux" ? false : "Linux: runs are on there only" }, async () => {
+  const { procStart } = await import("../lib/proc-start.mjs");
+  // (1) two children that exit together: in the first one's exit callback the second is already reaped though its
+  //  exitCode and signalCode are still null; signalRun signals nothing
+  const sent = [];
+  const kill = (p, sig) => sent.push([p, sig]);
+  const a = spawn("/bin/true", [], { stdio: "ignore", detached: true });
+  const b = spawn("/bin/true", [], { stdio: "ignore", detached: true });
+  const aStart = procStart(a.pid), bStart = procStart(b.pid);
+  assert.ok(aStart && bStart, "both recorded at their spawn");
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500); // (both exit while the loop waits: one batch)
+  const seen = await new Promise((resolve) => a.on("exit", () => resolve({ fields: [b.exitCode, b.signalCode], proc: existsSync(`/proc/${b.pid}`), sent: signalRun(b.pid, bStart, { kill }) })));
+  if (seen.fields[0] === null && seen.fields[1] === null) assert.equal(seen.proc, false, "a child Node still shows running, already reaped: its /proc entry is gone");
+  assert.equal(seen.sent, false);
+  assert.deepEqual(sent, [], "the reaped child's number never signalled");
+  await new Promise((r) => (b.exitCode !== null || b.signalCode !== null ? r() : b.on("exit", r)));
+  // (2) a child reaped: nothing; (3) the number now another process's (another start time), or a process not leading
+  //  its own group: nothing; (4) the run's own leader: its group, once
+  assert.equal(signalRun(a.pid, aStart, { kill }), false);
+  assert.equal(signalRun(4242, "linux:1", { kill, info: () => ({ start: "linux:2", pgid: 4242 }) }), false, "reused: another start time");
+  assert.equal(signalRun(4242, "linux:1", { kill, info: () => ({ start: "linux:1", pgid: 1 }) }), false, "not leading its own group");
+  assert.equal(signalRun(4242, "linux:1", { kill, info: () => ({ unknown: "unreadable" }) }), false, "can't be told: nothing");
+  for (const bad of [0, 1, -5, 1.5, "4242"]) assert.equal(signalRun(bad, "linux:1", { kill, info: () => ({ start: "linux:1", pgid: bad }) }), false, String(bad));
+  assert.equal(signalRun(4242, null, { kill, info: () => ({ start: null, pgid: 4242 }) }), false, "no recorded start");
+  assert.deepEqual(sent, []);
+  const live = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true });
+  const liveStart = procStart(live.pid);
+  const gone = new Promise((r) => live.on("exit", (code, sig) => r(sig)));
+  assert.equal(signalRun(live.pid, liveStart), true, "its own leader: signalled");
+  assert.equal(await gone, "SIGKILL");
 });

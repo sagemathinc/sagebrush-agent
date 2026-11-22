@@ -4,6 +4,8 @@
 // the shared turn quota and the fork's deletion. The real pinned SDK's fork is in chat-brief-sdk.test.mjs.
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import v8 from "node:v8";
+import vm from "node:vm";
 import WebSocket from "ws";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -629,8 +631,9 @@ test("after the wait the conversation is checked again: a steer the closing turn
     server.tasks = {};
     server.sock = ws;
     server.binding = { ws, grant: { delegate: true }, gen: 1 };
-    let closed;
-    const c = { sessionId: "11111111-1111-4111-8111-111111111111", queue: [], running: { finished: () => true, done: new Promise((r) => { closed = r; }) } };
+    const waiters = new Set();
+    const closed = () => { for (const w of [...waiters]) w(); };
+    const c = { sessionId: "11111111-1111-4111-8111-111111111111", queue: [], running: { finished: () => true, waiters } };
     server.conversations.set("c1", c);
     const answered = server.brief(ws, { id: "p2", params: { conversation: "c1" } });
     await until(() => c.drafting, "held while the turn closes");
@@ -643,5 +646,47 @@ test("after the wait the conversation is checked again: a steer the closing turn
     assert.equal(c.drafting, null, "the hold given back");
     assert.equal(started, 0, "no draft started");
     assert.equal(server.runningCount, 0);
+  } finally { rmSync(server.cwd, { recursive: true, force: true }); }
+});
+
+test("waiting and cancelling again and again leaves nothing behind: each cancelled wait takes its waiter out; the turn closing then tells no one", WIN_DELEGATE, async () => {
+  // (a finished turn that never closes, and many briefs that wait on it and are cancelled: SEC's retention control, as
+  //  a regression)
+  let started = 0;
+  const frames = [];
+  const server = new AgentServer({ log() {}, deleteSession: async () => {}, query: () => { started++; return (async function* () {})(); } });
+  try {
+    const ws = { send: (x) => frames.push(JSON.parse(x)) };
+    server.tasks = {};
+    server.sock = ws;
+    server.binding = { ws, grant: { delegate: true }, gen: 1 };
+    const waiters = new Set();
+    const c = { sessionId: "11111111-1111-4111-8111-111111111111", queue: [], running: { finished: () => true, waiters } };
+    server.conversations.set("c1", c);
+    // (the heap measured as SEC's control does: after a forced collection, over two batches of 10,000)
+    v8.setFlagsFromString("--expose-gc");
+    const gc = vm.runInNewContext("gc");
+    let n = 0;
+    const batch = async (count) => {
+      for (let i = 0; i < count; i++, n++) {
+        const answered = server.brief(ws, { id: `p${(n % 1e6) + 2}`, params: { conversation: "c1" } });
+        if (waiters.size !== 1) assert.fail(`request ${n}: ${waiters.size} waiters while it waits`);
+        c.drafting.cancel("stopped");
+        await answered;
+        if (waiters.size !== 0 || c.drafting !== null) assert.fail(`request ${n}: ${waiters.size} waiters, drafting ${!!c.drafting} after its cancel`);
+      }
+      frames.length = 0; // (the answers themselves are the test's, not the agent's: dropped between batches)
+      gc();
+      return process.memoryUsage().heapUsed;
+    };
+    await batch(1000);
+    const a = await batch(10000), b = await batch(10000);
+    assert.ok(b - a < 1024 * 1024, `the heap stays bounded: ${b - a} bytes over the last 10,000`);
+    assert.equal(started, 0, "no draft started");
+    // (the turn closes at last: it has no one to tell, and a brief now drafts)
+    c.running = null;
+    await server.brief(ws, { id: "p2", params: { conversation: "c1" } });
+    assert.equal(started, 1);
+    assert.equal(frames.length, 1);
   } finally { rmSync(server.cwd, { recursive: true, force: true }); }
 });

@@ -1,5 +1,12 @@
 # sagebrush-agent changes
 
+## 0.8.11
+
+**A Delegate proposal no longer looks unfinished, and a task's changes are proposed even when Claude doesn't propose them.** Running code in Delegate is still not enabled in this version.
+
+- **After "Proposal ready":** the task view no longer shows the propose call still running or "Working…". The proposal now comes with the propose call's answer and the turn's end, saved together.
+- **A turn that ends with changes but no proposal:** when Claude's turn completes and the task's copy has changes, the agent proposes the copy itself, and the summary says it was proposed automatically. A turn with no changes, or one that was stopped, failed or ran past a limit, still leaves the task interrupted, saying why.
+
 ## 0.8.10
 
 **The printed link opens the page you named with --origin.** Running code in Delegate is still not enabled in this version.

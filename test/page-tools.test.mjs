@@ -457,4 +457,4 @@ test("row 7: all 8 allowed without a card while bound; after the grant changes, 
   await done(s);
 });
 
-test("row 8: VERSION is 0.8.3", () => assert.equal(VERSION, "0.8.3"));
+test("row 8: VERSION is 0.8.4", () => assert.equal(VERSION, "0.8.4"));

@@ -1,5 +1,14 @@
 # sagebrush-agent changes
 
+## 0.8.4
+
+**Delegate reads notebooks with plots, and both modes read notebooks the same way.** Running code in Delegate is still not enabled in this version: `notebook_run` refuses, saying so.
+
+- **Reading a notebook:** a task (Delegate) and a chat (Pair) now read a notebook the same way: its cells, with each output summarized. A picture or other data is never sent to the model, only its type and size; text outputs are cut at 400 bytes, said so. A whole answer is at most 48 KB; cells past that are named, with how to read them, and one cell can be read in full. Before, a task read a notebook's whole file, pictures included, and a notebook with a plot could be too large for the model to read at all.
+- **Changing one cell in a task:** a task can now change a notebook by cell (change a cell's source or type, insert a cell, remove a cell), and every other cell keeps its outputs and its id. Before, a task could only rewrite a notebook whole.
+- **Deleting a file in a task:** a task can delete a file it created in its copy. The change is part of its proposal, which the person reviews.
+- **Files that are cut:** a long text file a task reads says how long it is and how much a read returns, in numbers.
+
 ## 0.8.3
 
 **For tests: the fake model carries an Ask for changes into its next proposal.** Nothing changes for Claude or Codex. The fake model runs only with `SAGEBRUSH_AGENT_FAKE=1`, which the end-to-end tests set. Running code in Delegate is still not enabled in this version: `notebook_run` refuses, saying so.

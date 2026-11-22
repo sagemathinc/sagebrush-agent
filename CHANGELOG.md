@@ -4,7 +4,7 @@
 
 **A task can delete any file or folder in its copy.** Running code in Delegate is still not enabled in this version.
 
-- **Deleting in a task:** a task (Delegate) can now delete any file in its copy, including the documents it started with, and a folder with everything in it. So a task like "consolidate tmp1.py and tmp2.py into lib.py" can finish the job. The deletion is part of the task's proposal, which the person reviews before anything changes in their own files, and the task's history keeps every deleted file. Before, a task could delete only a file it had created.
+- **Deleting in a task:** a task (Delegate) can now delete any file in its copy, including the documents it started with, and a folder with everything in it. So a task like "consolidate tmp1.py and tmp2.py into lib.py" can finish the job. The deletion is part of the task's proposal, which the person reviews before anything changes in their own files, and the task's history (git) keeps the documents it started with. Before, a task could delete only a file it had created.
 - **What stays refused:** a path outside the task's copy, and a link, or a path through one. A folder holding a link, or anything that isn't a plain file or folder, is refused whole, with nothing deleted.
 
 ## 0.8.4

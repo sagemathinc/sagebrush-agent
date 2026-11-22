@@ -472,7 +472,7 @@ test("a stuck model (next() and return() never settle, the abort ignored): its b
   } finally { await h.done(); }
 });
 
-test("forks' deletions share RETIRING_MAX: with deletions that never settle, at most 8 are under way and the ninth draft is busy; nothing is logged for a fork with no transcript", WIN_DELEGATE, async () => {
+test("forks' deletions share RETIRING_MAX: with deletions that never settle, at most 7 are under way and the eighth draft is busy; nothing is logged for a fork with no transcript", WIN_DELEGATE, async () => {
   let launched = 0;
   const h = await setup({ retireTimeoutMs: 30, deleteSession: (m) => async (id, opts) => { launched++; m.deleted.push({ id, dir: opts?.dir }); return new Promise(() => {}); } });
   try {
@@ -484,19 +484,69 @@ test("forks' deletions share RETIRING_MAX: with deletions that never settle, at 
       busy = a;
       break;
     }
-    assert.equal(ok, 8, "eight drafts, each leaving an unsettled deletion");
+    // (a draft reserves two places while it runs, its fork's and its SDK work's: with k deletions unsettled it starts
+    //  only while k + 2 <= RETIRING_MAX, so seven run)
+    assert.equal(ok, 7, "seven drafts, each leaving an unsettled deletion");
     assert.equal(code(busy), "busy");
     assert.equal(busy.error.message, "the agent is running as many turns as it can: ask again in a moment");
-    await until(() => launched === 8, "the eight deletions launched, one after another");
+    await until(() => launched === 7, "the seven deletions launched, one after another");
     await new Promise((r) => setTimeout(r, 200));
-    assert.equal(launched, 8, "never more than RETIRING_MAX under way");
-    assert.equal(h.server.counters().retiring, 8);
+    assert.equal(launched, 7, "never more than the room allows under way");
+    assert.equal(h.server.counters().retiring, 7);
     assert.equal(h.server.counters().running, 0);
-    // (a chat message waits too: it starts no turn while retirement is full)
-    p.say("c1", "Waiting.");
-    await new Promise((r) => setTimeout(r, 200));
-    assert.equal(p.finished("c1"), 1);
+    // (one place is left: enough for a turn, which reserves one, not for a draft, which reserves two)
+    assert.equal(code(await p.call("chat.brief", { conversation: "c1" })), "busy");
+    p.say("c1", "A turn fits.");
+    await until(() => p.finished("c1") === 2, "the turn ran in the last place");
     // (no fork had a transcript: nothing about one was logged)
     assert.deepEqual(h.logs.filter((l) => /transcript|fork/.test(l)), []);
   } finally { await h.done(); }
+});
+
+test("stuck SDK work holds a place until it settles (not until its fork is deleted): 40 stuck drafts, 7 run, 33 busy; a late settle gives each place back exactly once", WIN_DELEGATE, async () => {
+  // (SEC's control, as it was written against the head before this one, with the outcome now required: the model's
+  //  next() and return() never settle and ignore the abort; deleteSession succeeds at once)
+  let started = 0, returns = 0, deleted = 0;
+  const frames = [], releases = [];
+  const stuck = () => new Promise((r) => releases.push(() => r({ done: true, value: undefined })));
+  const server = new AgentServer({ briefMs: 5, retireTimeoutMs: 5, log() {}, deleteSession: async () => { deleted++; },
+    query: () => { started++; return { [Symbol.asyncIterator]() { return this; }, next: stuck, return() { returns++; return stuck(); } }; } });
+  try {
+    const ws = { send: (x) => frames.push(JSON.parse(x)) };
+    server.tasks = {};
+    server.sock = ws;
+    server.binding = { ws, grant: { delegate: true }, gen: 1 };
+    const conv = "a".repeat(32);
+    server.conversations.set(conv, { sessionId: "11111111-1111-4111-8111-111111111111", queue: [] });
+    for (let i = 0; i < 40; i++) await server.brief(ws, { id: `p${i + 2}`, params: { conversation: conv } });
+    await until(() => deleted === started, "the forks deleted");
+    await new Promise((r) => setTimeout(r, 20));
+    const busy = frames.filter((f) => f.error?.data?.code === "busy").length;
+    assert.deepEqual({ started, returns, deleted, running: server.runningCount, retiring: server.retiringCount, replies: frames.length, busy },
+      { started: 7, returns: 7, deleted: 7, running: 0, retiring: 7, replies: 40, busy: 33 });
+    assert.equal(server.abandoned.size, 7, "the places held are the stuck drafts', though every fork was deleted");
+    // (one place left: a turn could still start (canRetire), a draft can't)
+    assert.equal(server.canRetire(), true);
+    const n = frames.length;
+    await server.brief(ws, { id: "p98", params: { conversation: conv } });
+    assert.equal(frames[n].error?.data?.code, "busy");
+    // (a running turn takes that last place: then no turn either)
+    server.runningCount++;
+    assert.equal(server.canRetire(), false);
+    server.runningCount--;
+    // (the stuck work settles, late: each draft's place comes back, once)
+    for (const r of releases.splice(0)) r();
+    await until(() => server.retiringCount === 0, "the places given back");
+    assert.equal(server.abandoned.size, 0);
+    for (const r of releases.splice(0)) r(); // (nothing left to settle twice)
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(server.retiringCount, 0);
+    // (and a draft runs again)
+    const before = started;
+    await server.brief(ws, { id: "p99", params: { conversation: conv } });
+    assert.equal(started, before + 1);
+  } finally {
+    for (const r of releases.splice(0)) r();
+    rmSync(server.cwd, { recursive: true, force: true });
+  }
 });

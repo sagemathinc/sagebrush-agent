@@ -1,5 +1,12 @@
 # sagebrush-agent changes
 
+## 0.8.6
+
+**A launch for the Sagebrush desktop app.** Nothing changes for `npx` or `sagebrush remote`: without the new option, the agent starts, pairs and runs as before. Running code in Delegate is still not enabled in this version.
+
+- **`--pair-stdin`:** the desktop app can start the agent itself, as `sagebrush-agent --pair-stdin --origin http://127.0.0.1:<port> --port 0`. The app makes the one-time pairing code and hands it over the agent's standard input, so no code or link is printed. The agent accepts only the app's own page (that one local address, never the usual Sagebrush sites), picks a free port and reports it as one line, and stops when the app is gone. A malformed, oversized or late first line refuses the launch without echoing it; the code works once.
+- **What the app's agent can reach:** only what the Agents page offers: its workspace, and web requests and web search the person allows for a turn. Claude's built-in tools that reach the computer (the shell, reading and writing its files, Claude's own web fetch, subagents and the like) are refused by name, no plugins load, and none of the person's Claude Code settings, hooks, MCP servers or CLAUDE.md files are loaded. A test runs the real pinned Claude Code against hostile settings of each kind and checks that none of them runs.
+
 ## 0.8.5
 
 **A task can delete any file or folder in its copy.** Running code in Delegate is still not enabled in this version.

@@ -73,7 +73,8 @@ test("readPairLine: refused with a fixed message, never the input: too long, a b
   const cases = [
     ["too long", (s) => s.emit("data", Buffer.alloc(PAIR_LINE_MAX + 1, 0x41)), /too long/],
     ["too long in pieces", (s) => { s.emit("data", Buffer.alloc(200, 0x41)); s.emit("data", Buffer.alloc(100, 0x41)); }, /too long/],
-    ["bad line", (s) => s.emit("data", Buffer.from(JSON.stringify({ v: 1, pair: c.toUpperCase() }) + "\n")), /not a valid one/],
+    // (a character outside base64url: always invalid, whatever the random code)
+    ["bad line", (s) => s.emit("data", Buffer.from(JSON.stringify({ v: 1, pair: c.slice(0, 42) + "!" }) + "\n")), /not a valid one/],
     ["bytes after the line", (s) => s.emit("data", Buffer.from(JSON.stringify({ v: 1, pair: c }) + "\nmore")), /after the pairing line/],
     ["early end", (s) => s.emit("end"), /ended before/],
   ];

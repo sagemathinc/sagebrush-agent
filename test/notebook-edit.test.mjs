@@ -169,3 +169,20 @@ test("E22h: an edit the page refuses leaves the held read in place: the same bas
     assert.equal(p.asked.filter((a) => a.method === "notebook.edit").length, 2);
   } finally { await p.close(); }
 });
+
+// (#1503, format v2: Pair's read of a hostile notebook, through its tool: each answer the shared fixture's exact bytes,
+//  within 48 KiB as serialized, and the revision beside it)
+test("Pair's workspace_read of the oversize fixture: the whole read, from and cell give the fixture's bytes, each bounded, the revision beside", async () => {
+  const { readFileSync } = await import("node:fs");
+  const fx = (n) => readFileSync(new URL(`./fixtures/nb-read/${n}`, import.meta.url), "utf8");
+  const p = await paired();
+  try {
+    p.files.set("notes/oversize.ipynb", { content: { json: JSON.parse(fx("oversize.json")) }, rev: 7, ref: "R9" });
+    for (const [name, o] of [["read", {}], ["from-1", { from: 1 }], ["from-3", { from: 3 }], ["cell-0", { cell: 0 }], ["cell-1", { cell: 1 }], ["cell-3", { cell: 3 }], ["cell-4", { cell: 4 }]]) {
+      const r = await p.tools().handlers.workspace_read({ path: "notes/oversize.ipynb", ...o });
+      assert.equal(r.content[0].text, fx(`expected-oversize-${name}.json`), name);
+      assert.ok(Buffer.byteLength(r.content[0].text) <= 49152, name);
+      assert.equal(r.content[1].text, "revision 7");
+    }
+  } finally { await p.close(); }
+});

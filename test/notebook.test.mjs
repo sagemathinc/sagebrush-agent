@@ -1,10 +1,10 @@
-// Notebooks for the agent: the tool's closed grammar and bounds, the base rule, the read shortened for the model, and
+// Notebooks for the agent: the tool's closed grammar and bounds, the base rule, the read summarized for the model, and
 // the end-to-end path with a fake page and the fake model. No Anthropic calls.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import WebSocket from "ws";
 import { fakeCreateServer, fakeQuery } from "../lib/fake.mjs";
-import { NOTEBOOK_LIMITS, notebookDoc, shortNotebookRead, chargedBytes } from "../lib/notebook.mjs";
+import { NOTEBOOK_LIMITS, notebookDoc } from "../lib/notebook.mjs";
 import { AgentServer } from "../lib/server.mjs";
 
 const ORIGIN = "https://agents.sagebrush.cloud";
@@ -46,109 +46,10 @@ test("notebookDoc: a closed grammar with bounds", () => {
   }
 });
 
-test("shortNotebookRead: pictures named, text cut at the cap on a character boundary, the file's entry and rev unchanged", () => {
-  const cap = NOTEBOOK_LIMITS.outputBytes;
-  const atCap = "a".repeat(cap);
-  const overCap = "b".repeat(cap + 1);
-  const multi = "c".repeat(cap - 1) + "é" + "dd"; // ("é" is 2 bytes: it straddles the cap)
-  const read = {
-    entry: { path: "/n.ipynb", kind: "notebook" },
-    rev: 7,
-    content: { json: { mode: "python", cells: [
-      { id: "a", code: "plot()", outputs: [{ output_type: "display_data", data: { "image/png": png(640, 480, 2 * 1024 * 1024), "text/plain": "<Figure>" } }] },
-      { id: "b", code: "print", outputs: [{ output_type: "stream", name: "stdout", text: atCap }, { output_type: "stream", name: "stdout", text: overCap }] },
-      { id: "c", code: "m", outputs: [{ output_type: "execute_result", data: { "text/plain": multi } }] },
-      { id: "d", code: "boom", outputs: [{ output_type: "error", ename: "ValueError", evalue: "bad", traceback: ["line 1"] }] },
-      { id: "e", code: "no outputs" },
-    ] } },
-  };
-  const before = JSON.stringify(read);
-  const r = shortNotebookRead(read);
-  assert.equal(JSON.stringify(read), before); // (the input isn't changed)
-  assert.deepEqual(r.entry, read.entry);
-  assert.equal(r.rev, 7);
-  const cells = r.content.json.cells;
-  assert.match(cells[0].outputs[0].data["image/png"], /^\[image\/png, 640×480, \d+ bytes omitted\]$/);
-  assert.equal(cells[0].outputs[0].data["text/plain"], "<Figure>");
-  assert.equal(cells[1].outputs[0].text, atCap); // (exactly at the cap: kept whole)
-  assert.equal(cells[1].outputs[1].text, "b".repeat(cap) + "…[1 more bytes]");
-  assert.equal(cells[2].outputs[0].data["text/plain"], "c".repeat(cap - 1) + "…[4 more bytes]"); // (cut before "é", not inside it)
-  assert.match(cells[3].outputs[0].text, /^ValueError: bad\nline 1$/);
-  assert.equal(cells[4].outputs, undefined);
-  assert.ok(Buffer.byteLength(JSON.stringify(r)) < 64 * 1024);
-});
-
-test("shortNotebookRead: the whole read is bounded; later cells' outputs are omitted and say so", () => {
-  const big = "x".repeat(NOTEBOOK_LIMITS.outputBytes);
-  const n = Math.ceil(NOTEBOOK_LIMITS.readBytes / NOTEBOOK_LIMITS.outputBytes) + 5;
-  const read = { entry: {}, rev: 1, content: { json: { cells: Array.from({ length: n }, (_, i) => ({ id: `c${i}`, code: "", outputs: [{ output_type: "stream", text: big }] })) } } };
-  const r = shortNotebookRead(read);
-  assert.match(r.content.json.note, /limit of 262144 bytes for outputs was reached at cell \d+/);
-  assert.ok(chargedBytes(r) <= NOTEBOOK_LIMITS.readBytes, `charged ${chargedBytes(r)}`);
-});
-
 // ART-C7: the cap is on what is returned (wrappers, labels, notes and metadata summaries included), not on text alone.
 const bytes = (v) => Buffer.byteLength(JSON.stringify(v));
 const readOf = (cells, extra = {}) => ({ entry: { path: "/n.ipynb" }, rev: 3, content: { json: { mode: "python", ...extra, cells } } });
 const allSources = (r) => r.content.json.cells.map((c) => c.code).join("");
-
-test("shortNotebookRead: 8000 empty outputs are charged by their serialized bytes and stop at the cap", () => {
-  const read = readOf(Array.from({ length: 40 }, (_, i) => ({ id: `c${i}`, code: "pass", outputs: Array.from({ length: 200 }, () => ({ output_type: "stream", name: "stdout", text: "" })) })));
-  assert.ok(bytes(read.content.json.cells.map((c) => c.outputs)) > NOTEBOOK_LIMITS.readBytes); // (the counterexample: over the cap with no text at all)
-  const r = shortNotebookRead(read);
-  assert.ok(chargedBytes(r) <= NOTEBOOK_LIMITS.readBytes, `charged ${chargedBytes(r)}`);
-  assert.match(r.content.json.note, /limit of 262144 bytes for outputs was reached at cell \d+/);
-  assert.equal(r.content.json.cells.length, 40); // (every cell's source is still there)
-  assert.equal(allSources(r), "pass".repeat(40));
-  assert.equal(r.rev, 3);
-});
-
-test("shortNotebookRead: 200 cells of one 2000-byte output each: wrappers and commas charged, the cap held exactly", () => {
-  const read = readOf(Array.from({ length: 200 }, (_, i) => ({ id: `c${i}`, code: "", outputs: [{ output_type: "stream", name: "stdout", text: "z".repeat(2000) }] })), { autorun: "always" });
-  const r = shortNotebookRead(read);
-  const charged = chargedBytes(r);
-  assert.ok(charged <= NOTEBOOK_LIMITS.readBytes, `charged ${charged}`);
-  // (and it fills the cap: one more cell's output would not have fit)
-  assert.ok(charged > NOTEBOOK_LIMITS.readBytes - 2100, `charged only ${charged}`);
-  assert.match(r.content.json.note, /reached at cell \d+/);
-  assert.match(r.content.json.metadata, /^\[the notebook's metadata, \d+ bytes omitted\]$/);
-});
-
-test("shortNotebookRead: at the exact cap, over many cell and output shapes", () => {
-  for (const n of [1, 7, 33, 150, 400]) for (const len of [0, 1, 500, 2000, 9000]) for (const per of [1, 3]) {
-    const read = readOf(Array.from({ length: n }, (_, i) => ({ id: `c${i}`, code: "x", ...(i % 5 === 0 ? { metadata: { k: "v".repeat(50) } } : {}), outputs: Array.from({ length: per }, () => ({ output_type: "stream", name: "stdout", text: "é".repeat(len) })) })), { seed: "s" });
-    const charged = chargedBytes(shortNotebookRead(read));
-    assert.ok(charged <= NOTEBOOK_LIMITS.readBytes, `n=${n} len=${len} per=${per}: charged ${charged}`);
-  }
-});
-
-test("shortNotebookRead: one output's text alternatives share one allowance", () => {
-  const t = "y".repeat(NOTEBOOK_LIMITS.outputBytes);
-  const r = shortNotebookRead(readOf([{ id: "a", code: "x", outputs: [{ output_type: "execute_result", data: { "text/plain": t, "text/markdown": t, "text/latex": t } }] }]));
-  const d = r.content.json.cells[0].outputs[0].data;
-  const kept = ["text/plain", "text/markdown", "text/latex"].map((m) => d[m].replace(/…\[\d+ more bytes\]$/, "")).join("");
-  assert.equal(Buffer.byteLength(kept), NOTEBOOK_LIMITS.outputBytes, "8 KiB in all, not 8 KiB each");
-  assert.equal(d["text/latex"], `…[${NOTEBOOK_LIMITS.outputBytes} more bytes]`);
-});
-
-test("shortNotebookRead: multibyte text and JSON escapes are charged as returned", () => {
-  const nasty = "\u0001".repeat(40000) + "é".repeat(40000); // (each \u0001 is 6 bytes once serialized)
-  const read = readOf(Array.from({ length: 60 }, (_, i) => ({ id: `c${i}`, code: "", outputs: [{ output_type: "stream", name: "stdout", text: nasty }] })));
-  const r = shortNotebookRead(read);
-  assert.ok(chargedBytes(r) <= NOTEBOOK_LIMITS.readBytes, `charged ${chargedBytes(r)}`);
-  for (const c of r.content.json.cells) for (const o of c.outputs ?? []) assert.ok(!/\uFFFD/.test(o.text)); // (never cut inside a character)
-});
-
-test("shortNotebookRead: cell and notebook metadata are summarized, not returned", () => {
-  const meta = { tags: ["t".repeat(300000)] };
-  const r = shortNotebookRead(readOf([{ id: "a", code: "1", metadata: meta, attachments: { "x.png": { "image/png": "A".repeat(100000) } }, outputs: [{ output_type: "execute_result", metadata: meta, data: { "text/plain": "1" } }] }], { autorun: "always", seed: "s".repeat(500000) }));
-  const json = r.content.json;
-  assert.match(json.metadata, /^\[the notebook's metadata, \d+ bytes omitted\]$/);
-  assert.match(json.cells[0].other, /^\[other fields of this cell, \d+ bytes omitted\]$/);
-  assert.match(json.cells[0].outputs[0].metadata, /^\[metadata, \d+ bytes omitted\]$/);
-  assert.equal(json.cells[0].outputs[0].data["text/plain"], "1");
-  assert.ok(bytes(r) < 4096, `returned ${bytes(r)}`);
-});
 
 // A fake page that keeps documents ({json}) and texts, and records every request.
 async function paired() {
@@ -192,7 +93,7 @@ const until = async (f, ms = 5000) => {
 };
 const finished = (p, n) => until(() => p.events.filter((e) => e.event.type === "turn_finished").length >= n);
 
-test("a notebook end to end: created as a {json} document, a notebook artifact, read back shortened; changing it needs a base; nothing runs", async () => {
+test("a notebook end to end: created as a {json} document, a notebook artifact, read back summarized; changing it needs a base; nothing runs", async () => {
   const p = await paired();
   p.say("u1", "make a notebook");
   await finished(p, 1);
@@ -216,7 +117,10 @@ test("a notebook end to end: created as a {json} document, a notebook artifact, 
   assert.equal(write2.status, "error");
   assert.match(write2.body, /already exists\. Read it with workspace_read, then call workspace_write_notebook again with base/);
   assert.equal(read2.status, "ok");
-  assert.match(read2.body, /\[image\/png, 640×480, \d+ bytes omitted\]/);
+  // (the shared read format: the picture as its kind, type and decoded size, never its data; and the revision, for a base)
+  assert.match(read2.body, /"outputs":\[\{"kind":"image","mime":"image\/png","bytes":2097152\}\]/);
+  assert.match(read2.body, /revision 1/);
+  assert.doesNotMatch(read2.body, /iVBORw0KGgo/);
   assert.ok(read2.body.length < 16 * 1024);
   assert.ok(p.files.get("/notes/plot.ipynb").content.json.cells[1].outputs[0].data["image/png"].length > 1024 * 1024); // (the file is as it was)
   assert.ok(!p.asked.some((a) => a.method === "workspace.write")); // (no write without base)

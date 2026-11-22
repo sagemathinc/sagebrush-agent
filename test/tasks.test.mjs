@@ -219,6 +219,25 @@ test("recovery: a grant edited in task.json doesn't match the base commit's, and
   rmSync(dir, { recursive: true, force: true });
 });
 
+// (a task failed in place keeps its failure's reason through the next loads: its state's seq is its log's)
+test("recovery: a task failed on load reads the same failure on the next loads, its state and log in step", WIN_DELEGATE, () => {
+  const { root, dir } = fresh();
+  let s = store(root);
+  const { task } = start(s);
+  const p = join(s.dir(task), "task.json"), st = JSON.parse(readFileSync(p, "utf8"));
+  st.grant.run = true;
+  writeFileSync(p, canonical(st));
+  for (let k = 0; k < 3; k++) {
+    s = store(root);
+    assert.equal(s.state(task).status, "failed");
+    assert.match(s.state(task).reason, /grant doesn't match/, `load ${k + 1}`);
+    const log = readFileSync(join(s.dir(task), "log.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(JSON.parse(readFileSync(p, "utf8")).seq, log.at(-1).seq, `load ${k + 1}`);
+    assert.deepEqual(log.at(-1).event, { type: "task_status", status: "failed", reason: s.state(task).reason });
+  }
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("the tasks folder: refused when it is open to others or a link; a start that never finished is removed", WIN_DELEGATE, () => {
   const { root, dir } = fresh();
   store(root);

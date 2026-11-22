@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -117,10 +117,13 @@ test("the fixed launch: exactly the plan's argv, the environment replaced whole,
   assert.equal(report.cells[0].stdout, "hello\n");
   const s = h.seen(), work = h.store.work(h.task), runTmp = s.env.TMPDIR;
   assert.match(runTmp, new RegExp(`^${h.store.dir(h.task)}/tmp/run-[0-9a-f]{12}$`));
-  assert.deepEqual(s.argv, runArgv({ engine: h.engine, work, runTmp, notebook: join(work, "nb dir/a.ipynb"), timeoutS: 300 }));
+  // (the engine as the runner names it to Deno: its real path, as on macOS, where the temporary folder is reached
+  //  through /var, a link to /private/var)
+  const engine = realpathSync(h.engine);
+  assert.deepEqual(s.argv, runArgv({ engine, work, runTmp, notebook: join(work, "nb dir/a.ipynb"), timeoutS: 300 }));
   assert.deepEqual(s.argv, ["run", "--no-prompt", "--no-config", "--no-lock", "--no-remote", "--no-npm", "--cached-only", "--no-code-cache",
-    `--allow-read=${work},${runTmp},${h.engine}`, `--allow-write=${work},${runTmp}`, "--allow-env", "--deny-net", "--deny-run", "--deny-ffi", "--deny-sys",
-    h.engine, "notebook", "run", join(work, "nb dir/a.ipynb"), "--json", "--write", "--timeout", "300", "--confine", work, "--confine", runTmp, "--until-stdin-ends"]);
+    `--allow-read=${work},${runTmp},${engine}`, `--allow-write=${work},${runTmp}`, "--allow-env", "--deny-net", "--deny-run", "--deny-ffi", "--deny-sys",
+    engine, "notebook", "run", join(work, "nb dir/a.ipynb"), "--json", "--write", "--timeout", "300", "--confine", work, "--confine", runTmp, "--until-stdin-ends"]);
   // (the environment: exactly these keys, nothing of this process's)
   assert.deepEqual(Object.keys(h.spawned[0].opts.env).sort(), ["DENO_DIR", "HOME", "NO_COLOR", "PYTHONTZPATH", "TMPDIR", "TZ", "TZDIR", ...(process.platform === "darwin" ? ["__CF_USER_TEXT_ENCODING"] : [])]);
   assert.deepEqual(h.spawned[0].opts.env, runEnv({ work, runTmp }));

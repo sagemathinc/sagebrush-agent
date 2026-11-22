@@ -51,7 +51,7 @@ const round2 = async (docs, note) => {
   const t2 = store.state(task);
   return { dir, store, task, r1: t2.proposals[0], r2: t2.proposals[1] };
 };
-test("the fake model on an Ask for changes: a notebook's round 2 ends with the Markdown cell \"Asked: <note>\" after round 1's note", async () => {
+test("the fake model on an Ask for changes: a notebook's round 2 ends with the Markdown cell \"Asked: <note>\" after round 1's note", WIN_DELEGATE, async () => {
   const note = "use matplotlib, not plotly\nand label the axes";
   const { dir, store, task, r1, r2 } = await round2([{ path: "a.ipynb", kind: "notebook", content: NB }], note);
   try {
@@ -61,7 +61,7 @@ test("the fake model on an Ask for changes: a notebook's round 2 ends with the M
     assert.equal(JSON.parse(store.file({ task, commit: r1, path: "a.ipynb" }).content).cells.length, cells.length - 1, "round 1 hasn't it");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
-test("the fake model on a .tex: round 1 adds a line before \\end{document}; an Ask adds \"% Asked: <note>\" and a visible \"Asked: <note>\" there, LaTeX's specials escaped", async () => {
+test("the fake model on a .tex: round 1 adds a line before \\end{document}; an Ask adds \"% Asked: <note>\" and a visible \"Asked: <note>\" there, LaTeX's specials escaped", WIN_DELEGATE, async () => {
   const note = "call it Findings, 50% & more_x\n  {soon}";
   const { dir, store, task, r1, r2 } = await round2([{ path: "paper.tex", kind: "file", content: TEX }], note);
   try {

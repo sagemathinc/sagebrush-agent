@@ -9,7 +9,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { chmodSync, existsSync, linkSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TaskStore, buildIntent, canonical } from "../lib/tasks.mjs";
+import { TaskStore, buildIntent, canonical, eventProblem } from "../lib/tasks.mjs";
 import { checkRequest, TaskError } from "../lib/tasks-schema.mjs";
 import { blobId, casRef, readRef, RefConflict } from "../lib/task-git.mjs";
 import { nameKey, pathProblem, pathSetProblem, privateDirProblem } from "../lib/task-paths.mjs";
@@ -812,3 +812,43 @@ test("a receipt's files in any order: recorded in the proposal's order; finished
   rmSync(h2.dir, { recursive: true, force: true });
 });
 
+
+// (why an interrupted task stopped, as a code, in its state, its entry and its task_status)
+test("reason codes: stop and recovery carry theirs; an interrupt carries the host's, from the list only; resume clears it; an intent from before codes still recovers", WIN_DELEGATE, async () => {
+  const { root, dir } = fresh();
+  let s = store(root);
+  const a = start(s).task, b = start(s).task, c = start(s).task;
+  await s.stop({ task: a });
+  assert.equal(s.state(a).reasonCode, "stopped");
+  assert.equal(s.list().tasks.find((t) => t.task === a).reason_code, "stopped");
+  await s.interrupt(b, "a limit", "limit");
+  assert.deepEqual([s.state(b).reason, s.state(b).reasonCode], ["a limit", "limit"]);
+  assert.deepEqual(s.get({ task: b, after: 0 }).events.at(-1).event, { type: "task_status", status: "interrupted", reason: "a limit", code: "limit" });
+  // (a code that isn't one of the list: refused, the task unchanged)
+  await assert.rejects(Promise.resolve().then(() => s.interrupt(c, "x", "nonsense")));
+  assert.equal(s.state(c).status, "working");
+  // (resume clears it)
+  await s.resume({ task: a });
+  assert.equal(s.state(a).reasonCode, undefined);
+  assert.ok(!Object.hasOwn(s.list().tasks.find((t) => t.task === a), "reason_code"));
+  // (a restart while working: restarted)
+  s = store(root);
+  assert.equal(s.state(a).reasonCode, "restarted");
+  assert.equal(s.state(c).reasonCode, "restarted");
+  // (the log's shape: a code only on an interrupted task_status, and only from the list)
+  for (const bad of [{ type: "task_status", status: "working", code: "stopped" }, { type: "task_status", status: "interrupted", code: "nope" }]) assert.ok(eventProblem(bad), JSON.stringify(bad));
+  assert.equal(eventProblem({ type: "task_status", status: "interrupted", reason: "r", code: "failed" }), null);
+  rmSync(dir, { recursive: true, force: true });
+  // (an interrupt intent recorded by an agent from before codes, interrupted by a crash: recovered as written)
+  const h2 = fresh();
+  let s2 = store(h2.root);
+  const t = start(s2).task;
+  const p = join(s2.dir(t), "task.json"), x = JSON.parse(readFileSync(p, "utf8"));
+  x.intent = { id: "e".repeat(32), op: "status", args: { op: "interrupt", reason: "an old reason" }, events: [{ type: "task_status", status: "interrupted", reason: "an old reason" }], set: { status: "interrupted", reason: "an old reason" } };
+  writeFileSync(p, canonical(x));
+  s2 = store(h2.root);
+  assert.equal(s2.state(t).status, "interrupted");
+  assert.equal(s2.state(t).reason, "an old reason");
+  assert.equal(s2.state(t).reasonCode, undefined);
+  rmSync(h2.dir, { recursive: true, force: true });
+});

@@ -168,6 +168,24 @@ test("the mapper: a result with an error ends the turn as an error", () => {
   assert.deepEqual(t.interrupted(), []);
 });
 
+// (Claude's words in a result it marks an error were shown as the error, in red)
+test("the mapper: a success result marked is_error: its text is a message, the error a fixed line; another error says its subtype", () => {
+  const t = new Turn("T", () => 0);
+  const out = t.feed({ type: "result", subtype: "success", is_error: true, result: "I've added a section on E.", usage: {} });
+  assert.deepEqual(out.map((e) => e.type), ["turn_usage", "message_revised", "text_delta", "turn_error", "turn_finished"]);
+  assert.equal(out[2].text, "I've added a section on E.");
+  assert.equal(out[2].message, out[1].message);
+  assert.deepEqual(out[3], { type: "turn_error", code: "is_error", message: "Claude ended the turn with an error" });
+  assert.deepEqual(out[4], { type: "turn_finished", outcome: "error", code: "is_error" });
+  assert.ok(!JSON.stringify(out.filter((e) => e.type === "turn_error")).includes("section on E"), "never in the error");
+  // (no text: just the error)
+  assert.deepEqual(new Turn("U", () => 0).feed({ type: "result", subtype: "success", is_error: true, usage: {} }).map((e) => e.type), ["turn_usage", "turn_error", "turn_finished"]);
+  // (any other error: its subtype, never the result's text)
+  const o2 = new Turn("V", () => 0).feed({ type: "result", subtype: "error_max_turns", is_error: true, result: "SECRET prose", usage: {} });
+  assert.deepEqual(o2.find((e) => e.type === "turn_error"), { type: "turn_error", code: "error_max_turns", message: "error_max_turns" });
+  assert.ok(!JSON.stringify(o2).includes("SECRET"));
+});
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const GRANT = { folders: ["/"], write: true, expires: null };
 

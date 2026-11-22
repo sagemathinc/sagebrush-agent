@@ -12,6 +12,8 @@
     "lib/turns.mjs",
     "lib/log.mjs",
     "lib/notebook.mjs",
+    "lib/notebook-read.mjs",
+    "lib/task-notebook-edit.mjs",
     "lib/canon.mjs",
     "lib/stdio.mjs",
     "lib/fake.mjs",

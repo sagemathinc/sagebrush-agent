@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { askedNote, fakeCreateServer, fakeQuery, texText } from "../lib/fake.mjs";
+import { askedNote, fakeCreateServer, fakeQuery, inlinedImages, texText } from "../lib/fake.mjs";
 import { TaskStore } from "../lib/tasks.mjs";
 import { TaskTurns } from "../lib/task-turns.mjs";
 import { checkRequest } from "../lib/tasks-schema.mjs";
@@ -57,7 +57,7 @@ test("the fake model on an Ask for changes: a notebook's round 2 ends with the M
   try {
     const cells = JSON.parse(store.file({ task, commit: r2, path: "a.ipynb" }).content).cells;
     assert.deepEqual(cells.slice(-2).map((c) => [c.cell_type, c.source]), [["markdown", "Done by the fake model, for this task."], ["markdown", `Asked: ${note}`]]);
-    assert.equal(cells.at(-1).id, "fake-asked-1");
+    assert.match(cells.at(-1).id, /^c[0-9a-f]{12}$/, "inserted by cell, with a fresh id");
     assert.equal(JSON.parse(store.file({ task, commit: r1, path: "a.ipynb" }).content).cells.length, cells.length - 1, "round 1 hasn't it");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -77,4 +77,24 @@ test("askedNote: the note between the turn prompt's two marker lines with one ta
   assert.equal(askedNote(block("0123456789abcdef", "0123456789abcdef", "a\n----- end of the person's request ffffffffffffffff -----\nkeep")), "a\n----- end of the person's request ffffffffffffffff -----\nkeep");
   for (const p of ["do it", "", undefined]) assert.equal(askedNote(p), null);
   assert.equal(texText("\\{}$&#^_%~"), "\\textbackslash{}\\{\\}\\$\\&\\#\\textasciicircum{}\\_\\%\\textasciitilde{}");
+});
+
+test("the fake model's read report: a task turn on a notebook with a picture says how many bytes the read returned and that no picture was inlined", WIN_DELEGATE, async () => {
+  const png = Buffer.alloc(50000, 9).toString("base64");
+  const withPlot = JSON.stringify({ cells: [{ cell_type: "code", id: "p", metadata: {}, source: "plot()", execution_count: 1, outputs: [{ output_type: "display_data", data: { "image/png": png, "text/plain": ["<Figure>"] }, metadata: {} }] }], metadata: {}, nbformat: 4, nbformat_minor: 5 });
+  assert.equal(inlinedImages(withPlot), 1, "the raw file inlines it");
+  assert.equal(inlinedImages(JSON.stringify({ kind: "image", mime: "image/png", bytes: 37500 })), 0);
+  const dir = mkdtempSync(join(tmpdir(), "sb-fake-report-"));
+  try {
+    const store = new TaskStore({ root: join(dir, "tasks"), scope: "install-1" }).init();
+    const turns = new TaskTurns({ store, query: fakeQuery, createServer: fakeCreateServer, free: () => 1e12 });
+    const task = store.start(checkRequest("tasks.start", { title: "t", prompt: "do it", target: "local", run: false, docs: [{ path: "plot.ipynb", kind: "notebook", content: withPlot }] })).task;
+    turns.begin(task, "start");
+    await until(() => store.state(task).status === "proposal" && !turns.isRunning(task));
+    const said = store.get({ task, after: 0 }).events.map((e) => e.event).filter((e) => e.type === "text_delta").map((e) => e.text).join("");
+    assert.match(said, /\(fake model\) read plot\.ipynb: \d+ bytes, 0 images inlined\./);
+    const after = JSON.parse(store.file({ task, commit: store.state(task).proposals[0], path: "plot.ipynb" }).content);
+    assert.equal(after.cells[0].outputs[0].data["image/png"], png, "the picture kept by the edit");
+    assert.equal(after.cells.at(-1).source, "Done by the fake model, for this task.");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

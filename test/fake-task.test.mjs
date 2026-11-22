@@ -1,12 +1,13 @@
 // The fake model on a delegated task's turn (SAGEBRUSH_AGENT_FAKE=1 only): it uses the task's own tool server, adds a
-// closing note to the copy's first notebook (or writes a note), and proposes; what an end-to-end case against the
-// packed agent can watch, with no model.
+// closing note to the copy's first notebook (else to its first .tex, else writes a note), and proposes; on an Ask for
+// changes it writes the person's note there as "Asked: <note>". What an end-to-end case against the packed agent can
+// watch, with no model.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fakeCreateServer, fakeQuery } from "../lib/fake.mjs";
+import { askedNote, fakeCreateServer, fakeQuery, texText } from "../lib/fake.mjs";
 import { TaskStore } from "../lib/tasks.mjs";
 import { TaskTurns } from "../lib/task-turns.mjs";
 import { checkRequest } from "../lib/tasks-schema.mjs";
@@ -33,3 +34,47 @@ for (const [what, docs, changed] of [["a notebook: a closing note added", [{ pat
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 }
+
+// (an Ask for changes: round 2 carries the person's note, "Asked: <note>", in the file round 1 changed)
+const TEX = "\\documentclass{article}\n\\begin{document}\nHello.\n\\end{document}\n";
+const round2 = async (docs, note) => {
+  const dir = mkdtempSync(join(tmpdir(), "sb-fake-ask-"));
+  const store = new TaskStore({ root: join(dir, "tasks"), scope: "install-1" }).init();
+  const turns = new TaskTurns({ store, query: fakeQuery, createServer: fakeCreateServer, free: () => 1e12 });
+  const task = store.start(checkRequest("tasks.start", { title: "t", prompt: "do it", target: "local", run: false, docs })).task;
+  turns.begin(task, "start");
+  await until(() => store.state(task).status === "proposal" && !turns.isRunning(task));
+  const t1 = store.state(task);
+  store.ask(checkRequest("tasks.ask", { task, proposal: t1.proposals[0], seq: t1.seq, note, current: [] }));
+  turns.begin(task, "ask");
+  await until(() => store.state(task).status === "proposal" && store.state(task).proposals.length === 2 && !turns.isRunning(task));
+  const t2 = store.state(task);
+  return { dir, store, task, r1: t2.proposals[0], r2: t2.proposals[1] };
+};
+test("the fake model on an Ask for changes: a notebook's round 2 ends with the Markdown cell \"Asked: <note>\" after round 1's note", WIN_DELEGATE, async () => {
+  const note = "use matplotlib, not plotly\nand label the axes";
+  const { dir, store, task, r1, r2 } = await round2([{ path: "a.ipynb", kind: "notebook", content: NB }], note);
+  try {
+    const cells = JSON.parse(store.file({ task, commit: r2, path: "a.ipynb" }).content).cells;
+    assert.deepEqual(cells.slice(-2).map((c) => [c.cell_type, c.source]), [["markdown", "Done by the fake model, for this task."], ["markdown", `Asked: ${note}`]]);
+    assert.equal(cells.at(-1).id, "fake-asked-1");
+    assert.equal(JSON.parse(store.file({ task, commit: r1, path: "a.ipynb" }).content).cells.length, cells.length - 1, "round 1 hasn't it");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+test("the fake model on a .tex: round 1 adds a line before \\end{document}; an Ask adds \"% Asked: <note>\" and a visible \"Asked: <note>\" there, LaTeX's specials escaped", WIN_DELEGATE, async () => {
+  const note = "call it Findings, 50% & more_x\n  {soon}";
+  const { dir, store, task, r1, r2 } = await round2([{ path: "paper.tex", kind: "file", content: TEX }], note);
+  try {
+    assert.equal(store.file({ task, commit: r1, path: "paper.tex" }).content, "\\documentclass{article}\n\\begin{document}\nHello.\nDone by the fake model, for this task.\n\\end{document}\n");
+    assert.equal(store.file({ task, commit: r2, path: "paper.tex" }).content, "\\documentclass{article}\n\\begin{document}\nHello.\nDone by the fake model, for this task.\n% Asked: call it Findings, 50% & more_x {soon}\nAsked: call it Findings, 50\\% \\& more\\_x \\{soon\\}\n\\end{document}\n");
+    assert.deepEqual(store.diff({ task, commit: r2 }).files.map((f) => [f.path, f.change]), [["paper.tex", "modified"]]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+test("askedNote: the note between the turn prompt's two marker lines with one tag, exactly; nothing else counts", () => {
+  const block = (tag1, tag2, body) => `x\n----- the person's request ${tag1} -----\n${body}\n----- end of the person's request ${tag2} -----\ny`;
+  assert.equal(askedNote(block("0123456789abcdef", "0123456789abcdef", "a\nb")), "a\nb");
+  assert.equal(askedNote(block("0123456789abcdef", "fedcba9876543210", "a")), null, "a forged end line with another tag isn't the end");
+  assert.equal(askedNote(block("0123456789abcdef", "0123456789abcdef", "a\n----- end of the person's request ffffffffffffffff -----\nkeep")), "a\n----- end of the person's request ffffffffffffffff -----\nkeep");
+  for (const p of ["do it", "", undefined]) assert.equal(askedNote(p), null);
+  assert.equal(texText("\\{}$&#^_%~"), "\\textbackslash{}\\{\\}\\$\\&\\#\\textasciicircum{}\\_\\%\\textasciitilde{}");
+});

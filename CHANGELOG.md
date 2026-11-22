@@ -1,5 +1,15 @@
 # sagebrush-agent changes
 
+## 0.8.3
+
+**For tests: the fake model carries an Ask for changes into its next proposal.** Nothing changes for Claude or Codex. The fake model runs only with `SAGEBRUSH_AGENT_FAKE=1`, which the end-to-end tests set. Running code in Delegate is still not enabled in this version: `notebook_run` refuses, saying so.
+
+- **Ask for changes:** on a Delegate task's next round, the fake model writes the person's note into the file it works on, as "Asked: <note>":
+  - a notebook gets a Markdown cell at the end, with the note exactly as sent;
+  - a LaTeX file gets a comment line and a visible line before `\end{document}`, the note on one line, with LaTeX's special characters escaped so the note is treated as text.
+  So a test can see that round 2 carries what was asked.
+- **A LaTeX file:** on a task whose copy has a .tex file and no notebook, the fake model's first round now adds a line to the .tex ("Done by the fake model, for this task."), so its proposal has a rendered change to preview.
+
 ## 0.8.2
 
 **Newer Codex and Claude Code, one collision key for task paths, and the groundwork for Windows.** Running code in Delegate is still not enabled in this version: `notebook_run` refuses, saying so.
@@ -14,7 +24,7 @@
   - Delegate stays off on Windows in this version, and says why.
   - Codex itself is still refused on Windows in this version ("Codex on Windows isn't supported here."). It is downloaded and checked there, then refused as soon as it answers its first request; no turn runs.
   - Known on Windows: Node writes the agent's output to its runner synchronously there, so a runner that stops reading holds up the whole agent until it reads again. On other systems only that turn is stopped.
-- **Tests (pending Windows confirmation):** the suite is made to run on Windows. The rows that can't apply there (Delegate, POSIX modes, signals) are declared skips with their reasons, never silent passes.
+- **Tests:** the suite passes on Windows: 438 rows pass and none fail. 127 are declared skips with their reasons: 101 are Delegate's (off on Windows in this version), 13 don't apply there (POSIX modes, signals, /proc, and the known output limit). The remaining 13 skip process lookup for runs (2), POSIX shell stand-ins (5), or TLS tests needing OpenSSL, which was absent on this VM (6).
 
 ## 0.8.1
 

@@ -12,7 +12,7 @@ import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { fakeCreateServer } from "../lib/fake.mjs";
 import { RUNNER_PIN } from "../lib/runner-fetch.mjs";
-import { cfUserTextEncoding, copyZones, RUNS_ENABLED, runArgv, runEnv, TaskRunner, TZ_SOURCE } from "../lib/task-runner.mjs";
+import { cfUserTextEncoding, copyZones, RUN_LIMITS as RUN_LIMITS_FOR_TEST, RUN_PLATFORMS, RUNS_ENABLED, runArgv, runEnv, signalRun, TaskRunner, TZ_SOURCE } from "../lib/task-runner.mjs";
 import { TaskRpc } from "../lib/task-rpc.mjs";
 import { TaskTurns, TASK_SERVER } from "../lib/task-turns.mjs";
 import { TaskStore } from "../lib/tasks.mjs";
@@ -90,17 +90,22 @@ function setup({ mode = "report", enabled = true, run = true, root = null, limit
   return { dir, fake, engine, store, runner, task, spawned, seen, done: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
-test("off in this version: RUNS_ENABLED is false, and the default runner refuses, saying why; so does a task started without runs", WIN_DELEGATE, async () => {
-  assert.equal(RUNS_ENABLED, false);
+test("on from this version: RUNS_ENABLED is true; a runner turned off, or a task started without runs, refuses, saying why", WIN_DELEGATE, async () => {
+  assert.equal(RUNS_ENABLED, true);
   const h = setup({ enabled: undefined });
-  const def = new TaskRunner({ store: h.store, pin: PIN, platform: "linux-x64" });
-  assert.equal(def.problem(h.task), "runs are turned off in this version");
-  await assert.rejects(def.run(h.task, "nb dir/a.ipynb"), (e) => e.code === "unavailable" && /Running code isn't available for Delegate on this computer: runs are turned off/.test(e.message));
+  assert.equal(new TaskRunner({ store: h.store, pin: PIN, platform: "linux-x64" }).problem(h.task), null, "the default runner, with the pins and a task allowing runs");
+  const off = new TaskRunner({ store: h.store, enabled: false, pin: PIN, platform: "linux-x64" });
+  assert.equal(off.problem(h.task), "runs are turned off in this version");
+  await assert.rejects(off.run(h.task, "nb dir/a.ipynb"), (e) => e.code === "unavailable" && /Running code isn't available for Delegate on this computer: runs are turned off/.test(e.message));
   const noRun = setup({ run: false });
   assert.equal(noRun.runner.problem(noRun.task), "this task wasn't started with running code allowed");
-  // (no engine pinned yet; a platform with no Deno pinned)
-  assert.equal(new TaskRunner({ store: h.store, enabled: true, platform: "linux-x64" }).problem(h.task), "no engine with confinement is pinned yet");
+  // (no engine pinned; a platform with no Deno pinned)
+  assert.equal(new TaskRunner({ store: h.store, enabled: true, pin: { ...PIN, engine: null }, platform: "linux-x64" }).problem(h.task), "no engine with confinement is pinned yet");
   assert.match(new TaskRunner({ store: h.store, enabled: true, pin: PIN, platform: null }).problem(h.task), /runs aren't available on/);
+  // (Linux only for now: a platform the pins have but RUN_PLATFORMS doesn't, macOS, refuses, saying so)
+  assert.deepEqual(RUN_PLATFORMS, ["linux-x64", "linux-arm64"]);
+  for (const p of ["darwin-arm64", "darwin-x64"]) assert.equal(new TaskRunner({ store: h.store, pin: PIN, platform: p }).problem(h.task), `runs aren't available on ${p} in this version (Linux only, for now)`);
+  assert.equal(new TaskRunner({ store: h.store, pin: PIN, platform: "linux-arm64" }).problem(h.task), null);
   assert.equal(h.spawned.length + noRun.spawned.length, 0);
   h.done(); noRun.done();
 });
@@ -572,4 +577,134 @@ test("on macOS the run's __CF_USER_TEXT_ENCODING is the runner's own, from the u
   } finally {
     if (before === undefined) delete process.env.__CF_USER_TEXT_ENCODING; else process.env.__CF_USER_TEXT_ENCODING = before;
   }
+});
+
+// (SEC H1: the run's group was signalled after Node had reaped its leader, by a number that may then be anyone's)
+test("no signal once the run's leader is reaped: a run that ends by itself signals nothing; after its exit a stop, the time bound or too much output signal nothing; before it, a stop signals its group once", { ...T, ...WIN_DELEGATE, skip: process.platform === "win32" ? "POSIX process groups" : T.skip }, async () => {
+  const { EventEmitter } = await import("node:events");
+  const { PassThrough } = await import("node:stream");
+  const realKill = process.kill;
+  const calls = [];
+  // (group signals recorded, never sent; any other kill goes through)
+  process.kill = function (pid, sig) { if (typeof pid === "number" && pid < 0) { calls.push([pid, sig]); return true; } return realKill.call(process, pid, sig); };
+  const holders = [];
+  try {
+    // (1) a real run to its end, then the turn's stop after it: nothing signalled
+    const h = setup({ mode: "report" });
+    const ac = new AbortController();
+    await h.runner.run(h.task, "nb dir/a.ipynb", { signal: ac.signal });
+    ac.abort();
+    assert.deepEqual(calls, [], "a run that ended by itself: no group signalled, before or after its close");
+    h.done();
+    // (2) a child that exits first; then, before its close: the turn's stop, output past its bound and the time bound
+    const scripted = (limits) => {
+      const g = setup({ mode: "report", limits });
+      // (a real process lends its pid, so the run can be recorded; its events are scripted here)
+      const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true });
+      holders.push(holder);
+      const child = Object.assign(new EventEmitter(), { pid: holder.pid, exitCode: null, signalCode: null, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill() {} });
+      const runner = new TaskRunner({ store: g.store, enabled: true, pin: PIN, platform: "linux-x64", ensure: async () => ({ deno: process.execPath, engine: g.engine }), spawnFn: () => child, limits: { ...RUN_LIMITS_FOR_TEST, ...limits } });
+      return { g, child, runner, holder };
+    };
+    // (2a) the turn's stop and the time bound after the exit: nothing signalled, and the run isn't said stopped or out
+    //  of time: both were disarmed when ownership ended
+    const a = scripted({ marginMs: 0 });
+    const stop = new AbortController();
+    const ran = a.runner.run(a.g.task, "nb dir/a.ipynb", { signal: stop.signal, timeoutS: 1 }).catch((e) => e);
+    await until(() => a.child.listenerCount("close") > 0, "the run started");
+    a.child.exitCode = 0;
+    a.child.emit("exit", 0, null);
+    stop.abort();
+    await new Promise((r) => setTimeout(r, 1300)); // (past the time bound, 1 s plus no margin)
+    a.child.stdout.end(); a.child.stderr.end();
+    a.child.emit("close", 0, null);
+    const res = await ran;
+    assert.deepEqual(calls, [], "after the leader's exit: no group signalled by a stop or the time bound");
+    assert.doesNotMatch(String(res?.message ?? JSON.stringify(res)), /turn was stopped|time was up/, "disarmed at the exit: not said stopped or out of time");
+    a.g.done();
+    // (2b) output past its bound after the exit: counted against the run, never signalled
+    const c = scripted({ stdout: 8 });
+    const ranC = c.runner.run(c.g.task, "nb dir/a.ipynb").catch((e) => e);
+    await until(() => c.child.listenerCount("close") > 0, "the run started");
+    c.child.exitCode = 0;
+    c.child.emit("exit", 0, null);
+    c.child.stdout.write(Buffer.alloc(64, 0x61));
+    await new Promise((r) => setTimeout(r, 50));
+    c.child.stdout.end(); c.child.stderr.end();
+    c.child.emit("close", 0, null);
+    await ranC;
+    assert.deepEqual(calls, [], "after the leader's exit: too much output signals no group");
+    c.g.done();
+    // (3) the control: a stop while the leader hasn't exited signals its group, once
+    const b = scripted({});
+    const stop2 = new AbortController();
+    const ran2 = b.runner.run(b.g.task, "nb dir/a.ipynb", { signal: stop2.signal }).catch((e) => e);
+    await until(() => b.child.listenerCount("close") > 0, "the run started");
+    stop2.abort();
+    assert.deepEqual(calls, [[-b.holder.pid, "SIGKILL"]], "a stop before the exit: its group, once");
+    b.child.signalCode = "SIGKILL";
+    b.child.emit("exit", null, "SIGKILL");
+    stop2.abort();
+    b.child.stdout.end(); b.child.stderr.end();
+    b.child.emit("close", null, "SIGKILL");
+    await ran2;
+    assert.equal(calls.length, 1, "nothing more after its exit");
+    b.g.done();
+    // (4) the leader reaped while its exitCode and signalCode still say it runs (libuv's batch): a stop then signals
+    //  nothing, its identity being gone
+    const d = scripted({});
+    const stop4 = new AbortController();
+    const ran4 = d.runner.run(d.g.task, "nb dir/a.ipynb", { signal: stop4.signal }).catch((e) => e);
+    await until(() => d.child.listenerCount("close") > 0, "the run started");
+    const reaped = new Promise((r) => d.holder.on("exit", r));
+    realKill.call(process, d.holder.pid, "SIGKILL");
+    await reaped;
+    assert.equal(existsSync(`/proc/${d.holder.pid}`), process.platform === "linux" ? false : existsSync(`/proc/${d.holder.pid}`), "reaped");
+    const before = calls.length;
+    stop4.abort();
+    assert.equal(calls.length, before, "a reaped leader's number is never signalled, though Node's fields still say running");
+    d.child.signalCode = "SIGKILL";
+    d.child.emit("exit", null, "SIGKILL");
+    d.child.stdout.end(); d.child.stderr.end();
+    d.child.emit("close", null, "SIGKILL");
+    await ran4;
+    d.g.done();
+  } finally {
+    process.kill = realKill;
+    for (const x of holders) x.kill("SIGKILL");
+  }
+});
+
+// (SEC H1, second round: libuv reaps every exited child before it runs their exit callbacks, so in one child's
+//  callback another can be reaped while Node still shows it running: only its identity, read with the signal, decides)
+test("signalRun: a leader is signalled only while it is still the run's own (its recorded start time, leading its group, read with the signal)", { skip: process.platform === "linux" ? false : "Linux: runs are on there only" }, async () => {
+  const { procStart } = await import("../lib/proc-start.mjs");
+  // (1) two children that exit together: in the first one's exit callback the second is already reaped though its
+  //  exitCode and signalCode are still null; signalRun signals nothing
+  const sent = [];
+  const kill = (p, sig) => sent.push([p, sig]);
+  const a = spawn("/bin/true", [], { stdio: "ignore", detached: true });
+  const b = spawn("/bin/true", [], { stdio: "ignore", detached: true });
+  const aStart = procStart(a.pid), bStart = procStart(b.pid);
+  assert.ok(aStart && bStart, "both recorded at their spawn");
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500); // (both exit while the loop waits: one batch)
+  const seen = await new Promise((resolve) => a.on("exit", () => resolve({ fields: [b.exitCode, b.signalCode], proc: existsSync(`/proc/${b.pid}`), sent: signalRun(b.pid, bStart, { kill }) })));
+  if (seen.fields[0] === null && seen.fields[1] === null) assert.equal(seen.proc, false, "a child Node still shows running, already reaped: its /proc entry is gone");
+  assert.equal(seen.sent, false);
+  assert.deepEqual(sent, [], "the reaped child's number never signalled");
+  await new Promise((r) => (b.exitCode !== null || b.signalCode !== null ? r() : b.on("exit", r)));
+  // (2) a child reaped: nothing; (3) the number now another process's (another start time), or a process not leading
+  //  its own group: nothing; (4) the run's own leader: its group, once
+  assert.equal(signalRun(a.pid, aStart, { kill }), false);
+  assert.equal(signalRun(4242, "linux:1", { kill, info: () => ({ start: "linux:2", pgid: 4242 }) }), false, "reused: another start time");
+  assert.equal(signalRun(4242, "linux:1", { kill, info: () => ({ start: "linux:1", pgid: 1 }) }), false, "not leading its own group");
+  assert.equal(signalRun(4242, "linux:1", { kill, info: () => ({ unknown: "unreadable" }) }), false, "can't be told: nothing");
+  for (const bad of [0, 1, -5, 1.5, "4242"]) assert.equal(signalRun(bad, "linux:1", { kill, info: () => ({ start: "linux:1", pgid: bad }) }), false, String(bad));
+  assert.equal(signalRun(4242, null, { kill, info: () => ({ start: null, pgid: 4242 }) }), false, "no recorded start");
+  assert.deepEqual(sent, []);
+  const live = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true });
+  const liveStart = procStart(live.pid);
+  const gone = new Promise((r) => live.on("exit", (code, sig) => r(sig)));
+  assert.equal(signalRun(live.pid, liveStart), true, "its own leader: signalled");
+  assert.equal(await gone, "SIGKILL");
 });

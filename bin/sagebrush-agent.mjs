@@ -174,7 +174,7 @@ if (fakeHome !== null) try {
   const store = fakeHome
     ? new TaskStore({ root: join(fakeHome, ".sagebrush", "tasks"), scope: installationId(fakeHome), transcripts: claudeProjects({ CLAUDE_CONFIG_DIR: join(fakeHome, ".claude") }) }).init()
     : new TaskStore({ scope: installationId(), transcripts: claudeProjects() }).init();
-  // (the runner: refuses every run in this version, saying why; RUNS_ENABLED is turned on only by a reviewed change)
+  // (the runner: runs a task's notebooks where this platform's pins exist and the task allows it; else refuses, saying why)
   const { TaskRunner } = await import("../lib/task-runner.mjs");
   const turns = new TaskTurns({ store, query, createServer, log: (m) => console.error(m), runner: new TaskRunner({ store }) });
   server.setTasks({ store, turns, rpc: new TaskRpc({ store, turns }) });

@@ -40,16 +40,20 @@ function server(routes) {
 }
 const scratch = () => mkdtempSync(join(tmpdir(), "sb-runner-cache-"));
 
-test("the pins: Deno 2.9.0 for the four M1 platforms from npm only; the engine slot empty, so runs say why; the zone data pinned file by file", () => {
-  assert.equal(RUNNER_PIN.deno.version, "2.9.0");
+test("the pins: Deno 2.9.6 for the four M1 platforms from npm only; the engine sagebrush 0.10.3 from npm, run as dist/sagebrush.cjs; the zone data pinned file by file", () => {
+  assert.equal(RUNNER_PIN.deno.version, "2.9.6");
   assert.deepEqual(Object.keys(RUNNER_PIN.deno.platforms).sort(), ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"]);
   for (const e of Object.values(RUNNER_PIN.deno.platforms)) {
-    assert.match(e.url, /^https:\/\/registry\.npmjs\.org\/@deno\/[a-z0-9-]+\/-\/[a-z0-9-]+-2\.9\.0\.tgz$/);
+    assert.match(e.url, /^https:\/\/registry\.npmjs\.org\/@deno\/[a-z0-9-]+\/-\/[a-z0-9-]+-2\.9\.6\.tgz$/);
     assert.equal(e.files.deno.exec, true);
     assert.match(e.sha256, /^[0-9a-f]{64}$/);
   }
-  assert.equal(RUNNER_PIN.engine, null);
-  assert.equal(pinProblem(RUNNER_PIN, "linux-x64"), "no engine with confinement is pinned yet");
+  assert.equal(RUNNER_PIN.engine.version, "0.10.3");
+  assert.equal(RUNNER_PIN.engine.url, "https://registry.npmjs.org/sagebrush/-/sagebrush-0.10.3.tgz");
+  assert.equal(RUNNER_PIN.engine.entry, "dist/sagebrush.cjs");
+  assert.match(RUNNER_PIN.engine.files["dist/sagebrush.cjs"].sha256, /^[0-9a-f]{64}$/);
+  assert.equal(pinProblem(RUNNER_PIN, "linux-x64"), null);
+  assert.equal(pinProblem({ ...RUNNER_PIN, engine: null }, "linux-x64"), "no engine with confinement is pinned yet");
   assert.match(pinProblem(RUNNER_PIN, null), /aren't available on/);
   assert.equal(RUNNER_PIN.tzdata.version, "2026.5");
   assert.equal(Object.keys(RUNNER_PIN.tzdata.files).length, 598);
@@ -60,7 +64,9 @@ test("the pins: Deno 2.9.0 for the four M1 platforms from npm only; the engine s
 
 test("ensureRunner refuses where the pins can't serve, fetching nothing", async () => {
   const f = server({}), dir = scratch();
-  await assert.rejects(ensureRunner({ root: join(dir, "r"), platform: "linux-x64", fetchFn: f }), (e) => e instanceof RunnerFetchError && e.code === "runner_platform" && /no engine/.test(e.message));
+  // (no engine pinned, and a platform with no Deno pinned: refused before any fetch or folder)
+  await assert.rejects(ensureRunner({ pin: { ...RUNNER_PIN, engine: null }, root: join(dir, "r"), platform: "linux-x64", fetchFn: f }), (e) => e instanceof RunnerFetchError && e.code === "runner_platform" && /no engine/.test(e.message));
+  await assert.rejects(ensureRunner({ root: join(dir, "r"), platform: "freebsd-x64", fetchFn: f }), (e) => e instanceof RunnerFetchError && e.code === "runner_platform" && /aren't available on/.test(e.message));
   assert.equal(f.calls.length, 0);
   assert.equal(existsSync(join(dir, "r")), false, "no cache folder made");
   rmSync(dir, { recursive: true, force: true });

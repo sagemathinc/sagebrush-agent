@@ -1,23 +1,23 @@
 {
- "comment": "What the Delegate runner runs (lib/task-runner.mjs): Deno, per platform, npm's tarball for it, its size and sha256, and every file in it; the engine (the sagebrush npm package, run as dist/sagebrush.cjs), null until a release with --confine is pinned; and the zone data shipped in lib/tzdata/zoneinfo (from the tzdata wheel named here), every file. From scripts/runner-pin.mjs, by a reviewed edit only.",
+ "comment": "What the Delegate runner runs (lib/task-runner.mjs): Deno, per platform, npm's tarball for it, its size and sha256, and every file in it; the engine (the sagebrush npm package, run as dist/sagebrush.cjs); and the zone data shipped in lib/tzdata/zoneinfo (from the tzdata wheel named here), every file. From scripts/runner-pin.mjs, by a reviewed edit only.",
  "deno": {
-  "version": "2.9.0",
+  "version": "2.9.6",
   "platforms": {
    "linux-x64": {
     "package": "@deno/linux-x64-glibc",
-    "url": "https://registry.npmjs.org/@deno/linux-x64-glibc/-/linux-x64-glibc-2.9.0.tgz",
-    "size": 44909197,
-    "sha256": "3f0cfa3035f04318accd398d7982e4361e75885598f697801fc863297bf72755",
-    "integrity": "sha512-So2+32HQUUGOw5x5DN2q+5kpUA0hGk6KgPmfH6AxQUofGtcUfakTAfo5qiW4t+tdAQVPBHQ5wgMrboy6JN1auw==",
+    "url": "https://registry.npmjs.org/@deno/linux-x64-glibc/-/linux-x64-glibc-2.9.6.tgz",
+    "size": 42285097,
+    "sha256": "a6596af07f3570b4f1ffa6783bfee9942aac14a719a601baa6bf5b71bf0105e2",
+    "integrity": "sha512-3md4TKLCuzsLDmfOoC5KN7NAZaxSVkMgm64vg6foD00JBADCpYS2/5QqXfzgnP5ZQz3iLP9vBQJtEgc116OAoQ==",
     "files": {
      "deno": {
-      "size": 106199312,
-      "sha256": "fe0a28090e2e0fef0c7a2e94ea4354e7dc3c74f4eef5c78f98252fa687894253",
+      "size": 95600728,
+      "sha256": "bceb5b6a6239b0b010418406d8c77a508f67cf4337d94288f1c19fe71304aab0",
       "exec": true
      },
      "package.json": {
       "size": 476,
-      "sha256": "1e800f01661e68be6e62d60eaf4dab90e737f9356b0373c767f5291c54e48e62"
+      "sha256": "ecf4896401e877a96f9e75fbcb7a40f8490673257fc36ac2dee8f8180246073f"
      },
      "README.md": {
       "size": 88,
@@ -28,19 +28,19 @@
    },
    "linux-arm64": {
     "package": "@deno/linux-arm64-glibc",
-    "url": "https://registry.npmjs.org/@deno/linux-arm64-glibc/-/linux-arm64-glibc-2.9.0.tgz",
-    "size": 43865672,
-    "sha256": "6ea161cf1cfa8319202785d31a47a189448bea7c864b97e9e90b45ce83442df0",
-    "integrity": "sha512-JiSC0y2diz3No5UZ2TZj0NfzAV/61KRY8x0l3Mvmd96PHrqcdAZQhS1zNKTPPzbSOZ8gyXMOhWcibvgG7P65uA==",
+    "url": "https://registry.npmjs.org/@deno/linux-arm64-glibc/-/linux-arm64-glibc-2.9.6.tgz",
+    "size": 40997166,
+    "sha256": "8e32a9c72c84c14f91fde26efbef0b5f347286f3c68b4b7d4b8040ae9e6f42ec",
+    "integrity": "sha512-poqhoH9B3nYloigEMPT5t8HY+wBeiuea1An5Q7fqgJzP0SYmWsoS/oUnWO/pEiA4ofzIBy1Elt/in58xKtxEoQ==",
     "files": {
      "deno": {
-      "size": 96049200,
-      "sha256": "a4df43dc2cf816a35142da30f3e58b5c660a65ce7f0cd0f9c3fecdb4ee724ce9",
+      "size": 84905856,
+      "sha256": "d08d392418df53f4e6e88a08909c0e1bccbf9adcead7232df72b6ad6075ec416",
       "exec": true
      },
      "package.json": {
       "size": 482,
-      "sha256": "8aedc76c0747ec50095185687ee79acc73271b997cd5ea4e978559afc48a73f7"
+      "sha256": "26f35747c6925073d6effa18bda6d248bdb9162e764a4db671e527c3b6d9afa1"
      },
      "README.md": {
       "size": 92,
@@ -51,19 +51,19 @@
    },
    "darwin-x64": {
     "package": "@deno/darwin-x64",
-    "url": "https://registry.npmjs.org/@deno/darwin-x64/-/darwin-x64-2.9.0.tgz",
-    "size": 42950881,
-    "sha256": "e5e88c1e490345c06c38176b4878982e4f897960ac4ef7c503f081a9cbf126ec",
-    "integrity": "sha512-jimxxz7Ko3zLxfMrVKNgrRJ8F9VJ05X2cI17vE07LtT9P3yHl8LKDj4GGbCQ2BVsL/fW0LJaV+AtrX+b3UiWpQ==",
+    "url": "https://registry.npmjs.org/@deno/darwin-x64/-/darwin-x64-2.9.6.tgz",
+    "size": 42906340,
+    "sha256": "7de9ca51343ef2f2ef1996e4a673d37920386681c3fef4aa964638ec62df398f",
+    "integrity": "sha512-tPi3CWPRdjW1MaWlvWjORE7Ass5SADdWdj1BF1Q1PEdzi+5u/mC5YhmZzniMiPr81PpaFeqjXaLAsfb8lFsZ0Q==",
     "files": {
      "deno": {
-      "size": 99330480,
-      "sha256": "d5d567b05d4dd173ad58fe8135d9a942693aae677f3f56fa89346a5644c23996",
+      "size": 97693344,
+      "sha256": "ec9fbd8e8f5f6ca5ceb0ebe4a564636f2c698bf60e3187460ded400cc0147fd5",
       "exec": true
      },
      "package.json": {
       "size": 438,
-      "sha256": "2cde9a64b739b12091a1acac3b61646889600ced5fb6faa34e6d6bdf7e9f4eb2"
+      "sha256": "a2266c8c3d1c9c87381c8088e3600c8ec3cde361ff2a8a7414bfd40b7d64bb4c"
      },
      "README.md": {
       "size": 78,
@@ -74,19 +74,19 @@
    },
    "darwin-arm64": {
     "package": "@deno/darwin-arm64",
-    "url": "https://registry.npmjs.org/@deno/darwin-arm64/-/darwin-arm64-2.9.0.tgz",
-    "size": 39086350,
-    "sha256": "f89387ed593391e4a7b0f8a134385fa24633dde86f0a0b5c97c3a7e5fdcd20b7",
-    "integrity": "sha512-9fzvTP9i8oxFirLezE06x/xFYcUko4TrKSC+dAoLpFkDFd/OvIwSqRCldwflWYyBoadRzoGJvudYoIDRgoSzNQ==",
+    "url": "https://registry.npmjs.org/@deno/darwin-arm64/-/darwin-arm64-2.9.6.tgz",
+    "size": 39597481,
+    "sha256": "60321cf03244e275589f0d099575bfc739c72ff5aa6e9d19d47d8f0757c24bad",
+    "integrity": "sha512-V8uO1Aolrl/yvdMb5lOtgtigs8YuZBjrOrgviVMiYkQ0swymFfzkae1wZak4Xi24t7vf7d/eiMb/7ryjjVm+tg==",
     "files": {
      "deno": {
-      "size": 82565888,
-      "sha256": "a817b1c193d34b58375e92f4e5c0c5f5de1914bf03f9690b5491eddc7b7d4fa5",
+      "size": 80915104,
+      "sha256": "b3ac3bd206e48c26026cadd80c1367e96c149f9c66130952382a642b09fa8a71",
       "exec": true
      },
      "package.json": {
       "size": 444,
-      "sha256": "c4e93d6ec5d4e65f08a6148f092e3bdc35b0a3328e58cf2d51fd06dd90be8c90"
+      "sha256": "2734584eb6267b495ed86c27280734e078208b3b59197ef1d53882bf41a784d0"
      },
      "README.md": {
       "size": 82,
@@ -97,7 +97,62 @@
    }
   }
  },
- "engine": null,
+ "engine": {
+  "version": "0.10.3",
+  "package": "sagebrush",
+  "url": "https://registry.npmjs.org/sagebrush/-/sagebrush-0.10.3.tgz",
+  "size": 11598870,
+  "sha256": "0618c9fe7d323e267da93ee9a57e769da43537792ce5e722779877f41a2c1f5e",
+  "integrity": "sha512-waJZFqCcvSzy10HQIER6wPAorXzF4FQLMLENDQPfF+BCectMd/eTm4ZVI3ZSDoKlajoPphDcGDEFdMDQZ0ZOnw==",
+  "files": {
+   "LICENSE-APACHE": {
+    "size": 10847,
+    "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+   },
+   "LICENSE-MIT": {
+    "size": 1071,
+    "sha256": "bca4b8cd5e2ef5652bab4a89a8289af39316e4de7d258f0808db344ef844ad11"
+   },
+   "dist/sagebrush-latex.cjs": {
+    "size": 978283,
+    "sha256": "3b07f3d06bc92e459b42bf8e784edd53687c01cabfe170bd561dc54703b975c8"
+   },
+   "bin/sagebrush.cjs": {
+    "size": 8808,
+    "sha256": "8a396552feaff2fa7eaf9fb16812ec1ac5d959b0daa5345e50e01e63964aa51f",
+    "exec": true
+   },
+   "dist/sagebrush.cjs": {
+    "size": 28565810,
+    "sha256": "485764329c3d08e87e4454ea1814f79e6ecd0fd74d3699884f18d1e92bbdf73a"
+   },
+   "package.json": {
+    "size": 1089,
+    "sha256": "a12d34d1ba404ac94558d79150e9d0a9e91419ec51227c166066f9a41525a738"
+   },
+   "NOTICE.md": {
+    "size": 2125,
+    "sha256": "d08f9cb416fbd559279aacc7fd4b2b6be6ae0bec6d27eba4d7bceb4553a5c9fd"
+   },
+   "README.md": {
+    "size": 2654,
+    "sha256": "71aa18e674b0f74769284e83827bd95ff5ca3606f872ffbd543e74057ee0f270"
+   },
+   "LICENSE-Artistic-2.0.txt": {
+    "size": 9447,
+    "sha256": "e7000d1562eb8d32209576028f36bf5caed23f01e9a99fa318063cc4684afc01"
+   },
+   "LICENSE-CPython.txt": {
+    "size": 13804,
+    "sha256": "b0e25a78cffb43f4d92de8b61ccfa1f1f98ecbc22330b54b5251e7b6ba010231"
+   },
+   "THIRD-PARTY-NOTICES.txt": {
+    "size": 243148,
+    "sha256": "93c92c4c0940304db55a347a708397b73eea6f5017ca175cb7f8f30f581e0268"
+   }
+  },
+  "entry": "dist/sagebrush.cjs"
+ },
  "tzdata": {
   "version": "2026.5",
   "wheel": {

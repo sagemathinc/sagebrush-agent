@@ -1,5 +1,27 @@
 # sagebrush-agent changes
 
+## 0.8.9
+
+**A brief asked right after a turn waits for it.** Running code in Delegate is still not enabled in this version.
+
+- **Drafting a brief just after a turn:** a turn shows as finished when Claude's answer arrives, but it can take a moment more to close. A brief asked in that moment used to be refused as busy; now it waits for the turn to close, then drafts. While it waits, that chat takes no new message. A brief asked while a turn is still under way is still refused as busy.
+- **Its limits, as in 0.8.7:** the 60 seconds include the time spent waiting for the previous turn to close. After 60 seconds, or when the person stops drafting, the draft is cancelled and no brief is returned. If its Claude Code work doesn't end, the agent reports that and keeps it counted against its limits.
+
+## 0.8.8
+
+**A Pair turn that hangs now ends for the page.** Running code in Delegate is still not enabled in this version.
+
+- **Stop ends a turn, even a stuck one:** if Claude Code stops answering in the middle of a Pair turn, the person's Stop (or the workspace access ending, a turn's time limit, or the agent stopping) now ends the turn for the page at once, and the chat can go on. Before, such a turn showed as running for good, and Stop didn't end it.
+- **What stays counted:** if that turn's Claude Code work doesn't end, the agent reports that, and the turn keeps its place among the turns the agent runs at once (at most 4) until the work ends. So a stuck turn never lets the agent start more than its limits allow.
+
+## 0.8.7
+
+**A Delegate task's brief, drafted from the Pair chat.** Running code in Delegate is still not enabled in this version.
+
+- **Drafting a brief (`chat.brief`):** when the person delegates from a Pair chat, the Agents page can ask the agent to draft the task's brief from that conversation: a title, then the Goal, the Decisions made, the Files named and when it's Done. The person edits it before starting the task. The task itself still starts fresh, with only the brief and its documents.
+- **How it is drafted:** by the chat's own Claude session, in a copy of it that has no tools of any kind and one turn. The chat itself is unchanged, nothing shows in it, and the copy isn't kept. It needs the Delegate switch on, and a chat Claude runs (not Codex).
+- **Its limits:** a title of at most 200 characters and a brief of at most 8 KiB (a longer one is cut, and says so). After 60 seconds, or when the person stops drafting, the draft is cancelled and no brief is returned. If its Claude Code work doesn't end, the agent reports that and keeps it counted against its limits. While one is being written that chat takes no new message. A draft counts against the agent's limit on turns running at once.
+
 ## 0.8.6
 
 **A launch for the Sagebrush desktop app.** Nothing changes for `npx` or `sagebrush remote`: without the new option, the agent starts, pairs and runs as before. Running code in Delegate is still not enabled in this version.

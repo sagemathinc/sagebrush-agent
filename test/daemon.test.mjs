@@ -397,22 +397,42 @@ test("the version the agent says (hello, status, its tool server) is the package
   assert.equal(VERSION, JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version);
 });
 
-test("the command line: the printed link opens sagebrush.space/agents unless SAGEBRUSH_AGENT_PAGE says otherwise", async () => {
+test("the command line: the printed link opens <origin>/agents with one --origin, else sagebrush.space/agents, unless SAGEBRUSH_AGENT_PAGE says otherwise", async () => {
   const { spawn } = await import("node:child_process");
-  const link = (env) => new Promise((resolve, reject) => {
+  // (the link, and the text printed with it up to the line after it)
+  const run = (env, args = []) => new Promise((resolve, reject) => {
     const e = { ...process.env, SAGEBRUSH_AGENT_FAKE: "1", ...env };
     if (env.SAGEBRUSH_AGENT_PAGE === undefined) delete e.SAGEBRUSH_AGENT_PAGE;
-    const c = spawn(process.execPath, ["bin/sagebrush-agent.mjs"], { env: e, stdio: ["ignore", "pipe", "pipe"] });
+    const c = spawn(process.execPath, ["bin/sagebrush-agent.mjs", ...args], { env: e, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     const t = setTimeout(() => { c.kill("SIGKILL"); reject(new Error(`no link: ${out}`)); }, 10000);
     c.stdout.on("data", (d) => {
       out += d;
       const m = /Open: +(\S+)/.exec(out);
-      if (m) { clearTimeout(t); c.kill("SIGKILL"); resolve(m[1]); }
+      if (m && /The code works once/.test(out)) { clearTimeout(t); c.kill("SIGKILL"); resolve({ link: m[1], out }); }
     });
   });
+  const link = async (env, args) => (await run(env, args)).link;
   assert.match(await link({}), /^https:\/\/sagebrush\.space\/agents\/\?pair=[^&]+&port=\d+$/);
   assert.match(await link({ SAGEBRUSH_AGENT_PAGE: "https://dev.sagebrush.space/agents" }), /^https:\/\/dev\.sagebrush\.space\/agents\/\?pair=/);
+  // (one --origin: that origin's /agents/, https or http)
+  assert.match(await link({}, ["--origin", "https://dev.sagebrush.space"]), /^https:\/\/dev\.sagebrush\.space\/agents\/\?pair=[^&]+&port=\d+$/);
+  assert.match(await link({}, ["--origin", "http://localhost:5173"]), /^http:\/\/localhost:5173\/agents\/\?pair=[^&]+&port=\d+$/);
+  // (SAGEBRUSH_AGENT_PAGE still wins over --origin)
+  assert.match(await link({ SAGEBRUSH_AGENT_PAGE: "https://agents.sagebrush.cloud/agents/" }, ["--origin", "https://dev.sagebrush.space"]), /^https:\/\/agents\.sagebrush\.cloud\/agents\/\?pair=/);
+  // (more than one --origin: sagebrush.space, and the person is told how to choose)
+  const two = await run({}, ["--origin", "https://dev.sagebrush.space", "--origin", "http://localhost:5173"]);
+  assert.match(two.link, /^https:\/\/sagebrush\.space\/agents\/\?pair=/);
+  assert.match(two.out, /with more than one --origin this link opens sagebrush\.space: set SAGEBRUSH_AGENT_PAGE to choose the page/);
+  assert.doesNotMatch((await run({}, ["--origin", "https://dev.sagebrush.space"])).out, /more than one --origin/);
+});
+
+test("the command line: --help says where the printed link opens", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const r = spawnSync(process.execPath, ["bin/sagebrush-agent.mjs", "--help"], { encoding: "utf8", env: { ...process.env, SAGEBRUSH_AGENT_FAKE: "1" } });
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /<origin>\/agents\/ with one --origin, else to https:\/\/sagebrush\.space\/agents\//);
+  assert.match(r.stdout, /SAGEBRUSH_AGENT_PAGE=<url> sets the link's page instead/);
 });
 
 test("the command line: when the page goes away, a fresh one-time link is printed; the page's session still reconnects", async () => {

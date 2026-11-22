@@ -14,7 +14,7 @@
   - Delegate stays off on Windows in this version, and says why.
   - Codex itself is still refused on Windows in this version ("Codex on Windows isn't supported here."). It is downloaded and checked there, then refused as soon as it answers its first request; no turn runs.
   - Known on Windows: Node writes the agent's output to its runner synchronously there, so a runner that stops reading holds up the whole agent until it reads again. On other systems only that turn is stopped.
-- **Tests (pending Windows confirmation):** the suite is made to run on Windows. The rows that can't apply there (Delegate, POSIX modes, signals) are declared skips with their reasons, never silent passes.
+- **Tests:** the suite passes on Windows: 438 rows pass and none fail. 127 are declared skips with their reasons: 101 are Delegate's (off on Windows in this version), 13 don't apply there (POSIX modes, signals, /proc, and the known output limit). The remaining 13 skip process lookup for runs (2), POSIX shell stand-ins (5), or TLS tests needing OpenSSL, which was absent on this VM (6).
 
 ## 0.8.1
 

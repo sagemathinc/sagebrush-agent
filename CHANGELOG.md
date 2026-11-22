@@ -1,5 +1,12 @@
 # sagebrush-agent changes
 
+## 0.8.9
+
+**A brief asked right after a turn waits for it.** Running code in Delegate is still not enabled in this version.
+
+- **Drafting a brief just after a turn:** a turn shows as finished when Claude's answer arrives, but it can take a moment more to close. A brief asked in that moment used to be refused as busy; now it waits for the turn to close, then drafts. While it waits, that chat takes no new message. A brief asked while a turn is still under way is still refused as busy.
+- **Its limits, as in 0.8.7:** the 60 seconds include the time spent waiting for the previous turn to close. After 60 seconds, or when the person stops drafting, the draft is cancelled and no brief is returned. If its Claude Code work doesn't end, the agent reports that and keeps it counted against its limits.
+
 ## 0.8.8
 
 **A Pair turn that hangs now ends for the page.** Running code in Delegate is still not enabled in this version.

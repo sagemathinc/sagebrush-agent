@@ -4,8 +4,8 @@
 
 **For tests: the fake model carries an Ask for changes into its next proposal.** Nothing changes for Claude or Codex. The fake model runs only with `SAGEBRUSH_AGENT_FAKE=1`, which the end-to-end tests set. Running code in Delegate is still not enabled in this version: `notebook_run` refuses, saying so.
 
-- **Ask for changes:** on a Delegate task's next round, the fake model writes the person's note, exactly as they sent it, into the file it works on, as "Asked: <note>":
-  - a notebook gets a Markdown cell at the end;
+- **Ask for changes:** on a Delegate task's next round, the fake model writes the person's note into the file it works on, as "Asked: <note>":
+  - a notebook gets a Markdown cell at the end, with the note exactly as sent;
   - a LaTeX file gets a comment line and a visible line before `\end{document}`, the note on one line, with LaTeX's special characters escaped so the preview always builds.
   So a test can see that round 2 carries what was asked.
 - **A LaTeX file:** on a task whose copy has a .tex file and no notebook, the fake model's first round now adds a line to the .tex ("Done by the fake model, for this task."), so its proposal has a rendered change to preview.

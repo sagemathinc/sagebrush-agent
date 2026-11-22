@@ -1,5 +1,14 @@
 # sagebrush-agent changes
 
+## 0.8.12
+
+**Coming back to the page never needs a restart.** Running code in Delegate is still not enabled in this version.
+
+- **The session holds:** the session a page gets when it pairs with a code stays valid for as long as sagebrush-agent runs, until another page pairs with a code. A page that reloads, navigates away and back, or loses its connection pairs again with no code.
+- **The newest link always works:** while no page is paired, a code that expires unused is replaced, and its link is printed on one line. Codes are still single use, for 5 minutes each.
+- **A second page gets a real answer:** a page that connects while another is paired is refused at its hello as busy, and a code it carried is not spent. Before, its connection was refused in a way a browser can't read, so it looked like no agent was running.
+- **A refusal says why:** `error.data.reason` is `busy`, `unknown-session` (the agent restarted, or another code paired since) or `bad-code` (wrong, spent or expired). `code` and `message` are unchanged, so older pages work as before.
+
 ## 0.8.11
 
 **A Delegate proposal no longer looks unfinished, and a task's changes are proposed even when Claude doesn't propose them.** Running code in Delegate is still not enabled in this version.

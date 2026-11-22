@@ -113,6 +113,7 @@ test("a proposal whose call id isn't known still ends its turn (no call is inven
   // (the turn's only end is the host's, at its end without a proposal; never a "completed" from the refused propose)
   assert.deepEqual(gev.filter((e) => e.type === "turn_finished").map((e) => e.outcome), ["completed"]);
   assert.equal(g.store.state(g.task).status, "interrupted");
+  assert.equal(g.store.state(g.task).reasonCode, "unproposable", "changes the store refused");
   g.done();
 });
 
@@ -143,7 +144,8 @@ test("no proposal is made for it when the copy didn't change, when the turn didn
   const { task } = await h.rpc.call("tasks.start", h.req());
   await until(() => h.store.state(task).status === "interrupted", "interrupted");
   assert.equal(h.store.state(task).proposals.length, 0);
-  assert.match(h.store.state(task).reason, /ended without a proposal/);
+  assert.match(h.store.state(task).reason, /ended with an error, without a proposal/);
+  assert.equal(h.store.state(task).reasonCode, "failed");
   h.done();
   // (a stopped turn, with a change made: interrupted as stopped, nothing proposed)
   let release;
@@ -302,6 +304,7 @@ test("a transcript growing past its bound mid-turn: the turn is interrupted then
   await until(() => h.store.state(task).status === "interrupted", "interrupted");
   assert.ok(grew);
   assert.match(h.store.state(task).reason, /transcript passed/);
+  assert.equal(h.store.state(task).reasonCode, "limit");
   assert.equal(h.store.state(task).proposals.length, 0);
   h.done();
 });
@@ -434,6 +437,7 @@ test("a model that ignores the abort: a breach interrupts the task at once, free
   writeFileSync(join(h.store.transcriptDir(task), "s.jsonl"), Buffer.alloc(64));
   await until(() => h.store.state(task).status === "interrupted" && !h.turns.isRunning(task), "interrupted, its place free", 2000);
   assert.match(h.store.state(task).reason, /transcript passed/);
+  assert.equal(h.store.state(task).reasonCode, "limit");
   const n = h.store.get({ task, after: 0 }).events.length;
   release();
   await new Promise((r) => setTimeout(r, 50));
@@ -601,4 +605,46 @@ test("Resume's note: optional, well-formed text bounded as Ask's; anything else 
   assert.deepEqual(await h.rpc.call("tasks.resume", { task, note: "" }), { status: "working" }, "an empty note is a note");
   await h.rpc.call("tasks.stop", { task });
   h.done();
+});
+
+// (every way a turn leaves its task interrupted records why, as a code)
+test("reason codes: a completed turn with no change, an error, the person's Stop, the Delegate switch, a limit and the 24-hour bound each record their own", WIN_DELEGATE, async () => {
+  const codeOf = (store, task) => [store.state(task).reasonCode, store.state(task).reason];
+  // (no change: no_proposal)
+  const a = setup({ steps: [["workspace_list", {}]] });
+  const ta = a.start();
+  a.turns.begin(ta, "start");
+  await until(() => a.store.state(ta).status === "interrupted", "a");
+  assert.deepEqual(codeOf(a.store, ta), ["no_proposal", "the agent's turn ended without a proposal"]);
+  // (the log's task_status carries the code)
+  assert.equal(a.store.get({ task: ta, after: 0 }).events.at(-1).event.code, "no_proposal");
+  a.done();
+  // (an error result: failed)
+  const fails = () => (async function* () {
+    yield { type: "system", subtype: "init", session_id: "s", tools: [], mcp_servers: [] };
+    yield { type: "result", subtype: "error_during_execution", is_error: true, result: "", usage: { input_tokens: 1, output_tokens: 1 } };
+  })();
+  const b = hostWith(perCall([fails]));
+  const tb = (await b.rpc.call("tasks.start", b.req())).task;
+  await until(() => b.store.state(tb).status === "interrupted", "b");
+  assert.equal(b.store.state(tb).reasonCode, "failed");
+  b.done();
+  // (the person's Stop: stopped; the Delegate switch: switched_off, for the running task and a waiting one)
+  const c = hostWith(perCall([stuck(new Promise(() => {}))]), { running: 1 });
+  const t1 = (await c.rpc.call("tasks.start", c.req())).task;
+  await until(() => c.turns.isRunning(t1), "c1");
+  await c.rpc.call("tasks.stop", { task: t1 });
+  assert.deepEqual(codeOf(c.store, t1), ["stopped", "stopped by the person"]);
+  await c.rpc.call("tasks.resume", { task: t1 });
+  await until(() => c.turns.isRunning(t1), "c1 again");
+  const t2 = (await c.rpc.call("tasks.start", c.req())).task;
+  await c.rpc.switchedOff();
+  for (const t of [t1, t2]) assert.deepEqual(codeOf(c.store, t), ["switched_off", "the Delegate switch was turned off"], t);
+  c.done();
+  // (the 24-hour bound, here shortened: limit, saying so)
+  const d = hostWith(perCall([stuck(new Promise(() => {}))]), { turnMs: 150 });
+  const td = (await d.rpc.call("tasks.start", d.req())).task;
+  await until(() => d.store.state(td).status === "interrupted", "d", 5000);
+  assert.deepEqual(codeOf(d.store, td), ["limit", "the turn reached its 24 hour limit"]);
+  d.done();
 });

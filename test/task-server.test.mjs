@@ -312,3 +312,49 @@ test("delegate.run: offered only where a task's notebooks can run here (runs on,
   assert.match(taskSystem(false), /Running code isn't available for this task: check your work by reading it\./);
   rmSync(dir, { recursive: true, force: true });
 });
+
+// (why a task stopped, as codes; a page's schema is closed, so only a page that says it reads them gets them)
+test("tasks.reason: a page without it gets exactly the old shapes (no code on task_status, no reason or reason_code in entries); a page that announces it gets them; the log keeps them", WIN_DELEGATE, async () => {
+  let release;
+  const h = await setup({ gate: new Promise((r) => (release = r)) });
+  const p = page(h.port);
+  await p.open;
+  await p.hello(h.code);
+  p.notify("grant.changed", { folders: ["/"], write: true, delegate: true });
+  await new Promise((r) => setTimeout(r, 50));
+  const { result: started } = await p.call("tasks.start", START);
+  await until(() => h.turns.isRunning(started.task), "running");
+  const stopped = await p.call("tasks.stop", { task: started.task });
+  assert.equal(stopped.result.status, "interrupted");
+  await until(() => p.events.some((e) => e.event.type === "task_status" && e.event.status === "interrupted"), "the live event");
+  // (the store recorded the code)
+  const logged = h.store.get({ task: started.task, after: 0 }).events.find((e) => e.event.type === "task_status" && e.event.status === "interrupted");
+  assert.deepEqual(logged.event, { type: "task_status", status: "interrupted", reason: "stopped by the person", code: "stopped" });
+  // (an old page: the live event, tasks.list and tasks.get exactly as before, field for field)
+  const OLD_ENTRY = ["task", "title", "status", "target", "run", "round", "seq", "proposal", "question", "updated"];
+  const live = p.events.find((e) => e.event.type === "task_status" && e.event.status === "interrupted");
+  // (byte for byte what an agent before codes sent: the log's canonical form, keys sorted)
+  assert.equal(JSON.stringify(live.event), '{"reason":"stopped by the person","status":"interrupted","type":"task_status"}');
+  const list = (await p.call("tasks.list", {})).result;
+  assert.deepEqual(Object.keys(list.tasks[0]), OLD_ENTRY);
+  const got = (await p.call("tasks.get", { task: started.task, after: 0 })).result;
+  assert.deepEqual(Object.keys(got.task), OLD_ENTRY);
+  assert.ok(got.events.every((e) => e.event.type !== "task_status" || !Object.hasOwn(e.event, "code")), "no code on any task_status");
+  // (the page announces tasks.reason: the same now carries why)
+  p.notify("page.features", { features: ["tasks.reason"] });
+  await new Promise((r) => setTimeout(r, 50));
+  const list2 = (await p.call("tasks.list", {})).result;
+  assert.equal(list2.tasks[0].reason, "stopped by the person");
+  assert.equal(list2.tasks[0].reason_code, "stopped");
+  const got2 = (await p.call("tasks.get", { task: started.task, after: 0 })).result;
+  assert.equal(got2.task.reason_code, "stopped");
+  assert.equal(got2.events.find((e) => e.event.type === "task_status" && e.event.status === "interrupted").event.code, "stopped");
+  // (a resumed task: no reason any more, to anyone)
+  await p.call("tasks.resume", { task: started.task });
+  const list3 = (await p.call("tasks.list", {})).result;
+  assert.ok(!Object.hasOwn(list3.tasks[0], "reason") && !Object.hasOwn(list3.tasks[0], "reason_code"));
+  release();
+  p.ws.close();
+  await h.server.close();
+  rmSync(h.dir, { recursive: true, force: true });
+});

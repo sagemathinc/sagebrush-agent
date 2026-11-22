@@ -12,7 +12,7 @@ import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { fakeCreateServer } from "../lib/fake.mjs";
 import { RUNNER_PIN } from "../lib/runner-fetch.mjs";
-import { cfUserTextEncoding, copyZones, RUNS_ENABLED, runArgv, runEnv, TaskRunner, TZ_SOURCE } from "../lib/task-runner.mjs";
+import { cfUserTextEncoding, copyZones, RUN_PLATFORMS, RUNS_ENABLED, runArgv, runEnv, TaskRunner, TZ_SOURCE } from "../lib/task-runner.mjs";
 import { TaskRpc } from "../lib/task-rpc.mjs";
 import { TaskTurns, TASK_SERVER } from "../lib/task-turns.mjs";
 import { TaskStore } from "../lib/tasks.mjs";
@@ -102,6 +102,10 @@ test("on from this version: RUNS_ENABLED is true; a runner turned off, or a task
   // (no engine pinned; a platform with no Deno pinned)
   assert.equal(new TaskRunner({ store: h.store, enabled: true, pin: { ...PIN, engine: null }, platform: "linux-x64" }).problem(h.task), "no engine with confinement is pinned yet");
   assert.match(new TaskRunner({ store: h.store, enabled: true, pin: PIN, platform: null }).problem(h.task), /runs aren't available on/);
+  // (Linux only for now: a platform the pins have but RUN_PLATFORMS doesn't, macOS, refuses, saying so)
+  assert.deepEqual(RUN_PLATFORMS, ["linux-x64", "linux-arm64"]);
+  for (const p of ["darwin-arm64", "darwin-x64"]) assert.equal(new TaskRunner({ store: h.store, pin: PIN, platform: p }).problem(h.task), `runs aren't available on ${p} in this version (Linux only, for now)`);
+  assert.equal(new TaskRunner({ store: h.store, pin: PIN, platform: "linux-arm64" }).problem(h.task), null);
   assert.equal(h.spawned.length + noRun.spawned.length, 0);
   h.done(); noRun.done();
 });

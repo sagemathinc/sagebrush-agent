@@ -285,7 +285,7 @@ test("the pairing's revoke turns Delegate off: the running task is interrupted, 
   }
 });
 
-test("delegate.run: offered only where a task's notebooks can run here (runs on, this platform's pins); the task's system prompt says which", WIN_DELEGATE, async () => {
+test("delegate.run: offered only where a task's notebooks can run here (runs on, a platform where runs are on, its pins); the task's system prompt says which", WIN_DELEGATE, async () => {
   const { TaskRunner } = await import("../lib/task-runner.mjs");
   const { RUN_FEATURE } = await import("../lib/server.mjs");
   const { taskSystem } = await import("../lib/task-turns.mjs");
@@ -303,6 +303,7 @@ test("delegate.run: offered only where a task's notebooks can run here (runs on,
   assert.ok(offer(linux).includes("delegate.1"));
   assert.ok(!offer((store) => new TaskRunner({ store, enabled: false, platform: "linux-x64" })).includes("delegate.run"), "runs off");
   assert.ok(!offer((store) => new TaskRunner({ store, platform: null })).includes("delegate.run"), "no pins for this platform");
+  assert.ok(!offer((store) => new TaskRunner({ store, platform: "darwin-arm64" })).includes("delegate.run"), "macOS: not yet (Linux only for now)");
   assert.ok(!offer(null).includes("delegate.run"), "no runner");
   assert.ok(!offer(linux, true).includes("delegate.run"), "never over the runner's stdio, where there are no tasks");
   // (the prompt: what it says about running code follows whether this task can run it)

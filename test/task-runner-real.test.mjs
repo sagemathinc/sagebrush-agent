@@ -24,7 +24,9 @@ const nb = (cells) => JSON.stringify({ cells: cells.map((src, i) => ({ cell_type
 function setup(cells, { root, extra = [] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "sb-runner-real-"));
   const store = new TaskStore({ root: root ?? join(dir, "tasks"), scope: "install-1", transcripts: join(dir, "projects") }).init();
-  const runner = new TaskRunner({ store, enabled: true, pin: PIN, platform: platformKey(), ensure: async () => ({ deno: DENO, engine: ENGINE }) });
+  // (this computer's platform taken as one where runs are on: the rows are the evidence that decides RUN_PLATFORMS, so
+//  they run on macOS too, before macOS is turned on)
+  const runner = new TaskRunner({ store, enabled: true, pin: PIN, platform: platformKey(), runPlatforms: [platformKey()], ensure: async () => ({ deno: DENO, engine: ENGINE }) });
   const docs = [{ path: "nb/a.ipynb", kind: "notebook", content: nb(cells) }, ...extra];
   const task = store.start(checkRequest("tasks.start", { title: "t", prompt: "p", target: "local", run: true, docs })).task;
   const other = store.start(checkRequest("tasks.start", { title: "o", prompt: "p", target: "local", run: true, docs: [{ path: "secret.txt", kind: "file", content: "OTHER TASK" }] })).task;

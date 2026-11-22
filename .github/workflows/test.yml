@@ -1,6 +1,6 @@
 # The test suite on Linux and Windows, for every push and pull request. Read-only: no secrets, no publishing.
-# Rows that need a real Codex binary, Deno or the Sagebrush engine skip here, saying why (they run in each
-# release's own checks).
+# Rows that need a real Codex binary skip here, saying why (they run in each release's own checks). The Delegate
+# runner's acceptance rows run in their own job, with the pinned Deno and engine fetched as the agent fetches them.
 name: test
 
 on:
@@ -27,3 +27,23 @@ jobs:
           node-version: 24.21.0
       - run: npm ci --ignore-scripts
       - run: node --test --test-force-exit "test/*.test.mjs"
+
+  # The Delegate runner's acceptance rows against the pinned Deno and engine (scripts/runner-ci.mjs): required on
+  # Linux, where runs are on; on macOS informational until macOS is turned on (RUN_PLATFORMS).
+  runner:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.21.0
+      - run: npm ci --ignore-scripts
+      - run: node scripts/runner-ci.mjs "$RUNNER_TEMP/sagebrush-runner"

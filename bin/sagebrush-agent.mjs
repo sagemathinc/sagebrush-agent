@@ -5,7 +5,8 @@
 //
 //   npx sagebrush-agent [--port N] [--origin https://...]
 //
-// Then open the link it prints (or enter the code and port in the page).
+// Then open the link it prints (or enter the code and port in the page): on <origin>/agents/ with one --origin,
+// else on sagebrush.space; SAGEBRUSH_AGENT_PAGE sets the link's page instead.
 //
 //   sagebrush-agent --stdio
 //
@@ -56,7 +57,7 @@ for (let i = 0; i < args.length; i++) {
   else if (args[i] === "--stdio") stdio = true;
   else if (args[i] === "--codex") codex = true;
   else if (args[i] === "--help" || args[i] === "-h") {
-    console.log("usage: sagebrush-agent [--port N] [--origin https://...]\n       sagebrush-agent [--codex] --stdio   (run by sagebrush remote --serve-agents)\n       sagebrush-agent --pair-stdin --origin http://127.0.0.1:<port> --port 0   (run by the desktop app)");
+    console.log("usage: sagebrush-agent [--port N] [--origin https://...]\n       (prints a link to <origin>/agents/ with one --origin, else to https://sagebrush.space/agents/;\n        SAGEBRUSH_AGENT_PAGE=<url> sets the link's page instead)\n       sagebrush-agent [--codex] --stdio   (run by sagebrush remote --serve-agents)\n       sagebrush-agent --pair-stdin --origin http://127.0.0.1:<port> --port 0   (run by the desktop app)");
     process.exit(0);
   } else {
     console.error(`unknown argument: ${args[i]}`);
@@ -194,8 +195,10 @@ if (appCode) {
   return;
 }
 const code = server.newCode();
-// SAGEBRUSH_AGENT_PAGE changes only the printed link, never the allowed origins.
-const page = (process.env.SAGEBRUSH_AGENT_PAGE ?? "https://sagebrush.space/agents/").replace(/\/?$/, "/");
+// The printed link: SAGEBRUSH_AGENT_PAGE if it is set; else, with exactly one --origin, that origin's /agents/; else
+// sagebrush.space's. Either changes only the printed link, never the allowed origins.
+const pageEnv = process.env.SAGEBRUSH_AGENT_PAGE;
+const page = (pageEnv ?? (given.length === 1 ? `${given[0]}/agents/` : "https://sagebrush.space/agents/")).replace(/\/?$/, "/");
 if (!/^https?:$/.test(new URL(page, "x:/").protocol)) {
   console.error("SAGEBRUSH_AGENT_PAGE must be an http(s) URL");
   process.exit(2);
@@ -205,7 +208,7 @@ Sagebrush agent: Claude on this computer, waiting for your Sagebrush page.
 
   Open:  ${page}?pair=${code}&port=${p}
   (or enter code ${code} and port ${p} in the page)
-
+${pageEnv === undefined && given.length > 1 ? "  (with more than one --origin this link opens sagebrush.space: set SAGEBRUSH_AGENT_PAGE to choose the page)\n" : ""}
 The code works once, for 5 minutes; a new one is printed here each time the page goes away.
 Claude uses your own Claude login, and only the workspace files you allow in the page.
 Press Ctrl+C to stop (this run's conversation transcripts are deleted then).

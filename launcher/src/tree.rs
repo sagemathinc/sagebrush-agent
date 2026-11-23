@@ -678,13 +678,16 @@ fn same<H>(i: &Inspected<H>, e: &Expected) -> bool {
     i.epoch == e.epoch && i.fsid == e.fsid && i.dir == e.dir && i.entries == e.entries
 }
 
-pub fn archive_home<O: Ops>(o: &mut O, mount: &str, agent: &str, tree: Tree, expect_path: &str) -> Result<()> {
+pub fn archive_home<O: Ops>(o: &mut O, mount: &str, agent: &str, tree: Tree, expect_path: &str, finish: bool) -> Result<()> {
     if !is_id(agent) {
         return Err(err(Fail::Usage, "bad arguments"));
     }
     let root = o.root().map_err(|_| pre("the root can't be opened"))?;
     let e = expected_tree(&read_expect(o, &root, expect_path)?)?;
     let uid = e.entries.first().map(|(_, x)| x.uid);
+    if finish {
+        return finish_archive(o, &root, mount, agent, tree, &e, uid);
+    }
     // 1-2. The source, every field checked on the opened descriptors (the epoch first, before any descent).
     let src = inspect(o, &root, mount, agent, tree, false, uid, Some(&e.epoch))?.ok_or(identity("the source is absent"))?;
     if !same(&src, &e) {
@@ -714,6 +717,30 @@ pub fn archive_home<O: Ops>(o: &mut O, mount: &str, agent: &str, tree: Tree, exp
     match inspect(o, &root, mount, agent, tree, true, uid, Some(&e.epoch)) {
         Ok(Some(d)) if same(&d, &e) => Ok(()),
         _ => Err(err(Fail::Partial, "moved; the destination doesn't match")),
+    }
+}
+
+/// `archive-home --finish` (A1 r2.4 §4a): the retry row "the source absent, the recorded identity archived" (a 75
+/// after the rename). No rename: the epoch first, the archive exactly the expected tree, the source absent; then both
+/// parents are synced again through trusted handles and the archive re-checked. A refusal before the syncs is 73; a
+/// failed sync or a changed archive is 75 (the next pass retries).
+fn finish_archive<O: Ops>(o: &mut O, root: &O::H, mount: &str, agent: &str, tree: Tree, e: &Expected, uid: Option<u32>) -> Result<()> {
+    let dst = inspect(o, root, mount, agent, tree, true, uid, Some(&e.epoch))?.ok_or(identity("the archive is absent"))?;
+    if !same(&dst, e) {
+        return Err(identity("the archive differs from the expected identity"));
+    }
+    let (_, _, src_parent) = open_parent(o, root, mount, parent_name(tree, false), Some(&e.epoch))?;
+    match o.at(&src_parent, agent, At::Path) {
+        Ok(_) => return Err(identity("the source exists")),
+        Err(x) if x.raw_os_error() == Some(libc::ENOENT) => {}
+        Err(x) => return Err(open_err(x)),
+    }
+    let partial = |_| err(Fail::Partial, "archived; not yet confirmed durable");
+    o.fsync(&dst.parent).map_err(partial)?;
+    o.fsync(&src_parent).map_err(partial)?;
+    match inspect(o, root, mount, agent, tree, true, uid, Some(&e.epoch)) {
+        Ok(Some(d)) if same(&d, e) => Ok(()),
+        _ => Err(err(Fail::Partial, "archived; the archive doesn't match")),
     }
 }
 
@@ -849,7 +876,12 @@ fn remove_tree_limited<O: Ops>(o: &mut O, anchor: &str, name: &str, expect_path:
     if fsid != e_fsid {
         return Err(identity("another filesystem"));
     }
-    let Some((x, h)) = child(o, &a, name, epoch.mnt_id)? else { return Ok(()) }; // already gone
+    // Already gone (an earlier call removed it, perhaps with a 75 at its final sync): the anchor is synced again, in
+    // this epoch only (A1 r2.4 §5), before that is success.
+    let Some((x, h)) = child(o, &a, name, epoch.mnt_id)? else {
+        o.fsync(&a).map_err(|_| err(Fail::Partial, "absent; not yet confirmed durable"))?;
+        return Ok(());
+    };
     if x != e_root {
         return Err(identity("the target differs from the expected identity"));
     }
@@ -1282,7 +1314,7 @@ mod tests {
         let mut f = Fake::new();
         f.agent("srv/sagebrush/agents");
         let x = archived_expect(&mut f, Tree::Home);
-        archive_home(&mut f, "/", A, Tree::Home, &x).unwrap();
+        archive_home(&mut f, "/", A, Tree::Home, &x, false).unwrap();
         assert!(f.nodes.contains_key(&format!("srv/sagebrush/archive/{A}/home")) && !f.nodes.contains_key(&format!("srv/sagebrush/agents/{A}")));
         let tail: Vec<&String> = f.log.iter().filter(|l| l.starts_with("rename") || l.starts_with("fsync")).collect();
         assert_eq!(tail, [&format!("rename srv/sagebrush/agents/{A} srv/sagebrush/archive/{A}"), &"fsync srv/sagebrush/archive".to_string(), &"fsync srv/sagebrush/agents".to_string()]);
@@ -1291,7 +1323,7 @@ mod tests {
         let d = config(&mut g);
         g.add(&format!("{d}/gen-1"), S_IFDIR | 0o755, 0, 0);
         let x = archived_expect(&mut g, Tree::Config);
-        archive_home(&mut g, "/", A, Tree::Config, &x).unwrap();
+        archive_home(&mut g, "/", A, Tree::Config, &x, false).unwrap();
         assert!(g.nodes.contains_key(&format!("srv/sagebrush/archive-config/{A}/gen-1")));
     }
 
@@ -1310,7 +1342,7 @@ mod tests {
             f.agent("srv/sagebrush/agents");
             let x = archived_expect(&mut f, Tree::Home);
             mutate(&mut f);
-            assert_eq!(code(archive_home(&mut f, "/", A, Tree::Home, &x)), want, "{name}");
+            assert_eq!(code(archive_home(&mut f, "/", A, Tree::Home, &x, false)), want, "{name}");
             assert_eq!(f.count("rename"), 0, "{name}: nothing moved");
         }
     }
@@ -1321,8 +1353,67 @@ mod tests {
         f.agent("srv/sagebrush/agents");
         let x = archived_expect(&mut f, Tree::Home);
         f.fail = Some("fsync");
-        assert_eq!(code(archive_home(&mut f, "/", A, Tree::Home, &x)), 75);
+        assert_eq!(code(archive_home(&mut f, "/", A, Tree::Home, &x, false)), 75);
         assert_eq!(f.count("rename"), 1);
+    }
+
+    /// The (n)th fsync from now fails, alone.
+    fn fail_nth_fsync(f: &mut Fake, n: usize) {
+        let at = f.count("fsync") + n;
+        if n == 1 {
+            f.fail = Some("fsync");
+            f.hook = Some(("fsync", at + 1, |f| f.fail = None));
+        } else {
+            f.hook = Some(("fsync", at, |f| f.fail = Some("fsync")));
+        }
+    }
+
+    #[test]
+    fn archive_home_finish_syncs_both_parents_again_after_a_partial_move() {
+        // A 75 at either fsync after the rename; --finish then re-syncs BOTH parents, and only then succeeds.
+        for nth in [1, 2] {
+            let mut f = Fake::new();
+            f.agent("srv/sagebrush/agents");
+            let x = archived_expect(&mut f, Tree::Home);
+            fail_nth_fsync(&mut f, nth);
+            assert_eq!(code(archive_home(&mut f, "/", A, Tree::Home, &x, false)), 75, "fsync {nth}");
+            f.fail = None;
+            f.hook = None;
+            // A retry whose own syncs fail, each alone: still 75, never success.
+            for k in [1, 2] {
+                fail_nth_fsync(&mut f, k);
+                assert_eq!(code(archive_home(&mut f, "/", A, Tree::Home, &x, true)), 75, "fsync {nth}, retry sync {k}");
+                f.fail = None;
+                f.hook = None;
+            }
+            f.log.clear();
+            archive_home(&mut f, "/", A, Tree::Home, &x, true).unwrap();
+            let tail: Vec<&String> = f.log.iter().filter(|l| l.starts_with("rename") || l.starts_with("fsync")).collect();
+            assert_eq!(tail, [&"fsync srv/sagebrush/archive".to_string(), &"fsync srv/sagebrush/agents".to_string()], "fsync {nth}");
+            assert_eq!(f.count("rename"), 1);
+        }
+    }
+
+    #[test]
+    fn archive_home_finish_refuses_with_no_sync() {
+        let cases: [(&str, fn(&mut Fake), bool); 4] = [
+            ("the source still exists (never moved)", |_| {}, false),
+            ("a stale boot", |f| { f.files.insert("proc/sys/kernel/random/boot_id".into(), b"11111111-2222-3333-4444-555555555555\n".to_vec()); }, true),
+            ("another archive (another ino)", |f| f.node(&format!("srv/sagebrush/archive/{A}")).id.ino = 999, true),
+            ("a source made again after the move", |f| f.add(&format!("srv/sagebrush/agents/{A}"), S_IFDIR | 0o755, 0, 0), true),
+        ];
+        for (name, mutate, moved) in cases {
+            let mut f = Fake::new();
+            f.agent("srv/sagebrush/agents");
+            let x = archived_expect(&mut f, Tree::Home);
+            if moved {
+                archive_home(&mut f, "/", A, Tree::Home, &x, false).unwrap();
+            }
+            mutate(&mut f);
+            let (renames, syncs) = (f.count("rename"), f.count("fsync"));
+            assert_eq!(code(archive_home(&mut f, "/", A, Tree::Home, &x, true)), 73, "{name}");
+            assert_eq!((f.count("rename"), f.count("fsync")), (renames, syncs), "{name}: nothing moved or synced");
+        }
     }
 
     // ---- remove-tree
@@ -1377,6 +1468,26 @@ mod tests {
         assert_eq!(code(remove_tree(&mut f, "/srv/sagebrush/archive", A, &x)), 73, "stale epoch, target absent: still parked");
         f.files.insert("proc/sys/kernel/random/boot_id".into(), format!("{BOOT}\n").into_bytes());
         assert_eq!(code(remove_tree(&mut f, "/srv/sagebrush/archive", A, &x)), 0, "current epoch, target absent: already gone");
+    }
+
+    #[test]
+    fn remove_tree_a_75_at_the_final_sync_then_an_absent_retry_syncs_the_anchor_again() {
+        let mut f = Fake::new();
+        let x = archive_tree(&mut f);
+        f.fail = Some("fsync");
+        assert_eq!(code(remove_tree(&mut f, "/srv/sagebrush/archive", A, &x)), 75);
+        assert!(!f.nodes.contains_key(&format!("srv/sagebrush/archive/{A}")), "removed, not yet confirmed");
+        // Absent now: the retry's own sync fails, so it is 75 again, never success.
+        assert_eq!(code(remove_tree(&mut f, "/srv/sagebrush/archive", A, &x)), 75);
+        f.fail = None;
+        f.log.clear();
+        assert_eq!(code(remove_tree(&mut f, "/srv/sagebrush/archive", A, &x)), 0);
+        assert_eq!(f.log.iter().filter(|l| l.starts_with("fsync")).collect::<Vec<_>>(), [&"fsync srv/sagebrush/archive".to_string()]);
+        // In another epoch the absent target is still refused, with no sync.
+        f.files.insert("proc/sys/kernel/random/boot_id".into(), b"11111111-2222-3333-4444-555555555555\n".to_vec());
+        let syncs = f.count("fsync");
+        assert_eq!(code(remove_tree(&mut f, "/srv/sagebrush/archive", A, &x)), 73);
+        assert_eq!(f.count("fsync"), syncs);
     }
 
     #[test]
@@ -1510,7 +1621,7 @@ mod tests {
             f.agent("srv/sagebrush/agents");
             let x = archived_expect(&mut f, Tree::Home);
             f.node(parent).acl = true;
-            assert_eq!(code(archive_home(&mut f, "/", A, Tree::Home, &x)), 73, "{parent}");
+            assert_eq!(code(archive_home(&mut f, "/", A, Tree::Home, &x, false)), 73, "{parent}");
             assert_eq!(f.count("rename"), 0, "{parent}");
         }
         let mut f = Fake::new();

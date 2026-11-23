@@ -55,19 +55,62 @@ test("provisioning through the wiring takes each tag's gid from the registry; a 
   fs.rmSync(root, { recursive: true, force: true });
   fs.mkdirSync(join(root, "srv"), { recursive: true });
   const calls = [];
-  const run = async (argv) => { calls.push(argv); return argv[0] === "getent" ? { code: 2, stdout: "", stderr: "" } : { code: 0, stdout: "", stderr: "" }; };
+  const tree = (t) => JSON.stringify({ tree: t }); // the launcher's output is passed through to the record, parsed
+  const run = async (argv) => {
+    calls.push(argv);
+    if (argv[1] === "inspect-home") return { code: 0, stdout: tree(argv.at(-1)), stderr: "" };
+    return argv[0] === "getent" ? { code: 2, stdout: "", stderr: "" } : { code: 0, stdout: "", stderr: "" };
+  };
   const fsx = { ...fs, chownSync: () => {} };
-  const fx = hostEffects({ store: store(), bodyOf, host: HOST, run, fsx, root, rootUid: process.getuid?.() ?? 0 });
+  const adopted = [];
+  const st = store({ provisioned: { adopt: (...a) => { adopted.push(a); return "recorded"; } } });
+  const fx = hostEffects({ store: st, bodyOf, host: HOST, run, fsx, root, rootUid: process.getuid?.() ?? 0 });
   await fx.provision(A, 70007, body.agents[0], 5000);
   assert.deepEqual(calls.find((c) => c[0] === "groupadd"), ["groupadd", "--gid", "80003", `sbt-${T1}`]);
   // The fixed parents are checked by the release's launcher, tolerant first, then strict (A1 r2.2).
+  const launch = `${HOST.release}/bin/sagebrush-agent-launch`;
   const checks = calls.filter((c) => c[1] === "check-parents");
-  assert.deepEqual(checks, [
-    [`${HOST.release}/bin/sagebrush-agent-launch`, "check-parents", "--mount", HOST.quota?.mount ?? "/", "--allow-missing"],
-    [`${HOST.release}/bin/sagebrush-agent-launch`, "check-parents", "--mount", HOST.quota?.mount ?? "/"],
-  ]);
+  assert.deepEqual(checks, [[launch, "check-parents", "--mount", "/", "--allow-missing"], [launch, "check-parents", "--mount", "/"]]);
   assert.equal(calls.indexOf(checks[0]), 0);
+  // Then the trees' identity from the launcher, recorded (deprovision r3.2 §3.6): home, then config, after everything.
+  const ins = calls.filter((c) => c[1] === "inspect-home");
+  assert.deepEqual(ins, [[launch, "inspect-home", "--mount", "/", "--agent", A, "--tree", "home"], [launch, "inspect-home", "--mount", "/", "--agent", A, "--tree", "config"]]);
+  assert.equal(calls.indexOf(ins[0]), calls.length - 2);
+  assert.deepEqual(adopted, [[A, 70007, false, { tree: "home" }, { tree: "config" }]]);
+  // A failing inspect, a non-JSON one, or a refused record: host-side.
+  for (const [what, r2, adopt] of [
+    ["inspect fails", async (argv) => (argv[1] === "inspect-home" ? { code: 73, stdout: "", stderr: "" } : run(argv)), () => "recorded"],
+    ["inspect prints no JSON", async (argv) => (argv[1] === "inspect-home" ? { code: 0, stdout: "nope", stderr: "" } : run(argv)), () => "recorded"],
+    ["the record refuses (a substitute)", run, () => { throw Object.assign(new Error("provisioned: another object in the same epoch"), { code: "bad_form" }); }],
+  ]) {
+    const f2 = hostEffects({ store: store({ provisioned: { adopt } }), bodyOf, host: HOST, run: r2, fsx, root, rootUid: process.getuid?.() ?? 0 });
+    await assert.rejects(f2.provision(A, 70007, body.agents[0], 5000), host, what);
+  }
   const none = hostEffects({ store: store({ registry: { agent: () => ({ uid: 70007 }), tag: () => null } }), bodyOf, host: HOST, run: async (argv) => ({ code: argv[1] === "check-parents" ? 0 : 2, stdout: "", stderr: "" }), root });
   await assert.rejects(none.provision(A, 70007, body.agents[0], 5000), host);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("the deprovision pass through the wiring: the executor's cgroup count, the whole-host uid proof under the same root; no broker adapter is host-side", async () => {
+  const root = join(os.tmpdir(), `sb-wire-dp-${process.pid}`);
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.mkdirSync(root, { recursive: true });
+  const reg = { uid: 70007, gid: 70007, life: 1, gen: 3, state: "deleted" };
+  const rec = { life: 1, gen: 3, uid: 70007, gid: 70007, policy: "archive", steps_done: [], identities: {}, done: false };
+  const st = store({
+    registry: { agent: (id) => (id === A ? reg : null), tag: () => null },
+    deprovision: { ensure: () => structuredClone(rec) },
+    pool: { names: () => false },
+  });
+  const calls = [];
+  const run = async (argv) => { calls.push(argv); return { code: 0, stdout: "", stderr: "" }; };
+  const adapters = { brokerRevoke: async () => { calls.push(["broker-revoke"]); } };
+  const fx = hostEffects({ store: st, bodyOf, host: HOST, adapters, run, root });
+  // No /proc under this root: the uid proof fails closed, so the pass parks before any step.
+  assert.deepEqual(await fx.deprovision(A, 5000), { status: "pending", step: "channels", reason: "the uid can't be proven empty" });
+  assert.ok(calls.some((c) => c[0] === "systemctl" && c[1] === "show" && c.at(-1).includes(A)), "the cgroup proof is the executor's procCount");
+  assert.ok(!calls.some((c) => c[0] === "broker-revoke"));
+  const bare = hostEffects({ store: st, bodyOf, host: HOST, run, root });
+  await assert.rejects(bare.deprovision(A, 5000), host);
   fs.rmSync(root, { recursive: true, force: true });
 });

@@ -100,3 +100,9 @@ Delegate works over the loopback address only, and only while the page's grant h
 In both modes, at most 4 chats run at once (a fifth waits its turn) and at most 16 messages wait; a seventeenth is refused, and the page says so. `SAGEBRUSH_AGENT_FAKE=1`, set where you start it, runs a scripted fake model instead of Claude, for tests. With it, Delegate keeps its tasks only under the folder `SAGEBRUSH_TASKS_HOME` names, and is off without it.
 
 Release: the tarball is published at an immutable, versioned URL with its SHA-256; a change means a new version and a new review.
+
+## License
+
+Copyright (c) 2026 SageMath, Inc. Licensed under either of the
+[Apache License, Version 2.0](LICENSE-APACHE) or the [MIT license](LICENSE-MIT),
+at your option.

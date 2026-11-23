@@ -3,12 +3,12 @@
 // stops, cancels and drains start jobs, and checks the tree; success needs a durable fence AND a proven drain AND a
 // readable empty tree, all within one end-to-end budget; each fence is lowered only by its own cause, under the lock.
 import assert from "node:assert/strict";
-import { mkdtempSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
-import { stop, raiseFence, lowerFence, fenced, countProcs } from "../lib/fleet/host/fence.mjs";
+import { stop, raiseFence, lowerFence, fenced, countProcs, rootUnitsIn, realSystemd } from "../lib/fleet/host/fence.mjs";
 import { lockDir, realIo } from "../lib/fleet/host/store.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
@@ -21,7 +21,7 @@ const fresh = () => join(mkdtempSync(join(tmpdir(), "sb-fence-")), "fence");
  * `passed` means the job already passed its ConditionPathExists check (a fence written now can't stop it); `ticks` is
  * how many looks it stays pending before it activates. Pending jobs progress whenever the stopper looks at the system.
  */
-function fakeSystemd(dir, { units = {}, jobs = [], stubborn = false } = {}) {
+function fakeSystemd(dir, { units = {}, jobs = [], stubborn = false, roots = [] } = {}) {
   const calls = [];
   const fenceUp = (unit) => { const a = unit.slice(16, 42); return ["all", a, "expiry"].some((n) => existsSync(join(dir, n))); };
   const progress = () => {
@@ -42,6 +42,7 @@ function fakeSystemd(dir, { units = {}, jobs = [], stubborn = false } = {}) {
     jobs: () => { progress(); return jobs.map((j) => ({ id: j.id, unit: j.unit, type: j.type })); },
     cancel: (id) => { calls.push(["cancel", id]); const i = jobs.findIndex((j) => j.id === id); if (i >= 0) jobs.splice(i, 1); },
     activeAgentUnits: () => { progress(); return Object.entries(units).filter(([, s]) => s.active).map(([n]) => n); },
+    rootUnits: () => roots,
     procCount: (u) => Object.entries(units).filter(([n]) => u === n || u === "sagebrush-agents.slice").reduce((s, [, st]) => s + st.procs, 0),
   };
 }
@@ -231,7 +232,8 @@ test("while another holds the fence lock, a stop still kills but is not durable;
   try {
     const a = newId();
     const sys = fakeSystemd(dir, { units: { [unitOf(a)]: { active: true, procs: 1 } } });
-    const r = await stop({ all: true }, "all", { sys, dir, deadlineMs: 600 });
+    // (A budget that leaves room for the lock wait, a third of it, even on a loaded machine.)
+    const r = await stop({ all: true }, "all", { sys, dir, deadlineMs: 3000 });
     assert.equal(sys.units[unitOf(a)].active, false, "the kill ran");
     assert.deepEqual([r.status, r.reason, r.fenced], ["killed, not durable", "fence", false]);
     await rejects(lowerFence("all", null, "resume-all", { dir, waitMs: 100 }), "in_progress");
@@ -245,11 +247,17 @@ test("raise vs lower, both orders: a lower can't run inside a stop, and a stop a
   const dir = fresh();
   const sys = fakeSystemd(dir);
   // Stop first, lower requested while the stop holds the lock: the lower waits, then runs after the stop finished.
-  let lowerDone = false;
+  // The lower is requested from inside the stop's first systemctl call, so the stop already holds the lock (requesting
+  // both at once would leave which one gets the lock first to the scheduler).
+  let lowerDone = false, q = null;
+  sys.stop = ((orig) => (...a) => {
+    q ??= lowerFence("all", null, "resume-all", { dir, waitMs: 5000 }).then(() => { lowerDone = true; });
+    return orig(...a);
+  })(sys.stop);
   sys.jobs = ((orig) => () => { if (!lowerDone) assert.ok(existsSync(join(dir, "all")), "the fence is up for the whole stop"); return orig(); })(sys.jobs);
-  const p = stop({ all: true }, "all", { sys, dir });
-  const q = lowerFence("all", null, "resume-all", { dir, waitMs: 5000 }).then(() => { lowerDone = true; });
-  const r = await p; await q;
+  const r = await stop({ all: true }, "all", { sys, dir });
+  assert.ok(q, "the lower was requested during the stop");
+  await q;
   assert.equal(r.status, "stopped and fenced");
   assert.ok(!existsSync(join(dir, "all")));
   // Lower first, then stop: the stop raises the fence again.
@@ -370,4 +378,60 @@ test("nothing runs once the budget is spent between commands: no active-unit rea
   const r = await stop({ all: true }, "all", { sys, dir, deadlineMs: 15000, now: () => clock });
   assert.deepEqual(calls, ["jobs"]);
   assert.notEqual(r.status, "stopped and fenced");
+});
+
+// §4.5: a root agent can act outside its cgroup and remove fences, so no stop is proven complete on a host with one.
+test("best_effort: false with no root agent unit installed; true whenever one is, whatever the status", async () => {
+  const a = newId(), r = newId();
+  const plain = await stop({ agent: a }, "agent", { sys: fakeSystemd(fresh(), { units: { [unitOf(a)]: { active: true, procs: 1 } } }), dir: fresh() });
+  assert.equal(plain.status, "stopped and fenced");
+  assert.equal(plain.best_effort, false);
+  for (const target of [{ agent: a }, { agent: r }]) {
+    const dir = fresh();
+    const sys = fakeSystemd(dir, { units: { [unitOf(a)]: { active: true, procs: 1 }, [unitOf(r)]: { active: true, procs: 1 } }, roots: [unitOf(r)] });
+    const res = await stop(target, "agent", { sys, dir });
+    assert.equal(res.status, "stopped and fenced", "the cgroup result is still reported");
+    assert.equal(res.best_effort, true);
+  }
+  const dir = fresh();
+  const all = await stop({ all: true }, "all", { sys: fakeSystemd(dir, { roots: [unitOf(r)] }), dir });
+  assert.equal(all.best_effort, true);
+  const stuck = await stop({ all: true }, "all", { sys: fakeSystemd(dir, { units: { [unitOf(a)]: { active: true, procs: 1 } }, stubborn: true, roots: [unitOf(r)] }), dir, deadlineMs: 200 });
+  assert.notEqual(stuck.status, "stopped and fenced");
+  assert.equal(stuck.best_effort, true);
+});
+
+test("best_effort: true when the installed units can't be read, the budget is spent before they are, or the read overruns it", async () => {
+  const dir = fresh();
+  const sys = fakeSystemd(dir);
+  sys.rootUnits = () => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); };
+  const r1 = await stop({ all: true }, "all", { sys, dir });
+  assert.equal(r1.status, "stopped and fenced");
+  assert.equal(r1.best_effort, true);
+  let clock = 0, looked = false;
+  const sys2 = fakeSystemd(dir);
+  sys2.procCount = () => { clock += 20000; return 0; };
+  sys2.rootUnits = () => { looked = true; return []; };
+  const r2 = await stop({ all: true }, "all", { sys: sys2, dir, now: () => clock });
+  assert.equal(r2.best_effort, true);
+  assert.equal(looked, false, "nothing runs once the budget is spent");
+  // A read that overruns the budget proves nothing, even when it says "no root unit".
+  clock = 0;
+  const sys3 = fakeSystemd(dir);
+  sys3.rootUnits = () => { clock += 20000; return []; };
+  const r3 = await stop({ all: true }, "all", { sys: sys3, dir, now: () => clock });
+  assert.equal(r3.best_effort, true);
+});
+
+test("rootUnitsIn: only generated agent units with User=root; other files and non-root units don't count", () => {
+  const d = mkdtempSync(join(tmpdir(), "sb-units-"));
+  const a = newId(), r = newId();
+  writeFileSync(join(d, unitOf(a)), "[Service]\nUser=sb-" + a + "\n");
+  writeFileSync(join(d, unitOf(r)), "# ROOT AGENT\n[Service]\nUser=root\n");
+  writeFileSync(join(d, "other.service"), "[Service]\nUser=root\n");
+  writeFileSync(join(d, unitOf(newId())), "[Service]\n# User=root\nUser=rooted\n");
+  mkdirSync(join(d, "multi-user.target.wants"));
+  assert.deepEqual(rootUnitsIn(d), [unitOf(r)]);
+  assert.deepEqual(realSystemd.rootUnits(1000, d), [unitOf(r)], "the real systemd uses it");
+  assert.throws(() => rootUnitsIn(join(d, "missing")));
 });

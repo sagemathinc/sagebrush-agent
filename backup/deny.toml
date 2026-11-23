@@ -22,8 +22,8 @@ allow = [
     "CC0-1.0",
 ]
 # The one dependency whose only license is outside the list: option-ext (MPL-2.0, file-level copyleft), linked
-# through rustic_core -> dirs -> dirs-sys. Kept as a named exception pending the host-side licensing decision; the
-# binary ships it unmodified, and its source is public.
+# through rustic_core -> dirs -> dirs-sys. A named exception: the binary links it unmodified, which its file-level
+# copyleft allows under this repository's Apache-2.0 OR MIT, and its source is public.
 exceptions = [
     { allow = ["MPL-2.0"], crate = "option-ext" },
 ]

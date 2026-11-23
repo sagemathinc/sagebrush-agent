@@ -12,6 +12,7 @@ import { raiseFence } from "../lib/fleet/host/fence.mjs";
 import { HostStore } from "../lib/fleet/host/host-store.mjs";
 import { planGrant, parseStep } from "../lib/fleet/host/plan.mjs";
 import { STATES } from "../lib/fleet/host/registry.mjs";
+import { STEPS } from "../lib/fleet/host/deprovision-record.mjs";
 
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
 const tmp = (n) => join(mkdtempSync(join(tmpdir(), "sb-exec-")), n);
@@ -52,6 +53,17 @@ function fakeFx(over = {}) {
     publishMap: async (g, map) => { log.push(["map", g, map.map((m) => m.agent)]); },
     sendAck: async (g, ack) => { acks.push([g, ack]); },
     freeze: async (id) => { log.push(["freeze", id]); u(id).frozen = true; },
+    // A deprovision pass: `dpResult` picks the outcome; a done pass completes the real record (as deprovision.mjs does).
+    deprovision: async (id, ms) => {
+      log.push(["deprovision", id, ms]);
+      const d = fx.dpResult?.(id) ?? { status: "done", step: null, reason: null };
+      if (d instanceof Error) throw d;
+      if (d.status === "done") {
+        const dp = fx.store.deprovision, rec = dp.ensure(id, fx.store.registry.agent(id));
+        for (const step of STEPS.slice(rec.steps_done.length)) dp.markStep(id, step);
+      }
+      return d;
+    },
     thaw: async (id) => { if (!u(id).frozen || !u(id).active) throw new Error("not frozen"); log.push(["thaw", id]); u(id).frozen = false; },
     sys: {
       stop: (unit) => { log.push(["sys-stop", unit]); for (const [id, s] of Object.entries(units)) if (unit === "sagebrush-agents.slice" || idOf(unit) === id) s.active = false; },
@@ -66,6 +78,7 @@ function fakeFx(over = {}) {
 async function setup({ fx = fakeFx(), root = tmp("state"), fenceDir = tmp("fence"), deadlines = {}, barrier } = {}) {
   const store = await HostStore.open(root);
   fx.fenceDir = fenceDir;
+  fx.store = store;
   const sup = new Supervisor({ store, fx, verify, bodyOf, fenceDir, deadlines, barrier });
   return { sup, store, fx, root, fenceDir, close: () => store.close() };
 }
@@ -411,6 +424,88 @@ test("delete: state deleted (op counted), fence up, stopped and masked; never pl
   assert.ok(!fx.log.some((l) => l[1] === A));
   await rejects(sup.submit({ kind: "resume", authority: "person", agent: A }), "not_granted");
   await close();
+});
+
+test("delete: a proven stop runs one deprovision pass, audited; a pending or failing pass is no error for the caller", async () => {
+  const { sup, store, fx, close } = await setup();
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B), entry(C)]) });
+  const dps = () => fx.log.filter((l) => l[0] === "deprovision");
+  const dpAudit = (id) => fx.audits.filter((r) => r.kind === "agent.deprovision" && r.agent === id).map(({ phase, step, reason }) => [phase, step, reason]);
+  await sup.submit({ kind: "delete", authority: "person", agent: A });
+  assert.deepEqual(dps(), [["deprovision", A, 120000]]);
+  // After the stop and mask: never before the proof.
+  const k = kinds(fx.log);
+  assert.ok(k.lastIndexOf("mask") < k.indexOf("deprovision"));
+  assert.deepEqual(dpAudit(A), [["succeeded", undefined, undefined]]);
+  assert.equal(store.deprovision.record(A).done, true);
+  fx.dpResult = (id) => (id === B ? { status: "pending", step: "accounts", reason: "uid still in use" } : new Error("EIO"));
+  await sup.submit({ kind: "delete", authority: "person", agent: B });
+  await sup.submit({ kind: "delete", authority: "person", agent: C });
+  assert.deepEqual(dpAudit(B), [["pending", "accounts", "uid still in use"]]);
+  assert.deepEqual(dpAudit(C), [["unknown_effect", undefined, undefined]]);
+  assert.deepEqual([B, C].map((id) => store.registry.agent(id).state), ["deleted", "deleted"]);
+  await close();
+});
+
+test("delete: an unproven stop runs no deprovision pass; recovery runs it once the stop is proven", async () => {
+  const root = tmp("state"), fenceDir = tmp("fence"), fx = fakeFx();
+  let s = await setup({ fx, root, fenceDir });
+  await s.sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
+  const sysStop = fx.sys.stop, stopUnit = fx.stopUnit;
+  fx.sys.stop = (u) => { if (u.includes(A)) throw new Error("EIO"); return sysStop(u); };
+  fx.stopUnit = async (id) => { if (id === A) throw new Error("EIO"); return stopUnit(id); };
+  await s.sup.submit({ kind: "delete", authority: "person", agent: A }).catch(() => {});
+  assert.equal(s.store.registry.agent(A).state, "deleted");
+  assert.ok(!fx.log.some((l) => l[0] === "deprovision"));
+  assert.equal(s.store.deprovision.record(A), null);
+  await s.close();
+  // Still unproven at recovery: no pass.
+  s = await setup({ fx, root, fenceDir });
+  const r1 = await s.sup.recover();
+  assert.deepEqual([r1.unproven, r1.deprovisioning], [[A], undefined]);
+  assert.ok(!fx.log.some((l) => l[0] === "deprovision"));
+  await s.close();
+  fx.sys.stop = sysStop; fx.stopUnit = stopUnit;
+  s = await setup({ fx, root, fenceDir });
+  const r2 = await s.sup.recover();
+  assert.deepEqual([r2.unproven, r2.deprovisioning], [undefined, undefined]);
+  assert.deepEqual(fx.log.filter((l) => l[0] === "deprovision").map((l) => l[1]), [A]);
+  assert.equal(s.store.deprovision.record(A).done, true);
+  await s.close();
+});
+
+test("recovery: every deleted agent not done gets a pass, from the registry (even out of the grant); done ones never again", async () => {
+  const root = tmp("state"), fenceDir = tmp("fence"), fx = fakeFx();
+  let s = await setup({ fx, root, fenceDir });
+  await s.sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B), entry(C)]) });
+  fx.dpResult = (id) => (id === C ? undefined : { status: "pending", step: "home", reason: "parked" });
+  for (const id of [A, B, C]) await s.sup.submit({ kind: "delete", authority: "person", agent: id });
+  // The next grant no longer names A or C.
+  await s.sup.submit({ kind: "grant", bytes: grant(2, [entry(B)]) });
+  await s.close();
+  const passes = () => fx.log.filter((l) => l[0] === "deprovision").map((l) => l[1]);
+  fx.log.length = 0;
+  s = await setup({ fx, root, fenceDir });
+  const r1 = await s.sup.recover();
+  assert.deepEqual(r1.deprovisioning, [A, B].sort());
+  assert.deepEqual(passes().sort(), [A, B].sort()); // C is done: no pass
+  await s.close();
+  fx.log.length = 0;
+  fx.dpResult = (id) => (id === B ? { status: "pending", step: "accounts", reason: "uid in use" } : undefined);
+  s = await setup({ fx, root, fenceDir });
+  assert.deepEqual((await s.sup.recover()).deprovisioning, [B]);
+  await s.close();
+  fx.log.length = 0;
+  fx.dpResult = undefined;
+  s = await setup({ fx, root, fenceDir });
+  assert.equal((await s.sup.recover()).deprovisioning, undefined);
+  assert.deepEqual(passes(), [B]);
+  await s.close();
+  fx.log.length = 0;
+  s = await setup({ fx, root, fenceDir });
+  await s.sup.recover();
+  assert.deepEqual(passes(), []);
+  await s.close();
 });
 
 // ---- recovery and crashes

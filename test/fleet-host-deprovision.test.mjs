@@ -330,6 +330,124 @@ test("every seam takes the pass's remaining time and its signal; an aborted sign
   }
 });
 
+test("an adapter that settles AFTER the abort: nothing after it runs: no mark, no unit unlinked, no daemon-reload; an already-aborted pass doesn't even make its record", async () => {
+  const { deprovisioner: mk } = await import("../lib/fleet/host/deprovision.mjs");
+  const unitOf = (t) => join(t.root, `usr/local/lib/systemd/system/sagebrush-agent-${t.A}.service`);
+  // Each adapter ignores the signal and returns after the abort.
+  for (const late of ["brokerRevoke", "procCount", "uidProof", "removeNetwork"]) {
+    const t = await setup();
+    t.m.root = t.root;
+    const ac = new AbortController();
+    const effects = [];
+    const lateFn = async () => { await new Promise((r) => setTimeout(r, 40)); return late === "procCount" ? 0 : late === "uidProof" ? { empty: true, holders: [] } : undefined; };
+    const seams = { procCount: async () => 0, uidProof: async () => ({ empty: true, holders: [] }), brokerRevoke: async () => {}, removeNetwork: async () => {}, [late]: lateFn };
+    // removeNetwork comes after channels and unit: let those run first, then abort while it is in flight.
+    const dp = mk({ store: t.h, run: t.run, launcher: LAUNCH, mount: "/", fsx: t.fsx, root: t.root, rootUid: 0, ...seams,
+      daemonReload: async () => { effects.push("daemon-reload"); }, inPool: () => false });
+    setTimeout(() => ac.abort(), 10);
+    const r = await dp.pass(t.A, 10000, ac.signal).then((x) => x, (e) => ({ threw: e.message, aborted: e.aborted }));
+    assert.equal(r.aborted, true, `${late}: ${JSON.stringify(r)}`);
+    const done = t.h.deprovision.record(t.A).steps_done;
+    if (late === "removeNetwork") {
+      assert.deepEqual(done, ["channels", "unit"], "the steps before the abort stay marked; network is never marked");
+    } else {
+      assert.deepEqual(done, [], `${late}: nothing marked after a late settlement`);
+      assert.ok(fs.existsSync(unitOf(t)), `${late}: the unit file was not unlinked`);
+      assert.deepEqual(effects, [], `${late}: no daemon-reload`);
+    }
+    const before = t.m.calls.length;
+    await new Promise((r) => setTimeout(r, 60)); // anything still pending would now run: nothing does
+    assert.equal(t.m.calls.length, before, `${late}: no launcher call after the abort`);
+    await t.close();
+  }
+  // A pass admitted with an already-aborted signal, or with no time left: no record, no proof, no effect.
+  for (const [name, signal, ms] of [["aborted", AbortSignal.abort(), 10000], ["no time", undefined, 0]]) {
+    const t = await setup();
+    t.m.root = t.root;
+    let proofs = 0;
+    const dp = mk({ store: t.h, run: t.run, launcher: LAUNCH, mount: "/", fsx: t.fsx, root: t.root, rootUid: 0,
+      procCount: async () => { proofs++; return 0; }, uidProof: async () => ({ empty: true, holders: [] }),
+      brokerRevoke: async () => {}, removeNetwork: async () => {}, daemonReload: async () => {}, inPool: () => false });
+    await assert.rejects(dp.pass(t.A, ms, signal), (e) => e.aborted === true, name);
+    assert.equal(t.h.deprovision.record(t.A), null, `${name}: no record made`);
+    assert.equal(proofs, 0, `${name}: no proof taken`);
+    assert.equal(t.m.calls.length, 0, `${name}: no launcher call`);
+    await t.close();
+  }
+});
+
+test("an abort or the deadline at EVERY point of a pass: after it, no effect starts and no step is marked", async () => {
+  // A sweep over the pass's points: each adapter or command settling (an abort, or the deadline passing, while it was in
+  // flight), and each synchronous filesystem read or store write (the deadline passing during slow I/O). After the
+  // trigger, nothing with an effect may start: no command, no adapter, no record, identity or mark, no file made,
+  // written, renamed, unlinked or removed (expect files included). An expect file already being written is finished
+  // whole, so the read inside that write is not a point.
+  const { deprovisioner: mk } = await import("../lib/fleet/host/deprovision.mjs");
+  const realNow = Date.now;
+  let skew = 0;
+  Date.now = () => realNow() + skew;
+  try {
+    const make = async (trigger) => {
+      const t = await setup();
+      t.m.root = t.root;
+      const ac = new AbortController();
+      const log = { points: 0, fired: false, after: [] };
+      const point = (name, sync) => {
+        log.points++;
+        if (log.points !== trigger?.at) return;
+        log.fired = name;
+        if (sync || trigger.kind === "deadline") skew += 1e7; else ac.abort();
+      };
+      const effect = (name) => { if (log.fired) log.after.push(name); };
+      const seam = (name, f, isEffect = true) => async (...a) => { if (isEffect) effect(name); const v = await f(...a); point(name); return v; };
+      const run = seam("run", async (argv, o) => t.run(argv, o));
+      const inExpect = (p) => String(p).endsWith("/run/sagebrush/deprovision");
+      const fsx = { ...t.fsx };
+      for (const k of ["unlinkSync", "rmSync", "renameSync", "mkdirSync", "writeFileSync"]) {
+        fsx[k] = (p, ...a) => { effect(`${k} ${p}`); return t.fsx[k](p, ...a); };
+      }
+      fsx.openSync = (p, flags, ...a) => { if (flags !== "r") effect(`openSync ${p}`); return t.fsx.openSync(p, flags, ...a); };
+      for (const k of ["lstatSync", "readdirSync", "readFileSync"]) {
+        fsx[k] = (...a) => { const v = t.fsx[k](...a); if (!inExpect(a[0])) point(`${k} ${a[0]}`, true); return v; };
+      }
+      const dpr = t.h.deprovision;
+      for (const k of ["ensure", "recordIdentity", "markStep"]) {
+        const f = dpr[k].bind(dpr);
+        dpr[k] = (...a) => { effect(k); const v = f(...a); point(k, true); return v; };
+      }
+      const dp = mk({ store: t.h, run, launcher: LAUNCH, mount: "/", fsx, root: t.root, rootUid: 0,
+        procCount: seam("procCount", async () => 0), uidProof: seam("uidProof", async () => ({ empty: true, holders: [] })),
+        brokerRevoke: seam("brokerRevoke", async () => {}), removeNetwork: seam("removeNetwork", async () => {}),
+        daemonReload: seam("daemonReload", async () => {}), inPool: () => false });
+      return { t, ac, log, dp };
+    };
+    const base = await make(null);
+    assert.equal((await base.dp.pass(base.t.A, 10000, base.ac.signal)).status, "done");
+    const n = base.log.points;
+    await base.t.close();
+    assert.ok(n > 40, `the sweep covers the pass (${n} points)`);
+    let rejected = 0;
+    for (let at = 1; at <= n; at++) {
+      for (const kind of ["abort", "deadline"]) {
+        skew = 0;
+        const { t, ac, log, dp } = await make({ at, kind });
+        const marked = () => t.h.deprovision.record(t.A)?.steps_done.length ?? 0;
+        let r;
+        try { r = await dp.pass(t.A, 10000, ac.signal); } catch (e) { r = { threw: e.message, aborted: e.aborted }; }
+        const what = `point ${at} (${log.fired}, ${kind}): ${JSON.stringify(r)}`;
+        assert.ok(log.fired, what);
+        assert.deepEqual(log.after, [], `${what}: effects after the trigger`);
+        if (r.threw) { assert.equal(r.aborted, true, what); rejected++; } else assert.equal(r.status, "done", what);
+        if (r.threw) assert.ok(marked() < STEPS.length, `${what}: not all marked`);
+        await t.close();
+      }
+    }
+    assert.ok(rejected >= 2 * n - 4, `nearly every point ends the pass aborted (${rejected} of ${2 * n})`);
+  } finally {
+    Date.now = realNow;
+  }
+});
+
 test("the accounts step parks while the agent is in a harness pool; another uid on the name is refused", async () => {
   const s = await setup({ pool: true });
   const r = await go(s);

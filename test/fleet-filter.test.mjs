@@ -374,3 +374,69 @@ test("filter: the handle budget: the result that crosses it isn't forwarded, the
   assert.equal(g.f.event(A.sessionId, "Runtime.consoleAPICalled", { type: "log", args: [{ type: "object", objectId: "REAL-O1" }, { type: "object", objectId: "REAL-O2" }], executionContextId: 900001, timestamp: 1 }), null);
   assert.ok(g.f.retired); // (an event that crosses it: dropped, and the session retires)
 });
+
+test("filter: a second getDocument ends the old document's node handles (CDP's rule)", () => {
+  const { f, pa } = setup();
+  const doc = () => roundTrip(f, { method: "DOM.getDocument", params: {}, sessionId: pa }, { root: { nodeId: 900001, backendNodeId: 900002, nodeType: 9, nodeName: "#document", localName: "", nodeValue: "" } }).out.result.root.nodeId;
+  const first = doc(), second = doc();
+  assert.notEqual(second, first);
+  assert.equal(f.command({ method: "DOM.querySelector", params: { nodeId: first, selector: "a" }, sessionId: pa }).error.message, "stale handle");
+  assert.ok(f.command({ method: "DOM.querySelector", params: { nodeId: second, selector: "a" }, sessionId: pa }).send);
+});
+
+test("filter: object handles end with their group's release and their context's destruction; unknown contexts fail closed", () => {
+  const { f, pa } = setup();
+  const props = (ob) => f.command({ method: "Runtime.getProperties", params: { objectId: ob }, sessionId: pa });
+  const ctxCreated = (id, frameId, isDefault = true) => f.event(A.sessionId, "Runtime.executionContextCreated", { context: { id, origin: "https://example.test", name: "", uniqueId: `REAL-U${id}`, auxData: { frameId, isDefault, type: "default" } } }).params.context.id;
+  const evalIn = (params, objectId) => roundTrip(f, { method: "Runtime.evaluate", params: { expression: "x", ...params }, sessionId: pa }, { result: { type: "object", objectId } }).out.result.result.objectId;
+  // groups
+  const g1 = evalIn({ objectGroup: "one" }, "REAL-O1"), g1b = evalIn({ objectGroup: "one" }, "REAL-O2"), g2 = evalIn({ objectGroup: "two" }, "REAL-O3");
+  const child = roundTrip(f, { method: "Runtime.getProperties", params: { objectId: g1 }, sessionId: pa }, { result: [{ name: "a", configurable: true, enumerable: true, value: { type: "object", objectId: "REAL-O4" } }] }).out.result.result[0].value.objectId;
+  roundTrip(f, { method: "Runtime.releaseObjectGroup", params: { objectGroup: "one" }, sessionId: pa }, {});
+  for (const ob of [g1, g1b, child]) assert.equal(props(ob).error.message, "stale handle"); // (a property's object joins its parent's group)
+  assert.ok(props(g2).send);
+  const failedRelease = f.command({ method: "Runtime.releaseObjectGroup", params: { objectGroup: "two" }, sessionId: pa });
+  f.failed(failedRelease.token);
+  assert.ok(props(g2).send); // (a release CDP refused ends nothing)
+  // contexts
+  const navigated = f.event(A.sessionId, "Page.frameNavigated", { frame: { id: "REAL-F1", loaderId: "REAL-L1", url: "https://example.test/", domainAndRegistry: "", securityOrigin: "https://example.test", mimeType: "text/html", secureContextType: "Secure", crossOriginIsolatedContextType: "NotIsolated", gatedAPIFeatures: [] }, type: "Navigation" });
+  assert.ok(navigated);
+  const main = ctxCreated(900021, "REAL-F1"), sub = ctxCreated(900022, "REAL-F2");
+  const inMain = evalIn({}, "REAL-O5"); // (no contextId: the main frame's default world)
+  const inSub = evalIn({ contextId: sub }, "REAL-O6");
+  const viaCall = roundTrip(f, { method: "Runtime.callFunctionOn", params: { functionDeclaration: "f", objectId: inSub }, sessionId: pa }, { result: { type: "object", objectId: "REAL-O7" } }).out.result.result.objectId;
+  f.event(A.sessionId, "Runtime.executionContextDestroyed", { executionContextId: 900022, executionContextUniqueId: "REAL-U900022" });
+  assert.equal(props(inSub).error.message, "stale handle");
+  assert.equal(props(viaCall).error.message, "stale handle"); // (an object made from one in that context lives there too)
+  assert.ok(props(inMain).send);
+  assert.equal(props(g2).error.message, "stale handle"); // (made before any context was known: its context is unknown, so it ends at the first destruction)
+  f.event(A.sessionId, "Runtime.executionContextDestroyed", { executionContextId: 900021, executionContextUniqueId: "REAL-U900021" });
+  assert.equal(props(inMain).error.message, "stale handle");
+  assert.equal(main.startsWith("cx_"), true);
+  // an object whose context the filter can't know ends at any context's destruction (fail closed)
+  const { f: g, pa: ga } = setup();
+  const unknown = roundTrip(g, { method: "Runtime.evaluate", params: { expression: "x" }, sessionId: ga }, { result: { type: "object", objectId: "REAL-O8" } }).out.result.result.objectId;
+  g.event(A.sessionId, "Runtime.executionContextDestroyed", { executionContextId: 900099, executionContextUniqueId: "REAL-U9" });
+  assert.equal(g.command({ method: "Runtime.getProperties", params: { objectId: unknown }, sessionId: ga }).error.message, "stale handle");
+});
+
+test("filter: object groups are bounded: releases keep no state, and past 256 live groups the session retires", () => {
+  const { f, pa } = setup({ budget: 32 });
+  for (let i = 0; i < 10000; i++) {
+    const r = f.command({ method: "Runtime.releaseObjectGroup", params: { objectGroup: `g${i}` }, sessionId: pa });
+    assert.ok(r.send); f.result(r.token, {});
+  }
+  assert.deepEqual(f.takeover().releaseGroups, []); // (no group was ever created)
+  f.handback();
+  const { f: h, pa: ha } = setup();
+  for (let i = 0; i < LIMITS.groups; i++) assert.ok(h.command({ method: "Runtime.evaluate", params: { expression: "1", objectGroup: `g${i}` }, sessionId: ha }).send, String(i));
+  assert.ok(h.command({ method: "Runtime.evaluate", params: { expression: "1", objectGroup: "g0" }, sessionId: ha }).send); // (an existing group costs nothing)
+  const stray = h.command({ method: "Runtime.releaseObjectGroup", params: { objectGroup: "never-used" }, sessionId: ha });
+  assert.ok(stray.send); h.failed(stray.token); // (at the cap, releasing a group that doesn't exist creates nothing)
+  assert.ok(!h.retired);
+  const rel = h.command({ method: "Runtime.releaseObjectGroup", params: { objectGroup: "g0" }, sessionId: ha });
+  h.result(rel.token, {});
+  assert.ok(h.command({ method: "Runtime.evaluate", params: { expression: "1", objectGroup: "new" }, sessionId: ha }).send); // (a released one frees its place)
+  assert.deepEqual(h.command({ method: "Runtime.evaluate", params: { expression: "1", objectGroup: "one-too-many" }, sessionId: ha }), { error: { code: -32000, message: "session retired" } });
+  assert.ok(h.retired);
+});

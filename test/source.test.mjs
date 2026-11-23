@@ -12,6 +12,9 @@ import { SourceCache } from "../lib/source-cache.mjs";
 import { LIMITS, searchPool, sourcePath, sourceVerbs } from "../lib/source.mjs";
 import { CardlessBudget } from "../lib/netverbs.mjs";
 
+// (node:sqlite is Node 22.13 or later; on Node 20 only the refusal row below runs for the cache and the tool)
+const NO_SQLITE = await import("node:sqlite").then((m) => typeof m.DatabaseSync !== "function", () => true) && "needs node:sqlite (Node 22.13 or later)";
+
 const SHA = "1111111111111111111111111111111111111111";
 const SHA2 = "2222222222222222222222222222222222222222";
 const SHA3 = "3333333333333333333333333333333333333333";
@@ -129,7 +132,7 @@ const pid0 = { pid: process.pid };
 function cacheAt(home, opts = {}) { return new SourceCache({ root: join(home, ".cache", "sagebrush-agent", "source"), ...opts }); }
 const gz = (t) => gzipSync(t);
 
-test("source cache: one fetch, then a hit; the tree read-only; leases counted and released", async () => {
+test("source cache: one fetch, then a hit; the tree read-only; leases counted and released", { skip: NO_SQLITE }, async () => {
   const home = tmp();
   try {
     const c = cacheAt(home);
@@ -147,28 +150,29 @@ test("source cache: one fetch, then a hit; the tree read-only; leases counted an
   } finally { cleanup(home); }
 });
 
-test("source cache: a refused archive leaves no slot, no staging, no tree", async () => {
+test("source cache: a refused archive leaves no slot, no staging, no tree", { skip: NO_SQLITE }, async () => {
   const home = tmp();
   try {
     const c = cacheAt(home);
     await assert.rejects(c.acquire(SHA, async () => gz(small(SHA2))), /another commit/);
-    assert.deepEqual(readdirSync(c.root).filter((n) => n !== ".lock"), []);
+    const left = () => readdirSync(c.root).filter((n) => !/^\.(lock|fetch)\.sqlite/.test(n));
+    assert.deepEqual(left(), []);
     await assert.rejects(c.acquire(SHA, async () => { throw new Error("network"); }), /couldn't be fetched/);
-    assert.deepEqual(readdirSync(c.root), []);
+    assert.deepEqual(left(), []);
   } finally { cleanup(home); }
 });
 
-test("source cache: the extraction deadline ends the worker and removes staging", async () => {
+test("source cache: the extraction deadline ends the worker and removes staging", { skip: NO_SQLITE }, async () => {
   const home = tmp();
   try {
     const c = cacheAt(home, { extractMs: 1 });
     const t = tarOf(Array.from({ length: 3000 }, (_, i) => ent(`${ROOT()}/f${i}`, "x".repeat(200))));
     await assert.rejects(c.acquire(SHA, async () => gz(t)), /too long/);
-    assert.deepEqual(readdirSync(c.root).filter((n) => n !== ".lock"), []);
+    assert.deepEqual(readdirSync(c.root).filter((n) => !/^\.(lock|fetch)\.sqlite/.test(n)), []);
   } finally { cleanup(home); }
 });
 
-test("source cache: two slots held by live leases, then a third commit: busy, with no download and no staging", async () => {
+test("source cache: two slots held by live leases, then a third commit: busy, with no download and no staging", { skip: NO_SQLITE }, async () => {
   const home = tmp();
   try {
     const c = cacheAt(home);
@@ -186,7 +190,7 @@ test("source cache: two slots held by live leases, then a third commit: busy, wi
   } finally { cleanup(home); }
 });
 
-test("source cache: leases: a reused pid (another start time) or an old lease doesn't pin", async () => {
+test("source cache: leases: a reused pid (another start time) or an old lease doesn't pin", { skip: NO_SQLITE }, async () => {
   const home = tmp();
   try {
     let start = "linux:100";
@@ -204,7 +208,7 @@ test("source cache: leases: a reused pid (another start time) or an old lease do
   } finally { cleanup(home); }
 });
 
-test("source cache: leftovers of a process that's gone are cleaned; an incomplete commit is never a hit", async () => {
+test("source cache: leftovers of a process that's gone are cleaned; an incomplete commit is never a hit", { skip: NO_SQLITE }, async () => {
   const home = tmp();
   try {
     const c = cacheAt(home, { procInfo: (pid) => (pid === process.pid ? { start: "me" } : { gone: true }) });
@@ -222,7 +226,7 @@ test("source cache: leftovers of a process that's gone are cleaned; an incomplet
   } finally { cleanup(home); }
 });
 
-test("source cache: two caches (two processes) asking at once: one download, both served", async () => {
+test("source cache: two caches (two processes) asking at once: one download, both served", { skip: NO_SQLITE }, async () => {
   const home = tmp();
   try {
     const c1 = cacheAt(home), c2 = cacheAt(home);
@@ -234,7 +238,7 @@ test("source cache: two caches (two processes) asking at once: one download, bot
   } finally { cleanup(home); }
 });
 
-test("source cache: a planted link or a loose mode at the root is refused", async () => {
+test("source cache: a planted link or a loose mode at the root is refused", { skip: NO_SQLITE }, async () => {
   const home = tmp();
   try {
     mkdirSync(join(home, ".cache", "sagebrush-agent"), { recursive: true, mode: 0o700 });
@@ -270,7 +274,7 @@ async function withTool(opts, fn) {
 }
 const text = (r) => r.content.map((c) => c.text).join("\n");
 
-test("source tool: the commit: a paired Sagebrush site's own, else production's, labeled; never a model's origin", async () => {
+test("source tool: the commit: a paired Sagebrush site's own, else production's, labeled; never a model's origin", { skip: NO_SQLITE }, async () => {
   await withTool({ origin: "https://dev.sagebrush.space" }, async (src, calls) => {
     const r = await src({ op: "index", origin: "https://evil.example" });
     assert.match(r.content[0].text, /^source: paired_site, https:\/\/dev\.sagebrush\.space, commit 1{40}\./);
@@ -288,7 +292,7 @@ test("source tool: the commit: a paired Sagebrush site's own, else production's,
   }
 });
 
-test("source tool: a site that can't say its commit fails, with no fallback, and the failure holds for the turn", async () => {
+test("source tool: a site that can't say its commit fails, with no fallback, and the failure holds for the turn", { skip: NO_SQLITE }, async () => {
   for (const version of ["<html>", { core: "abc" }, { core: "ABCDEF0123".repeat(4) }, { nope: SHA }, () => ({ redirect: "https://evil.example" }), () => { throw new Error("down"); }]) {
     await withTool({ origin: "https://sagebrush.space", net: { version } }, async (src, calls) => {
       const r = await src({ op: "index" });
@@ -299,7 +303,7 @@ test("source tool: a site that can't say its commit fails, with no fallback, and
   }
 });
 
-test("source tool: index, list and read: bounded, inside the index, with the reasons for a skipped file", async () => {
+test("source tool: index, list and read: bounded, inside the index, with the reasons for a skipped file", { skip: NO_SQLITE }, async () => {
   await withTool({}, async (src) => {
     assert.match(text(await src({ op: "index" })), /no INDEX\.md[\s\S]*README\.md[\s\S]*engine\//);
     assert.match(text(await src({ op: "list", path: "engine" })), /lib\.rs {2}\d+/);
@@ -313,7 +317,7 @@ test("source tool: index, list and read: bounded, inside the index, with the rea
   });
 });
 
-test("source tool: search: hits as path:line, max and the 'at least' wording, line cuts, a giant line, a folder prefix", async () => {
+test("source tool: search: hits as path:line, max and the 'at least' wording, line cuts, a giant line, a folder prefix", { skip: NO_SQLITE }, async () => {
   const many = tarOf([...Array.from({ length: 30 }, (_, i) => ent(`${ROOT()}/src/f${i}.rs`, "fn x() {}\n")), ent(`${ROOT()}/giant.txt`, "y".repeat(100_000) + "NEEDLE")]);
   await withTool({ net: { archive: () => gz(many) } }, async (src, calls) => {
     const r = text(await src({ op: "search", pattern: "fn x", max: 5 }));
@@ -331,7 +335,7 @@ test("source tool: search: hits as path:line, max and the 'at least' wording, li
   });
 });
 
-test("source tool: a catastrophic regex ends at the time limit; a fourth concurrent search is busy", async () => {
+test("source tool: a catastrophic regex ends at the time limit; a fourth concurrent search is busy", { skip: NO_SQLITE }, async () => {
   const evil = tarOf([ent(`${ROOT()}/a.txt`, "a".repeat(40) + "!\n")]);
   await withTool({ net: { archive: () => gz(evil) }, limits: { searchMs: 400 } }, async (src) => {
     await src({ op: "index" });
@@ -348,7 +352,7 @@ test("source tool: a catastrophic regex ends at the time limit; a fourth concurr
   });
 });
 
-test("source tool: the per-turn call limit, and the fixed requests charged to the turn's budget", async () => {
+test("source tool: the per-turn call limit, and the fixed requests charged to the turn's budget", { skip: NO_SQLITE }, async () => {
   await withTool({ limits: { callsPerTurn: 3 } }, async (src) => {
     for (let i = 0; i < 3; i++) assert.ok(!(await src({ op: "index" })).isError);
     assert.match(text(await src({ op: "index" })), /used its 3 source calls/);
@@ -361,7 +365,7 @@ test("source tool: the per-turn call limit, and the fixed requests charged to th
   });
 });
 
-test("source tool: a redirect off codeload or another commit's archive: refused, and no slot kept", async () => {
+test("source tool: a redirect off codeload or another commit's archive: refused, and no slot kept", { skip: NO_SQLITE }, async () => {
   await withTool({ net: { archive: { redirect: "https://evil.example" } } }, async (src) => {
     assert.match(text(await src({ op: "index" })), /didn't give the Sagebrush source/);
   });
@@ -375,4 +379,158 @@ test("sourcePath: relative, no '..', bounded", () => {
   assert.equal(sourcePath("engine/", { folder: true }), "engine");
   assert.equal(sourcePath(undefined, { folder: true }), "");
   for (const bad of ["", "/x", "a/../b", "a//b", ".", "a\\b", "x".repeat(513)]) assert.equal(sourcePath(bad), null, bad);
+});
+
+// ---- the SEC implementation review's holds (H1-H3) and the lock's takeover
+test("source tar (H1): implied parent folders count toward the folder cap, before anything is made", () => {
+  // (no folder headers at all: a/b/c/x implies three folders)
+  assert.throws(() => sink(tarOf([ent(`${ROOT()}/a/b/c/x.txt`, "x")]), SHA, { ...TAR, dirs: 2 }), /too many folders/);
+  assert.equal(sink(tarOf([ent(`${ROOT()}/a/b/c/x.txt`, "x")]), SHA, { ...TAR, dirs: 3 }).files.length, 1);
+  // (a folder named by its header and implied by a file counts once)
+  assert.equal(sink(tarOf([ent(`${ROOT()}/a/`, "", "5"), ent(`${ROOT()}/a/x.txt`, "x")]), SHA, { ...TAR, dirs: 1 }).files.length, 1);
+});
+
+test("source tool (H2): a failed download is one attempt a turn: later calls answer the same failure with no request", { skip: NO_SQLITE }, async () => {
+  let n = 0;
+  await withTool({ net: { archive: () => { n++; return Buffer.from("not gzip"); } } }, async (src, calls) => {
+    for (let i = 0; i < 3; i++) assert.ok((await src({ op: "index" })).isError);
+    assert.equal(calls.filter((c) => c.url.includes("codeload")).length, 1, "one archive request");
+    assert.equal(n, 1);
+  });
+});
+
+test("source tool (H3): both index answers are capped in bytes, cut on a character boundary", { skip: NO_SQLITE }, async () => {
+  const wide = tarOf(Array.from({ length: 2500 }, (_, i) => ent(`${ROOT()}/file-with-a-rather-long-name-${String(i).padStart(5, "0")}.txt`, "x")));
+  await withTool({ net: { archive: () => gz(wide) } }, async (src) => {
+    const t = (await src({ op: "index" })).content[1].text;
+    assert.ok(Buffer.byteLength(t) <= LIMITS.indexBytes, `fallback listing ${Buffer.byteLength(t)} bytes`);
+    assert.match(t, /…\(cut\)$/);
+  });
+  const idx = tarOf([ent(`${ROOT()}/INDEX.md`, "é".repeat(40_000) + "\n")]);
+  await withTool({ net: { archive: () => gz(idx) } }, async (src) => {
+    const t = (await src({ op: "index" })).content[1].text;
+    assert.ok(Buffer.byteLength(t) <= LIMITS.indexBytes, `INDEX.md ${Buffer.byteLength(t)} bytes`);
+    assert.ok(!t.includes("�"), "no character cut in half");
+  });
+});
+
+test("source cache: the lock: a second holder in this process waits, and is busy past its wait", { skip: NO_SQLITE }, async () => {
+  const home = tmp();
+  try {
+    const c1 = cacheAt(home), c2 = cacheAt(home);
+    c1.checkRoot();
+    let inside = 0, most = 0;
+    const hold = (c, ms) => c.withLock(async () => { inside++; most = Math.max(most, inside); await new Promise((r) => setTimeout(r, ms)); inside--; }, ".lock", 5000);
+    await Promise.all([hold(c1, 150), hold(c2, 150)]);
+    assert.equal(most, 1, "never two holders at once");
+    let release;
+    const held = c1.withLock(() => new Promise((r) => { release = r; }));
+    await new Promise((r) => setTimeout(r, 50));
+    await assert.rejects(c2.withLock(async () => {}, ".lock", 200), /busy/);
+    release();
+    await held;
+    assert.deepEqual(readdirSync(c1.root).filter((n) => !n.startsWith(".lock.sqlite")), []);
+    // (repeated contention: three holders, many rounds, never two inside)
+    const c3 = cacheAt(home);
+    inside = 0; most = 0;
+    await Promise.all([c1, c2, c3].map(async (c) => { for (let i = 0; i < 15; i++) await hold(c, 2); }));
+    assert.equal(most, 1);
+  } finally { cleanup(home); }
+});
+
+test("source cache: a damaged or foreign lock file is refused, never removed or recreated", { skip: NO_SQLITE }, async () => {
+  const home = tmp();
+  try {
+    const c = cacheAt(home);
+    c.checkRoot();
+    const p = join(c.root, ".lock.sqlite");
+    writeFileSync(p, "this is not a database, but a planted file of 64 bytes or so..........", { mode: 0o600 });
+    await assert.rejects(c.withLock(async () => {}), /damaged/);
+    assert.match(String(await import("node:fs").then((f) => f.readFileSync(p, "utf8"))), /not a database/, "left as it was");
+    chmodSync(p, 0o644);
+    await assert.rejects(c.withLock(async () => {}), /private file/);
+  } finally { cleanup(home); }
+});
+
+test("source tool: close() ends this turn's searches before giving the lease back, and refuses later calls", { skip: NO_SQLITE }, async () => {
+  const evil = tarOf([ent(`${ROOT()}/a.txt`, "a".repeat(40) + "!\n")]);
+  const home = tmp();
+  try {
+    const cache = cacheAt(home);
+    const f = fakeGet({ archive: () => gz(evil) });
+    const v = sourceVerbs({ budget: new CardlessBudget(), get: f.get, cache, limits: { ...LIMITS, searchMs: 20_000 } });
+    await v.sagebrush_source({ op: "index" });
+    const running = v.sagebrush_source({ op: "search", pattern: "^(a+)+$" });
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(cache.liveLeases(SHA), 1);
+    const t0 = Date.now();
+    await v.close();
+    const r = await running;
+    assert.ok(r.isError && /turn ended/.test(text(r)) && Date.now() - t0 < 5000, "the running search ended with the turn");
+    assert.equal(cache.liveLeases(SHA), 0, "then the lease was given back");
+    assert.match(text(await v.sagebrush_source({ op: "index" })), /turn ended/);
+  } finally { cleanup(home); }
+});
+
+test("source tool: a turn's lease is given back when the turn ends: its commit is then reclaimable for a third", { skip: NO_SQLITE }, async () => {
+  const home = tmp();
+  try {
+    const cache = cacheAt(home);
+    const turn = (sha) => {
+      const f = fakeGet({ version: { core: sha }, archive: () => gz(small(sha)) });
+      return sourceVerbs({ budget: new CardlessBudget(), get: f.get, cache });
+    };
+    const t1 = turn(SHA), t2 = turn(SHA2);
+    assert.ok(!(await t1.sagebrush_source({ op: "index" })).isError);
+    assert.ok(!(await t2.sagebrush_source({ op: "index" })).isError);
+    // (both turns still running: a third commit is busy)
+    const t3 = turn(SHA3);
+    assert.match(text(await t3.sagebrush_source({ op: "index" })), /busy/);
+    // (the first turn ends: its lease is given back, so its commit can be reclaimed for a fourth turn's third commit)
+    await t1.close();
+    assert.match(text(await t1.sagebrush_source({ op: "index" })), /the turn ended/);
+    const t4 = turn(SHA3);
+    assert.ok(!(await t4.sagebrush_source({ op: "index" })).isError, "the slot was reclaimed");
+    assert.ok(cache.isComplete(SHA2) && cache.isComplete(SHA3) && !existsSync(join(cache.root, SHA)));
+    await t2.close(); await t4.close();
+  } finally { cleanup(home); }
+});
+
+test("source tool on a Node without node:sqlite: a plain refusal, nothing fetched", { skip: !NO_SQLITE && "node:sqlite is here" }, async () => {
+  const home = tmp();
+  try {
+    const f = fakeGet({ archive: () => gz(tarOf([ent(`${ROOT()}/a.txt`, "a\n")])) });
+    const v = sourceVerbs({ budget: new CardlessBudget(), get: f.get, cache: cacheAt(home), limits: LIMITS });
+    const r = await v.sagebrush_source({ op: "index" });
+    assert.ok(r.isError && /Node 22\.13 or later/.test(text(r)));
+    assert.ok(!f.calls.some((c) => /codeload/.test(c.url)), "no archive was asked for");
+    await v.close();
+  } finally { cleanup(home); }
+});
+
+test("source tool: a turn that ends while its archive downloads: the late lease is given back at once, and no read", { skip: NO_SQLITE }, async () => {
+  const home = tmp();
+  try {
+    const cache = cacheAt(home);
+    const f = fakeGet();
+    let arrived;
+    const downloading = new Promise((r) => { arrived = r; });
+    const get = async (u, o) => { if (u.pathname !== "/version.json") { arrived(); await new Promise((r) => setTimeout(r, 300)); } return f.get(u, o); };
+    const v = sourceVerbs({ budget: new CardlessBudget(), get, cache, limits: LIMITS });
+    const call = v.sagebrush_source({ op: "index" });
+    await downloading;
+    await v.close();
+    const r = await call;
+    assert.ok(r.isError && /turn ended/.test(text(r)), text(r));
+    assert.ok(cache.isComplete(SHA), "the download itself finished");
+    assert.equal(cache.liveLeases(SHA), 0, "its lease was given back as it came");
+  } finally { cleanup(home); }
+});
+
+test("source tool: after close, a call makes no request at all", async () => {
+  const f = fakeGet();
+  const v = sourceVerbs({ budget: new CardlessBudget(), get: f.get, cache: cacheAt(tmp()), limits: LIMITS });
+  await v.close();
+  assert.match(text(await v.sagebrush_source({ op: "index" })), /turn ended/);
+  assert.deepEqual(f.calls, []);
 });

@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { FleetError, newId, keyFromSeed, seal, sha256b64 } from "../lib/fleet/index.mjs";
-import { verifyGrant, GrantState } from "../lib/fleet/host/grant.mjs";
+import { verifyGrant } from "../lib/fleet/host/grant.mjs";
+import { HostStore } from "../lib/fleet/host/host-store.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
@@ -82,7 +83,10 @@ test("refused: cross-field rules and every agent's config_schema 1", () => {
 
 const fresh = () => join(mkdtempSync(join(tmpdir(), "sb-grant-")), "state");
 const okIntent = () => { const log = []; const f = async (r) => { log.push(r); }; f.log = log; return f; };
-const stateOnDisk = (dir) => JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+const stateFile = (root) => join(root, "grant", "state.json");
+const stateOnDisk = (root) => JSON.parse(readFileSync(stateFile(root), "utf8"));
+/** Open the host store and return its grant view, with close() closing the store. */
+const GrantState = { open: async (root, opts) => { const h = await HostStore.open(root, opts); const g = h.grants; g.close = () => h.close(); g.store = h; return g; } };
 const g = (gen, over = {}) => { const bytes = grant({ gen, ...over }); return { bytes, digest: sha256b64(bytes) }; };
 
 test("begin: the intent first; then grant bytes; then ONE atomic state commit; steps; applied(N)", async () => {
@@ -111,7 +115,7 @@ test("a failed intent changes nothing: no highwater, no grant file, N not accept
   const { bytes, digest } = g(1);
   await rejects(s.begin(1, bytes, digest, ["x"], async () => { throw new FleetError("audit_unavailable"); }), "audit_unavailable");
   assert.equal(s.highwater.gen, 0);
-  assert.equal(existsSync(join(dir, "grants", "1")), false);
+  assert.equal(existsSync(join(dir, "grant", "grants", "1")), false);
   assert.equal(s.reconcileIntent(1), "failed_no_effect");
   await s.close();
 });
@@ -180,7 +184,7 @@ const failAt = (step, after = 0) => {
   return {
     ...realIo,
     open: (p, f, m) => { if (f === "w" && hit("open")) boom(); dirOpen = f === "r"; return realIo.open(p, f, m); },
-    write: (fd, d) => { if (hit("write")) boom(); return realIo.write(fd, d); },
+    write: (fd, b, o, l) => { if (hit("write")) boom(); return realIo.write(fd, b, o, l); },
     fsync: (fd) => { if (!dirOpen && hit("fsync")) boom(); if (dirOpen && hit("dirfsync")) boom(); return realIo.fsync(fd); },
     rename: (a, b) => { if (hit("rename")) boom(); return realIo.rename(a, b); },
   };
@@ -189,8 +193,8 @@ const failAt = (step, after = 0) => {
 for (const step of ["open", "write", "fsync", "rename", "dirfsync"]) {
   test(`a failure at ${step} while committing begin: poisoned; disk holds the old state or the whole new one`, async () => {
     const dir = fresh();
-    // after: 2 skips creating the initial state and writing the grant bytes, so the failure hits the state commit.
-    const s = await GrantState.open(dir, { io: failAt(step, 2) });
+    // after: 3 skips creating the initial registry and grant state and writing the grant bytes: the failure hits the state commit.
+    const s = await GrantState.open(dir, { io: failAt(step, 3) });
     const g1 = g(1);
     await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a", "b"], okIntent()), /ENOSPC/);
     assert.equal(s.poisoned, true);
@@ -206,7 +210,7 @@ for (const step of ["open", "write", "fsync", "rename", "dirfsync"]) {
 
   test(`a failure at ${step} while writing the grant bytes: nothing accepted, nothing poisoned`, async () => {
     const dir = fresh();
-    const s = await GrantState.open(dir, { io: failAt(step, 1) });
+    const s = await GrantState.open(dir, { io: failAt(step, 2) });
     const g1 = g(1);
     await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a"], okIntent()), /ENOSPC/);
     assert.equal(s.poisoned, false);
@@ -228,12 +232,39 @@ for (const step of ["open", "write", "fsync", "rename", "dirfsync"]) {
   });
 }
 
-test("one writer: a second open refuses while the first holds the state", async () => {
+test("one host store: registry and grant state open together; commit both; crash; reload; a second supervisor refused", async () => {
+  const dir = fresh();
+  const h = await HostStore.open(dir);
+  const a = newId();
+  h.registry.addAgent(a, 1); h.registry.setState(a, "running");
+  const g1 = g(1);
+  await h.grants.begin(1, g1.bytes, g1.digest, ["start:a"], okIntent());
+  await rejects(HostStore.open(dir), "in_progress");   // a second supervisor
+  // "Crash": a new process opens after this one is gone (simulated by closing without finishing the plan).
+  await h.close();
+  const h2 = await HostStore.open(dir);
+  assert.deepEqual(h2.registry.runnable(), [a]);
+  assert.deepEqual(h2.grants.pending(), { phase: "applying", gen: 1, remaining: [0] });
+  h2.grants.done(0); h2.grants.finish();
+  await h2.close();
+});
+
+test("a held intent across lock loss: the begin's commit refuses; highwater is unchanged on disk", async () => {
   const dir = fresh();
   const s = await GrantState.open(dir);
-  await rejects(GrantState.open(dir), "in_progress");
-  await s.close();
-  await (await GrantState.open(dir)).close();
+  let release;
+  const held = new Promise((r) => { release = r; });
+  const g1 = g(1);
+  const p = s.begin(1, g1.bytes, g1.digest, ["a"], async () => { await held; });
+  const { execFileSync } = await import("node:child_process");
+  for (const pid of String(execFileSync("pgrep", ["-f", join(dir, ".lock")])).trim().split("\n").filter(Boolean)) {
+    try { process.kill(Number(pid), "SIGKILL"); } catch {}
+  }
+  for (let i = 0; i < 50 && !s.poisoned; i++) await new Promise((r) => setTimeout(r, 50));
+  release();
+  await rejects(p, "outcome_unknown");
+  assert.equal(stateOnDisk(dir).gen, 0);
+  refused(() => s.pending(), "outcome_unknown");
 });
 
 test("anything but the exact closed state is refused at load and left as found", async () => {
@@ -258,8 +289,8 @@ test("anything but the exact closed state is refused at load and left as found",
     const dir = fresh();
     await (await GrantState.open(dir)).close();
     const text = typeof v === "string" ? v : JSON.stringify(v);
-    writeFileSync(join(dir, "state.json"), text);
+    writeFileSync(stateFile(dir), text);
     await rejects(GrantState.open(dir), "bad_form");
-    assert.equal(readFileSync(join(dir, "state.json"), "utf8"), text);
+    assert.equal(readFileSync(stateFile(dir), "utf8"), text);
   }
 });

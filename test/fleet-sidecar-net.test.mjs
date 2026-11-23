@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EventEmitter } from "node:events";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import { connect as tcpConnect } from "node:net";
 import { createEncoder, createDecoder } from "../lib/fleet/browser/frames.mjs";
 import { main, createWriter, LIMITS } from "../lib/fleet/browser/sidecar-net-main.mjs";
@@ -213,27 +213,33 @@ test("net sidecar: the app's channel: garbage, a misrouted frame, a truncated fr
 
 test("net sidecar: one writer with a cap and a reserve: a data frame past the cap ends it, and 'ended' is still said", async () => {
   const limits = { outBytes: 2000, reserveBytes: 512, flushMs: 1000 };
-  const t = await run({ limits });
+  const stdout = blockedStdout(1 << 20); // (a real Writable that never finishes a write)
+  const t = await run({ limits, stdout });
   await t.push(fromRust({ ...START }));
   await t.push(fromRust({ to: "net", kind: "net.record" }, Buffer.from("r")));
   t.channel.made.onCommand(1, Buffer.alloc(800, 0x61));
   t.channel.made.onCommand(2, Buffer.alloc(800, 0x62));
   t.channel.made.onCommand(3, Buffer.alloc(800, 0x63)); // (past 2000 unwritten bytes: not written)
+  // (ended at once, in the same call: no more admissions, the channel closed, the proxy stopped)
+  assert.equal(t.sidecar.state, "ended");
+  assert.deepEqual(t.channel.calls, [["close"]]);
+  assert.equal(t.proxy.closed, true);
+  t.channel.made.onCommand(4, Buffer.from("{}"));
   await tick();
-  assert.deepEqual(t.stdout.frames().filter((f) => f.head.kind === "cdp.command").map((f) => f.head.seq), [1, 2]);
-  assert.deepEqual(ended(t), ["the app isn't reading"], "the ended state fit in the reserve");
+  assert.deepEqual(stdout.frames().filter((f) => f.head.kind === "cdp.command").map((f) => f.head.seq), [1, 2]);
+  assert.deepEqual(stdout.frames().filter((f) => f.head.state === "ended").map((f) => f.head.reason), ["the app isn't reading"], "exactly one terminal frame, in the reserve");
   // (the writer alone: a control frame may use the reserve, nothing may pass it)
   const out = fakeStdout();
   const write = createWriter(out, limits);
   assert.equal(write(Buffer.alloc(2000)), true);
   assert.equal(write(Buffer.alloc(1)), false);
-  assert.equal(write(Buffer.alloc(512), { control: true }), true);
-  assert.equal(write(Buffer.alloc(1), { control: true }), false);
+  assert.equal(write(Buffer.alloc(512), { terminal: true }), true);
+  assert.equal(write(Buffer.alloc(1), { terminal: true }), false);
   assert.deepEqual(LIMITS, { outBytes: 8 * 1024 * 1024, reserveBytes: 64 * 1024, flushMs: 2000 });
 });
 
 test("net sidecar: the flush deadline: it exits even if the app never reads the rest", async () => {
-  const t = await run({ stdout: fakeStdout({ hang: true }), limits: { ...LIMITS, flushMs: 150 } });
+  const t = await run({ stdout: blockedStdout(1 << 20), limits: { ...LIMITS, flushMs: 150 } }); // (end() never finishes)
   await t.push(fromRust({ to: "net", kind: "net.retire" }));
   assert.deepEqual(t.exits, []);
   await new Promise((r) => setTimeout(r, 250));
@@ -277,4 +283,79 @@ test("net sidecar: the real process: hello on stdout, retire on stdin, 'ended' s
   const code = await new Promise((r) => child.on("exit", r));
   assert.equal(code, 0);
   assert.deepEqual(got.slice(1).map((f) => [f.head.kind, f.head.state, f.head.reason]), [["rust.net_state", "ended", "retired by the app"]]);
+});
+
+/** A real Writable that never finishes a write (highWaterMark 1, callback withheld): everything after the first chunk
+ *  stays queued, as when the app stops reading. `seen` keeps every frame handed to write(). */
+function blockedStdout(highWaterMark = 1) {
+  const out = new Writable({ highWaterMark, write(_chunk, _enc, _cb) { /* (never called back) */ } });
+  out.seen = [];
+  const write = out.write.bind(out);
+  out.write = (b) => { out.seen.push(Buffer.from(b)); return write(b); };
+  out.frames = () => {
+    const all = Buffer.concat(out.seen), frames = [];
+    for (let i = 0; i < all.length; ) {
+      const n = 4 + all.readUInt32BE(i), one = all.subarray(i, i + n);
+      const to = JSON.parse(one.subarray(8, 8 + one.readUInt32BE(4)).toString()).to;
+      frames.push(...createDecoder({ to, from: "net" }).push(one));
+      i += n;
+    }
+    return frames;
+  };
+  return out;
+}
+
+test("net sidecar, a real blocked stdout: stdin pauses while stdout needs to drain, and resumes when it drains", async () => {
+  let release;
+  const out = new Writable({ highWaterMark: 1, write(_c, _e, cb) { release = cb; } });
+  out.frames = () => [];
+  const stdin = new PassThrough();
+  const sidecar = main({ stdin, stdout: out, stderr: { write() {} }, exit() {}, makeChannel: fakeChannel().make, makeProxy: async () => ({ port: 50125, close() {} }) });
+  await tick();
+  assert.equal(out.writableNeedDrain, true, "the hello filled the blocked stdout");
+  assert.equal(stdin.isPaused(), true, "no more frames are taken from the app");
+  stdin.write(fromRust({ ...START }));
+  await tick();
+  assert.equal(sidecar.state, "hello", "the start waits in stdin, unread");
+  release();
+  await tick(); await tick();
+  assert.equal(stdin.isPaused(), false, "resumed on drain");
+  assert.equal(sidecar.state, "started", "and the start was read");
+});
+
+test("net sidecar, a real blocked stdout: state frames share the normal budget; the reserve keeps 'ended' writable", async () => {
+  // (writes never complete, and the high-water mark is above the cap, so the budget fills without a drain pause)
+  const stdout = blockedStdout(1 << 20);
+  const t = await run({ stdout, limits: { outBytes: 2500, reserveBytes: 200, flushMs: 100 } });
+  await t.push(fromRust({ ...START }));
+  await t.push(fromRust({ to: "net", kind: "net.record" }, Buffer.from("r")));
+  // (the channel says "open" over and over: each a non-terminal state frame, until the budget is spent)
+  for (let i = 0; i < 100 && t.sidecar.state !== "ended"; i++) t.channel.made.onState("open");
+  assert.equal(t.sidecar.state, "ended", "ended in the call that hit the cap");
+  const states = stdout.frames().filter((f) => f.head.kind === "rust.net_state");
+  assert.deepEqual(states.at(-1).head, { to: "rust", kind: "rust.net_state", state: "ended", reason: "the app isn't reading" }, "the terminal frame was written");
+  assert.ok(stdout.writableLength > 2500, "the terminal frame used the reserve");
+  assert.ok(stdout.writableLength <= 2700);
+  assert.deepEqual(t.channel.calls, [["close"]]);
+  assert.equal(t.proxy.closed, true);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.deepEqual(t.exits, [0], "and it exits by the flush deadline though nothing was read");
+});
+
+test("net sidecar: a channel that ends while it is being made is closed exactly once, and nothing follows", async () => {
+  for (const [name, during, reason] of [
+    ["ends", (a) => a.onState("ended", "gone"), "the channel ended"],
+    ["commands", (a) => a.onCommand(1, Buffer.from("{}")), "the channel spoke before it was made"],
+    ["opens", (a) => a.onState("open"), "the channel spoke before it was made"],
+  ]) {
+    let closes = 0;
+    const t = await run({ channel: { make: (a) => { during(a); return { close: () => { closes++; }, result() {}, refused() {}, event() {}, takeover() {}, resume() {} }; } } });
+    await t.push(fromRust({ ...START }));
+    await t.push(fromRust({ to: "net", kind: "net.record" }, Buffer.from("r")));
+    await t.push(fromRust({ to: "net", kind: "net.retire" }));
+    assert.equal(closes, 1, name);
+    assert.deepEqual(ended(t), [reason], name);
+    assert.deepEqual(t.stdout.kinds(), ["rust.net_hello", "rust.net_state:connecting", "rust.net_state:ended"], name);
+    assert.deepEqual(t.exits, [0], name);
+  }
 });

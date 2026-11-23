@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { FleetError, b64, enc, newId, keyFromSeed, seal, applyChainEntry as apply } from "../lib/fleet/index.mjs";
 import { signRequest } from "../lib/fleet/request.mjs";
 import * as nodeFace from "../lib/fleet/channel/relay.mjs";
@@ -15,6 +16,8 @@ import * as core from "../lib/fleet/core/relay.mjs";
 import { verifyRequest as coreVerifyRequest } from "../lib/fleet/core/request.mjs";
 
 const AUD = "https://dev.sagebrush.space";
+// (a file path on every platform: a URL's pathname is /D:/... on Windows)
+const CHILD = fileURLToPath(new URL("./fleet-relay-core-child.mjs", import.meta.url));
 const NOW = 1_800_000_000_000;
 const nonce = () => b64(randomBytes(16));
 const code = async (fn) => { try { await fn(); return "ok"; } catch (e) { if (e instanceof FleetError) return e.code; throw e; } };
@@ -123,7 +126,7 @@ async function run(face, w, k, ctx) {
 test("the corpus: Node's face, the core on Node's backend and the core on WebCrypto alone give the same code and fields", async () => {
   const w = await world();
   const cases = corpus(w);
-  const child = JSON.parse(execFileSync(process.execPath, [new URL("./fleet-relay-core-child.mjs", import.meta.url).pathname], {
+  const child = JSON.parse(execFileSync(process.execPath, [CHILD], {
     input: JSON.stringify({ AUD, NOW, fleet: w.fleet, host: w.host, agent: w.agent, hostRaw: b64(w.H.raw), genesis: b64(w.genesis), cases, control: CONTROL }),
     encoding: "utf8", maxBuffer: 1 << 22,
   })).out;
@@ -152,7 +155,7 @@ const CONTROL = { key: b64(new Uint8Array(32).fill(3)), method: "POST", target: 
 
 test("the control plane's MACs on the WebCrypto backend alone equal an independent HMAC of the documented strings", async () => {
   const w = await world();
-  const r = JSON.parse(execFileSync(process.execPath, [new URL("./fleet-relay-core-child.mjs", import.meta.url).pathname], {
+  const r = JSON.parse(execFileSync(process.execPath, [CHILD], {
     input: JSON.stringify({ AUD, NOW, fleet: w.fleet, host: w.host, agent: w.agent, hostRaw: b64(w.H.raw), genesis: b64(w.genesis), cases: [], control: CONTROL }),
     encoding: "utf8",
   }));

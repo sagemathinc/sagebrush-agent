@@ -3,6 +3,12 @@
 // through test/fleet-fixture-cases.mjs, plus the recovery known answer the Node tests pin. Skipped where there is no
 // Chromium or Chrome on PATH (or SAGEBRUSH_CHROME), and off Linux. One bounded run: the browser is killed at the
 // deadline and when this process exits.
+//
+// The page reports its result by POSTing it to this test's loopback server; the test ends the moment it arrives. It
+// doesn't rely on Chromium's --dump-dom (printed only when Chromium decides it's done) or on virtual time, which
+// pauses while fetches are pending: a CI run once ended with Chromium silent for the whole deadline. A failure says
+// which stage was reached (Chromium never asked for the page, or the page loaded and never reported), with the
+// requests the server saw and the end of Chromium's stderr.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -24,11 +30,11 @@ function findChrome() {
 }
 const chrome = process.platform === "linux" ? findChrome() : null;
 
-const HARNESS = `<!doctype html><meta charset="utf-8"><pre id="out">PENDING</pre>
+const HARNESS = `<!doctype html><meta charset="utf-8">
 <script type="module">
 import * as core from "/lib/fleet/core/index.mjs";
 import { checkFixtures, checkHpkeFixtures, checkHpkeVector } from "/test/fleet-fixture-cases.mjs";
-const out = document.getElementById("out");
+const report = (r) => fetch("/result", { method: "POST", body: JSON.stringify(r) });
 try {
   const get = async (p) => (await fetch(p)).json();
   const [F, fleet, reasons] = await Promise.all([get("/test/fixtures/fleet-fixtures.json"), get("/schema/fleet/fleet.schema.json"), get("/schema/fleet/reasons.json")]);
@@ -46,10 +52,14 @@ try {
   const body = { fleet: F.ids.fleet, aud: F.aud, chain_seq: 0, what: "host", id: F.ids.fleet, host: F.ids.fleet, gen: 1, at_ms: 1 };
   const sealed = await core.seal("sb.revocation.v1", signer, body, rfc);
   const opened = (await core.open(sealed, { aud: F.aud, fleet: F.ids.fleet, resolveKey: () => rfc.raw })).body.gen;
-  out.textContent = "RESULT " + JSON.stringify({ ...r, recovery: [k.key, core.b64(k.raw)], rfcPublic: core.b64(rfc.raw), rfcSig, opened, hpke: { vector: hv, fleet: hf }, ua: navigator.userAgent });
+  await report({ ...r, recovery: [k.key, core.b64(k.raw)], rfcPublic: core.b64(rfc.raw), rfcSig, opened, hpke: { vector: hv, fleet: hf }, ua: navigator.userAgent });
 } catch (e) {
-  out.textContent = "RESULT " + JSON.stringify({ error: String((e && e.stack) || e) });
+  await report({ error: String((e && e.stack) || e) });
 }
+</script>
+<script>
+// (a module that fails to load never runs the try above: report that too)
+addEventListener("error", (e) => { fetch("/result", { method: "POST", body: JSON.stringify({ error: "load: " + (e.message || (e.target && e.target.src) || "an error") }) }); }, true);
 </script>`;
 
 // (only these files are served: the pure core, the shared checker, the vectors and the schemas)
@@ -57,8 +67,19 @@ const SERVED = /^\/(lib\/fleet\/core\/[a-z0-9-]+\.mjs|test\/fleet-fixture-cases\
 const TYPES = { mjs: "text/javascript", json: "application/json" };
 
 test("headless Chromium: the core with the WebCrypto backend passes every shared vector", { skip: !chrome && "no Chromium or Chrome on PATH (Linux only)" }, async () => {
+  const seen = [];
+  let resolveResult;
+  const result = new Promise((ok) => { resolveResult = ok; });
   const server = createServer((req, res) => {
     const path = new URL(req.url, "http://x").pathname;
+    if (seen.length < 64) seen.push(`${req.method} ${path}`);
+    if (req.method === "POST" && path === "/result") {
+      let body = "";
+      req.setEncoding("utf8");
+      req.on("data", (d) => { if (body.length < 1 << 20) body += d; });
+      req.on("end", () => { res.writeHead(204).end(); resolveResult(body); });
+      return;
+    }
     if (path === "/harness.html") return res.writeHead(200, { "content-type": "text/html" }).end(HARNESS);
     if (!SERVED.test(path)) return res.writeHead(404).end();
     res.writeHead(200, { "content-type": TYPES[path.split(".").pop()] }).end(readFileSync(new URL("." + path, ROOT)));
@@ -68,19 +89,24 @@ test("headless Chromium: the core with the WebCrypto backend passes every shared
   // (--no-sandbox: containers and Ubuntu 24.04 runners refuse the namespaces Chromium's sandbox needs, and the page
   // loads nothing but the files above, from this loopback server)
   const args = ["--headless=new", "--no-sandbox", "--disable-gpu", "--no-first-run", "--no-default-browser-check", `--user-data-dir=${profile}`,
-    "--virtual-time-budget=30000", "--dump-dom", `http://127.0.0.1:${server.address().port}/harness.html`];
-  const child = spawn(chrome, args, { stdio: ["ignore", "pipe", "ignore"] });
-  const kill = () => { try { child.kill("SIGKILL"); } catch {} };
+    `http://127.0.0.1:${server.address().port}/harness.html`];
+  // (its own process group, so that the whole of Chromium, helpers included, is killed together)
+  const child = spawn(chrome, args, { stdio: ["ignore", "ignore", "pipe"], detached: true });
+  let stderr = "";
+  child.stderr.on("data", (d) => { stderr = (stderr + d).slice(-4096); });
+  const kill = () => { try { process.kill(-child.pid, "SIGKILL"); } catch {} try { child.kill("SIGKILL"); } catch {} };
   process.once("exit", kill);
+  const closed = new Promise((ok) => child.once("close", (code, signal) => ok({ exited: `${code ?? signal}` })));
+  let timer;
   try {
-    let dom = "";
-    child.stdout.on("data", (d) => { if (dom.length < 1 << 20) dom += d; });
-    const timer = setTimeout(kill, DEADLINE_MS);
-    await new Promise((ok) => child.once("close", ok));
-    clearTimeout(timer);
-    const m = /RESULT (\{.*\})<\/pre>/s.exec(dom);
-    assert.ok(m, `no result from the page: ${dom.slice(0, 300)}`);
-    const r = JSON.parse(m[1].replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&"));
+    const exited = closed;
+    const deadline = new Promise((ok) => { timer = setTimeout(() => ok({ deadline: true }), DEADLINE_MS); });
+    const got = await Promise.race([result.then((body) => ({ body })), exited, deadline]);
+    if (got.body === undefined) {
+      const stage = seen.some((r) => r.endsWith("/harness.html")) ? "the page loaded but never reported" : "Chromium never asked for the page";
+      assert.fail(`${stage} (${got.deadline ? `deadline ${DEADLINE_MS} ms` : `Chromium exited: ${got.exited}`}); requests: ${seen.join(", ") || "none"}; stderr: ${stderr.slice(-800)}`);
+    }
+    const r = JSON.parse(got.body);
     assert.equal(r.error, undefined, r.error);
     assert.deepEqual(r.bad, []);
     assert.ok(r.n > 80, `${r.n} cases`);
@@ -94,9 +120,13 @@ test("headless Chromium: the core with the WebCrypto backend passes every shared
     assert.ok(r.hpke.fleet.n > 25, `${r.hpke.fleet.n} HPKE cases`);
     console.log(`# ${r.n} cases, HPKE ${r.hpke.vector.n} + ${r.hpke.fleet.n}, in ${r.ua}`);
   } finally {
+    clearTimeout(timer);
     kill();
+    // (wait, bounded, for Chromium to be gone before its profile is removed; a cleanup failure never fails the test)
+    await Promise.race([closed, new Promise((ok) => setTimeout(ok, 5000).unref())]);
     process.removeListener("exit", kill);
     server.close();
-    rmSync(profile, { recursive: true, force: true });
+    server.closeAllConnections?.();
+    try { rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch (e) { console.log(`# the profile directory stays: ${e.code}`); }
   }
 });

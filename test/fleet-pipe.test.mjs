@@ -20,6 +20,7 @@ function fakeEnds() {
   read.destroy = () => { chrome.destroyed.read = true; };
   write.destroy = () => { chrome.destroyed.write = true; };
   write.write = (buf) => {
+    if (chrome.writeThrows) throw new Error("EPIPE (synchronous)");
     assert.equal(buf[buf.length - 1], 0, "every message ends with one NUL");
     chrome.sent.push(JSON.parse(buf.subarray(0, -1).toString("utf8")));
     return true;
@@ -233,6 +234,52 @@ test("pipe: read and write errors close the pipe with their own fixed reasons", 
   cdp = await p;
   w.write.emit("error", new Error("EPIPE"));
   assert.equal(await reasonOf(cdp), "pipe write error");
+});
+
+test("pipe: a write that throws closes the pipe: that send and every other pending one reject, both ends released", async () => {
+  const { cdp, chrome } = await open();
+  const earlier = cdp.send("A");
+  chrome.writeThrows = true;
+  const failed = cdp.send("B");
+  await assert.rejects(failed, (e) => e instanceof CdpClosed && e.reason === "pipe write error");
+  await assert.rejects(earlier, (e) => e instanceof CdpClosed && e.reason === "pipe write error");
+  assert.deepEqual(await cdp.closed, { reason: "pipe write error" });
+  assert.deepEqual(chrome.destroyed, { read: true, write: true });
+  await assert.rejects(cdp.send("C"), (e) => e instanceof CdpClosed);
+});
+
+test("pipe: a message dripped in tiny fragments is held in one buffer: memory is bounded by bytes, not by fragments", async () => {
+  // (2^21 one-byte fragments: one retained object per fragment would hold well over 64 MB of heap until the NUL)
+  const { cdp, chrome } = await open();
+  const v8 = await import("node:v8");
+  const vm = await import("node:vm");
+  v8.setFlagsFromString("--expose-gc");
+  const gc = vm.runInNewContext("gc");
+  const n = 1 << 21;
+  const head = '{"method":"Drip","params":{"s":"', tail = '"}}';
+  const msg = Buffer.alloc(n, 0x61);
+  msg.write(head, 0, "latin1");
+  msg.write(tail, n - tail.length, "latin1");
+  let got = -1;
+  cdp.on((ev) => { got = ev.params.s.length; });
+  gc();
+  const before = process.memoryUsage().heapUsed;
+  for (let i = 0; i < n; i++) chrome.raw(msg.subarray(i, i + 1));
+  gc();
+  const grew = process.memoryUsage().heapUsed - before;
+  assert.ok(grew < 32 * 1024 * 1024, `heap grew ${grew} bytes holding one ${n}-byte message`);
+  chrome.raw(Buffer.from([0]));
+  assert.equal(got, n - head.length - tail.length);
+  // (and the exact byte limit still holds across fragments: 64 MiB in 4 KiB fragments is delivered, one more byte closes)
+  const big = Buffer.alloc(LIMITS.messageBytes, 0x61);
+  big.write(head, 0, "latin1");
+  big.write(tail, big.length - tail.length, "latin1");
+  for (let i = 0; i < big.length; i += 4096) chrome.raw(big.subarray(i, i + 4096));
+  chrome.raw(Buffer.from([0]));
+  assert.equal(got, LIMITS.messageBytes - head.length - tail.length);
+  for (let i = 0; i < big.length; i += 4096) chrome.raw(big.subarray(i, i + 4096));
+  chrome.raw("a");
+  assert.equal(await reasonOf(cdp), "message over the size limit");
 });
 
 test("pipe: close() sends Browser.close and resolves once Chrome ends the pipe", async () => {

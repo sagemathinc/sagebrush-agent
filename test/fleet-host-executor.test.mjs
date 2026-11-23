@@ -616,8 +616,10 @@ test("a deprovision pass is owned: past its deadline its signal aborts; one that
   // It settles late: A is contained again (mask, drain) ahead of anything else, and normal input runs again.
   fx.log.length = 0;
   settle({ status: "done", step: null, reason: null });
-  await new Promise((r) => setTimeout(r, 50));
-  assert.ok(fx.log.some((l) => l[0] === "mask" && l[1] === A), "recontained");
+  // Bounded polling, not a fixed sleep: a loaded run may take longer than a few ms to recontain.
+  const masked = () => fx.log.some((l) => l[0] === "mask" && l[1] === A);
+  for (const end = Date.now() + 5000; !masked() && Date.now() < end;) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(masked(), "recontained");
   assert.equal(sup.unsettled, 0);
   assert.notEqual((await sup.submit({ kind: "pause", authority: "service", agent: B })).reason, "in_progress");
   await close();

@@ -323,8 +323,8 @@ test("every seam takes the pass's remaining time and its signal; an aborted sign
     };
     const dp2 = mk({ store: t.h, run: t.run, launcher: LAUNCH, mount: "/", fsx: t.fsx, root: t.root, rootUid: 0, ...seams, daemonReload: async () => {}, removeNetwork: async () => {}, inPool: () => false });
     setTimeout(() => a2.abort(), 30);
-    const r = await dp2.pass(t.A, 10000, a2.signal).then((x) => x, (e) => ({ threw: e.message }));
-    assert.ok(r.threw || r.status === "pending", `${hung}: ${JSON.stringify(r)}`);
+    const r = await dp2.pass(t.A, 10000, a2.signal).then((x) => x, (e) => ({ threw: e.message, aborted: e.aborted }));
+    assert.equal(r.aborted, true, `${hung}: the abort rejects the pass, never parks it: ${JSON.stringify(r)}`);
     assert.deepEqual(t.h.deprovision.record(t.A).steps_done, [], hung);
     await t.close();
   }
@@ -374,6 +374,64 @@ test("an adapter that settles AFTER the abort: nothing after it runs: no mark, n
     assert.equal(t.m.calls.length, 0, `${name}: no launcher call`);
     await t.close();
   }
+});
+
+test("an adapter or command that REJECTS after the abort or the deadline: the pass rejects as aborted, never parks", async () => {
+  const { deprovisioner: mk } = await import("../lib/fleet/host/deprovision.mjs");
+  // Each rejects with a plain error (no aborted flag), as a real adapter or runArgv does: on the signal, or after the
+  // pass's deadline has passed while it ran (the clock moved past it, then the rejection).
+  const onAbort = (sig) => new Promise((_, rej) => sig.addEventListener("abort", () => rej(new Error("killed")), { once: true }));
+  const realNow = Date.now;
+  let skew = 0;
+  Date.now = () => realNow() + skew;
+  const late = () => new Promise((_, rej) => setTimeout(() => { skew += 1e7; rej(Object.assign(new Error("timed out"), { code: "effect_failed" })); }, 20));
+  try {
+    for (const seam of ["procCount", "uidProof", "brokerRevoke", "run"]) {
+      for (const how of ["abort", "deadline"]) {
+        const t = await setup();
+        t.m.root = t.root;
+        const ac = new AbortController();
+        // The abort comes while this call is in flight (not on a wall-clock timer, so a loaded run can't move it).
+        const fail = (sig) => (how === "abort" ? (setTimeout(() => ac.abort(), 5), onAbort(sig)) : late());
+        const seams = { procCount: async () => 0, uidProof: async () => ({ empty: true, holders: [] }), brokerRevoke: async () => {}, run: t.run };
+        if (seam === "run") seams.run = async (argv, o) => (argv[0] === LAUNCH ? fail(o.signal) : t.run(argv, o));
+        else seams[seam] = async (...a) => fail(a.at(-1));
+        const effects = [];
+        const dp = mk({ store: t.h, launcher: LAUNCH, mount: "/", fsx: t.fsx, root: t.root, rootUid: 0, ...seams,
+          removeNetwork: async () => { effects.push("network"); }, daemonReload: async () => { effects.push("daemon-reload"); }, inPool: () => false });
+        skew = 0;
+        const r = await dp.pass(t.A, 10000, ac.signal).then((x) => x, (e) => ({ threw: e.message, aborted: e.aborted }));
+        assert.equal(r.aborted, true, `${seam}, ${how}: ${JSON.stringify(r)}`);
+        const done = t.h.deprovision.record(t.A).steps_done;
+        if (seam === "run") {
+          // The first launcher call is the runtime step's: channels, unit and network are done; nothing after it.
+          assert.deepEqual(done, ["channels", "unit", "network"], `${seam}, ${how}: runtime is not marked`);
+          assert.equal(t.m.calls.filter((c) => c[0] === LAUNCH).length, 0, `${seam}, ${how}: the rejected call reached nothing`);
+        } else {
+          // A proof or the first step: nothing marked, no effect, no command.
+          assert.deepEqual(done, [], `${seam}, ${how}: nothing marked`);
+          assert.deepEqual(effects, [], `${seam}, ${how}: no effect`);
+          assert.equal(t.m.calls.length, 0, `${seam}, ${how}: no command`);
+          assert.ok(fs.existsSync(join(t.root, `usr/local/lib/systemd/system/sagebrush-agent-${t.A}.service`)), `${seam}, ${how}: the unit stays`);
+        }
+        const calls = t.m.calls.length;
+        await new Promise((r) => setTimeout(r, 80)); // nothing still pending runs later
+        assert.equal(t.m.calls.length, calls, `${seam}, ${how}: no command after the rejection`);
+        await t.close();
+      }
+    }
+  } finally {
+    Date.now = realNow;
+  }
+  // Control: a proof that fails while the pass is alive still parks with its reason.
+  const t = await setup();
+  const dp = mk({ store: t.h, run: t.run, launcher: LAUNCH, mount: "/", fsx: t.fsx, root: t.root, rootUid: 0,
+    procCount: async () => { throw new Error("EIO"); }, uidProof: async () => ({ empty: true, holders: [] }),
+    brokerRevoke: async () => {}, removeNetwork: async () => {}, daemonReload: async () => {}, inPool: () => false });
+  const r = await dp.pass(t.A, 10000);
+  assert.equal(r.status, "pending");
+  assert.match(r.reason, /cgroup/);
+  await t.close();
 });
 
 test("an abort or the deadline at EVERY point of a pass: after it, no effect starts and no step is marked", async () => {

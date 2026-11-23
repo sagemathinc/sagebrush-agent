@@ -61,3 +61,20 @@ jobs:
         with:
           node-version: 22.23.5
       - run: node --test "test/fleet-*.test.mjs" test/tags.test.mjs test/canon.test.mjs
+
+  # The Python reference verifier (python/): every case of both shared fleet fixture files, each with the JavaScript
+  # checker's result, the RFC 9180 vector, and its own rule rows. Its one dependency, cryptography (with cffi and
+  # pycparser), is installed by hash.
+  fleet-python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --require-hashes --no-deps -r python/requirements.txt
+      - run: python -I python/tests/test_fixtures.py -v
+      - run: python -I python/tests/test_rules.py -v

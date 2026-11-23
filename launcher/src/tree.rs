@@ -609,6 +609,51 @@ pub fn inspect_home<O: Ops>(o: &mut O, mount: &str, agent: &str, tree: Tree, arc
     }
 }
 
+// ---- check-parents (A1 r2.2 §3a): the fixed parents provisioning writes beneath
+
+/// The fixed directories under /srv/sagebrush that provisioning creates or adopts and then writes beneath.
+pub const FIXED_PARENTS: [&str; 5] = ["agents", "agent-config", "archive", "archive-config", "tags"];
+
+/// Check the quota mount (its root, its ancestors) and every fixed parent: each root:root, without group or other
+/// write, without an ACL, on the mount. With `allow_missing`, a fixed component that doesn't exist yet ends the walk
+/// there (provisioning creates it next, beneath a checked parent); without it, all must exist. Read-only.
+pub fn check_parents<O: Ops>(o: &mut O, mount: &str, allow_missing: bool) -> Result<()> {
+    let root = o.root().map_err(|_| pre("the root can't be opened"))?;
+    let comps = srv_components(mount)?;
+    let m = anchor_policy(o, &root, mount)?;
+    let mid = o.ident(&m).map_err(open_err)?;
+    if mid.attributes & libc::STATX_ATTR_MOUNT_ROOT as u64 == 0 {
+        return Err(pre("the quota mount isn't a mount root"));
+    }
+    let check = |o: &mut O, h: &O::H| -> Result<()> {
+        let id = o.ident(h).map_err(open_err)?;
+        let acl = o.has_acl(h).map_err(|_| pre("a parent's ACL can't be read"))?;
+        if id.mnt_id != mid.mnt_id || id.uid != 0 || id.gid != 0 || id.mode & 0o022 != 0 || kind_of(&id) != Some(Kind::Dir) || acl {
+            return Err(identity("a fixed parent isn't a root-only directory on the quota mount"));
+        }
+        Ok(())
+    };
+    let mut cur = m;
+    for seg in comps {
+        match o.at(&cur, seg, At::Dir) {
+            Ok(next) => {
+                check(o, &next)?;
+                cur = next;
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) && allow_missing => return Ok(()),
+            Err(e) => return Err(open_err(e)),
+        }
+    }
+    for name in FIXED_PARENTS {
+        match o.at(&cur, name, At::Dir) {
+            Ok(h) => check(o, &h)?,
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) && allow_missing => {}
+            Err(e) => return Err(open_err(e)),
+        }
+    }
+    Ok(())
+}
+
 // ---- archive-home (A1 §4, L1 step 6b)
 
 struct Expected {
@@ -1606,6 +1651,47 @@ mod tests {
             assert!(!t.exists());
             std::fs::remove_dir_all(&base).unwrap();
         }
+    }
+
+    #[test]
+    fn check_parents_requires_every_fixed_parent_root_only_without_acls() {
+        let mut f = Fake::new();
+        f.dir("srv/sagebrush/tags", 0, 0o755);
+        check_parents(&mut f, "/", false).unwrap();
+        // Missing components: refused strictly, tolerated (and the walk ends there) when allowed.
+        let mut g = Fake::new();
+        g.nodes.retain(|k, _| !k.starts_with("srv/sagebrush"));
+        assert_eq!(code(check_parents(&mut g, "/", false)), 66);
+        check_parents(&mut g, "/", true).unwrap();
+        for (path, how) in [
+            ("srv/sagebrush", "acl"),
+            ("srv/sagebrush/agents", "acl"),
+            ("srv/sagebrush/agent-config", "g+w"),
+            ("srv/sagebrush/archive", "owner"),
+            ("srv/sagebrush/archive-config", "acl"),
+            ("srv/sagebrush/tags", "mount"),
+        ] {
+            let mut f = Fake::new();
+            f.dir("srv/sagebrush/tags", 0, 0o755);
+            let n = f.node(path);
+            match how {
+                "acl" => n.acl = true,
+                "g+w" => n.id.mode |= 0o020,
+                "owner" => n.id.uid = UID,
+                _ => n.id.mnt_id = MNT + 1,
+            }
+            for allow in [false, true] {
+                assert_eq!(code(check_parents(&mut f, "/", allow)), 73, "{path} {how} {allow}");
+            }
+        }
+        // A component between the mount and /srv/sagebrush (here srv, under a root mount): the same rule (73); the
+        // mount itself and its ancestors are under the anchor policy (66).
+        let mut f = Fake::new();
+        f.node("srv").acl = true;
+        assert_eq!(code(check_parents(&mut f, "/", true)), 73);
+        let mut f = Fake::new();
+        f.node("").acl = true;
+        assert_eq!(code(check_parents(&mut f, "/", true)), 66);
     }
 
     #[test]

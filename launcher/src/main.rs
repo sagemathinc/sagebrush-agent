@@ -41,7 +41,7 @@ fn run() -> err::Result<()> {
             stage::run(&stage::parse(&v)?)
         }
         // Launcher contract amendment A1 (deprovision): root only, outside any unit.
-        "identify" | "inspect-home" | "archive-home" | "remove-tree" => {
+        "identify" | "inspect-home" | "archive-home" | "remove-tree" | "check-parents" => {
             if !after.is_empty() {
                 return Err(err(Fail::Usage, "bad arguments"));
             }
@@ -83,6 +83,19 @@ fn a1(cmd: &str, rest: &[String]) -> err::Result<()> {
             }
             guard()?;
             tree::inspect_home(&mut o, mount, v[1], t, archive == 1)?
+        }
+        "check-parents" => {
+            // `--allow-missing` takes no value, like inspect-home's `--archive`.
+            let allow = rest.iter().filter(|a| *a == "--allow-missing").count();
+            if allow > 1 {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            let kept: Vec<String> = rest.iter().filter(|a| *a != "--allow-missing").cloned().collect();
+            let v = args::flags(&kept, &["mount"])?;
+            let mount = tree::parse_mount(v[0])?;
+            guard()?;
+            tree::check_parents(&mut o, mount, allow == 1)?;
+            String::new()
         }
         "archive-home" => {
             let v = args::flags(rest, &["mount", "agent", "tree", "expect"])?;

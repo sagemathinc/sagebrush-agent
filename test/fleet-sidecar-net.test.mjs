@@ -235,7 +235,7 @@ test("net sidecar: one writer with a cap and a reserve: a data frame past the ca
   assert.equal(write(Buffer.alloc(1)), false);
   assert.equal(write(Buffer.alloc(512), { terminal: true }), true);
   assert.equal(write(Buffer.alloc(1), { terminal: true }), false);
-  assert.deepEqual(LIMITS, { outBytes: 8 * 1024 * 1024, reserveBytes: 64 * 1024, flushMs: 2000 });
+  assert.deepEqual(LIMITS, { outBytes: 8 * 1024 * 1024, reserveBytes: 64 * 1024, flushMs: 2000, stallMs: 30000 });
 });
 
 test("net sidecar: the flush deadline: it exits even if the app never reads the rest", async () => {
@@ -358,4 +358,117 @@ test("net sidecar: a channel that ends while it is being made is closed exactly 
     assert.deepEqual(t.stdout.kinds(), ["rust.net_hello", "rust.net_state:connecting", "rust.net_state:ended"], name);
     assert.deepEqual(t.exits, [0], name);
   }
+});
+
+/** A real Writable (highWaterMark 1) that holds each write's callback: `release()` finishes the oldest write (so it
+ *  drains once the queue empties); `frames()` decodes everything handed to write(). */
+function heldStdout() {
+  const held = [];
+  const out = new Writable({ highWaterMark: 1, write(_c, _e, cb) { held.push(cb); } });
+  out.seen = [];
+  const write = out.write.bind(out);
+  out.write = (b) => { out.seen.push(Buffer.from(b)); return write(b); };
+  out.release = () => { while (held.length) held.shift()(); };
+  out.frames = () => {
+    const all = Buffer.concat(out.seen), frames = [];
+    for (let i = 0; i < all.length; ) {
+      const n = 4 + all.readUInt32BE(i), one = all.subarray(i, i + n);
+      const to = JSON.parse(one.subarray(8, 8 + one.readUInt32BE(4)).toString()).to;
+      frames.push(...createDecoder({ to, from: "net" }).push(one));
+      i += n;
+    }
+    return frames;
+  };
+  return out;
+}
+/** Timers that count the live stall timers (those set for `stallMs`). */
+function countingTimers(stallMs) {
+  const live = new Set();
+  let most = 0;
+  return {
+    live, get most() { return most; },
+    setTimeout(fn, ms) {
+      const id = setTimeout(() => { live.delete(id); fn(); }, ms);
+      if (ms === stallMs) { live.add(id); most = Math.max(most, live.size); }
+      return id;
+    },
+    clearTimeout(id) { live.delete(id); clearTimeout(id); },
+  };
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test("net sidecar, stall: output below the cap that never drains ends it at the stall bound, once, then exit after the flush", async () => {
+  const out = heldStdout(), stdin = new PassThrough(), exits = [];
+  const sidecar = main({ stdin, stdout: out, stderr: { write() {} }, exit: (c) => exits.push(c), makeChannel: fakeChannel().make, makeProxy: async () => ({ port: 50126, close() {} }), limits: { stallMs: 200, flushMs: 100 } });
+  await tick();
+  assert.equal(out.writableNeedDrain, true, "the hello is waiting (well below the cap)");
+  assert.equal(stdin.isPaused(), true);
+  stdin.end(fromRust({ to: "net", kind: "net.retire" })); // (stdin ends while paused: nothing of it is read)
+  await sleep(120);
+  assert.equal(sidecar.state, "hello", "still live before the bound");
+  await sleep(150);
+  assert.equal(sidecar.state, "ended", "ended at the stall bound");
+  const after = out.seen.length;
+  const terminal = out.frames().filter((f) => f.head.state === "ended");
+  assert.deepEqual(terminal.map((f) => f.head.reason), ["the app stopped reading"], "one terminal frame, the stall's");
+  assert.deepEqual(exits, [], "the flush deadline still runs");
+  await sleep(150);
+  assert.deepEqual(exits, [0]);
+  assert.equal(out.seen.length, after, "nothing after the terminal frame");
+});
+
+test("net sidecar, stall: a drain just before the deadline clears it", async () => {
+  const out = heldStdout(), stdin = new PassThrough(), exits = [];
+  const timers = countingTimers(300);
+  const sidecar = main({ stdin, stdout: out, stderr: { write() {} }, exit: (c) => exits.push(c), makeChannel: fakeChannel().make, makeProxy: async () => ({ port: 50127, close() {} }), limits: { stallMs: 300 }, timers });
+  await tick();
+  assert.equal(timers.live.size, 1, "the stall timer started when the write had to wait");
+  await sleep(220);
+  out.release(); // (the app reads, 80 ms before the deadline)
+  await tick();
+  assert.equal(timers.live.size, 0, "cleared by the drain");
+  assert.equal(stdin.isPaused(), false);
+  await sleep(250);
+  assert.equal(sidecar.state, "hello", "no end at the old deadline");
+  assert.deepEqual(exits, []);
+  stdin.write(fromRust({ to: "net", kind: "net.retire" }));
+  await tick();
+  assert.equal(sidecar.state, "ended");
+});
+
+test("net sidecar, stall: repeated backpressure cycles leave at most one timer, and none after a drain", async () => {
+  const out = heldStdout(), stdin = new PassThrough(), exits = [], channel = fakeChannel();
+  const timers = countingTimers(5000);
+  const sidecar = main({ stdin, stdout: out, stderr: { write() {} }, exit: (c) => exits.push(c), makeChannel: channel.make, makeProxy: async () => ({ port: 50128, close() {} }), limits: { stallMs: 5000 }, timers });
+  await tick();
+  out.release(); await tick();
+  stdin.write(fromRust({ ...START })); await tick();
+  stdin.write(fromRust({ to: "net", kind: "net.record" }, Buffer.from("r"))); await tick();
+  out.release(); await tick();
+  for (let i = 1; i <= 5; i++) {
+    channel.made.onCommand(2 * i - 1, Buffer.from("{}"));
+    channel.made.onCommand(2 * i, Buffer.from("{}")); // (two writes while waiting: still one timer)
+    assert.equal(timers.live.size, 1, `cycle ${i}: one timer while waiting`);
+    out.release(); await tick();
+    assert.equal(timers.live.size, 0, `cycle ${i}: none after the drain`);
+  }
+  assert.equal(timers.most, 1, "never more than one at once");
+  assert.equal(sidecar.state, "live");
+  assert.deepEqual(exits, []);
+});
+
+test("net sidecar, stall: a drain after the end does nothing", async () => {
+  const out = heldStdout(), stdin = new PassThrough(), exits = [];
+  const timers = countingTimers(100);
+  const sidecar = main({ stdin, stdout: out, stderr: { write() {} }, exit: (c) => exits.push(c), makeChannel: fakeChannel().make, makeProxy: async () => ({ port: 50129, close() {} }), limits: { stallMs: 100, flushMs: 5000 }, timers });
+  await tick();
+  await sleep(160);
+  assert.equal(sidecar.state, "ended");
+  const frames = out.seen.length;
+  out.release(); // (the app reads at last)
+  await tick(); await tick();
+  assert.equal(stdin.isPaused(), true, "stdin stays paused");
+  assert.equal(timers.live.size, 0, "no timer comes back");
+  assert.equal(out.seen.length, frames, "nothing more is written");
+  assert.ok(exits.length <= 1);
 });

@@ -12,7 +12,8 @@ import { UNIT_DIRS_ABOVE_MASK } from "../lib/fleet/host/names.mjs";
 import { CONTRACT, launcherContract, renderUnit } from "../lib/fleet/host/unit.mjs";
 
 const A = "abcdefghijklmnopqrstuvwxya", T1 = "tagtagtagtagtagtagtagtagaa";
-const UID = 70000, GID = 70000, ME = process.getuid();
+// process.getuid doesn't exist off POSIX; there every test here is skipped (host-linux-only), so ME is never used.
+const UID = 70000, GID = 70000, ME = process.getuid?.() ?? -1;
 const UNIT = `sagebrush-agent-${A}.service`;
 const config = () => ({
   files: { rw: ["/data/project"], ro: ["/data/reference"] },

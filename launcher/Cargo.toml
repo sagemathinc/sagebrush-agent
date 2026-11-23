@@ -1,0 +1,20 @@
+[package]
+name = "sagebrush-agent-launch"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Stages granted paths by handle and execs an agent's CLI under Landlock (host supervisor freeze r3.1 §4.3, §4.6)"
+publish = false
+
+[dependencies]
+# The only dependency, pinned exactly; the build runs with --offline --locked.
+libc = "=0.2.191"
+
+[profile.release]
+panic = "unwind"   # every Drop (secret zeroing) runs before main maps a panic to exit 72
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+panic = "unwind"

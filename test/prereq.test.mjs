@@ -71,7 +71,7 @@ test("prereq: a turn that finds Claude Code not signed in says the same next ste
   const turn = new Turn("t1");
   turn.start();
   const ev = turn.feed({ type: "assistant", error: "authentication_failed", message: { content: [{ type: "text", text: "Not logged in · Please run /login" }] } });
-  assert.deepEqual(ev, [{ type: "turn_error", code: "authentication_failed", message: SETUP_TEXT.notSignedIn }]);
+  assert.deepEqual(ev, [{ type: "turn_error", code: "claude_not_signed_in", message: SETUP_TEXT.turnNotSignedIn }]);
   // (a stand-in that ends as Claude Code does when it isn't signed in: that frame, an error result, exit 1)
   const bin = stand(`printf '%s\\n' '{"type":"assistant","error":"authentication_failed","message":{"content":[{"type":"text","text":"Not logged in"}]}}' '{"type":"result","subtype":"success","is_error":true,"result":"Not logged in"}'; exit 1`);
   const q = cliQuery({ prompt: "x", options: { canUseTool: async () => ({ behavior: "deny", message: "no" }) } }, { bin, env: { PATH: process.env.PATH }, limits: { connectMs: 20_000, killGraceMs: 200 } });
@@ -81,4 +81,35 @@ test("prereq: a turn that finds Claude Code not signed in says the same next ste
   await q.return().catch(() => {});
   assert.deepEqual(got, ["assistant", "result"]);
   assert.equal(err, null, "the error result said why; no extra 'stopped (exit 1)'");
+});
+
+// (#1804: an expired or invalid Claude login, as the pinned Claude Code says it, reaches the page as one fixed reason in
+//  our words; Claude Code's own text, with its setup-token advice, never does)
+test("prereq: an expired Claude login is one reason, claude_login_expired, in our words; Claude Code's text (setup-token advice) never reaches the page", () => {
+  const raw = "Failed to authenticate: this login reached its time limit and cannot be renewed. Run `claude auth login` to sign in again, or use `claude setup-token` and set CLAUDE_CODE_OAUTH_TOKEN for unattended jobs";
+  const flat = (evs) => JSON.stringify(evs);
+  // (as a result only)
+  const a = new Turn("t1"); a.start();
+  const ra = a.feed({ type: "result", subtype: "success", is_error: true, result: raw });
+  assert.deepEqual(ra.filter((e) => e.type !== "turn_usage"), [
+    { type: "turn_error", code: "claude_login_expired", message: "Your Claude sign-in expired. In your terminal, run `claude auth login`, then send your message again." },
+    { type: "turn_finished", outcome: "error", code: "claude_login_expired" },
+  ]);
+  assert.ok(!/setup-token|CLAUDE_CODE_OAUTH_TOKEN|time limit/.test(flat(ra)));
+  // (as the assistant's error frame, then the result: said once)
+  const b = new Turn("t2"); b.start();
+  const rb = [...b.feed({ type: "assistant", error: "authentication_failed", message: { content: [{ type: "text", text: raw }] } }), ...b.feed({ type: "result", subtype: "success", is_error: true, result: raw })];
+  assert.equal(rb.filter((e) => e.type === "turn_error").length, 1);
+  assert.equal(rb.find((e) => e.type === "turn_finished").code, "claude_login_expired");
+  assert.ok(!/setup-token|CLAUDE_CODE_OAUTH_TOKEN/.test(flat(rb)));
+  // (not signed in, as the pinned release says it)
+  const c = new Turn("t3"); c.start();
+  const rc = [...c.feed({ type: "assistant", error: "authentication_failed", message: { content: [{ type: "text", text: "Not logged in · Please run /login" }] } }), ...c.feed({ type: "result", subtype: "success", is_error: true, result: "Not logged in · Please run /login" })];
+  assert.deepEqual(rc.filter((e) => e.type === "turn_error").map((e) => e.code), ["claude_not_signed_in"]);
+  assert.ok(!/Please run \/login/.test(flat(rc)));
+  // (any other error result is as before: Claude's words as a message, the error fixed)
+  const d = new Turn("t4"); d.start();
+  const rd = d.feed({ type: "result", subtype: "success", is_error: true, result: "The tool failed." });
+  assert.ok(rd.some((e) => e.type === "text_delta" && e.text === "The tool failed."));
+  assert.ok(rd.some((e) => e.type === "turn_error" && e.code === "is_error"));
 });

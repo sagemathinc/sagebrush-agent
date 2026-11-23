@@ -255,3 +255,13 @@ test("Fetch request ids are a session's own: the same id on two sessions is two 
     assert.ok(!m.cdp.calls.some((c) => c.method === "Fetch.continueWithAuth"));
   }
 });
+
+test("the permission list comes from a resolver keyed by the build Chrome reports (the wiring's pinned lists)", async () => {
+  const asked = [];
+  const { cdp, h } = setup({}, { permissions: (build) => { asked.push(build); return build === BUILD ? permissions : null; } });
+  await h.harden({ kind: "browser_context", browserContextId: "CTX" });
+  assert.deepEqual(asked, [BUILD]);
+  assert.equal(cdp.calls.filter((c) => c.method === "Browser.setPermission").length, permissions.descriptors.length);
+  const other = setup({ "Browser.getVersion": { product: "HeadlessChrome/149.0.7827.196" } }, { permissions: (build) => (build === BUILD ? permissions : null) });
+  await assert.rejects(other.h.harden({ kind: "browser_context", browserContextId: "CTX" }), /no permission list/);
+});

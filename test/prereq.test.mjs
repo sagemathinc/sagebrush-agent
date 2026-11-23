@@ -113,3 +113,40 @@ test("prereq: an expired Claude login is one reason, claude_login_expired, in ou
   assert.ok(rd.some((e) => e.type === "text_delta" && e.text === "The tool failed."));
   assert.ok(rd.some((e) => e.type === "turn_error" && e.code === "is_error"));
 });
+
+// (astra5's hold on the first cut: only the pinned Claude Code's own sign-in texts are sign-in failures; an error result
+//  about any other time limit, authentication or token is said as before, with its text)
+test("prereq: only the pinned Claude Code's sign-in texts are sign-in failures; other timeout, auth and token errors keep their text", async () => {
+  const { signInFailure, keyFailure } = await import("../lib/claude-cli.mjs");
+  for (const t of [
+    "Login reached its time limit \u00b7 Please run /login",
+    "Login expired \u00b7 Please run /login",
+    "OAuth token revoked \u00b7 Please run /login",
+    "Failed to authenticate: this login reached its time limit \u00b7 Sign in again to continue",
+    "Failed to authenticate: OAuth session expired and could not be refreshed",
+    "Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator.",
+  ]) assert.equal(signInFailure(t), "claude_login_expired", t);
+  assert.equal(signInFailure("Not logged in \u00b7 run /login"), "claude_not_signed_in");
+  const others = [
+    "The tool reached its time limit.",
+    "Failed to authenticate to the GitHub API.",
+    "The upload access token expired.",
+    "Your token has expired; run claude auth login on the server.",
+    "Not logged in to the registry.",
+    "Login expired for the database",
+    "Invalid API key \u00b7 Fix external API key",
+  ];
+  for (const t of others) assert.equal(signInFailure(t), null, t);
+  for (const [i, t] of others.entries()) {
+    const turn = new Turn(`n${i}`); turn.start();
+    const ev = turn.feed({ type: "result", subtype: "success", is_error: true, result: t });
+    assert.ok(ev.some((e) => e.type === "text_delta" && e.text === t), t);
+    assert.deepEqual(ev.filter((e) => e.type === "turn_error"), [{ type: "turn_error", code: "is_error", message: "Claude ended the turn with an error" }], t);
+    assert.equal(ev.find((e) => e.type === "turn_finished").code, "is_error", t);
+  }
+  // (an authentication_failed about a key the person set isn't called an expired sign-in)
+  assert.ok(keyFailure("Invalid API key \u00b7 Fix external API key") && keyFailure("Invalid auth token \u00b7 Fix external auth token"));
+  const k = new Turn("k"); k.start();
+  const rk = k.feed({ type: "assistant", error: "authentication_failed", message: { content: [{ type: "text", text: "Invalid API key \u00b7 Fix external API key" }] } });
+  assert.deepEqual(rk.filter((e) => e.type === "turn_error").map((e) => e.code), ["authentication_failed"]);
+});

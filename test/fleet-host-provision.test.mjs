@@ -17,7 +17,7 @@ const host = (e) => !(e instanceof FleetError) && e.code === "effect_failed";
 const grantAgent = (over = {}) => ({ agent: A, client: "claude", root: false, tags: [T1, T2], config: { resources: { disk_gb: 50 } }, ...over });
 
 let seq = 0;
-function setup({ quota = { mount: "/srv" }, passwd = {}, group = {}, over = {} } = {}) {
+function setup({ quota = { mount: "/srv" }, passwd = {}, group = {}, over = {}, refuseCheck = null } = {}) {
   const root = join(os.tmpdir(), `sb-prov-${process.pid}-${seq++}`);
   fs.rmSync(root, { recursive: true, force: true });
   fs.mkdirSync(join(root, "etc"), { recursive: true });
@@ -57,10 +57,15 @@ function setup({ quota = { mount: "/srv" }, passwd = {}, group = {}, over = {} }
     chownSync: (p, u, g) => owner.set(p, [u, g]),
     lstatSync: (p) => { const st = fs.lstatSync(p); const o = owner.get(p); return o ? Object.assign(Object.create(Object.getPrototypeOf(st)), st, { uid: o[0], gid: o[1] }) : st; },
   };
-  const p = provisioner({ run, fsx, root, rootUid: 0, tagGid: (t) => ({ [T1]: G1, [T2]: G2 })[t], quota });
+  const checks = []; // the launcher's check-parents calls: allowMissing, and how many commands ran before it
+  const checkParents = async (allowMissing) => {
+    checks.push({ allowMissing, after: calls.length, dirs: fs.existsSync(join(root, "srv/sagebrush/agents")) });
+    if (refuseCheck?.(allowMissing, checks.length)) throw Object.assign(new Error("provision: the fixed parents failed their check (73)"), { code: "effect_failed" });
+  };
+  const p = provisioner({ run, fsx, root, rootUid: 0, tagGid: (t) => ({ [T1]: G1, [T2]: G2 })[t], quota, checkParents });
   const runRaw = run;
   const stat = (path) => { const st = fsx.lstatSync(join(root, path)); return [st.uid, st.gid, st.mode & 0o7777]; };
-  return { root, db, proj, calls, owner, p, stat, fsx, runRaw };
+  return { root, db, proj, calls, owner, p, stat, fsx, runRaw, checks };
 }
 const cmds = (calls, name) => calls.filter((c) => c[0] === name);
 /** Every command that changes the host (getent and lsattr only read). */
@@ -82,6 +87,14 @@ test("its directories: exact owners and modes; tag folders setgid to the tag gro
   assert.deepEqual(s.stat(`/srv/sagebrush/agents/${A}`), [0, 0, 0o755]);
   assert.deepEqual(s.stat(HOME), [UID, UID, 0o700]);
   assert.deepEqual(s.stat(`/srv/sagebrush/agents/${A}/var-tmp`), [UID, UID, 0o700]);
+  // Exactly home, var-tmp and sessions in the agent directory; the config tree beside it, root-owned (L1).
+  assert.deepEqual(s.stat(`/srv/sagebrush/agents/${A}/sessions`), [UID, UID, 0o700]);
+  assert.deepEqual(s.fsx.readdirSync(join(s.root, `/srv/sagebrush/agents/${A}`)).sort(), ["home", "sessions", "var-tmp"]);
+  assert.deepEqual(s.stat("/srv/sagebrush/agent-config"), [0, 0, 0o755]);
+  assert.deepEqual(s.stat(`/srv/sagebrush/agent-config/${A}`), [0, 0, 0o700]);
+  // The archive parents deprovision moves into: root-only.
+  assert.deepEqual(s.stat("/srv/sagebrush/archive"), [0, 0, 0o700]);
+  assert.deepEqual(s.stat("/srv/sagebrush/archive-config"), [0, 0, 0o700]);
   assert.deepEqual(s.stat(`/srv/sagebrush/tags/${T1}`), [0, G1, 0o2770]);
   assert.deepEqual(s.stat(`/srv/sagebrush/tags/${T2}`), [0, G2, 0o2770]);
 });
@@ -92,6 +105,8 @@ test("project quotas: the agent's id on home and var-tmp, each tag's on its fold
   const r = s.root;
   assert.deepEqual(cmds(s.calls, "chattr"), [
     ["chattr", "+P", "-p", String(UID), `${r}${HOME}`], ["chattr", "+P", "-p", String(UID), `${r}/srv/sagebrush/agents/${A}/var-tmp`],
+    ["chattr", "+P", "-p", String(UID), `${r}/srv/sagebrush/agents/${A}/sessions`],
+    ["chattr", "+P", "-p", String(UID), `${r}/srv/sagebrush/agent-config/${A}`], // the config tree is charged to the agent (L1)
     ["chattr", "+P", "-p", String(G1), `${r}/srv/sagebrush/tags/${T1}`], ["chattr", "+P", "-p", String(G2), `${r}/srv/sagebrush/tags/${T2}`],
   ]);
   const sq = cmds(s.calls, "setquota");
@@ -105,6 +120,57 @@ test("project quotas: the agent's id on home and var-tmp, each tag's on its fold
   assert.equal(cmds(n.calls, "setquota").length, 0);
   await s.p.requota(A, UID, grantAgent({ config: { resources: { disk_gb: 9 } } }), () => 1000);
   assert.deepEqual(cmds(s.calls, "setquota").at(-1), ["setquota", "-P", String(UID), "0", String(9 * 1024 * 1024), "0", String(QUOTA_INODES), "/srv"]);
+});
+
+test("the config tree: a crash after mkdir and before its label is finished, then left alone; populated and unlabelled is refused", async () => {
+  const cfg = `/srv/sagebrush/agent-config/${A}`;
+  const s = setup();
+  await s.p.provision(A, UID, grantAgent(), 5000);
+  // A crash right after making it (root:root 0700, as final) and before chattr: the label is missing, the tree empty.
+  s.proj.delete(`${s.root}${cfg}`);
+  const before = cmds(s.calls, "chattr").length;
+  await s.p.provision(A, UID, grantAgent(), 5000);
+  assert.deepEqual(cmds(s.calls, "chattr").slice(before), [["chattr", "+P", "-p", String(UID), `${s.root}${cfg}`]]);
+  await s.p.provision(A, UID, grantAgent(), 5000);
+  assert.equal(cmds(s.calls, "chattr").length, before + 1, "labelled once: nothing redone");
+  // An empty config tree carrying a FOREIGN project (or a lone inherit flag) is refused, never relabelled.
+  for (const label of [{ id: 77777, inherit: true }, { id: 0, inherit: true }, { id: UID + 1, inherit: false }]) {
+    s.proj.set(`${s.root}${cfg}`, label);
+    const n = cmds(s.calls, "chattr").length;
+    await assert.rejects(s.p.provision(A, UID, grantAgent(), 5000), /another project state/, JSON.stringify(label));
+    assert.equal(cmds(s.calls, "chattr").length, n, "nothing relabelled");
+  }
+  s.proj.delete(`${s.root}${cfg}`);
+  await s.p.provision(A, UID, grantAgent(), 5000);
+  // A populated config tree without its label is never relabelled (it wouldn't charge what's already there).
+  s.fsx.writeFileSync(join(s.root, `${cfg}/current`), "gen-1");
+  s.proj.delete(`${s.root}${cfg}`);
+  await assert.rejects(s.p.provision(A, UID, grantAgent(), 5000), /another project state/);
+});
+
+test("the fixed parents are checked by the launcher: tolerant first, strict before any effect beneath them", async () => {
+  const s = setup();
+  await s.p.provision(A, UID, grantAgent(), 5000);
+  assert.deepEqual(s.checks.map((c) => c.allowMissing), [true, false]);
+  // The tolerant check comes before ANY command; the strict one after the fixed parents exist and before any quota or
+  // label below them.
+  assert.equal(s.checks[0].after, 0, "first, before getent/groupadd");
+  assert.equal(s.checks[0].dirs, false);
+  assert.equal(s.checks[1].dirs, true);
+  const firstBelow = s.calls.findIndex((c) => ["setquota", "chattr", "lsattr"].includes(c[0]));
+  assert.ok(s.checks[1].after <= firstBelow, `strict check at ${s.checks[1].after}, first effect below at ${firstBelow}`);
+  // A refusal at the first check (an ACL on an existing parent, a retained writer): nothing at all happens.
+  const a = setup({ refuseCheck: (allow) => allow });
+  await assert.rejects(a.p.provision(A, UID, grantAgent(), 5000), /fixed parents failed/);
+  assert.deepEqual(a.calls, []);
+  assert.equal(a.fsx.existsSync(join(a.root, "/srv/sagebrush")), false);
+  // A refusal at the strict check (a writer swapped a parent after the first): nothing is made beneath the parents.
+  const b = setup({ refuseCheck: (allow) => !allow });
+  await assert.rejects(b.p.provision(A, UID, grantAgent(), 5000), /fixed parents failed/);
+  assert.equal(b.fsx.existsSync(join(b.root, `/srv/sagebrush/agents/${A}`)), false);
+  assert.equal(b.fsx.existsSync(join(b.root, `/srv/sagebrush/agent-config/${A}`)), false);
+  assert.deepEqual(cmds(b.calls, "chattr"), []);
+  assert.deepEqual(cmds(b.calls, "setquota"), []);
 });
 
 test("a redone provision creates nothing and changes nothing", async () => {
@@ -178,7 +244,7 @@ test("bad input or a failing command is host-side", async () => {
   await assert.rejects(setup().p.provision(A, 69999, grantAgent(), 5000), host);
   await assert.rejects(setup().p.provision(A, UID, grantAgent({ agent: T1 }), 5000), host);
   const bad = setup();
-  const p = provisioner({ run: async () => ({ code: 0, stdout: "", stderr: "" }), tagGid: () => 1000 });
+  const p = provisioner({ run: async () => ({ code: 0, stdout: "", stderr: "" }), tagGid: () => 1000, checkParents: async () => {} });
   await assert.rejects(p.provision(A, UID, grantAgent(), 5000), host, "a tag gid outside the tag range");
   void bad;
   for (const m of ["getent passwd", "groupadd", "useradd", "chattr", "setquota"]) {
@@ -186,6 +252,7 @@ test("bad input or a failing command is host-side", async () => {
     await assert.rejects(s.p.provision(A, UID, grantAgent(), 5000), host, m);
   }
   assert.throws(() => provisioner({ run: async () => ({}) }), (e) => e instanceof FleetError && e.code === "bad_form");
+  assert.throws(() => provisioner({ run: async () => ({}), tagGid: () => 1 }), (e) => e instanceof FleetError && e.code === "bad_form", "no launcher check");
 });
 
 test("a pre-existing group with members is refused, never adopted: the private group, and a tag group before its folder exists", async () => {
@@ -299,6 +366,6 @@ test("the tag race: the tag group gets no access to a new tag folder until its p
 
 /** A provision run on the same root and databases with quotas off: what a crash before the first label leaves. */
 async function provisionWithoutQuotas(s) {
-  const p = provisioner({ run: async (argv, o) => (argv[0] === "chattr" || argv[0] === "setquota" ? assert.fail("no quota calls") : s.runRaw(argv, o)), fsx: s.fsx, root: s.root, rootUid: 0, tagGid: (t) => ({ [T1]: G1, [T2]: G2 })[t], quota: null });
+  const p = provisioner({ run: async (argv, o) => (argv[0] === "chattr" || argv[0] === "setquota" ? assert.fail("no quota calls") : s.runRaw(argv, o)), fsx: s.fsx, root: s.root, rootUid: 0, tagGid: (t) => ({ [T1]: G1, [T2]: G2 })[t], quota: null, checkParents: async () => {} });
   await p.provision(A, UID, grantAgent(), 5000);
 }

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { HOST_FREEZE, validateConfig, checkGrantPath, checkLanCidr } from "../lib/fleet/host/config.mjs";
-import { agentUser, tagGroup, agentUnit, agentNetns, agentHome, agentVarTmp, tagDir, brokerDir, fenceFiles } from "../lib/fleet/host/names.mjs";
+import { agentUser, tagGroup, agentUnit, agentNetns, agentHome, agentVarTmp, agentSessions, agentConfigDir, agentArchive, agentConfigArchive, tagDir, brokerDir, fenceFiles } from "../lib/fleet/host/names.mjs";
 
 const refused = (fn, code = "bad_form") => assert.throws(fn, (e) => e instanceof FleetError && e.code === code);
 
@@ -35,11 +35,15 @@ test("names: derived from the id, within Linux's 32-character user and group lim
   assert.equal(agentNetns(a), `sb-${a}`);
   assert.equal(agentHome(a), `/srv/sagebrush/agents/${a}/home`);
   assert.equal(agentVarTmp(a), `/srv/sagebrush/agents/${a}/var-tmp`);
+  assert.equal(agentSessions(a), `/srv/sagebrush/agents/${a}/sessions`);
+  assert.equal(agentConfigDir(a), `/srv/sagebrush/agent-config/${a}`);
+  assert.equal(agentArchive(a), `/srv/sagebrush/archive/${a}`);
+  assert.equal(agentConfigArchive(a), `/srv/sagebrush/archive-config/${a}`);
   assert.equal(tagDir(t), `/srv/sagebrush/tags/${t}`);
   assert.equal(brokerDir(a), `/run/sagebrush/broker/${a}`);
   assert.deepEqual(fenceFiles(a), { all: "/var/lib/sagebrush/fence/all", agent: `/var/lib/sagebrush/fence/${a}`, expiry: "/var/lib/sagebrush/fence/expiry" });
   for (const bad of ["worker-1", a.toUpperCase(), `${a}x`, "../etc", `${a.slice(0, 25)}b`, "", null, 5]) {
-    for (const f of [agentUser, tagGroup, agentUnit, agentNetns, agentHome, tagDir, brokerDir, fenceFiles]) refused(() => f(bad));
+    for (const f of [agentUser, tagGroup, agentUnit, agentNetns, agentHome, agentSessions, agentConfigDir, agentArchive, agentConfigArchive, tagDir, brokerDir, fenceFiles]) refused(() => f(bad));
   }
 });
 

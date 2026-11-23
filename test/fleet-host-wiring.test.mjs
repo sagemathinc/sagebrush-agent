@@ -60,7 +60,14 @@ test("provisioning through the wiring takes each tag's gid from the registry; a 
   const fx = hostEffects({ store: store(), bodyOf, host: HOST, run, fsx, root, rootUid: process.getuid?.() ?? 0 });
   await fx.provision(A, 70007, body.agents[0], 5000);
   assert.deepEqual(calls.find((c) => c[0] === "groupadd"), ["groupadd", "--gid", "80003", `sbt-${T1}`]);
-  const none = hostEffects({ store: store({ registry: { agent: () => ({ uid: 70007 }), tag: () => null } }), bodyOf, host: HOST, run: async () => ({ code: 2, stdout: "", stderr: "" }), root });
+  // The fixed parents are checked by the release's launcher, tolerant first, then strict (A1 r2.2).
+  const checks = calls.filter((c) => c[1] === "check-parents");
+  assert.deepEqual(checks, [
+    [`${HOST.release}/bin/sagebrush-agent-launch`, "check-parents", "--mount", HOST.quota?.mount ?? "/", "--allow-missing"],
+    [`${HOST.release}/bin/sagebrush-agent-launch`, "check-parents", "--mount", HOST.quota?.mount ?? "/"],
+  ]);
+  assert.equal(calls.indexOf(checks[0]), 0);
+  const none = hostEffects({ store: store({ registry: { agent: () => ({ uid: 70007 }), tag: () => null } }), bodyOf, host: HOST, run: async (argv) => ({ code: argv[1] === "check-parents" ? 0 : 2, stdout: "", stderr: "" }), root });
   await assert.rejects(none.provision(A, 70007, body.agents[0], 5000), host);
   fs.rmSync(root, { recursive: true, force: true });
 });

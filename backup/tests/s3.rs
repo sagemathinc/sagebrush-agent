@@ -142,6 +142,26 @@ fn http_body(port: u16, path: &str) -> String {
     buf.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default()
 }
 
+/// A raw object read from the filer (bytes).
+fn http_get_bytes(port: u16, path: &str) -> Vec<u8> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(s, "GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).unwrap();
+    let at = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("an HTTP header") + 4;
+    buf[at..].to_vec()
+}
+
+/// A raw object written through the filer; returns the status code.
+fn http_put(port: u16, path: &str, body: &[u8]) -> u16 {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(s, "PUT {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+    s.write_all(body).unwrap();
+    let mut buf = String::new();
+    let _ = s.read_to_string(&mut buf);
+    buf.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0)
+}
+
 /// A host's backup state: dest.json, the credential handle's file and host.key, all 0600.
 struct Host {
     state: PathBuf,
@@ -437,6 +457,83 @@ fn prune_delays_deletion() {
     let gone: Vec<&String> = before.iter().filter(|p| !after.contains(p)).collect();
     assert!(gone.is_empty(), "packs deleted before keep_delete passed: {gone:?}");
     assert_eq!(run(&h, json!({ "op": "check-data", "part": 1, "of": 1 }))["ok"], true);
+}
+
+/// Two snapshots whose ids share their first 8 hex digits: dump and restore by a full id keep the selected snapshot (an
+/// abbreviated id would be ambiguous). The second id is made by storing snapshot B's object again under A's 8-digit
+/// prefix, so the two prefix-twins hold different trees.
+#[test]
+fn full_ids_survive_a_shared_prefix() {
+    let Some(bin) = weed() else { return };
+    let w = start_weed(&bin);
+    let h = host(&w, "prefix");
+    assert_eq!(run(&h, json!({ "op": "init" }))["ok"], true);
+    let (a, b) = (tmpdir("pa"), tmpdir("pb"));
+    fs::write(a.join("which"), b"snapshot A").unwrap();
+    fs::write(b.join("which"), b"snapshot B").unwrap();
+    let sa = snapshot_id(&run(&h, json!({ "op": "backup", "sources": [a], "host": "h1" })));
+    let sb = snapshot_id(&run(&h, json!({ "op": "backup", "sources": [b], "host": "h1" })));
+    // B's object under a name that shares A's first 8 hex digits
+    let twin = format!("{}{}", &sa[..8], if &sb[8..] == &sa[8..] { "0".repeat(56) } else { sb[8..].to_string() });
+    assert_ne!(twin, sa);
+    let body = http_get_bytes(w.filer, &format!("/buckets/qual/{}/snapshots/{sb}", h.prefix));
+    assert!(!body.is_empty());
+    let put = http_put(w.filer, &format!("/buckets/qual/{}/snapshots/{twin}", h.prefix), &body);
+    assert!((200..300).contains(&put), "stored the prefix twin: http {put}");
+    let listed = run(&h, json!({ "op": "snapshots" }));
+    let ids: Vec<&str> = listed["snapshots"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert_eq!(ids.iter().filter(|i| i.starts_with(&sa[..8])).count(), 2, "two ids share the prefix: {ids:?}");
+    let path_a = format!("{}/which", a.to_str().unwrap().trim_start_matches('/'));
+    let d = run(&h, json!({ "op": "dump", "snapshot": sa, "path": path_a }));
+    assert_eq!(d["text"], "snapshot A", "dump keeps A: {d}");
+    let dst = tmpdir("prefix-dst");
+    let r = run(&h, json!({ "op": "restore", "snapshot": sa, "dest": dst }));
+    assert_eq!(r["ok"], true, "restore of A by its full id: {r}");
+    assert_eq!(fs::read(walk_find(&dst, "which").unwrap()).unwrap(), b"snapshot A", "restore keeps A");
+    // and the twin, by its own full id, is B's tree
+    let path_b = format!("{}/which", b.to_str().unwrap().trim_start_matches('/'));
+    let dt = run(&h, json!({ "op": "dump", "snapshot": twin, "path": path_b }));
+    assert_eq!(dt["text"], "snapshot B", "dump of the twin keeps B: {dt}");
+}
+
+/// A restore never creates a FIFO or a socket (or a device node: the same filter), and never writes an extended
+/// attribute: the snapshot records them, the restore skips and counts the special files, and the regular file comes
+/// back with its bytes and without the attribute.
+#[test]
+fn restore_skips_specials_and_attributes() {
+    let Some(bin) = weed() else { return };
+    let w = start_weed(&bin);
+    let h = host(&w, "special");
+    assert_eq!(run(&h, json!({ "op": "init" }))["ok"], true);
+    let src = tmpdir("special-src");
+    fs::write(src.join("plain"), b"plain bytes").unwrap();
+    let fifo = std::ffi::CString::new(src.join("pipe").to_str().unwrap()).unwrap();
+    // SAFETY: mkfifo with a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0, "mkfifo");
+    let _sock = std::os::unix::net::UnixListener::bind(src.join("sock")).unwrap();
+    let path = std::ffi::CString::new(src.join("plain").to_str().unwrap()).unwrap();
+    let (name, value) = (std::ffi::CString::new("user.sb-test").unwrap(), b"v");
+    // SAFETY: setxattr with valid NUL-terminated strings and a live buffer.
+    let set = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+    if set != 0 {
+        eprintln!("note: this filesystem refuses user xattrs; the attribute half of this row runs where they work");
+    }
+    let b = run(&h, json!({ "op": "backup", "sources": [src], "host": "h1" }));
+    assert_eq!(b["ok"], true, "{b}");
+    let dst = tmpdir("special-dst");
+    let r = run(&h, json!({ "op": "restore", "snapshot": snapshot_id(&b), "dest": dst }));
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["skipped_special"], 2, "the FIFO and the socket: {r}");
+    assert!(walk_find(&dst, "pipe").is_none() && walk_find(&dst, "sock").is_none(), "no special file restored");
+    let plain = walk_find(&dst, "plain").expect("the regular file is restored");
+    assert_eq!(fs::read(&plain).unwrap(), b"plain bytes");
+    if set == 0 {
+        let p = std::ffi::CString::new(plain.to_str().unwrap()).unwrap();
+        let mut buf = [0u8; 256];
+        // SAFETY: listxattr into a live buffer of the given length.
+        let n = unsafe { libc::listxattr(p.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(n, 0, "no extended attribute restored: {:?}", String::from_utf8_lossy(&buf[..n.max(0) as usize]));
+    }
 }
 
 /// A restore that still holds CAP_SYS_RESOURCE is refused before anything is read or written (host backup design r3.3 §5.7). Where

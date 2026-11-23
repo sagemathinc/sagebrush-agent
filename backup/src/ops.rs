@@ -10,7 +10,7 @@ use std::{
 };
 
 use rustic_core::{
-    repofile::SnapshotFile, BackupOptions, CheckOptions, ConfigOptions, Credentials, Excludes, FileType, KeyOptions,
+    repofile::{Node, NodeType, SnapshotFile}, BackupOptions, CheckOptions, ConfigOptions, Credentials, Excludes, FileType, KeyOptions,
     LocalDestination, LocalSourceFilterOptions, LsOptions, OpenStatus, ParentOptions, PathList, PruneOptions,
     ReadSubsetOption, Repository, RepositoryBackends, RepositoryOptions, RestoreOptions, SnapshotOptions,
     SparseRestore,
@@ -292,9 +292,9 @@ fn dump(ctx: &Ctx, snapshot: &str, path: &str) -> Result<Value> {
     let repo = ctx.open(false)?;
     let snap = one_snapshot(&repo, snapshot)?;
     let repo = repo.to_indexed().map_err(lib("index_failed"))?;
-    let node = repo
-        .node_from_snapshot_path(&format!("{}:{}", snap.id, path), |_| true)
-        .map_err(lib("dump_failed"))?;
+    // The node is found from the snapshot already resolved by its full id, never by re-parsing an id string (an
+    // abbreviated id would be ambiguous once two snapshots share its prefix).
+    let node = repo.node_from_snapshot_and_path(&snap, path).map_err(lib("dump_failed"))?;
     if !node.is_file() {
         return Err(Fail::new("dump_failed", "not a regular file"));
     }
@@ -310,6 +310,10 @@ fn dump(ctx: &Ctx, snapshot: &str, path: &str) -> Result<Value> {
 /// Restore into an existing, empty staging directory (host backup design r3.3 §5.7-§5.8): refused unless CAP_SYS_RESOURCE is gone
 /// from all five sets, under no_new_privs, so the agent's project quota is enforced by the kernel. Sparse files are
 /// restored sparse or not at all; numeric ids; nothing in the destination is deleted.
+///
+/// Device nodes, FIFOs and sockets are never created, and no extended attribute is ever written (ACLs and file
+/// capabilities are extended attributes): the node stream is filtered before the library sees it, and the result
+/// counts what was skipped. The fill re-checks both before anything reaches an agent's tree.
 fn restore(ctx: &Ctx, snapshot: &str, path: Option<&str>, dest: &Path) -> Result<Value> {
     caps::require_no_sys_resource()?;
     if !dest.is_absolute() {
@@ -325,10 +329,24 @@ fn restore(ctx: &Ctx, snapshot: &str, path: Option<&str>, dest: &Path) -> Result
     let repo = ctx.open(false)?;
     let snap = one_snapshot(&repo, snapshot)?;
     let repo = repo.to_indexed().map_err(lib("index_failed"))?;
-    let node = repo
-        .node_from_snapshot_path(&format!("{}:{}", snap.id, path.unwrap_or("")), |_| true)
-        .map_err(lib("restore_failed"))?;
-    let ls = repo.ls(&node, &LsOptions::default()).map_err(lib("restore_failed"))?;
+    let node = repo.node_from_snapshot_and_path(&snap, path.unwrap_or("")).map_err(lib("restore_failed"))?;
+    let special = |n: &Node| matches!(n.node_type, NodeType::Dev { .. } | NodeType::Chardev { .. } | NodeType::Fifo | NodeType::Socket);
+    let ls = repo
+        .ls(&node, &LsOptions::default())
+        .map_err(lib("restore_failed"))?
+        .filter(move |r| !matches!(r, Ok((_, n)) if special(n)))
+        .map(|r| {
+            r.map(|(path, mut n)| {
+                n.meta.extended_attributes.clear();
+                (path, n)
+            })
+        });
+    let mut skipped = 0u64;
+    for r in repo.ls(&node, &LsOptions::default()).map_err(lib("restore_failed"))? {
+        if matches!(r, Ok((_, ref n)) if special(n)) {
+            skipped += 1;
+        }
+    }
     let dest_str = dest.to_str().ok_or_else(|| Fail::new("request_invalid", "dest must be UTF-8"))?;
     let dest = LocalDestination::new(&format!("{dest_str}/"), false, !node.is_dir()).map_err(lib("restore_failed"))?;
     let mut opts = RestoreOptions::default();
@@ -336,7 +354,7 @@ fn restore(ctx: &Ctx, snapshot: &str, path: Option<&str>, dest: &Path) -> Result
     opts.sparse = Some(SparseRestore::ByContentRequired);
     let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false).map_err(lib("restore_failed"))?;
     repo.restore(plan, &opts, ls, &dest).map_err(lib("restore_failed"))?;
-    Ok(json!({ "snapshot": full(*snap.id) }))
+    Ok(json!({ "snapshot": full(*snap.id), "skipped_special": skipped }))
 }
 
 fn forget(ctx: &Ctx, ids: &[String]) -> Result<Value> {

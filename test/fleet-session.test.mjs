@@ -540,3 +540,34 @@ test("a command given up at its own 30 s leaves tracking then: an idle takeover 
   assert.equal(s2.inflight, 0);
   assert.equal(c2.find("Runtime.terminateExecution").length, 0);
 });
+
+test("createTarget waiting for an attach that never comes: a takeover's abandon (or retirement) removes its waiter too, every time", async () => {
+  const { cdp, session, clock } = await setup();
+  for (let i = 0; i < 5; i++) {
+    let outcome = "pending";
+    session.command({ method: "Target.createTarget", params: { url: "about:blank" } }).then((r) => { outcome = r; });
+    await settle();
+    cdp.last("Target.createTarget").ok({ targetId: `REAL-NOATTACH${i}` }); // (answered at once; the page never attaches)
+    await settle();
+    assert.equal(session.waitingTargets, 1, String(i));
+    const t = session.takeover();
+    await clock.advance(DRAIN.waitMs);
+    await clock.advance(DRAIN.terminateMs);
+    assert.deepEqual(await t, { paused: true }, String(i));
+    assert.deepEqual(outcome, { unknown: true }, String(i));
+    assert.equal(session.inflight, 0, String(i));
+    assert.equal(session.waitingTargets, 0, String(i));
+    session.handback();
+  }
+  await clock.advance(60000);
+  assert.equal(session.waitingTargets, 0);
+  const r = await setup(); // (retirement: the same)
+  r.session.command({ method: "Target.createTarget", params: { url: "about:blank" } });
+  await settle();
+  r.cdp.last("Target.createTarget").ok({ targetId: "REAL-NOATTACH" });
+  await settle();
+  assert.equal(r.session.waitingTargets, 1);
+  r.cdp.die("crash");
+  await settle();
+  assert.equal(r.session.waitingTargets, 0);
+});

@@ -1069,7 +1069,9 @@ test("pendingProof raised DURING an application (a preempting revoke-caps) block
   // The continued application can't finish: A's proof is pending.
   const r = await sup.submit({ kind: "grant", bytes: g2 });
   assert.equal(r.status, "refused");
-  assert.equal(r.previous.step, `prove:${A}`);
+  // Refused at the first widening step for A after the proof became pending (here the map publish), else at finish.
+  assert.ok(["map", `prove:${A}`].includes(r.previous.step), r.previous.step);
+  assert.equal(r.previous.reason, "not_empty");
   assert.equal(s.store.grants.pending().phase, "applying");
   assert.deepEqual(fx.acks.map((x) => x[0]), [1]);
   stuck = false;
@@ -1209,5 +1211,179 @@ test("SEC r7: recovery proves EVERY pending agent first, also one the current gr
   s = await setup({ fx, root, fenceDir });
   await s.sup.recover();
   assert.deepEqual(s.store.grants.pendingProofs(), [], "A too, though grant 2 doesn't list it");
+  await s.close();
+});
+
+// ---- eighth review round: ONE widening gate; nothing widens a pending agent before a passing proof
+
+/** Grant 1 applied with A running; then a failed stop leaves A pending (count stuck). Returns helpers. */
+async function pendingA({ via = "stop", fx = fakeFx() } = {}) {
+  const root = tmp("state"), fenceDir = tmp("fence");
+  const s = await setup({ fx, root, fenceDir });
+  await s.sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  const stuck = { on: true };
+  const sysStop = fx.sys.stop, sysCount = fx.sys.procCount;
+  fx.sys.stop = (u) => { if (stuck.on) throw new Error("EIO"); return sysStop(u); };
+  fx.sys.procCount = (u) => (stuck.on ? 1 : sysCount(u));
+  if (via === "stop") await s.sup.submit({ kind: "stop", authority: "service", agent: A });
+  if (via === "stop-all") await s.sup.submit({ kind: "stop-all", authority: "local" });
+  if (via === "pause") {
+    fx.freeze = async (id) => { fx.u(id).frozen = true; throw Object.assign(new Error("EIO"), { code: "EIO" }); }; // takes effect, then throws
+    await s.sup.submit({ kind: "pause", authority: "service", agent: A });
+  }
+  assert.deepEqual(s.store.grants.pendingProofs(), [A]);
+  const snapshot = () => ({
+    fences: ["all", A, "expiry"].filter((n) => existsSync(join(fenceDir, n))),
+    state: s.store.registry.agent(A).state,
+    widened: fx.log.filter((l) => ["unit", "daemon-reload", "unmask", "start", "thaw", "map", "provision"].includes(l[0])).length,
+    active: fx.u(A).active, frozen: fx.u(A).frozen, masked: fx.u(A).masked,
+  });
+  return { ...s, fx, root, fenceDir, stuck, snapshot };
+}
+
+test("SEC r8 (astra4b): a pending, paused, frozen agent: a person's resume is refused before any fence, state or thaw", async () => {
+  const p = await pendingA({ via: "pause" });
+  assert.equal(p.store.registry.agent(A).state, "paused");
+  const before = p.snapshot();
+  const r = await p.sup.submit({ kind: "resume", authority: "person", agent: A });
+  assert.deepEqual([r.status, r.reason, r.started], ["refused", "pending_proof", false]);
+  assert.deepEqual(p.snapshot(), before, "nothing changed: no fence lowered, no state change, no thaw");
+  // At a real 0 the same resume proves it first, then goes on.
+  p.stuck.on = false;
+  const r2 = await p.sup.submit({ kind: "resume", authority: "person", agent: A });
+  assert.equal(r2.status, "resumed");
+  assert.deepEqual(p.store.grants.pendingProofs(), []);
+  await p.close();
+});
+
+test("SEC r8: a stopped pending agent: resume is refused with no fence lowering, state change or unit write before the proof", async () => {
+  const p = await pendingA({ via: "stop" });
+  assert.equal(p.store.registry.agent(A).state, "stopped");
+  assert.ok(p.snapshot().fences.includes(A));
+  const before = p.snapshot();
+  const r = await p.sup.submit({ kind: "resume", authority: "person", agent: A });
+  assert.deepEqual([r.status, r.reason], ["refused", "pending_proof"]);
+  assert.deepEqual(p.snapshot(), before);
+  await p.close();
+});
+
+test("SEC r8: every widening effect, called for a pending agent, is refused with nothing changed", async () => {
+  // Ops: resume, resume-all, revoke-caps' restart, and a grant whose plan widens A, plus recovery.
+  const p = await pendingA({ via: "stop-all" });
+  const before = p.snapshot();
+  const ops = [
+    ["resume", () => p.sup.submit({ kind: "resume", authority: "person", agent: A })],
+    ["resume-all", () => p.sup.submit({ kind: "resume-all", authority: "person" })],
+    ["revoke-caps", () => p.sup.submit({ kind: "revoke-caps", authority: "service", agent: A })],
+    ["a grant widening A", () => p.sup.submit({ kind: "grant", bytes: grant(2, [entry(A, { x: 2 })]) })],
+    ["recovery", () => p.sup.recover()],
+  ];
+  for (const [name, op] of ops) {
+    try { await op(); } catch (e) { assert.ok(e instanceof FleetError, `${name}: ${e?.message}`); } // a refusal either way
+    const now = p.snapshot();
+    // Nothing widened: no fence lowered (a failed proof may RAISE the agent's own fence: that only narrows), no
+    // widening effect, the agent not started.
+    for (const f of before.fences) assert.ok(now.fences.includes(f), `${name}: fence ${f} still up`);
+    assert.deepEqual([now.widened, now.active === true && !before.active], [before.widened, false], name);
+    assert.ok(!["running"].includes(now.state) || before.state === "running", `${name}: no registry move toward running`);
+  }
+  assert.deepEqual(p.fx.acks.map((x) => x[0]), [1], "no acknowledgement");
+  // The plan steps' own gates: each widening step of a plan refuses a pending agent before its effect.
+  await p.close();
+});
+
+for (const step of ["unit", "start", "map"]) {
+  test(`SEC r8: a plan's ${step} step refuses an agent that became pending mid-application, before its effect`, async () => {
+    const fx = fakeFx();
+    let sup, store, armed = false;
+    const at = { unit: "after_broker_gen", start: "after_daemon_reload", map: "after_start" }[step];
+    let stuck = false;
+    const sysStop = fx.sys.stop, sysCount = fx.sys.procCount;
+    fx.sys.stop = (u) => { if (stuck) throw new Error("EIO"); return sysStop(u); };
+    fx.sys.procCount = (u) => (stuck ? 1 : sysCount(u));
+    const s = await setup({ fx, barrier: async (n) => { if (armed && n === at) { armed = false; stuck = true; store.grants.markProof(A); } } });
+    sup = s.sup; store = s.store;
+    await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+    armed = true;
+    fx.log.length = 0;
+    const r = await sup.submit({ kind: "grant", bytes: grant(2, [entry(A, { x: 2 })]) });
+    assert.equal(r.status, "failed");
+    const effect = { unit: "unit", start: "start", map: "map" }[step];
+    assert.ok(!fx.log.some((l) => l[0] === effect && (l[1] === A || effect === "map")), `no ${effect} for the pending agent`);
+    assert.deepEqual(fx.acks.map((x) => x[0]), [1]);
+    // Liveness: once the count is really 0, the redo proves A at that same step and finishes.
+    stuck = false;
+    const r2 = await sup.submit({ kind: "grant", bytes: grant(2, [entry(A, { x: 2 })]) });
+    assert.ok(["applied", "reapplied"].includes(r2.status), r2.status);
+    assert.deepEqual(store.grants.pendingProofs(), []);
+    await s.close();
+  });
+}
+
+test("SEC r8: lowering the expiry fence is a gated step (unexpire): refused while any proof is pending", async () => {
+  const p = await pendingA({ via: "stop" });
+  await p.sup.submit({ kind: "expiry", authority: "host" });
+  assert.ok(existsSync(join(p.fenceDir, "expiry")));
+  const r = await p.sup.submit({ kind: "grant", bytes: grant(2, [entry(A)]) });
+  assert.equal(r.status, "failed");
+  assert.ok(existsSync(join(p.fenceDir, "expiry")), "the expiry fence stays up");
+  p.stuck.on = false;
+  const r2 = await p.sup.submit({ kind: "grant", bytes: grant(2, [entry(A)]) });
+  assert.ok(["applied", "reapplied"].includes(r2.status), r2.status);
+  assert.ok(!existsSync(join(p.fenceDir, "expiry")), "lowered once proven");
+  await p.close();
+});
+
+test("SEC r8: revoke-caps for a pending agent proves it first: refused while stuck, restarts once the count is really 0", async () => {
+  const p = await pendingA({ via: "stop-all" });
+  await p.sup.submit({ kind: "resume-all", authority: "person" }).catch(() => {});
+  p.fx.log.length = 0;
+  const r = await p.sup.submit({ kind: "revoke-caps", authority: "service", agent: A });
+  assert.equal(r.status, "failed");
+  assert.ok(!p.fx.log.some((l) => ["unit", "unmask", "start"].includes(l[0]) && l[1] === A));
+  await p.close();
+  // At a real 0, with A pending, running and unfenced (a stop-all that couldn't write its fence): revoke-caps itself
+  // proves A, then regenerates and restarts it.
+  const fx = fakeFx();
+  const root = tmp("state"), fenceDir = tmp("fence");
+  const q = await setup({ fx, root, fenceDir });
+  await q.sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  let stuck = true;
+  const sysStop = fx.sys.stop, sysCount = fx.sys.procCount;
+  fx.sys.stop = (u) => { if (stuck) throw new Error("EIO"); return sysStop(u); };
+  fx.sys.procCount = (u) => (stuck ? 1 : sysCount(u));
+  chmodSync(fenceDir, 0o500);
+  await q.sup.submit({ kind: "stop-all", authority: "local" });
+  chmodSync(fenceDir, 0o700);
+  assert.deepEqual([q.store.grants.pendingProofs(), q.store.registry.agent(A).state], [[A], "running"]);
+  stuck = false;
+  fx.log.length = 0;
+  const r2 = await q.sup.submit({ kind: "revoke-caps", authority: "service", agent: A });
+  assert.deepEqual([r2.status, r2.started], ["revoked-caps", true]);
+  assert.deepEqual(q.store.grants.pendingProofs(), []);
+  await q.close();
+});
+
+test("SEC r8: an emergency between the proofs and unexpire: the unexpire step's gate keeps the expiry fence up", async () => {
+  const fx = fakeFx();
+  let sup, store, armed = false, stuck = false;
+  const sysStop = fx.sys.stop, sysCount = fx.sys.procCount;
+  fx.sys.stop = (u) => { if (stuck) throw new Error("EIO"); return sysStop(u); };
+  fx.sys.procCount = (u) => (stuck ? 1 : sysCount(u));
+  const s = await setup({ fx, barrier: async (n) => {
+    if (armed && n === "after_contain") { armed = false; stuck = true; sup.submit({ kind: "stop-all", authority: "local" }); }
+  } });
+  sup = s.sup; store = s.store;
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  // A pending proof, then expiry: grant 2's plan is prove:A, unexpire, …
+  stuck = true;
+  await sup.submit({ kind: "stop", authority: "service", agent: A });
+  await sup.submit({ kind: "expiry", authority: "host" });
+  stuck = false;
+  armed = true; // during prove:A (it passes), a failing stop-all arrives and marks A pending again
+  await sup.submit({ kind: "grant", bytes: grant(2, [entry(A)]) });
+  await sup.submit({ kind: "grant", bytes: grant(2, [entry(A)]) }).catch(() => {});
+  assert.ok(store.grants.pendingProofs().includes(A));
+  assert.ok(existsSync(join(s.fenceDir, "expiry")), "expiry not lowered while a proof is pending");
   await s.close();
 });

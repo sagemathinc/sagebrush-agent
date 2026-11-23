@@ -163,6 +163,23 @@ test("highwater only increases: astra2's sequence (gen 2 intent held, gen 3 begu
   await s.close();
 });
 
+test("supersede: a held applying(N) is replaced by N+1 only when asked; the generation rule still holds", async () => {
+  const dir = fresh();
+  const s = await GrantState.open(dir);
+  const g1 = g(1), g2 = g(2), g3 = g(3);
+  await s.begin(1, g1.bytes, g1.digest, ["broker-gen", "map"], okIntent());
+  await rejects(s.begin(2, g2.bytes, g2.digest, ["map"], okIntent()), "in_progress");
+  await rejects(s.begin(1, g1.bytes, g1.digest, ["map"], okIntent(), { supersede: true }), "bad_form"); // a re-apply has no effects
+  await s.begin(2, g2.bytes, g2.digest, ["map"], okIntent(), { supersede: true });
+  assert.deepEqual(s.pending(), { phase: "applying", gen: 2, remaining: [0] });
+  assert.deepEqual(s.steps(), ["map"]);
+  await rejects(s.begin(2, g3.bytes, g3.digest, ["map"], okIntent(), { supersede: true }), "stale_generation");
+  s.done(0); s.finish({ narrowed: false, restarted: [] });
+  await s.begin(3, g3.bytes, g3.digest, ["map"], okIntent(), { supersede: true }); // nothing to supersede: an ordinary begin
+  assert.equal(s.highwater.gen, 3);
+  await s.close();
+});
+
 test("a new generation can't begin while another is applying", async () => {
   const s = await GrantState.open(fresh());
   const g1 = g(1), g2 = g(2);

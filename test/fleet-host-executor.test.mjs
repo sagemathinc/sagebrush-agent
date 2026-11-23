@@ -44,12 +44,14 @@ function fakeFx(over = {}) {
     provision: async (id, uid) => { log.push(["provision", id, uid]); },
     writeUnit: async (id, uid, ga) => { log.push(["unit", id]); u(id).unit = JSON.stringify(ga.config); },
     daemonReload: async () => { log.push(["daemon-reload"]); },
-    start: async (id) => { log.push(["start", id]); if (u(id).masked) throw new Error("masked"); u(id).active = true; },
+    // Like systemctl start: a masked unit refuses; a fenced one is skipped by its ConditionPathExists.
+    start: async (id) => { log.push(["start", id]); if (u(id).masked) throw new Error("masked"); if (!fx.fenced(id)) u(id).active = true; },
+    fenced: (id) => fx.fenceDir !== undefined && ["all", id, "expiry"].some((n) => existsSync(join(fx.fenceDir, n))),
     isActive: async (id) => u(id).active,
     publishMap: async (g, map) => { log.push(["map", g, map.map((m) => m.agent)]); },
     sendAck: async (g, ack) => { acks.push([g, ack]); },
     freeze: async (id) => { log.push(["freeze", id]); u(id).frozen = true; },
-    thaw: async (id) => { if (!u(id).frozen) throw new Error("not frozen"); log.push(["thaw", id]); u(id).frozen = false; },
+    thaw: async (id) => { if (!u(id).frozen || !u(id).active) throw new Error("not frozen"); log.push(["thaw", id]); u(id).frozen = false; },
     sys: {
       stop: (unit) => { log.push(["sys-stop", unit]); for (const [id, s] of Object.entries(units)) if (unit === "sagebrush-agents.slice" || idOf(unit) === id) s.active = false; },
       jobs: () => [], cancel: () => {}, rootUnits: () => [],
@@ -62,6 +64,7 @@ function fakeFx(over = {}) {
 
 async function setup({ fx = fakeFx(), root = tmp("state"), fenceDir = tmp("fence"), deadlines = {}, barrier } = {}) {
   const store = await HostStore.open(root);
+  fx.fenceDir = fenceDir;
   const sup = new Supervisor({ store, fx, verify, bodyOf, fenceDir, deadlines, barrier });
   return { sup, store, fx, root, fenceDir, close: () => store.close() };
 }
@@ -187,6 +190,7 @@ for (const [code, phase] of [["preflight_missing", "refused"], ["landlock_abi", 
     assert.equal(r.status, "applied");
     assert.deepEqual(r.ack, { narrowed: false, restarted: [B] });
     assert.equal(store.registry.agent(A).start_failed, code);
+    assert.equal(store.registry.agent(A).state, "stopped", "a failed start leaves the agent stopped");
     assert.deepEqual([fx.units[A].active, fx.units[A].masked], [false, true]);
     const rec = fx.audits.find((a) => a.kind === "agent.start" && a.agent === A);
     assert.equal(rec.phase, phase);
@@ -195,27 +199,36 @@ for (const [code, phase] of [["preflight_missing", "refused"], ["landlock_abi", 
   });
 }
 
-test("a start past its deadline is start_timeout (agent-side); recovery never retries it; the next grant clears and retries it", async () => {
+/** An effect that stays pending until its signal aborts, then rejects: it settles at the deadline. */
+const untilAborted = (signal) => new Promise((_, rej) => signal.addEventListener("abort", () => rej(new Error("aborted")), { once: true }));
+
+test("a start past its deadline that settles is start_timeout (agent-side): stopped, contained, no fence; a resume retries it", async () => {
   const fx = fakeFx();
   let hang = true;
-  fx.start = async (id) => { if (id === A && hang) await new Promise(() => {}); fx.u(id).active = true; };
+  fx.start = async (id, ms, signal) => { if (id === A && hang) await untilAborted(signal); fx.u(id).active = true; };
   const root = tmp("state"), fenceDir = tmp("fence");
   let s = await setup({ fx, root, fenceDir, deadlines: { start: 100 } });
   const r = await s.sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
   assert.equal(r.status, "applied");
-  assert.equal(s.store.registry.agent(A).start_failed, "start_timeout");
+  assert.deepEqual(r.ack.restarted, [B]);
+  const a = s.store.registry.agent(A);
+  assert.deepEqual([a.start_failed, a.state, a.life], ["start_timeout", "stopped", 0], "stopped, no lifecycle op counted");
+  assert.deepEqual([fx.units[A].active, fx.units[A].masked, existsSync(join(fenceDir, A))], [false, true, false]);
+  assert.equal(s.sup.unsettled, 0);
   await s.close();
   // Recovery: B starts again, A does not.
   for (const u of Object.values(fx.units)) u.active = false;
   s = await setup({ fx, root, fenceDir });
-  const rec = await s.sup.recover();
-  assert.deepEqual(rec.started, [B]);
+  assert.deepEqual((await s.sup.recover()).started, [B]);
   assert.equal(fx.units[A].active, false);
-  // The next grant (A itself unchanged) clears the failure and retries it.
+  // The next grant clears start_failed but doesn't start a stopped agent; a person's resume does.
   hang = false;
   const r2 = await s.sup.submit({ kind: "grant", bytes: grant(2, [entry(A), entry(B)]) });
-  assert.ok(r2.ack.restarted.includes(A));
+  assert.ok(!r2.ack.restarted.includes(A));
   assert.equal(s.store.registry.agent(A).start_failed, null);
+  const r3 = await s.sup.submit({ kind: "resume", authority: "person", agent: A });
+  assert.equal(r3.started, true);
+  assert.equal(fx.units[A].active, true);
   await s.close();
 });
 
@@ -379,7 +392,8 @@ test("revoke-caps (§7): op counted, broker revokes, narrowing restart; state un
   fx.log.length = 0;
   const r = await sup.submit({ kind: "revoke-caps", authority: "service", agent: A });
   assert.deepEqual(r, { status: "revoked-caps", started: true });
-  assert.deepEqual(kinds(fx.log).filter((k) => k !== "intent"), ["broker-revoke", "stop", "mask", "unit", "daemon-reload", "unmask", "start"]);
+  // The old unit is gone (masked, drained, proven empty) BEFORE the broker revokes; then regenerate and start.
+  assert.deepEqual(kinds(fx.log).filter((k) => k !== "intent"), ["mask", "sys-stop", "broker-revoke", "unit", "daemon-reload", "unmask", "start"]);
   assert.deepEqual([store.registry.agent(A).state, store.registry.agent(A).life], ["running", 1]);
   assert.ok(!existsSync(join(fenceDir, A)));
   await rejects(sup.submit({ kind: "revoke", authority: "person", agent: A }), "not_granted");
@@ -542,4 +556,200 @@ test("an agent deleted while an application is unfinished only gets stopped and 
   assert.equal(store.registry.agent(A).state, "deleted");
   assert.equal(fx.units[A].active, false);
   await close();
+});
+
+// ---- the review holds: abandoned effects, pause and revoke-caps failures, recovery from applying, expiry holds
+
+/** An effect that ignores its signal and completes `late` ms after its deadline, running `then` when it does. */
+const lateBy = (late, then) => new Promise((res) => setTimeout(() => { then?.(); res(); }, late));
+
+test("SEC H1 / TESTS T1: a start that completes after its deadline can't start the unit; it is fenced; inputs wait for it", async () => {
+  const fx = fakeFx();
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const unmask = fx.unmask;
+  fx.unmask = async (id, ...rest) => { if (id === A) await gate; return unmask(id, ...rest); }; // ignores the abort
+  const { sup, store, fenceDir, close } = await setup({ fx, deadlines: { start: 50, grace: 50 } });
+  const r = await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  assert.deepEqual([r.status, r.step, r.settled], ["failed", `start:${A}`, false]);
+  assert.ok(existsSync(join(fenceDir, A)), "an unsettled start fences its agent");
+  assert.deepEqual([store.registry.agent(A).state, fx.units[A].masked, fx.units[A].active], ["stopped", true, false]);
+  assert.ok(fx.audits.some((x) => x.kind === "agent.start" && x.phase === "unknown_effect" && !("reason" in x)));
+  // While it is pending: normal inputs are refused; an emergency still runs.
+  assert.equal(sup.unsettled, 1);
+  assert.deepEqual((await sup.submit({ kind: "grant", bytes: grant(2, [entry(A)]) })).reason, "in_progress");
+  assert.equal((await sup.submit({ kind: "stop-all", authority: "local" })).status, "stopped and fenced");
+  // It completes late (its unmask lands): the closure sees its abort and never calls start, and the agent is
+  // contained again (masked, drained) before any normal input runs.
+  release();
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(sup.unsettled, 0);
+  for (let i = 0; i < 50 && !fx.units[A].masked; i++) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(fx.units[A].masked, true, "contained again after the late unmask");
+  assert.equal(fx.units[A].active, false);
+  assert.ok(!fx.log.some((l) => l[0] === "start"), "no start after the deadline");
+  await close();
+});
+
+test("SEC H1: a unit write that completes late can't leave its stale unit to be started: resume regenerates it", async () => {
+  const fx = fakeFx();
+  const { sup, fenceDir, close } = await setup({ fx, deadlines: { unit: 50, grace: 50 } });
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  const write = fx.writeUnit;
+  fx.writeUnit = async (id, uid, ga, ...rest) => { await lateBy(150); return write(id, uid, ga, ...rest); }; // ignores the abort
+  const r = await sup.submit({ kind: "grant", bytes: grant(2, [entry(A, { x: 2 })]) });
+  assert.deepEqual([r.status, r.step, r.settled], ["failed", `unit:${A}`, false]);
+  assert.ok(existsSync(join(fenceDir, A)));
+  await new Promise((res) => setTimeout(res, 200)); // the late write lands: { x: 2 } from the abandoned attempt
+  fx.writeUnit = write;
+  fx.units[A].unit = JSON.stringify({ x: "stale" });
+  assert.equal((await sup.submit({ kind: "grant", bytes: grant(3, [entry(A, { x: 3 })]) })).status, "applied");
+  assert.equal(fx.units[A].active, false, "fenced: the grant doesn't start it");
+  fx.units[A].unit = JSON.stringify({ x: "left behind" }); // whatever an abandoned effect left on disk
+  const rr = await sup.submit({ kind: "resume", authority: "person", agent: A });
+  assert.equal(rr.started, true);
+  assert.equal(fx.units[A].unit, JSON.stringify({ x: 3 }), "started from a unit regenerated from the current grant");
+  await close();
+});
+
+for (const [how, freeze] of [
+  ["throws", async () => { throw Object.assign(new Error("EIO"), { code: "EIO" }); }],
+  ["times out", async (id, ms, signal) => untilAborted(signal)],
+  ["completes late", async (id) => lateBy(150)],
+]) {
+  test(`SEC H2: a freeze that ${how} leaves the agent fenced, stopped and masked (state paused), never running`, async () => {
+    const fx = fakeFx();
+    const { sup, store, fenceDir, close } = await setup({ fx, deadlines: { freeze: 50, grace: 50 } });
+    await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+    fx.freeze = freeze;
+    const r = await sup.submit({ kind: "pause", authority: "service", agent: A });
+    assert.deepEqual([r.status, r.fenced, r.proven], ["failed", true, true]);
+    assert.deepEqual([store.registry.agent(A).state, fx.units[A].active, fx.units[A].masked], ["paused", false, true]);
+    assert.ok(existsSync(join(fenceDir, A)));
+    await new Promise((res) => setTimeout(res, 200));
+    assert.equal(fx.units[A].active, false);
+    const rr = await sup.submit({ kind: "resume", authority: "person", agent: A });
+    assert.deepEqual([rr.started, rr.thawed ?? false], [true, false], "not frozen: regenerated and started");
+    await close();
+  });
+}
+
+for (const [how, revoke] of [
+  ["throws", async () => { throw Object.assign(new Error("EIO"), { code: "EIO" }); }],
+  ["times out", async (id, ms, signal) => untilAborted(signal)],
+  ["completes late", async (id) => lateBy(150)],
+]) {
+  test(`SEC H3: a broker revocation that ${how} leaves the old unit stopped (first) and the agent fenced; nothing revives it`, async () => {
+    const fx = fakeFx();
+    const { sup, store, fenceDir, close } = await setup({ fx, deadlines: { "broker-gen": 50, grace: 50 } });
+    await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+    fx.brokerRevoke = revoke;
+    fx.log.length = 0;
+    const r = await sup.submit({ kind: "revoke-caps", authority: "service", agent: A });
+    assert.deepEqual([r.status, r.fenced], ["failed", true]);
+    assert.ok(kinds(fx.log).indexOf("sys-stop") >= 0, "the old unit was stopped before the broker was asked");
+    assert.deepEqual([store.registry.agent(A).state, store.registry.agent(A).life, fx.units[A].active], ["stopped", 1, false]);
+    assert.ok(existsSync(join(fenceDir, A)));
+    await new Promise((res) => setTimeout(res, 200));
+    assert.equal(fx.units[A].active, false, "a late broker completion revives nothing");
+    assert.ok(!fx.log.some((l) => l[0] === "start"));
+    await close();
+  });
+}
+
+test("TESTS T2: recovery from applying(N) re-verifies grant N and fails closed when it doesn't verify", async () => {
+  const root = tmp("state"), fenceDir = tmp("fence"), fx = fakeFx();
+  let s = await setup({ fx, root, fenceDir, barrier: async (n) => { if (n === "after_highwater_persist") throw new Error("crash"); } });
+  await assert.rejects(s.sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) }), /crash/);
+  await s.close();
+  s = await setup({ fx, root, fenceDir });
+  let calls = 0;
+  s.sup.verify = () => { calls += 1; throw new FleetError("grant_expired", "expired"); };
+  assert.deepEqual(await s.sup.recover(), { status: "not_started", reason: "grant_not_valid" });
+  assert.ok(calls >= 1, "verified");
+  assert.ok(!fx.log.some((l) => ["start", "unit", "provision", "broker-gen"].includes(l[0])), "no effect at all");
+  assert.equal(s.store.grants.pending().phase, "applying");
+  await s.close();
+});
+
+test("TESTS T3: after unit_failed the agent is stopped; a person's resume clears start_failed and retries it", async () => {
+  const fx = fakeFx();
+  let fail = true;
+  const start = fx.start;
+  fx.start = async (id, ...rest) => { if (fail) throw new FleetError("unit_failed", "exited"); return start(id, ...rest); };
+  const { sup, store, close } = await setup({ fx });
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  assert.deepEqual([store.registry.agent(A).state, store.registry.agent(A).start_failed], ["stopped", "unit_failed"]);
+  fail = false;
+  const r = await sup.submit({ kind: "resume", authority: "person", agent: A });
+  assert.equal(r.started, true);
+  assert.deepEqual([store.registry.agent(A).state, store.registry.agent(A).start_failed, fx.units[A].active], ["running", null, true]);
+  await close();
+});
+
+test("TESTS T4: expiry preempting an application holds it at applying(N): no continue, no ack; a newer grant supersedes it", async () => {
+  let sup;
+  const [first] = [A, B].sort();
+  let armed = true;
+  const s = await setup({ barrier: async (n, d) => { if (armed && n === "after_unit_write" && d.agent === first) { armed = false; sup.submit({ kind: "expiry", authority: "host" }); } } });
+  sup = s.sup;
+  const g1 = grant(1, [entry(A), entry(B)]);
+  assert.equal((await sup.submit({ kind: "grant", bytes: g1 })).status, "preempted");
+  // The same grant again: held, nothing done.
+  assert.deepEqual((await sup.submit({ kind: "grant", bytes: g1 })).status, "held");
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(s.store.grants.pending().phase, "applying", "held at applying(N)");
+  assert.deepEqual(s.fx.acks, [], "no acknowledgement");
+  assert.ok(!s.fx.log.some((l) => l[0] === "start"));
+  // A stale one is refused; a newer valid grant lowers expiry and supersedes N, planning every listed agent.
+  await rejects(sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) }), "stale_generation");
+  const r = await sup.submit({ kind: "grant", bytes: grant(2, [entry(A), entry(B)]) });
+  assert.equal(r.status, "applied");
+  assert.deepEqual(r.ack.restarted, [A, B].sort());
+  assert.deepEqual(s.fx.acks.map((x) => x[0]), [2]);
+  await s.close();
+});
+
+test("an applying(N) whose grant no longer verifies is held too, and a newer grant supersedes it", async () => {
+  const fx = fakeFx();
+  let fail = true;
+  fx.daemonReload = async () => { if (fail) throw Object.assign(new Error("EIO"), { code: "EIO" }); };
+  const s = await setup({ fx });
+  assert.equal((await s.sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) })).status, "failed");
+  fail = false;
+  const verify0 = s.sup.verify;
+  s.sup.verify = (bytes) => { const v = verify0(bytes); if (v.body.gen === 1) throw new FleetError("grant_expired", "expired"); return v; };
+  const r = await s.sup.submit({ kind: "grant", bytes: grant(2, [entry(A)]) });
+  assert.equal(r.status, "applied");
+  assert.deepEqual(r.ack.restarted, [A]);
+  await s.close();
+});
+
+test("recovery from an applying(N) held by expiry stays held: nothing continues or starts after a restart", async () => {
+  const root = tmp("state"), fenceDir = tmp("fence"), fx = fakeFx();
+  let sup, armed = true;
+  const [first] = [A, B].sort();
+  let s = await setup({ fx, root, fenceDir, barrier: async (n, d) => { if (armed && n === "after_unit_write" && d.agent === first) { armed = false; sup.submit({ kind: "expiry", authority: "host" }); } } });
+  sup = s.sup;
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
+  await new Promise((r) => setTimeout(r, 50));
+  await s.close();
+  s = await setup({ fx, root, fenceDir });
+  assert.deepEqual(await s.sup.recover(), { status: "held", reason: "expired" });
+  assert.equal(s.store.grants.pending().phase, "applying");
+  assert.ok(!fx.log.some((l) => l[0] === "start"));
+  await s.close();
+});
+
+test("containment raises the fence when it can't mask, or can't prove the cgroup empty", async () => {
+  for (const broken of ["mask", "proof"]) {
+    const fx = fakeFx();
+    fx.start = async () => { throw new FleetError("unit_failed", "exited"); };
+    if (broken === "mask") fx.mask = async () => { throw Object.assign(new Error("EIO"), { code: "EIO" }); };
+    else fx.sys.procCount = () => 1;
+    const { sup, fenceDir, close } = await setup({ fx });
+    await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+    assert.ok(existsSync(join(fenceDir, A)), `${broken}: fenced`);
+    await close();
+  }
 });

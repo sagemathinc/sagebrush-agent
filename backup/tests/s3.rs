@@ -271,7 +271,9 @@ fn run_cmd(cmd: &mut Command, h: &Host, req: Value, extra: &[&str]) -> Value {
         .unwrap();
     c.stdin.take().unwrap().write_all(req.to_string().as_bytes()).unwrap();
     let out = c.wait_with_output().unwrap();
-    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("stdout is one JSON value: {}", String::from_utf8_lossy(&out.stdout)));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| {
+        panic!("stdout is one JSON value: {}; stderr: {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    });
     assert_eq!(out.status.success(), v["ok"] == true, "exit status matches ok: {v}");
     v
 }
@@ -563,16 +565,38 @@ fn restore_skips_specials_and_attributes() {
     }
 }
 
+/// Whether this environment can run the rows that need their own mount namespace (`sudo unshare -m`, which needs sudo
+/// with CAP_SYS_ADMIN: CI). Where it can't, those rows skip, unless SB_TEST_REQUIRE_NOPROC=1 (set by CI), which makes
+/// every such row required.
+fn sudo_unshare() -> bool {
+    let can = Command::new("sudo").args(["-n", "unshare", "-m", "true"]).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+    if !can {
+        assert!(std::env::var_os("SB_TEST_REQUIRE_NOPROC").is_none(), "sudo unshare -m is required (SB_TEST_REQUIRE_NOPROC is set)");
+        eprintln!("skipping: no sudo unshare -m here");
+    }
+    can
+}
+
+/// Runs a restore in its own mount namespace: `setup` (a shell fragment, run as root) first, then the binary as this
+/// user without CAP_SYS_RESOURCE.
+fn restore_in_namespace(h: &Host, setup: &str, req: Value) -> Value {
+    // SAFETY: getuid and getgid have no preconditions.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let script = format!(
+        "{setup} && \
+         exec setpriv --reuid={uid} --regid={gid} --clear-groups --bounding-set=-sys_resource --inh-caps=-sys_resource -- \"$0\" \"$@\""
+    );
+    let mut cmd = Command::new("sudo");
+    cmd.args(["-n", "unshare", "-m", "--propagation", "private", "--", "sh", "-c", &script, BIN]);
+    run_cmd(&mut cmd, h, req, &[])
+}
+
 /// The restore's view has no procfs, so the capability check asks the kernel directly. This row runs the restore in its
-/// own mount namespace with an empty read-only tmpfs over `/proc`, then without CAP_SYS_RESOURCE, and needs `sudo` with
-/// CAP_SYS_ADMIN for the `unshare` (CI). Elsewhere it skips, unless SB_TEST_REQUIRE_NOPROC=1.
+/// own mount namespace with an empty read-only tmpfs over `/proc`, then without CAP_SYS_RESOURCE.
 #[test]
 fn restore_runs_without_proc() {
     let Some(bin) = weed() else { return };
-    let can_unshare = Command::new("sudo").args(["-n", "unshare", "-m", "true"]).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
-    if !can_unshare {
-        assert!(std::env::var_os("SB_TEST_REQUIRE_NOPROC").is_none(), "sudo unshare -m is required (SB_TEST_REQUIRE_NOPROC is set)");
-        eprintln!("skipping: no sudo unshare -m here");
+    if !sudo_unshare() {
         return;
     }
     let w = start_weed(&bin);
@@ -583,17 +607,38 @@ fn restore_runs_without_proc() {
     let b = run(&h, json!({ "op": "backup", "sources": [src], "host": "h1" }));
     assert_eq!(b["ok"], true, "{b}");
     let dst = tmpdir("noproc-dst");
-    // SAFETY: getuid and getgid have no preconditions.
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    let script = format!(
-        "mount -t tmpfs -o ro,nosuid,nodev,noexec,size=4k none /proc && \
-         exec setpriv --reuid={uid} --regid={gid} --clear-groups --bounding-set=-sys_resource --inh-caps=-sys_resource -- \"$0\" \"$@\""
-    );
-    let mut cmd = Command::new("sudo");
-    cmd.args(["-n", "unshare", "-m", "--propagation", "private", "--", "sh", "-c", &script, BIN]);
-    let r = run_cmd(&mut cmd, &h, json!({ "op": "restore", "snapshot": snapshot_id(&b), "dest": dst }), &[]);
+    let setup = "mount -t tmpfs -o ro,nosuid,nodev,noexec,size=4k none /proc";
+    let r = restore_in_namespace(&h, setup, json!({ "op": "restore", "snapshot": snapshot_id(&b), "dest": dst }));
     assert_eq!(r["ok"], true, "{r}");
     assert_eq!(fs::read(walk_find(&dst, "f").expect("restored")).unwrap(), b"no proc");
+}
+
+/// A restore that runs out of room says which kind: a full filesystem is `no_space` (ENOSPC) and a quota hit is
+/// `quota_exceeded` (EDQUOT), so the host can tell a transient failure from a permanent refusal (host backup design
+/// r3.3 §5.7). Both are real: the destination is a tmpfs mounted in the restore's own namespace, 256 KiB in all for
+/// the first, and with a 256 KiB per-user block quota for the second (tmpfs quotas: Linux 6.6 and later). The
+/// snapshot holds 2 MiB.
+#[test]
+fn restore_reports_a_full_or_quota_limited_target() {
+    let Some(bin) = weed() else { return };
+    if !sudo_unshare() {
+        return;
+    }
+    let w = start_weed(&bin);
+    let h = host(&w, "space");
+    assert_eq!(run(&h, json!({ "op": "init" }))["ok"], true);
+    let src = tmpdir("space-src");
+    let data: Vec<u8> = (0..2u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8 | 1).collect();
+    fs::write(src.join("big"), &data).unwrap();
+    let b = run(&h, json!({ "op": "backup", "sources": [src], "host": "h1" }));
+    assert_eq!(b["ok"], true, "{b}");
+    for (options, want) in [("size=256k", "no_space"), ("size=64m,usrquota,usrquota_block_hardlimit=256k", "quota_exceeded")] {
+        let dst = tmpdir("space-dst");
+        let setup = format!("mount -t tmpfs -o mode=0777,nosuid,nodev,{options} none '{}'", dst.display());
+        let r = restore_in_namespace(&h, &setup, json!({ "op": "restore", "snapshot": snapshot_id(&b), "dest": dst }));
+        assert_eq!(r["ok"], false, "{options}: {r}");
+        assert_eq!(code(&r), want, "{options}: {r}");
+    }
 }
 
 /// A restore that still holds CAP_SYS_RESOURCE is refused before anything is read or written (host backup design r3.3 §5.7). Where

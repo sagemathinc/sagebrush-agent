@@ -1,5 +1,13 @@
 # sagebrush-agent changes
 
+## 0.8.15
+
+**The agent reads Sagebrush's own doc pages, and a failed task keeps its reason.**
+
+- **Sagebrush's docs:** `sagebrush_docs` now also reads `/docs-index.json`, the list of doc, article and blog pages the site writes with its sitemap, and any page on that list, as text. The index is read once a turn from sagebrush.space and checked whole; a path that isn't on it is refused before any request. The tool descriptions tell the model to prefer `sagebrush_docs` and `repo_read` to `web_fetch` for Sagebrush's site and GitHub.
+- **A failed task keeps its reason:** a task the agent found broken while loading it used to lose its reason the next time the agent started ("its state and its log disagree"). Now the failure is logged before the state is saved, so the reason holds.
+- **Reason codes only on interrupted tasks:** a task's saved state may carry a reason code only while the task is interrupted, as its events already did. A task failed in place drops its code.
+
 ## 0.8.14
 
 **A Delegate task runs code on macOS too, and a task that stops says why.**

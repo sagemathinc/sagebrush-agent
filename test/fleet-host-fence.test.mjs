@@ -245,11 +245,17 @@ test("raise vs lower, both orders: a lower can't run inside a stop, and a stop a
   const dir = fresh();
   const sys = fakeSystemd(dir);
   // Stop first, lower requested while the stop holds the lock: the lower waits, then runs after the stop finished.
-  let lowerDone = false;
+  // The lower is requested from inside the stop's first systemctl call, so the stop already holds the lock (requesting
+  // both at once would leave which one gets the lock first to the scheduler).
+  let lowerDone = false, q = null;
+  sys.stop = ((orig) => (...a) => {
+    q ??= lowerFence("all", null, "resume-all", { dir, waitMs: 5000 }).then(() => { lowerDone = true; });
+    return orig(...a);
+  })(sys.stop);
   sys.jobs = ((orig) => () => { if (!lowerDone) assert.ok(existsSync(join(dir, "all")), "the fence is up for the whole stop"); return orig(); })(sys.jobs);
-  const p = stop({ all: true }, "all", { sys, dir });
-  const q = lowerFence("all", null, "resume-all", { dir, waitMs: 5000 }).then(() => { lowerDone = true; });
-  const r = await p; await q;
+  const r = await stop({ all: true }, "all", { sys, dir });
+  assert.ok(q, "the lower was requested during the stop");
+  await q;
   assert.equal(r.status, "stopped and fenced");
   assert.ok(!existsSync(join(dir, "all")));
   // Lower first, then stop: the stop raises the fence again.

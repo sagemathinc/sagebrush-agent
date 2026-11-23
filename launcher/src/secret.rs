@@ -63,6 +63,15 @@ impl Drop for Secret {
             unsafe { core::ptr::write_volatile(b, 0) };
         }
         self.len = 0;
+        // Debug builds only (compiled out of release): lets tests/cli.rs prove a panic still zeroed every Secret.
+        #[cfg(debug_assertions)]
+        if let Some(log) = std::env::var_os("SAGEBRUSH_LAUNCH_TEST_DROPLOG") {
+            use std::io::Write;
+            let zeroed = self.buf.iter().all(|&b| b == 0);
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(log) {
+                let _ = writeln!(f, "dropped zeroed={zeroed} cap={}", self.buf.len());
+            }
+        }
     }
 }
 

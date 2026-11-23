@@ -35,41 +35,34 @@ fn cstr(s: &str, fail: Fail) -> Result<CString> {
     CString::new(s).map_err(|_| err(fail, "bad string"))
 }
 
-/// Read a whole file through the trusted root into a bounded buffer (non-secret: the contract).
+/// Read a whole file through the trusted root into a bounded buffer (non-secret: the contract). Safe file I/O:
+/// std's File from the OwnedFd (contract §6: read and write go through File, not raw syscalls).
 fn read_bounded(root: &OwnedFd, rel_path: &str, max: usize, fail: Fail, msg: &'static str) -> Result<Vec<u8>> {
+    use std::io::Read;
     let f = sys::openat2(root, &cstr(rel_path, fail)?, libc::O_RDONLY, 0).map_err(|_| err(fail, msg))?;
-    let mut buf = vec![0u8; max + 1];
-    let mut len = 0;
-    loop {
-        let n = match sys::read(&f, &mut buf[len..]) {
-            Ok(n) => n,
-            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-            Err(_) => return Err(err(fail, msg)),
-        };
-        if n == 0 {
-            break;
-        }
-        len += n;
-        if len > max {
-            return Err(err(fail, msg));
-        }
+    let mut buf = Vec::new();
+    std::fs::File::from(f).take(max as u64 + 1).read_to_end(&mut buf).map_err(|_| err(fail, msg))?;
+    if buf.len() > max {
+        return Err(err(fail, msg));
     }
-    buf.truncate(len);
     Ok(buf)
 }
 
-/// Read one credential into a Secret zero-initialized to CREDENTIAL_MAX + 1 bytes (contract §7).
+/// Read one credential into a Secret zero-initialized to CREDENTIAL_MAX + 1 bytes (contract §7), through std's File:
+/// each read goes into the initialized, unused tail; nothing ever lands in uninitialized memory or a second buffer.
 fn read_credential(root: &OwnedFd, rel_path: &str) -> Result<Secret> {
+    use std::io::Read;
     let bad = || err(Fail::Credentials, "a credential can't be read");
     let f = sys::openat2(root, &cstr(rel_path, Fail::Credentials)?, libc::O_RDONLY, 0).map_err(|_| bad())?;
+    let mut f = std::fs::File::from(f);
     let mut s = Secret::zeroed(CREDENTIAL_MAX + 1);
     loop {
         if s.spare().is_empty() {
             return Err(err(Fail::Credentials, "a credential is too large")); // the Secret is zeroed as it drops
         }
-        let n = match sys::read(&f, s.spare()) {
+        let n = match f.read(s.spare()) {
             Ok(n) => n,
-            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return Err(bad()),
         };
         if n == 0 {
@@ -148,6 +141,10 @@ pub fn run(a: &Args, cli_args: &[String]) -> Result<Error> {
         secret_entries.push(env_entry(name, &value)?);
         drop(value); // zeroed now
     }
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SAGEBRUSH_LAUNCH_TEST_PANIC").is_some() {
+        panic!("injected"); // debug builds only: proves a panic after the secrets are loaded zeroes them (tests/cli.rs)
+    }
     let mut plain_env: Vec<CString> = Vec::with_capacity(c.env.len());
     for (k, v) in &c.env {
         plain_env.push(cstr(&format!("{k}={v}"), Fail::Contract)?);
@@ -172,52 +169,64 @@ pub fn run(a: &Args, cli_args: &[String]) -> Result<Error> {
     Ok(err(Fail::Exec, "the CLI can't be executed"))
 }
 
-/// close_range(3, ~0U, 0) with no OwnedFd left (the root is dropped first). On ENOSYS only: re-open the root, list
-/// proc/<pid>/fd through it (getdents64 to EOF, bounded), DROP both handles, then close each listed number above 2;
-/// EBADF (a gap: the listing's own, now closed handles) is tolerated, any other error is 72.
+/// close_range(3, ~0U, 0) with no OwnedFd left (the root is dropped first). On ENOSYS only: re-open the root, find
+/// the highest open descriptor from proc/<pid>/fd (getdents64 to EOF, bounded, canonical names), DROP both handles,
+/// then close EVERY number in 3..=highest (contract §6): EBADF (a gap) is tolerated, any other error is 72.
 fn close_all_above_2(root: OwnedFd) -> Result<()> {
-    let internal = |m| err(Fail::Internal, m);
     drop(root);
     match sys::close_range_from_3() {
-        Ok(()) => return Ok(()),
-        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {}
-        Err(_) => return Err(internal("descriptors can't be closed")),
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+            let highest = highest_open_fd()?;
+            close_range_by_hand(highest, sys::close_raw)
+        }
+        Err(_) => Err(err(Fail::Internal, "descriptors can't be closed")),
     }
-    let mut fds: Vec<i32> = Vec::new();
-    {
-        let root = sys::open_root().map_err(|_| internal("the root can't be opened"))?;
-        let rel_dir = format!("proc/{}/fd", std::process::id()); // not proc/self: a symlink RESOLVE_NO_SYMLINKS refuses
-        let d = sys::openat2(&root, &cstr(&rel_dir, Fail::Internal)?, libc::O_RDONLY | libc::O_DIRECTORY, 0)
-            .map_err(|_| internal("the descriptors can't be listed"))?;
-        let mut buf = [0u8; 4096];
-        let mut calls = 0;
-        loop {
-            calls += 1;
-            if calls > 4096 {
+}
+
+/// The highest descriptor number listed in proc/<pid>/fd, read through a freshly opened root; both handles are
+/// dropped before this returns (so the caller's raw closes can't race a Drop).
+fn highest_open_fd() -> Result<i32> {
+    let internal = |m| err(Fail::Internal, m);
+    let root = sys::open_root().map_err(|_| internal("the root can't be opened"))?;
+    let rel_dir = format!("proc/{}/fd", std::process::id()); // not proc/self: a symlink RESOLVE_NO_SYMLINKS refuses
+    let d = sys::openat2(&root, &cstr(&rel_dir, Fail::Internal)?, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+        .map_err(|_| internal("the descriptors can't be listed"))?;
+    let mut buf = [0u8; 4096];
+    let (mut calls, mut seen, mut highest) = (0usize, 0usize, 2i32);
+    loop {
+        calls += 1;
+        if calls > 4096 {
+            return Err(internal("too many descriptors"));
+        }
+        let n = sys::getdents64(&d, &mut buf).map_err(|_| internal("the descriptors can't be listed"))?;
+        if n == 0 {
+            break;
+        }
+        for name in dirent_names(&buf, n).ok_or(internal("the descriptors can't be listed"))? {
+            if name == b"." || name == b".." {
+                continue;
+            }
+            let fd = canonical_fd(&name).ok_or(internal("an odd descriptor name"))?;
+            seen += 1;
+            if seen > 65536 {
                 return Err(internal("too many descriptors"));
             }
-            let n = sys::getdents64(&d, &mut buf).map_err(|_| internal("the descriptors can't be listed"))?;
-            if n == 0 {
-                break;
-            }
-            for name in dirent_names(&buf, n).ok_or(internal("the descriptors can't be listed"))? {
-                if name == b"." || name == b".." {
-                    continue;
-                }
-                fds.push(canonical_fd(&name).ok_or(internal("an odd descriptor name"))?);
-                if fds.len() > 65536 {
-                    return Err(internal("too many descriptors"));
-                }
-            }
+            highest = highest.max(fd);
         }
-        drop(d);
-        drop(root); // both dropped BEFORE any raw close: no Drop can close a number the loop closes
     }
-    for fd in fds.into_iter().filter(|&f| f > 2) {
-        match sys::close_raw(fd) {
+    drop(d);
+    drop(root);
+    Ok(highest)
+}
+
+/// Close every descriptor in 3..=highest with `close` (EBADF tolerated; anything else is 72).
+fn close_range_by_hand(highest: i32, mut close: impl FnMut(i32) -> std::io::Result<()>) -> Result<()> {
+    for fd in 3..=highest {
+        match close(fd) {
             Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(libc::EBADF) => {}
-            Err(_) => return Err(internal("a descriptor can't be closed")),
+            Err(_) => return Err(err(Fail::Internal, "a descriptor can't be closed")),
         }
     }
     Ok(())
@@ -234,6 +243,32 @@ mod tests {
         for bad in [["x", "/c", "/cli"], [a, "c", "/cli"], [a, "/c", "cli"], [a, "/c/", "/cli"]] {
             assert_eq!(parse(&bad).err().map(|e| e.fail), Some(Fail::Usage));
         }
+    }
+
+    #[test]
+    fn the_enosys_fallback_closes_the_whole_range_and_tolerates_only_ebadf() {
+        let mut closed = Vec::new();
+        close_range_by_hand(9, |fd| {
+            closed.push(fd);
+            if fd == 5 { Err(std::io::Error::from_raw_os_error(libc::EBADF)) } else { Ok(()) }
+        })
+        .unwrap();
+        assert_eq!(closed, (3..=9).collect::<Vec<_>>(), "every number in 3..=highest, gaps included");
+        let r = close_range_by_hand(9, |fd| if fd == 6 { Err(std::io::Error::from_raw_os_error(libc::EIO)) } else { Ok(()) });
+        assert_eq!(r.err().map(|e| e.fail), Some(Fail::Internal));
+        let mut none = 0;
+        close_range_by_hand(2, |_| { none += 1; Ok(()) }).unwrap();
+        assert_eq!(none, 0, "nothing at or below 2");
+    }
+
+    #[test]
+    fn the_enosys_fallback_finds_the_highest_open_descriptor() {
+        // Non-destructive: it only lists this process's descriptors. Open one high above the rest and look for it.
+        let f = std::fs::File::open("/proc/self/status").unwrap();
+        use std::os::fd::AsRawFd;
+        let mine = f.as_raw_fd();
+        let h = highest_open_fd().unwrap();
+        assert!(h >= mine, "{h} >= {mine}");
     }
 
     #[test]

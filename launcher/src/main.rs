@@ -46,7 +46,9 @@ fn run() -> err::Result<()> {
 }
 
 fn main() {
-    // A panic unwinds (every Drop, the secret zeroing included, runs) and is mapped to 72.
+    // A panic prints NOTHING of its own (no message, location or value): only the fixed 72 line below. It unwinds, so
+    // every Drop (the secret zeroing included) runs first.
+    std::panic::set_hook(Box::new(|_| {}));
     let outcome = std::panic::catch_unwind(run).unwrap_or(Err(err(Fail::Internal, "internal error")));
     match outcome {
         Ok(()) => std::process::exit(0),

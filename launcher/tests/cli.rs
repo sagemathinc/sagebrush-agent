@@ -273,3 +273,51 @@ fn a1_subcommands_refuse_bad_arguments_and_a_missing_anchor() {
     assert_eq!(stderr(&o).lines().count(), 1);
     assert!(o.stdout.is_empty());
 }
+
+#[test]
+fn a2_subcommands_refuse_bad_arguments_then_the_root_guard() {
+    let run = |args: &[&str]| Command::new(BIN).env_clear().args(args).output().unwrap();
+    let owner = format!("a-{A}");
+    let snap = "0123456789abcdef".repeat(4);
+    let stage = |over: &[(&str, &str)]| -> Vec<String> {
+        let mut v = vec![("mount", "/srv/sagebrush"), ("owner", owner.as_str()), ("class", "home"), ("run", "abcdefghijklmnop"), ("attempt", "1"), ("projid", "70001"), ("snapshot", snap.as_str()), ("path", "srv/x")];
+        for (k, val) in over {
+            v.iter_mut().find(|(n, _)| n == k).unwrap().1 = val;
+        }
+        std::iter::once("restore-stage".to_string()).chain(v.iter().flat_map(|(k, val)| [format!("--{k}"), val.to_string()])).collect()
+    };
+    let ctl = "\u{1}".repeat(250);
+    let heavy = [ctl.as_str(); 4].join("/");
+    for over in [
+        vec![("class", "tag")],
+        vec![("owner", A)],
+        vec![("run", "short")],
+        vec![("attempt", "0")],
+        vec![("projid", "80001")],
+        vec![("projid", "070001")],
+        vec![("snapshot", "XYZ")],
+        vec![("path", "/abs")],
+        vec![("path", "a/../b")],
+        vec![("path", heavy.as_str())], // over 4096 bytes once encoded
+        vec![("mount", "/etc")],
+    ] {
+        let a = stage(&over);
+        let o = run(&a.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(code(&o), 64, "{over:?}: {}", stderr(&o));
+        assert!(o.stdout.is_empty());
+    }
+    for bad in [
+        vec!["fill-home", "--mount", "/srv/sagebrush", "--owner", &owner, "--class", "home", "--run", "abcdefghijklmnop", "--attempt", "1", "--source", "srv/x", "--expect", "/x"],
+        vec!["fill-home", "--mount", "/srv/sagebrush", "--owner", &owner, "--class", "home", "--run", "abcdefghijklmnop", "--attempt", "1", "--source", "data/x", "--expect", "x"],
+        vec!["fill-home", "--mount", "/srv/sagebrush", "--owner", &owner, "--class", "home", "--run", "abcdefghijklmnop", "--attempt", "1", "--source", "data/x"],
+    ] {
+        let o = run(&bad);
+        assert_eq!(code(&o), 64, "{bad:?}: {}", stderr(&o));
+    }
+    // Well-formed arguments as a non-root user: the root guard (66), one fixed line, nothing on stdout.
+    let a = stage(&[]);
+    let o = run(&a.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(code(&o), 66, "{}", stderr(&o));
+    assert_eq!(stderr(&o).lines().count(), 1);
+    assert!(o.stdout.is_empty());
+}

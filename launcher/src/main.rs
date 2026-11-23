@@ -5,12 +5,17 @@
 //!
 //! Amendment A1 (deprovision) adds four root-only subcommands run by the supervisor outside any unit: `identify`,
 //! `inspect-home`, `archive-home` and `remove-tree` (tree.rs).
+//!
+//! Amendment A2 (backup restore) adds two more, also root-only and outside any unit: `restore-stage` and `fill-home`
+//! (restore.rs, child.rs).
 
 // Unsafe code is refused everywhere except the syscall module and the secret's zeroing Drop (contract §6).
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod args;
+mod child;
+mod restore;
 mod contract;
 mod err;
 mod exec;
@@ -46,6 +51,13 @@ fn run() -> err::Result<()> {
                 return Err(err(Fail::Usage, "bad arguments"));
             }
             a1(cmd, rest)
+        }
+        // Launcher contract amendment A2 (backup restore): root only, outside any unit.
+        "restore-stage" | "fill-home" => {
+            if !after.is_empty() {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            a2(cmd, rest)
         }
         "exec" => {
             let v = args::flags(rest, &["agent", "contract", "cli"])?;
@@ -124,6 +136,46 @@ fn a1(cmd: &str, rest: &[String]) -> err::Result<()> {
         }
     };
     std::io::stdout().write_all(out.as_bytes()).map_err(|_| err(Fail::Internal, "internal error"))
+}
+
+fn a2(cmd: &str, rest: &[String]) -> err::Result<()> {
+    let bad = || err(Fail::Usage, "bad arguments");
+    let mut o = tree::RealOps;
+    let done = if cmd == "restore-stage" {
+        let v = args::flags(rest, &["mount", "owner", "class", "run", "attempt", "projid", "snapshot", "path"])?;
+        let name = restore::Name::parse(v[3], v[1], v[2], v[4]).ok_or_else(bad)?;
+        let projid: u32 = v[5].parse().ok().filter(|_| !v[5].starts_with('0') && v[5].bytes().all(|b| b.is_ascii_digit())).ok_or_else(bad)?;
+        if !name.projid_ok(projid) {
+            return Err(bad());
+        }
+        tree::parse_mount(v[0])?;
+        let a = restore::StageArgs { mount: v[0], name, projid, snapshot: v[6], path: v[7] };
+        // The request is built and bounded (64) before the root guard (66), like every other argument.
+        restore::request(a.snapshot, a.path)?;
+        if !sys::is_root() {
+            return Err(err(Fail::Preflight, "root only"));
+        }
+        sys::umask0();
+        restore::restore_stage(&mut o, &mut child::RealRunner, &a)
+    } else {
+        let v = args::flags(rest, &["mount", "owner", "class", "run", "attempt", "source", "expect"])?;
+        let name = restore::Name::parse(v[3], v[1], v[2], v[4]).ok_or_else(bad)?;
+        tree::parse_mount(v[0])?;
+        if !v[5].starts_with("data/") || !restore::rel_ok(v[5]) || args::rel(v[6]).is_none() {
+            return Err(bad());
+        }
+        if !sys::is_root() {
+            return Err(err(Fail::Preflight, "root only"));
+        }
+        sys::umask0();
+        let a = restore::FillArgs { mount: v[0], name, source: v[5], expect: v[6] };
+        match restore::fill_home(&mut o, &a) {
+            Ok(out) => restore::Done { out: out.into_bytes(), result: Ok(()) },
+            Err(e) => restore::Done { out: Vec::new(), result: Err(e) },
+        }
+    };
+    std::io::stdout().write_all(&done.out).map_err(|_| err(Fail::Internal, "internal error"))?;
+    done.result
 }
 
 fn main() {

@@ -98,13 +98,19 @@ fn a1(cmd: &str, rest: &[String]) -> err::Result<()> {
             String::new()
         }
         "archive-home" => {
-            let v = args::flags(rest, &["mount", "agent", "tree", "expect"])?;
+            // `--finish` takes no value (A1 r2.4 §4a), like inspect-home's `--archive`.
+            let finish = rest.iter().filter(|a| *a == "--finish").count();
+            if finish > 1 {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            let kept: Vec<String> = rest.iter().filter(|a| *a != "--finish").cloned().collect();
+            let v = args::flags(&kept, &["mount", "agent", "tree", "expect"])?;
             let (mount, t) = (tree::parse_mount(v[0])?, tree::parse_tree(v[2])?);
             if !args::is_id(v[1]) || args::rel(v[3]).is_none() {
                 return Err(err(Fail::Usage, "bad arguments"));
             }
             guard()?;
-            tree::archive_home(&mut o, mount, v[1], t, v[3])?;
+            tree::archive_home(&mut o, mount, v[1], t, v[3], finish == 1)?;
             String::new()
         }
         _ => {

@@ -61,3 +61,28 @@ jobs:
         with:
           node-version: 22.23.5
       - run: node --test "test/fleet-*.test.mjs" test/tags.test.mjs test/canon.test.mjs
+
+  # The backup binary (backup/): its licenses and sources (cargo-deny, backup/deny.toml), its third-party list, its
+  # unit tests in both builds, and its integration tests against a local S3 server (SeaweedFS 4.53, pinned by
+  # SHA-256). The restore rows remove CAP_SYS_RESOURCE with `sudo setpriv`, as the launcher's runner will.
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.21.0
+      - run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0
+      - run: cargo install --locked cargo-deny@0.18.9
+      - run: cargo deny --manifest-path backup/Cargo.toml check licenses sources
+      - run: node scripts/backup-third-party.mjs --check
+      - run: cargo test --locked --manifest-path backup/Cargo.toml --bins
+      - run: scripts/fetch-test-s3.sh "$RUNNER_TEMP/weed"
+      - run: cargo test --locked --manifest-path backup/Cargo.toml --features test-loopback-http
+        env:
+          SB_TEST_WEED: ${{ runner.temp }}/weed/bin/weed
+          SB_TEST_REQUIRE_WEED: "1"
+      - run: cargo build --locked --release --manifest-path backup/Cargo.toml

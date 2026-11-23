@@ -2,7 +2,7 @@
 name = "sagebrush-agent-launch"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0 OR MIT"
 description = "Stages granted paths by handle and execs an agent's CLI under Landlock (host supervisor freeze r3.1 §4.3, §4.6)"
 publish = false
 

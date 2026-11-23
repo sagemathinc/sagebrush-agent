@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test } from "./host-linux-only.mjs";
 import { FleetError, refuse } from "../lib/fleet/index.mjs";
 import { DurableState, exactKeys, lockDir } from "../lib/fleet/host/store.mjs";
 

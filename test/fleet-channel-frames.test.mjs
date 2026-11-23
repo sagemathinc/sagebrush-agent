@@ -48,6 +48,7 @@ for (const from of ["app", "broker"]) {
     const long = fragment(L, 7, longBody(from), ack(from, 11));
     assert.equal(long.length, 2);
     assert.equal(r.push(long[0]), null);
+    assert.equal(r.highWater, 11, "an accepted first fragment of several commits at once, before any interleave");
     assert.equal(r.push(fragment("ctl", 1, ping(), ack(from, 12))[0]).kind, "ctl");
     const done = r.push(long[1]);
     assert.deepEqual([done.kind, done.seq, done.ack], [L, 7, 11]);
@@ -70,11 +71,25 @@ for (const from of ["app", "broker"]) {
     const shortHigh = encodeFrame({ kind: L, seq: 1, frag: 0, nfrag: 2, ...ack(from, 20), body: new Uint8Array(10) });
     assert.equal(code(() => r4.push(shortHigh)), "bad_form");
     assert.equal(r4.highWater, 12, "committed only after the first fragment is accepted in full");
+    // a one-fragment message whose body fails (not canonical; an extra field): the mark stays where it was
+    for (const text of ['{"ctl":"ping", "t":1}', '{"ctl":"ping","t":1,"x":1}']) {
+      const r5 = open();
+      assert.equal(code(() => r5.push(fragment("ctl", 1, new TextEncoder().encode(text), ack(from, 20))[0])), "bad_form", text);
+      assert.equal(r5.highWater, 0, `${text}: committed only after the body passed`);
+    }
     const r3 = open();
     r3.push(fragment("ctl", 1, ping(), ack(from, 12))[0]);
     assert.equal(r3.push(fragment(L, 1, encodeBody(L, from === "app" ? { answer: {} } : { command: {} }), ack(from, 12))[0]).kind, L, "an equal acknowledgement on a new message of another kind");
     assert.equal(code(() => open(5).push(fragment("ctl", 1, ping(), ack(from, 6))[0])), "bad_form", "acknowledging what wasn't sent");
     assert.equal(open(6).push(fragment("ctl", 1, ping(), ack(from, 6))[0]).ack, 6, "exactly what was sent");
+    // (H3) the caller's limit must be an exact count: anything else ends the reader, the mark unchanged
+    for (const bad of [NaN, undefined, Infinity, -1, 1.5, "6", null]) {
+      const r6 = reader({ from, ackLimit: () => bad });
+      assert.equal(code(() => r6.push(fragment("ctl", 1, ping(), ack(from, 0))[0])), "bad_form", String(bad));
+      assert.equal(r6.highWater, 0, String(bad));
+      assert.equal(code(() => r6.push(fragment("ctl", 1, ping(), ack(from, 0))[0])), "bad_form", `${bad}: dead`);
+    }
+    assert.equal(code(() => reader({ from, ackLimit: () => NaN }).push(fragment("ctl", 1, ping(), ack(from, Number.MAX_SAFE_INTEGER))[0])), "bad_form", "a peer acknowledging 2^53 - 1 against a NaN limit");
   });
 
   test(`ownership and order, from the ${from}: the unowned field is 0, only its own kinds, seq and fragments in order`, () => {

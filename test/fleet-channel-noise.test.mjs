@@ -61,16 +61,28 @@ test("one role per object: an initiator writes 1 and reads 2, a responder reads 
   assert.deepEqual(i2.receive.decrypt(EMPTY, r2.send.encrypt(EMPTY, Uint8Array.of(2))), Uint8Array.of(2));
 });
 
-test("a handshake is single-use and in order", () => {
-  const { I, R } = pair();
-  assert.equal(code(() => R.writeMessage2(EMPTY)), "bad_form", "message 2 before message 1");
-  assert.equal(code(() => I.readMessage2(new Uint8Array(48))), "bad_form", "reading message 2 before writing message 1");
-  const m1 = I.writeMessage1(EMPTY);
-  assert.equal(code(() => I.writeMessage1(EMPTY)), "bad_form", "message 1 again");
-  R.readMessage1(m1);
-  assert.equal(code(() => R.readMessage1(m1)), "bad_form", "message 1 read again");
-  R.writeMessage2(EMPTY);
-  assert.equal(code(() => R.writeMessage2(EMPTY)), "bad_form", "message 2 again");
+test("a handshake is single-use and in order, and an order error kills it like any refusal (a fresh pair per row)", () => {
+  // the responder: message 2 first; then even the honest message 1 is refused
+  { const { I, R } = pair(); const m1 = I.writeMessage1(EMPTY);
+    assert.equal(code(() => R.writeMessage2(EMPTY)), "bad_form", "message 2 before message 1");
+    assert.equal(code(() => R.readMessage1(m1)), "bad_form", "dead: the honest message 1");
+    assert.equal(code(() => R.writeMessage2(EMPTY)), "bad_form", "dead: message 2 after it"); }
+  // the initiator: reading message 2 first; then writing message 1 is refused
+  { const { I } = pair();
+    assert.equal(code(() => I.readMessage2(new Uint8Array(48))), "bad_form", "reading message 2 before writing message 1");
+    assert.equal(code(() => I.writeMessage1(EMPTY)), "bad_form", "dead: message 1");
+    assert.equal(code(() => I.readMessage2(new Uint8Array(48))), "bad_form", "dead: message 2 after it"); }
+  // a repeated step: refused, and the next correct step too
+  { const { I, R } = pair(); const m1 = I.writeMessage1(EMPTY);
+    assert.equal(code(() => I.writeMessage1(EMPTY)), "bad_form", "message 1 again");
+    R.readMessage1(m1);
+    const m2 = R.writeMessage2(EMPTY).message;
+    assert.equal(code(() => I.readMessage2(m2)), "bad_form", "dead: the honest message 2"); }
+  { const { I, R } = pair(); R.readMessage1(I.writeMessage1(EMPTY));
+    assert.equal(code(() => R.readMessage1(new Uint8Array(96))), "bad_form", "message 1 read again");
+    assert.equal(code(() => R.writeMessage2(EMPTY)), "bad_form", "dead: message 2"); }
+  { const { I, R } = pair(); R.readMessage1(I.writeMessage1(EMPTY)); R.writeMessage2(EMPTY);
+    assert.equal(code(() => R.writeMessage2(EMPTY)), "bad_form", "message 2 again"); }
 });
 
 test("a refused message kills the handshake object: a tampered message 1, then the honest one, both refused", () => {

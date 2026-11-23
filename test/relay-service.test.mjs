@@ -3,6 +3,8 @@
 // including across a restart; the limits before admission; facts that aren't the query's; a late admit answer after a
 // revocation; the feed's availability; raw-frame ingress (sizes from the frame header, fragments, RSV bits, no
 // compression, interleaved pings with no automatic pong); and logs with no secret values.
+// (Not named fleet-*: CI's fleet-node22 job installs no dependencies, and this file needs `ws`, a pinned dependency
+//  of the agent that the main test jobs install. The relay's other test files need nothing and stay in that set.)
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -11,30 +13,31 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { WebSocket } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import { openTarget, COMMIT_ROUTE, RECORD_HEADER_MAX } from "../lib/fleet/core/relay.mjs";
 import { controlKey } from "../lib/fleet/core/control.mjs";
 import { openStore } from "../lib/fleet/relay/store.mjs";
 import { controlClient } from "../lib/fleet/relay/control.mjs";
 import { Slots, CODES } from "../lib/fleet/relay/slots.mjs";
 import { Feed } from "../lib/fleet/relay/feed.mjs";
-import { createRelayServer, INGRESS, SOURCE_HEADER } from "../lib/fleet/relay/service.mjs";
+import { createRelayServer, INGRESS, SOURCE_HEADER, APP_RECORD_MAX_MS } from "../lib/fleet/relay/service.mjs";
+import { CONSUMED_MS } from "../lib/fleet/relay/store.mjs";
 import { manualClock, FakeWorker, ids, rid, settle, KEY_TEXT } from "./fleet-relay-harness.mjs";
 
 const KEY = controlKey(KEY_TEXT());
 
-async function relay({ store = openStore(":memory:"), ingress = INGRESS, worker = new FakeWorker(KEY) } = {}) {
+async function relay({ store = openStore(":memory:"), ingress = INGRESS, worker = new FakeWorker(KEY), wallNow = () => Date.now() } = {}) {
   const clock = manualClock(), log = [];
-  const control = controlClient({ transport: worker.transport, key: KEY });
-  const slots = new Slots({ clock, log: (o) => log.push(o) });
+  const control = controlClient({ transport: worker.transport, key: KEY, wallNow });
+  const slots = new Slots({ clock, wallNow, log: (o) => log.push(o) });
   const feed = new Feed({ control, store, slots, clock, log: (o) => log.push(o) });
-  const { server } = createRelayServer({ control, store, slots, feed, clock, log: (o) => log.push(o), ingress });
+  const { server, stats } = createRelayServer({ control, store, slots, feed, clock, log: (o) => log.push(o), ingress, wallNow, WebSocketServer });
   feed.start(); await settle();
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const port = server.address().port;
   const live = new Set();
   return {
-    clock, log, worker, slots, feed, store, port, server, live,
+    clock, log, worker, slots, feed, store, port, server, live, stats,
     async close() { for (const w of live) w.terminate(); feed.stop(); slots.closeAll(1001, "test over"); server.closeAllConnections(); await new Promise((r) => server.close(r)); },
   };
 }
@@ -316,5 +319,115 @@ test("consumption comes before any slot change: a store that can't record the id
     r.store.consume = real;
     assert.ok((await open(r, "host", t)).ws);
     assert.equal(r.slots.sockets, 1);
+  } finally { await r.close(); }
+});
+
+// ---- replay-id retention (the #58 ruling): an app request id is kept until min(record end, session expiry) + 60 s
+
+/** A relay and fake Worker on one movable wall clock (the relay's may run ahead by `skew`). */
+async function timed({ skew = 0, store } = {}) {
+  let wall = Date.now();
+  const worker = new FakeWorker(KEY, { wallNow: () => wall });
+  const r = await relay({ worker, wallNow: () => wall + skew, ...(store ? { store } : {}) });
+  return { r, at: (t) => { wall = t; }, now: () => wall };
+}
+
+test("retention: an app request id is kept until min(record end, session expiry) + 60 s, from the app answer alone (no host answer); a replay is refused before that, and the Worker refuses it after", async () => {
+  for (const [what, recordIn, sessionIn] of [["the session expires first", 2 * 3600_000, 3600_000], ["the record ends first", 3600_000, 2 * 3600_000]]) {
+    const { r, at, now } = await timed(), t = ids(), t0 = now();
+    try {
+      r.worker.app = { not_after_ms: t0 + recordIn, session_ms: t0 + sessionIn };
+      const request = rid();
+      assert.ok((await open(r, "app", t, { request })).ws, what);
+      const end = Math.min(recordIn, sessionIn) + 60_000 + t0;
+      at(t0 + CONSUMED_MS + 60_000); r.store.prune(t0 + CONSUMED_MS + 60_000);
+      assert.equal((await open(r, "app", t, { request })).status, 409, `${what}: still refused after 11 min`);
+      at(end - 1); r.store.prune(end - 1);
+      assert.equal(r.store.consumed("app", request), true, `${what}: kept until its end`);
+      r.worker.app.checkWindow = false; // (show the relay's own refusal just before the end)
+      at(Math.min(recordIn, sessionIn) + t0 - 1);
+      assert.equal((await open(r, "app", t, { request })).status, 409, `${what}: replay just inside the window`);
+      r.worker.app.checkWindow = true;
+      at(end + 1); r.store.prune(end + 1);
+      assert.equal(r.store.consumed("app", request), false, `${what}: pruned after its end`);
+      assert.equal((await open(r, "app", t, { request })).status, 403, `${what}: the Worker refuses it then (grant_expired)`);
+    } finally { await r.close(); }
+  }
+});
+
+test("retention: host nonces keep the 10-minute rule; a restart keeps an app id's retention; the relay's clock 60 s ahead still covers the window", async () => {
+  { const { r, now } = await timed(), t = ids(), t0 = now(), nonce = rid();
+    try {
+      assert.ok((await open(r, "host", t, { nonce })).ws);
+      r.store.prune(t0 + CONSUMED_MS - 1);
+      assert.equal(r.store.consumed("host", nonce), true);
+      r.store.prune(t0 + CONSUMED_MS + 1000);
+      assert.equal(r.store.consumed("host", nonce), false);
+    } finally { await r.close(); } }
+  { const dir = mkdtempSync(join(tmpdir(), "relay-ret-")), path = join(dir, "r.sqlite");
+    try {
+      const t0 = Date.now(), request = rid(), t = ids();
+      const a = await timed({ store: openStore(path) });
+      a.r.worker.app = { not_after_ms: t0 + 2 * 3600_000, session_ms: t0 + 2 * 3600_000 };
+      assert.ok((await open(a.r, "app", t, { request })).ws);
+      await a.r.close(); a.r.store.close();
+      const s = openStore(path);
+      s.prune(t0 + 3600_000);
+      assert.equal(s.consumed("app", request), true, "after a restart, an hour later");
+      s.close();
+    } finally { rmSync(dir, { recursive: true, force: true }); } }
+  { const { r, at, now } = await timed({ skew: 60_000 }), t = ids(), t0 = now(), request = rid();
+    try {
+      r.worker.app = { not_after_ms: t0 + 3600_000, session_ms: t0 + 3600_000 };
+      assert.ok((await open(r, "app", t, { request })).ws);
+      at(t0 + 3600_000 - 1); r.store.prune(t0 + 3600_000 - 1 + 60_000); // (the relay prunes on its own clock, 60 s ahead)
+      assert.ok([403, 409].includes((await open(r, "app", t, { request })).status), "refused at the last moment the Worker would still accept it");
+      assert.equal(r.store.consumed("app", request), true, "the id is still kept: the relay's 60 s lead is inside the margin");
+    } finally { await r.close(); } }
+});
+
+test("retention: the record's remaining window must be within (0, 12 h]: an overlong or ended record is refused before anything is consumed; exactly 12 h is admitted and kept to its end", async () => {
+  const { r, now } = await timed(), t0 = now();
+  try {
+    for (const [what, notAfter] of [["over 12 h", t0 + APP_RECORD_MAX_MS + 1], ["already ended", t0]]) {
+      const request = rid();
+      r.worker.app = { not_after_ms: notAfter, session_ms: t0 + 24 * 3600_000, checkWindow: false }; // (a verified answer the relay must still refuse)
+      assert.equal((await open(r, "app", ids(), { request })).status, 403, what);
+      assert.equal(r.store.consumed("app", request), false, `${what}: nothing consumed`);
+    }
+    assert.equal(r.slots.sockets, 0);
+    const request = rid();
+    r.worker.app = { not_after_ms: t0 + APP_RECORD_MAX_MS, session_ms: t0 + 24 * 3600_000 };
+    assert.ok((await open(r, "app", ids(), { request })).ws, "exactly 12 h");
+    r.store.prune(t0 + APP_RECORD_MAX_MS + 60_000 - 1);
+    assert.equal(r.store.consumed("app", request), true, "kept to its end");
+  } finally { await r.close(); }
+});
+
+test("retention: concurrent duplicate opens both verify, and exactly one insert wins; storage stays bounded after many valid app opens", async () => {
+  const { r, now } = await timed(), t0 = now();
+  try {
+    const t = ids(), request = rid();
+    const [a, b] = await Promise.all([open(r, "app", t, { request }), open(r, "app", { ...t, session: ids().session }, { request })]);
+    assert.deepEqual([a.ws ? "open" : a.status, b.ws ? "open" : b.status].sort(), [409, "open"].sort());
+    r.worker.app = { not_after_ms: t0 + 3600_000, session_ms: t0 + 3600_000 };
+    for (let i = 0; i < 25; i++) { const o = await open(r, "app", ids()); assert.ok(o.ws, `open ${i}: ${o.status}`); o.ws.close(); }
+    await settle(20);
+    assert.equal(r.store.count(), 26);
+    r.store.prune(t0 + 3600_000 + 60_000 - 1);
+    assert.equal(r.store.count(), 26, "every id is kept to its window's end");
+    r.store.prune(t0 + 3600_000 + 60_000 + 10_000);
+    assert.equal(r.store.count(), 0, "every window passes: nothing is kept");
+  } finally { await r.close(); }
+});
+
+test("memory before admission is bounded: after the global cap fills, fresh sources are refused and allocate nothing", async () => {
+  const clock0 = { opensPerMinute: 5, opensPerSourcePerMinute: 30, controlCalls: 16, controlPerSource: 2 };
+  const r = await relay({ ingress: { ...INGRESS, ...clock0 } });
+  try {
+    for (let i = 0; i < 5; i++) assert.ok((await open(r, "host", ids(), { headers: { [SOURCE_HEADER]: `2001:db8::${i + 1}` } })).ws);
+    for (let i = 0; i < 300; i++) assert.equal((await open(r, "host", ids(), { headers: { [SOURCE_HEADER]: `2001:db8:1::${(i + 1).toString(16)}` } })).status, 429);
+    const s = r.stats();
+    assert.ok(s.rateKeys <= 5 && s.rateEvents <= 5 && s.inflight === 0, JSON.stringify(s));
   } finally { await r.close(); }
 });

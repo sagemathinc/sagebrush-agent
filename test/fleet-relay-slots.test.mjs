@@ -144,6 +144,21 @@ test("the stall: below the cap, a queue that never moves closes at exactly 30 s;
     assert.ok(slot.timers.size <= 1, `timers ${slot.timers.size}`); }
 });
 
+test("the stall restarts on any decrease from the last observed size: growth, then a partial drain above the old low, is progress", () => {
+  const { slots, clock } = setup(), p = pair(slots, ids());
+  handshake(p); slots.commit(commitOf(p.hf, p.af));
+  p.app.in(Buffer.alloc(10)); // (t = 0: 10 queued)
+  clock.advance(10_000);
+  p.app.in(Buffer.alloc(90)); // (t = 10 s: 100 queued)
+  clock.advance(1000);
+  p.host.take(20); // (t = 11 s: 80 queued, above the old low of 10)
+  clock.advance(SLOTS.pollMs);
+  clock.advance(SLOTS.stallMs - 2 * SLOTS.pollMs - 1);
+  assert.equal(p.host.closed, null, "not at 30 s: the drain at 11 s was progress");
+  clock.advance(SLOTS.pollMs + 11_000 + 1);
+  assert.equal(p.host.closed?.code, CODES.stalled, "30 s after the last progress");
+});
+
 test("revocation and expiry: an agent, account or host change closes its slots; each side's end closes the pair, and a null host grant end never removes the app's", () => {
   const { slots } = setup(), t = ids(), u = ids(), w = ids();
   const a = pair(slots, t), b = pair(slots, u), c = pair(slots, w);
@@ -183,4 +198,16 @@ test("limits from verified facts: per agent, per host, per account, sockets in a
     refused(() => slots.reserve(facts("host", { ...ids(), host: t.host })), "limit");
     clock.advance(60_000);
     void clock; }
+});
+
+test("memory: the verified rate history holds only the last minute's opens, however many hosts and accounts come and go", () => {
+  const { slots, clock } = setup();
+  for (let minute = 0; minute < 20; minute++) {
+    for (let i = 0; i < 10; i++) slots.reserve(facts("host", ids()));
+    assert.ok(slots.opens.keys <= 20 && slots.opens.size <= 10, `minute ${minute}: ${slots.opens.keys} keys`);
+    clock.advance(60_000);
+  }
+  clock.advance(60_000);
+  assert.equal(slots.opens.keys, 0);
+  assert.equal(slots.opens.size, 0);
 });

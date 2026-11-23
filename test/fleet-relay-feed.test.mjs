@@ -119,9 +119,10 @@ test("the fail-close: at exactly 30 s without a success everything closes and op
 });
 
 test("cursor_expired closes everything at once, resets the cursor, and restarts from since=0; it isn't a success, so the fail-close still fires at 30 s", async () => {
-  const { clock, feed, slots, worker, store } = setup();
+  const { clock, feed, slots, worker, store, log } = setup();
   feed.start(); await settle();
   const before = store.cursor();
+  const failCloses = () => log.filter((o) => o.event === "feed_fail_close").length;
   const p = livePair(slots, ids());
   const sinces = [];
   worker.feedQueue.push((since) => ({ result: "refused", since, code: "cursor_expired" }));
@@ -132,12 +133,30 @@ test("cursor_expired closes everything at once, resets the cursor, and restarts 
   assert.ok(before > 0);
   await run(clock, FEED.pollMs, 100);
   assert.equal(sinces[0], 0, "the next poll starts from since=0");
-  assert.equal(feed.available, true, "not yet failed closed: 30 s haven't passed since the last success");
+  assert.equal(feed.available, false, "unavailable since the refusal");
   await run(clock, FEED.failMs - 2 * FEED.pollMs - 100, 100);
-  assert.equal(feed.available, true, "at 29.9 s");
+  assert.equal(failCloses(), 0, "at 29.9 s: the refusal didn't move the fail-close");
   await run(clock, 100, 100);
-  assert.equal(feed.available, false, "the fail-close fired at 30 s after the last success");
+  assert.equal(failCloses(), 1, "the fail-close fired at 30 s after the last success");
   feed.stop();
+});
+
+test("after a success, cursor_expired makes the feed unavailable at once: opens stay refused until a fresh, committed success, also when the reset itself fails", async () => {
+  for (const resetFails of [false, true]) {
+    const { clock, feed, worker, store } = setup();
+    feed.start(); await settle();
+    assert.equal(feed.available, true);
+    if (resetFails) store.reset = () => { throw new Error("disk full"); };
+    worker.feedQueue.push((since) => ({ result: "refused", since, code: "cursor_expired" }), fail, fail);
+    await run(clock, FEED.pollMs, 100);
+    assert.equal(feed.available, false, `unavailable at once (reset ${resetFails ? "fails" : "works"})`);
+    await run(clock, 2 * FEED.pollMs, 100);
+    assert.equal(feed.available, false, "still, while polls fail");
+    if (resetFails) { feed.stop(); continue; }
+    await run(clock, FEED.pollMs, 100);
+    assert.equal(feed.available, true, "a fresh success from since=0 restores it");
+    feed.stop();
+  }
 });
 
 test("more: true polls again at once, at most 8 times in a row, each answer checked; then the normal interval", async () => {
@@ -194,4 +213,23 @@ test("a restart never rolls the cursor back: an answer behind the committed curs
     assert.equal(s.cursor(), 101, "an answer for another since changes nothing");
     feed.stop(); s.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("memory: the feed's known epochs are bounded to live slots plus a minute; a live pair's epoch stays, so its lower-epoch barrier holds", async () => {
+  const { clock, feed, slots, worker } = setup();
+  feed.start(); await settle();
+  const t = ids();
+  const p = livePair(slots, t);
+  assert.equal(feed.current({ agent: 3, account: 0, host: 0 }, { agent: t.agent, account: t.account, host: t.host }), true);
+  let n = 0;
+  for (let i = 0; i < 240; i++) worker.feedQueue.push((since) => worker.empty(since, { agents: Array.from({ length: 20 }, () => ({ id: ids().agent, epoch: ++n })) }));
+  let peak = 0;
+  for (let i = 0; i < 240; i++) { await run(clock, FEED.pollMs, 2500); peak = Math.max(peak, feed.known.size); }
+  assert.ok(peak <= 20 * 14 + 3, `peak ${peak}`);
+  assert.ok(feed.known.has(`agent:${t.agent}`), "the live pair's agent epoch is kept after 20 minutes");
+  assert.equal(p.app.closed, null);
+  worker.feedQueue.push((since) => worker.empty(since, { agents: [{ id: t.agent, epoch: 2 }] }));
+  await run(clock, FEED.pollMs, 500);
+  assert.equal(p.app.closed, null, "a lower epoch for the live agent is refused, so nothing closes");
+  feed.stop();
 });

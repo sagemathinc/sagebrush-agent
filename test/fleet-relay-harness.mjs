@@ -121,8 +121,12 @@ export class FakeWorker {
       const sig = Object.fromEntries(p.sig.split(";").map((kv) => kv.split("=")));
       return { result: "ok", role: "host", ...tuple, host: sig.host, nonce: sig.nonce, account: sig.acct ?? "acct-host", not_after_ms: null, epochs: ep(q.agent, sig.acct ?? "acct-host", sig.host) };
     }
-    return { result: "ok", role: "app", ...tuple, host: p.record.slice(0, 26), request: p.request, account: p.cookie, account_session: "sess-1", account_session_expires_ms: this.wallNow() + 3_600_000,
-      signer: newId(), chain_seq: 1, not_after_ms: this.wallNow() + 3_600_000, epochs: ep(q.agent, p.cookie, p.record.slice(0, 26)) };
+    // (the record's end and the session's expiry: fixed by the test in `app`, else an hour from now; past either one,
+    //  the Worker refuses grant_expired, as the real one does)
+    const now = this.wallNow(), notAfter = this.app?.not_after_ms ?? now + 3_600_000, session = this.app?.session_ms ?? now + 3_600_000;
+    if (this.app?.checkWindow !== false && (now >= notAfter || now >= session)) return { result: "refused", code: "grant_expired" };
+    return { result: "ok", role: "app", ...tuple, host: p.record.slice(0, 26), request: p.request, account: p.cookie, account_session: "sess-1", account_session_expires_ms: session,
+      signer: newId(), chain_seq: 1, not_after_ms: notAfter, epochs: ep(q.agent, p.cookie, p.record.slice(0, 26)) };
   }
 }
 

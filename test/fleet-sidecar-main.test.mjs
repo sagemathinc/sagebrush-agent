@@ -38,7 +38,7 @@ function frameReader(stream) {
   return frames;
 }
 // A fake Chrome on two in-memory streams: answers every command, and lets the test send events.
-function fakeChrome({ build = BUILD } = {}) {
+function fakeChrome({ build = BUILD, hold = [] } = {}) {
   const toChrome = new PassThrough(), fromChrome = new PassThrough(), seen = [];
   let buf = Buffer.alloc(0);
   const out = (m) => fromChrome.write(JSON.stringify(m) + "\0");
@@ -47,6 +47,7 @@ function fakeChrome({ build = BUILD } = {}) {
     for (let i; (i = buf.indexOf(0)) !== -1; buf = buf.subarray(i + 1)) {
       const m = JSON.parse(buf.subarray(0, i).toString("utf8"));
       seen.push(m);
+      if (hold.includes(m.method)) continue; // (Chrome got it, the effect happened, and no answer comes)
       const result = m.method === "Browser.getVersion" ? { product: `HeadlessChrome/${build}`, protocolVersion: "1.3" }
         : m.method === "Target.createBrowserContext" ? { browserContextId: "REAL-CTX" }
         : m.method === "Target.closeTarget" ? { success: true } : {};
@@ -333,6 +334,27 @@ test("the final flush has a deadline: a stalled app (on retire, or on stdin's en
   assert.deepEqual(t.exits, [0]);
   assert.equal(clock.pending(), 0, "the deadline is cleared");
   assert.deepEqual(t.logs, []);
+});
+
+test("takeover outcomes end to end (real codec, real session): a command Chrome had is 'abandoned' (it may have run), one sent while paused is 'takeover' and never reaches Chrome", async () => {
+  const t = run({ chrome: { hold: ["Runtime.evaluate"] } });
+  t.stdin.write(Buffer.concat([auth(), start()]));
+  await settle();
+  t.chrome.event("Target.attachedToTarget", { sessionId: "SESS-A", targetInfo: { targetId: "REAL-TA", type: "page", title: "", url: "about:blank", attached: true, browserContextId: "REAL-CTX" }, waitingForDebugger: true });
+  await settle();
+  const page = JSON.parse(t.frames.find((f) => f.head.kind === "net.event").body).params.targetInfo.targetId;
+  t.stdin.write(command(2, { method: "Runtime.evaluate", params: { expression: "1" }, sessionId: page }));
+  await settle();
+  const evals = () => t.chrome.seen.filter((m) => m.method === "Runtime.evaluate" && m.sessionId === "SESS-A").length;
+  assert.equal(evals(), 1, "Chrome has it");
+  t.stdin.write(fromRust({ to: "cdp", kind: "cdp.takeover" }));
+  for (let i = 0; i < 70 && !t.frames.some((f) => f.head.kind === "rust.takeover_done"); i++) await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(t.frames.filter((f) => f.head.to === "net" && f.head.seq === 2).map((f) => [f.head.kind, f.head.reason]), [["net.refused", "abandoned"]]);
+  t.stdin.write(command(3, { method: "Runtime.evaluate", params: { expression: "2" }, sessionId: page }));
+  await settle();
+  assert.deepEqual(t.frames.filter((f) => f.head.to === "net" && f.head.seq === 3).map((f) => [f.head.kind, f.head.reason]), [["net.refused", "takeover"]]);
+  assert.equal(evals(), 1, "nothing more reached Chrome");
+  assert.equal(t.sidecar.state, "paused");
 });
 
 test("the permission list must be the pinned one for the running build: none pinned (today's PINS), another build or tampered bytes end the session before anything attaches", async () => {

@@ -15,7 +15,8 @@ class FakeSession {
   startResult = true; takeoverResult = { paused: true };
   constructor(sink) { this.sink = sink; }
   async start() { this.state = this.startResult ? "running" : "retired"; return this.startResult; }
-  command(cmd) { return new Promise((resolve) => this.commands.push({ cmd, resolve })); }
+  calls = []; // (every command the session was handed: the effect counter)
+  command(cmd) { this.calls.push(cmd); return new Promise((resolve) => this.commands.push({ cmd, resolve })); }
   async takeover() { this.takeovers++; this.state = "paused"; const r = this.takeoverResult; for (const c of this.commands.splice(0)) c.resolve({ unknown: true }); return r; }
   handback() { this.handbacks++; this.state = "running"; return true; }
   retire(reason) { this.retiredWith = reason; this.state = "retired"; }
@@ -118,7 +119,7 @@ test("commands: a seq must be greater than every one before it; a repeat ends th
   }
 });
 
-test("takeover: new commands are refused 'takeover'; commands the drain abandons are refused 'takeover' once each; then takeover_done and paused; resume makes it ready", async () => {
+test("takeover: a new command is refused 'takeover' and never reaches the session; one the session reports unknown during the drain is 'abandoned', once; then takeover_done and paused; resume makes it ready", async () => {
   const t = setup();
   await ready(t);
   t.sidecar.frame({ kind: "cdp.command", seq: 1 }, bytes({ method: "Runtime.evaluate", params: { expression: "x" } }));
@@ -126,7 +127,8 @@ test("takeover: new commands are refused 'takeover'; commands the drain abandons
   t.sidecar.frame({ kind: "cdp.takeover" });
   t.sidecar.frame({ kind: "cdp.command", seq: 2 }, bytes({ method: "Page.reload" })); // (during the drain)
   await settle();
-  assert.deepEqual(toNet(t.frames).map((f) => [f.head.kind, f.head.seq, f.head.reason]), [["net.refused", 2, "takeover"], ["net.refused", 1, "takeover"]]);
+  assert.deepEqual(toNet(t.frames).map((f) => [f.head.kind, f.head.seq, f.head.reason]), [["net.refused", 2, "takeover"], ["net.refused", 1, "abandoned"]]);
+  assert.deepEqual(t.session().calls.map((c) => c.method), ["Runtime.evaluate"]); // (seq 2 never reached the session: not run)
   assert.deepEqual(t.frames.filter((f) => f.head.to === "rust").map((f) => f.head.kind + (f.head.state ? `:${f.head.state}` : "")), ["rust.cdp_state:starting", "rust.cdp_state:ready", "rust.takeover_done", "rust.cdp_state:paused"]);
   t.sidecar.frame({ kind: "cdp.takeover" }); // (again while paused: done again, nothing else)
   assert.equal(t.frames.at(-1).head.kind, "rust.takeover_done");
@@ -185,7 +187,7 @@ test("events go to net; the session retiring ends the sidecar; after the end not
   assert.deepEqual(states(f.frames), ["ended:bad frame"]);
 });
 
-test("takeover: a command the session hasn't settled is answered 'takeover' once by the sidecar itself; its late answer after resume is never sent", async () => {
+test("takeover: a command the session hasn't settled is swept by the drain as 'abandoned', once, by the sidecar itself; its late answer after resume is never sent", async () => {
   const t = setup();
   await ready(t);
   t.session().takeover = async function () { this.takeovers++; this.state = "paused"; return { paused: true }; }; // (settles nothing)
@@ -193,7 +195,7 @@ test("takeover: a command the session hasn't settled is answered 'takeover' once
   await settle();
   t.sidecar.frame({ kind: "cdp.takeover" });
   await settle();
-  assert.deepEqual(toNet(t.frames).map((f) => [f.head.kind, f.head.seq, f.head.reason]), [["net.refused", 1, "takeover"]]);
+  assert.deepEqual(toNet(t.frames).map((f) => [f.head.kind, f.head.seq, f.head.reason]), [["net.refused", 1, "abandoned"]]);
   t.sidecar.frame({ kind: "cdp.resume" });
   t.session().commands[0].resolve({ result: { late: true } }); // (the late answer)
   await settle();
@@ -215,6 +217,7 @@ test("takeover in progress: duplicate takeovers wait for the same drain and each
   assert.equal(drains, 1);
   assert.equal(t.frames.filter((f) => f.head.kind === "rust.takeover_done").length, 0); // (nothing before the drain ends)
   assert.deepEqual(toNet(t.frames).map((f) => [f.head.seq, f.head.reason]), [[1, "takeover"]]);
+  assert.equal(t.session().calls.length, 0); // (refused before the session: not run)
   gate.release();
   await settle();
   assert.equal(t.frames.filter((f) => f.head.kind === "rust.takeover_done").length, 2); // (one per takeover frame)
@@ -319,7 +322,12 @@ test("real session: a duplicate takeover during the drain gets no done before th
   assert.equal(kinds(t.frames, "rust.takeover_done"), 2);
   assert.equal(t.session().state, "paused");
   assert.equal(t.session().inflight, 0);
-  assert.deepEqual(toNet(t.frames).filter((f) => f.head.seq === 1).map((f) => [f.head.kind, f.head.reason]), [["net.refused", "takeover"]]);
+  assert.deepEqual(toNet(t.frames).filter((f) => f.head.seq === 1).map((f) => [f.head.kind, f.head.reason]), [["net.refused", "abandoned"]]); // (Chrome had it: it may have run)
+  assert.equal(t.pipe.find("Runtime.evaluate").length, 1);
+  t.sidecar.frame({ kind: "cdp.command", seq: 2 }, bytes({ method: "Runtime.evaluate", params: { expression: "y" } })); // (while paused)
+  await settle();
+  assert.deepEqual(toNet(t.frames).filter((f) => f.head.seq === 2).map((f) => [f.head.kind, f.head.reason]), [["net.refused", "takeover"]]);
+  assert.equal(t.pipe.find("Runtime.evaluate").length, 1, "nothing more reached Chrome");
   t.sidecar.frame({ kind: "cdp.resume" });
   assert.equal(states(t.frames).at(-1), "ready");
   assert.equal(t.session().state, "running");

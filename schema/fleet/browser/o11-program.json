@@ -6,7 +6,7 @@
  },
  "spec": {
   "file": "schema/fleet/browser/o11-cdp.json",
-  "sha256": "09309230a615bb78691a6b4c7d8d298c38c8b90faa214649603b9fb5ae48bb7e"
+  "sha256": "f2c215b010c66128f720b31c3519f169ac15dec6ec540f988bbff26d96c265d0"
  },
  "owners": {
   "Accessibility.getFullAXTree result": [

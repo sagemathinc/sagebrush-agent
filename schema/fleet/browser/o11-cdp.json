@@ -1,6 +1,6 @@
 {
- "$comment": "O11 browser freeze, the CDP filter's closed schemas (draft 3, Nov 22 2026, @sagebrush-space). Machine-readable companion to agent-autonomous-browser-o11.md §4. Types follow the pinned Chrome for Testing build's own protocol JSON (browser_protocol.json / js_protocol.json of that build); this file is the SUBSET and the BOUNDS: a parameter not listed is refused, every listed parameter has a closed type, and every string/array/number has both bounds. 'vid' = a virtual handle (see handles). Results are the pinned protocol's result types, with every handle rewritten to a vid, privileged ids removed, and the size cap applied; a result over its cap is refused (error) and nothing else is sent.",
- "version": "o11-cdp-3.3",
+ "$comment": "O11 browser freeze, the CDP filter's closed schemas (draft 3, Nov 22 2026; 3.4, Nov 23: handleBudget). Machine-readable companion to agent-autonomous-browser-o11.md §4. Types follow the pinned Chrome for Testing build's own protocol JSON (browser_protocol.json / js_protocol.json of that build); this file is the SUBSET and the BOUNDS: a parameter not listed is refused, every listed parameter has a closed type, and every string/array/number has both bounds. 'vid' = a virtual handle (see handles). Results are the pinned protocol's result types, with every handle rewritten to a vid, privileged ids removed, and the size cap applied; a result over its cap is refused (error) and nothing else is sent.",
+ "version": "o11-cdp-3.4",
  "defs": {
   "url": {
    "type": "string",
@@ -97,6 +97,10 @@
    "of": "Accessibility AXNodeId",
    "valid": "until the next getFullAXTree/getPartialAXTree call on that page replaces the tree, or the page navigates or closes; takeover revokes. Output only, like ld."
   }
+ },
+ "handleBudget": {
+  "$comment": "The most vids one agent session ever allocates, live and revoked together (revoked vids are kept, so they are never reused). At the bound the session is spent: every handle call is refused (handle_budget), nothing more is forwarded, and the app retires the session; the agent starts a new one. 2^18 is about 6 new handles a second for 12 hours.",
+  "issued": 262144
  },
  "commands": {
   "Page.enable": {

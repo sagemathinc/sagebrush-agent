@@ -209,7 +209,9 @@ fn a_panic_prints_only_the_fixed_72_line_and_every_secret_is_zeroed() {
         return; // the injection hook exists only in debug builds; the credentials are read after the Landlock steps
     }
     let d = tmp("panic");
-    let log = d.join("drops.log");
+    // The log lives in the granted rw work dir: anywhere else, Landlock would deny the Drop's write after restrict_self.
+    let log = d.join("work/drops.log");
+    assert!(!log.exists());
     let o = Command::new(BIN)
         .env_clear()
         .env("CREDENTIALS_DIRECTORY", d.join("creds"))
@@ -221,9 +223,19 @@ fn a_panic_prints_only_the_fixed_72_line_and_every_secret_is_zeroed() {
     assert_eq!(code(&o), 72);
     assert_eq!(stderr(&o), "sagebrush-agent-launch: internal: internal error\n", "nothing but the fixed line");
     assert!(o.stdout.is_empty());
-    // The Landlock ruleset doesn't allow writing the log after restrict_self, unless it is under the rw work dir:
-    // so the test reads whatever the Drop could write, and requires every recorded drop to have been zeroed.
-    let drops = fs::read_to_string(&log).unwrap_or_default();
-    assert!(drops.lines().all(|l| l.contains("zeroed=true")), "{drops}");
+    // Exactly the four Secrets, in drop order, each zeroed: the two input buffers (CREDENTIAL_MAX + 1 bytes, dropped
+    // in the loop), then the two env entries ("NAME=value\0", dropped while the panic unwinds).
+    let drops = fs::read_to_string(&log).expect("the Drop log must exist: every Secret drop writes one line");
+    let entry = |name: &str, value: &str| name.len() + 1 + value.len() + 1;
+    let want: Vec<String> = [
+        16 * 1024 + 1,
+        16 * 1024 + 1,
+        entry("SAGEBRUSH_BROKER_PLACEHOLDER", "placeholder-123"),
+        entry("SAGEBRUSH_WORKSPACE_CAPABILITY", "cap-456"),
+    ]
+    .iter()
+    .map(|cap| format!("dropped zeroed=true cap={cap}"))
+    .collect();
+    assert_eq!(drops.lines().collect::<Vec<_>>(), want, "{drops}");
     let _ = fs::remove_dir_all(&d);
 }

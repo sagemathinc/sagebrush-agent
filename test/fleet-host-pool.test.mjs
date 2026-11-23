@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { HostStore } from "../lib/fleet/host/host-store.mjs";
-import { MAX_CAPACITY, MAX_LABEL, MAX_SUBSCRIPTIONS, POOL_CAP, checkPool } from "../lib/fleet/host/pool.mjs";
+import { MAX_CAPACITY, MAX_LABEL, MAX_SUBSCRIPTIONS, POOL_CAP, checkBindings, checkPool } from "../lib/fleet/host/pool.mjs";
 
 const refused = (fn, code = "bad_form") => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const fresh = () => join(mkdtempSync(join(tmpdir(), "sb-pool-")), "state");
@@ -62,6 +62,69 @@ test("the generation must increase; a refusal changes nothing on disk", async ()
   assert.equal(readFileSync(join(root, "pool", "pool.json"), "utf8"), before);
   assert.equal(p.get().gen, 5);
   await p.close();
+});
+
+test("a subscription's harness and provider are bound forever: changed or re-listed differently, refused", async () => {
+  const root = fresh();
+  const p = await open(root);
+  const O = entry([A], { harness: "opencode", provider: "openai" });
+  p.set(doc(1, [O]), isAgent);
+  assert.deepEqual(p.bindingOf(O.sub), { harness: "opencode", provider: "openai" });
+  const before = readFileSync(join(root, "pool", "pool.json"), "utf8");
+  // The same sub as another provider (openai → anthropic), or as another harness: refused, nothing written.
+  refused(() => p.set(doc(2, [{ ...O, provider: "anthropic" }]), isAgent));
+  refused(() => p.set(doc(2, [{ ...O, harness: "pi" }]), isAgent));
+  refused(() => p.set(doc(2, [{ ...O, harness: "claude", provider: null }]), isAgent));
+  assert.equal(readFileSync(join(root, "pool", "pool.json"), "utf8"), before);
+  // Dropped, then listed again as another provider: still refused (the binding outlives the listing).
+  p.set(doc(2, []), isAgent);
+  refused(() => p.set(doc(3, [{ ...O, provider: "anthropic" }]), isAgent));
+  p.set(doc(3, [O]), isAgent); // its own binding again is fine
+  assert.deepEqual(p.poolOf(A, "opencode", "openai"), [O.sub]);
+  await p.close();
+  const again = await open(root);
+  assert.deepEqual(again.bindingOf(O.sub), { harness: "opencode", provider: "openai" }, "bindings are durable");
+  assert.equal(again.bindingOf(newId()), null);
+  await again.close();
+});
+
+test("eligible: only bound profiles of exactly the entry's harness and provider, in the agent's pool", async () => {
+  const p = await open(fresh());
+  const O = entry([A], { harness: "opencode", provider: "openai" }), P = entry([A, B]), Q = entry([B]);
+  p.set(doc(1, [O, P, Q]), isAgent);
+  const prof = (sub, o = {}) => ({ pid: newId(), harness: "claude", provider: null, auth: "subscription", sub, storage_uid: 90000, project_id: 100000, gen: 1, state: "bound", ...o });
+  const good = prof(P.sub), openai = prof(O.sub, { harness: "opencode", provider: "openai", auth: "api_key" });
+  const profiles = [
+    good, openai,
+    prof(Q.sub), // another agent's subscription
+    prof(P.sub, { state: "creating" }), prof(P.sub, { state: "retiring" }), prof(P.sub, { state: "retired" }),
+    // A profile whose own recorded kind differs from its sub's entry is never selectable (e.g. an old credential).
+    prof(O.sub, { harness: "opencode", provider: "anthropic", auth: "api_key" }),
+    prof(O.sub, { harness: "pi", provider: "openai", auth: "api_key" }),
+    prof(P.sub, { harness: "codex", auth: "api_key" }),
+  ];
+  assert.deepEqual(p.eligible(A, "claude", null, profiles), [good]);
+  assert.deepEqual(p.eligible(A, "opencode", "openai", profiles), [openai]);
+  assert.deepEqual(p.eligible(A, "opencode", "anthropic", profiles), []);
+  assert.deepEqual(p.eligible(C, "claude", null, profiles), []);
+  assert.deepEqual(p.eligible(B, "claude", null, profiles).map((r) => r.sub).sort(), [P.sub, Q.sub].sort());
+  await p.close();
+});
+
+test("bindings: anything but the exact closed shape is refused", () => {
+  const S = newId();
+  const ok = () => ({ v: 1, subs: { [S]: { harness: "pi", provider: "openai" }, [newId()]: { harness: "claude", provider: null } } });
+  assert.equal(checkBindings(ok()), true);
+  const cases = {
+    "another version": (b) => { b.v = 2; },
+    "an extra key": (b) => { b.x = 1; },
+    "a bad sub": (b) => { b.subs.nope = { harness: "claude", provider: null }; },
+    "an extra field": (b) => { b.subs[S].auth = "api_key"; },
+    "an unknown harness": (b) => { b.subs[S].harness = "gemini"; },
+    "no provider on pi": (b) => { b.subs[S].provider = null; },
+    "a provider on claude": (b) => { b.subs[S] = { harness: "claude", provider: "anthropic" }; },
+  };
+  for (const [name, f] of Object.entries(cases)) { const b = ok(); f(b); assert.throws(() => checkBindings(b), (e) => e instanceof FleetError && e.code === "bad_form", name); }
 });
 
 test("the pool cap: an agent in POOL_CAP entries is accepted, in POOL_CAP + 1 refused; MAX_SUBSCRIPTIONS entries", () => {

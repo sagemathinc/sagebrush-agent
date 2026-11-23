@@ -9,20 +9,21 @@ import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { HostStore } from "../lib/fleet/host/host-store.mjs";
-import { HARNESSES, PROJECT_RANGE, STORAGE_UID_RANGE, checkProfiles } from "../lib/fleet/host/profiles.mjs";
+import { PROJECT_RANGE, STORAGE_UID_RANGE, authKinds, checkProfiles } from "../lib/fleet/host/profiles.mjs";
 import { GID_RANGE, UID_RANGE } from "../lib/fleet/host/registry.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const fresh = () => join(mkdtempSync(join(tmpdir(), "sb-profiles-")), "state");
 const disk = (root) => JSON.parse(readFileSync(join(root, "profiles", "profiles.json"), "utf8"));
+const CL = { harness: "claude", auth: "subscription" };
 const open = async (root) => { const h = await HostStore.open(root); const p = h.profiles; p.close = () => h.close(); return p; };
 
 test("create, bind, retire: each state durable on disk before it is visible", async () => {
   const root = fresh();
   const p = await open(root);
   const pid = newId(), sub = newId();
-  const first = { harness: "claude", sub, storage_uid: STORAGE_UID_RANGE[0], project_id: PROJECT_RANGE[0], gen: 1, state: "creating" };
-  assert.deepEqual(p.beginCreate(pid, "claude", sub), first);
+  const first = { harness: "claude", provider: null, auth: "subscription", sub, storage_uid: STORAGE_UID_RANGE[0], project_id: PROJECT_RANGE[0], gen: 1, state: "creating" };
+  assert.deepEqual(p.beginCreate(pid, CL, sub), first);
   assert.equal(disk(root).profiles[pid].state, "creating");
   assert.equal(statSync(join(root, "profiles", "profiles.json")).mode & 0o777, 0o600);
   p.markBound(pid);
@@ -43,7 +44,7 @@ test("create, bind, retire: each state durable on disk before it is visible", as
 test("only the table's moves; a creation can be abandoned to retiring", async () => {
   const p = await open(fresh());
   const pid = newId();
-  p.beginCreate(pid, "claude", newId());
+  p.beginCreate(pid, CL, newId());
   refused(() => p.markRetired(pid), "not_granted"); // creating → retired skips the non-selectable intent
   assert.equal(p.beginRetire(pid).state, "retiring"); // an abandoned creation
   refused(() => p.markBound(pid), "not_granted"); // never back to selectable
@@ -56,24 +57,44 @@ test("only the table's moves; a creation can be abandoned to retiring", async ()
 test("a profile id is never reused; a subscription has at most one live profile; uids and project ids never repeat", async () => {
   const p = await open(fresh());
   const pid = newId(), sub = newId();
-  p.beginCreate(pid, "claude", sub);
-  refused(() => p.beginCreate(pid, "claude", newId()), "bad_form"); // same id, another subscription
-  refused(() => p.beginCreate(newId(), "claude", sub), "bad_form"); // a second live profile for the subscription
+  p.beginCreate(pid, CL, sub);
+  refused(() => p.beginCreate(pid, CL, newId()), "bad_form"); // same id, another subscription
+  refused(() => p.beginCreate(newId(), CL, sub), "bad_form"); // a second live profile for the subscription
   p.beginRetire(pid); p.markRetired(pid);
-  refused(() => p.beginCreate(pid, "claude", sub), "bad_form"); // a retired id never comes back
-  const next = p.beginCreate(newId(), "claude", sub); // a NEW profile for the same subscription is fine once retired
+  refused(() => p.beginCreate(pid, CL, sub), "bad_form"); // a retired id never comes back
+  const next = p.beginCreate(newId(), CL, sub); // a NEW profile for the same subscription is fine once retired
   assert.equal(next.storage_uid, STORAGE_UID_RANGE[0] + 1, "storage uids are never reused");
   assert.equal(next.project_id, PROJECT_RANGE[0] + 1, "project ids are never reused");
-  // Profiles of different subscriptions and harnesses coexist.
-  for (const h of HARNESSES) assert.equal(p.beginCreate(newId(), h, newId()).harness, h);
+  // Profiles of different subscriptions and kinds coexist.
+  for (const k of [{ harness: "codex", auth: "api_key" }, { harness: "opencode", provider: "openai", auth: "oauth" }, { harness: "pi", provider: "anthropic", auth: "api_key" }]) {
+    assert.deepEqual((({ harness, provider, auth }) => ({ harness, provider, auth }))(p.beginCreate(newId(), k, newId())), { provider: null, ...k });
+  }
+  await p.close();
+});
+
+test("the kind is checked against the harness table: a Claude subscription only in the claude harness", async () => {
+  const p = await open(fresh());
+  // Anthropic's terms: no Claude subscription sign-in in opencode or pi; API keys and cloud credentials are fine.
+  for (const h of ["opencode", "pi"]) {
+    refused(() => p.beginCreate(newId(), { harness: h, provider: "anthropic", auth: "subscription" }, newId()), "bad_form");
+    refused(() => p.beginCreate(newId(), { harness: h, provider: "anthropic", auth: "oauth" }, newId()), "bad_form");
+    for (const auth of ["api_key", "cloud"]) assert.equal(p.beginCreate(newId(), { harness: h, provider: "anthropic", auth }, newId()).auth, auth);
+    refused(() => p.beginCreate(newId(), { harness: h, auth: "api_key" }, newId()), "bad_form"); // a provider is required
+    refused(() => p.beginCreate(newId(), { harness: h, provider: "Open AI", auth: "api_key" }, newId()), "bad_form");
+  }
+  for (const auth of ["subscription", "api_key", "cloud"]) assert.equal(p.beginCreate(newId(), { harness: "claude", auth }, newId()).auth, auth);
+  refused(() => p.beginCreate(newId(), { harness: "claude", provider: "anthropic", auth: "api_key" }, newId()), "bad_form"); // no provider on claude
+  refused(() => p.beginCreate(newId(), { harness: "codex", auth: "cloud" }, newId()), "bad_form");
+  refused(() => p.beginCreate(newId(), { harness: "claude", auth: "oauth" }, newId()), "bad_form");
+  assert.deepEqual(authKinds("gemini", null), []);
   await p.close();
 });
 
 test("bad input refuses: an unknown harness, bad ids", async () => {
   const p = await open(fresh());
-  for (const h of ["Claude", "gemini", "", null, 1]) refused(() => p.beginCreate(newId(), h, newId()), "bad_form");
-  refused(() => p.beginCreate("nope", "claude", newId()), "bad_form");
-  refused(() => p.beginCreate(newId(), "claude", "nope"), "bad_form");
+  for (const h of ["Claude", "gemini", "", null, 1]) refused(() => p.beginCreate(newId(), { harness: h, auth: "api_key" }, newId()), "bad_form");
+  refused(() => p.beginCreate("nope", CL, newId()), "bad_form");
+  refused(() => p.beginCreate(newId(), CL, "nope"), "bad_form");
   assert.deepEqual(p.all(), [], "nothing recorded");
   await p.close();
 });
@@ -92,10 +113,10 @@ for (const [name, full, first] of [
     mkdirSync(join(root, "profiles"), { recursive: true, mode: 0o700 });
     const pid = newId();
     writeFileSync(join(root, "profiles", "profiles.json"), JSON.stringify({ v: 2, ...full,
-      profiles: { [pid]: { harness: "claude", sub: newId(), ...first, gen: 1, state: "bound" } } }), { mode: 0o600 });
+      profiles: { [pid]: { harness: "claude", provider: null, auth: "subscription", sub: newId(), ...first, gen: 1, state: "bound" } } }), { mode: 0o600 });
     const p = await open(root);
     const before = readFileSync(join(root, "profiles", "profiles.json"), "utf8");
-    refused(() => p.beginCreate(newId(), "claude", newId()), "uid_exhausted");
+    refused(() => p.beginCreate(newId(), CL, newId()), "uid_exhausted");
     assert.equal(readFileSync(join(root, "profiles", "profiles.json"), "utf8"), before, "nothing allocated");
     await p.close();
   });
@@ -104,8 +125,8 @@ for (const [name, full, first] of [
 test("anything but the exact closed shape is refused at load", () => {
   const P = newId(), Q = newId(), S = newId();
   const ok = () => ({ v: 2, next_storage_uid: STORAGE_UID_RANGE[0] + 2, next_project: PROJECT_RANGE[0] + 2, profiles: {
-    [P]: { harness: "claude", sub: S, storage_uid: STORAGE_UID_RANGE[0], project_id: PROJECT_RANGE[0], gen: 1, state: "bound" },
-    [Q]: { harness: "claude", sub: S, storage_uid: STORAGE_UID_RANGE[0] + 1, project_id: PROJECT_RANGE[0] + 1, gen: 3, state: "retired" } } });
+    [P]: { harness: "claude", provider: null, auth: "subscription", sub: S, storage_uid: STORAGE_UID_RANGE[0], project_id: PROJECT_RANGE[0], gen: 1, state: "bound" },
+    [Q]: { harness: "claude", provider: null, auth: "subscription", sub: S, storage_uid: STORAGE_UID_RANGE[0] + 1, project_id: PROJECT_RANGE[0] + 1, gen: 3, state: "retired" } } });
   assert.equal(checkProfiles(ok()), true);
   const cases = {
     "another version": (s) => { s.v = 1; },
@@ -114,6 +135,10 @@ test("anything but the exact closed shape is refused at load", () => {
     "the old owner fields": (s) => { s.profiles[P].owner_agent = newId(); },
     "an unknown state": (s) => { s.profiles[P].state = "active"; },
     "an unknown harness": (s) => { s.profiles[P].harness = "gemini"; },
+    "a provider on claude": (s) => { s.profiles[P].provider = "anthropic"; },
+    "an auth kind the harness lacks": (s) => { s.profiles[P].auth = "oauth"; },
+    "a Claude subscription in opencode": (s) => { Object.assign(s.profiles[P], { harness: "opencode", provider: "anthropic", auth: "subscription" }); },
+    "no auth": (s) => { delete s.profiles[P].auth; },
     "a bad sub": (s) => { s.profiles[P].sub = "nope"; },
     "a storage uid at or past next": (s) => { s.profiles[P].storage_uid = s.next_storage_uid; },
     "a duplicate storage uid": (s) => { s.profiles[Q].storage_uid = STORAGE_UID_RANGE[0]; },

@@ -1,4 +1,4 @@
-// Host supervisor freeze r3.1 §4.2, §4.3, §4.6: the unit generator. A fixed agent renders byte-for-byte to the golden
+// Host supervisor freeze r3.1 §4.2, §4.3, §4.5, §4.6: the unit generator. A fixed agent renders byte-for-byte to the golden
 // unit; every §4.2 directive is present; the stop fences are start conditions; secrets arrive only by LoadCredential;
 // the mount view and the Landlock ruleset come from one contract; anything unsafe to render is refused.
 import assert from "node:assert/strict";
@@ -132,8 +132,8 @@ test("refused: staged binds that don't match the grant exactly, or that sit outs
   refused(() => renderUnit(agent(), ctx({ staged: [{ ...ctx().staged[0], staging: `/run/sagebrush/binds/${T1}/0` }, ctx().staged[1]] })), "bad_form");
 });
 
-test("refused: a root agent (rendered separately, §4.5), an unknown client, bad ids, bad tags, a bad config", () => {
-  refused(() => renderUnit(agent({ root: true }), ctx()), "bad_form");
+test("refused: a root that isn't a boolean, an unknown client, bad ids, bad tags, a bad config", () => {
+  for (const root of [undefined, null, "yes", 1, 0, "true"]) refused(() => renderUnit(agent({ root }), ctx()), "bad_form");
   refused(() => renderUnit(agent({ client: "gpt" }), ctx()), "bad_form");
   refused(() => renderUnit(agent({ agent: "worker-1" }), ctx()), "bad_form");
   refused(() => renderUnit(agent({ tags: [T1, T1] }), ctx()), "bad_form");
@@ -162,4 +162,51 @@ test("no CPUQuota line when the quota is null", () => {
 test("pathContract hides other agents and lists the tags only of this agent", () => {
   const rows = pathContract({ ...agent(), id: A }, ctx());
   assert.equal(rows.filter((r) => r.path.startsWith("/srv/sagebrush/tags/")).length, 2);
+});
+
+// §4.5: a root agent's unit is the same unit with User=root and Group=root, and without the Privilege and Namespaces
+// rows. Compared line by line with the non-root unit of the same grant, so a shared row can neither bring a dropped
+// restriction back nor lose a retained one.
+const GOLDEN_ROOT = new URL("./fixtures/host/agent-unit-root.service", import.meta.url);
+const DROPPED = ["NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "RestrictSUIDSGID=yes", "SecureBits=noroot-locked", "RestrictNamespaces=yes"];
+
+test("a fixed root agent renders byte-for-byte to the golden root unit", () => {
+  const out = renderUnit(agent({ root: true }), ctx());
+  assert.equal(out.root, true);
+  assert.equal(renderUnit(agent(), ctx()).root, false);
+  if (process.env.UPDATE_GOLDEN === "1") writeFileSync(GOLDEN_ROOT, out.text);
+  assert.equal(out.text, readFileSync(GOLDEN_ROOT, "utf8"));
+});
+
+test("root unit = the non-root unit minus exactly the Privilege and Namespaces rows, with uid 0 and no tag groups", () => {
+  const plain = renderUnit(agent(), ctx()).text.split("\n");
+  const root = renderUnit(agent({ root: true }), ctx()).text.split("\n");
+  const swapped = plain
+    .filter((l) => !DROPPED.includes(l) && !l.startsWith("SupplementaryGroups="))
+    .map((l) => (l === `User=sb-${A}` ? "User=root" : l === `Group=sb-${A}` ? "Group=root" : l));
+  const banner = "# ROOT AGENT (person-signed root: true): runs as uid 0; not isolated from the host; stop is best effort.";
+  assert.deepEqual(root, [swapped[0], banner, ...swapped.slice(1)]);
+  for (const l of DROPPED) assert.ok(plain.includes(l), l);
+  // Retained, named explicitly: the fences, the mount view, the syscall filter, the netns, the resources, the secrets.
+  for (const l of [`ConditionPathExists=!/var/lib/sagebrush/fence/all`, "ProtectSystem=strict", "TemporaryFileSystem=/srv/sagebrush:ro",
+    "SystemCallFilter=~@mount @swap @reboot @raw-io @module @obsolete @cpu-emulation @privileged", "PrivateIPC=yes", "ProtectKernelModules=yes",
+    `NetworkNamespacePath=/run/netns/sb-${A}`, "MemoryMax=6144M", "Delegate=no", "KillMode=control-group",
+    `LoadCredential=broker-placeholder:/var/lib/sagebrush/creds/${A}/broker-placeholder`]) assert.ok(root.includes(l), l);
+  assert.ok(!root.some((l) => /^Environment/.test(l)));
+});
+
+test("a root agent keeps the same path contract and Landlock ruleset; its digest differs from the non-root one", () => {
+  const plain = renderUnit(agent(), ctx()), root = renderUnit(agent({ root: true }), ctx());
+  assert.deepEqual(root.contract, plain.contract);
+  assert.deepEqual(root.landlock, plain.landlock);
+  assert.notEqual(root.digest, plain.digest);
+});
+
+test("a root agent with no tags and a GPU still renders, with no tag groups and the GPU device policy", () => {
+  const c = config(); c.gpu = true;
+  const { text } = renderUnit(agent({ root: true, tags: [], config: c }), ctx({ gpuNodes: ["/dev/nvidia0"] }));
+  assert.match(text, /^User=root$/m);
+  assert.match(text, /^DevicePolicy=closed$/m);
+  assert.doesNotMatch(text, /^SupplementaryGroups=/m);
+  assert.doesNotMatch(text, /^PrivateDevices=/m);
 });

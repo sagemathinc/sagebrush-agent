@@ -12,7 +12,7 @@ const url = (p) => new URL(p, import.meta.url).href;
 
 for (const [name, body] of [
   ["stop", `const { stop } = await import(${JSON.stringify(url("../lib/fleet/host/fence.mjs"))});
-     const sys = { stop() {}, jobs() { return []; }, cancel() {}, activeAgentUnits() { return []; }, procCount() { return 0; } };
+     const sys = { stop() {}, jobs() { return []; }, cancel() {}, activeAgentUnits() { return []; }, rootUnits() { return []; }, procCount() { return 0; } };
      const r = await stop({ all: true }, "all", { dir: process.argv[1], sys });
      console.log("result", r.status);`],
   ["lowerFence", `const { raiseFence, lowerFence, fenced } = await import(${JSON.stringify(url("../lib/fleet/host/fence.mjs"))});

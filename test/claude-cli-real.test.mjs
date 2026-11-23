@@ -347,7 +347,7 @@ test("cli: the bound counts every unsettled tool call, waiting, being decided or
 test("cli: retained state is bounded in bytes: id and name formats closed at 64 characters, settled entries keep neither name nor input, a measured ceiling for 65,536 ids, the held-input budget", { timeout: 60_000 }, async () => {
   const { CLI_LIMITS } = await import("../lib/claude-cli.mjs");
   // (the registered caps)
-  assert.deepEqual({ pendingMax: CLI_LIMITS.pendingMax, seenMax: CLI_LIMITS.seenMax, heldInputBytes: CLI_LIMITS.heldInputBytes, lineMax: CLI_LIMITS.lineMax, bodyMax: CLI_LIMITS.bodyMax }, { pendingMax: 64, seenMax: 65536, heldInputBytes: 64 * 1024 * 1024, lineMax: 16 * 1024 * 1024, bodyMax: 32 * 1024 * 1024 });
+  assert.deepEqual({ pendingMax: CLI_LIMITS.pendingMax, seenMax: CLI_LIMITS.seenMax, heldInputBytes: CLI_LIMITS.heldInputBytes, lineMax: CLI_LIMITS.lineMax, bodyMax: CLI_LIMITS.bodyMax, queueMax: CLI_LIMITS.queueMax, queueBytesMax: CLI_LIMITS.queueBytesMax }, { pendingMax: 64, seenMax: 65536, heldInputBytes: 64 * 1024 * 1024, lineMax: 16 * 1024 * 1024, bodyMax: 32 * 1024 * 1024, queueMax: 256, queueBytesMax: 32 * 1024 * 1024 });
   // (a stand-in that only waits: the run's own state is driven directly)
   const { writeFileSync, chmodSync } = await import("node:fs");
   const sleeper = join(mkdtempSync(join(tmpdir(), "sb-sleep-")), "wait");
@@ -439,4 +439,67 @@ test("cli: a run that ends while it is still being set up starts no process and 
     assert.equal(q.child, null, `${how}: nothing was spawned`);
     assert.equal(existsSync(mark), false, `${how}: the stand-in never ran`);
   }
+});
+
+test("cli: the held-input budget counts canonical UTF-8 bytes, and an Allow's changed input is checked against it with every other held input", { timeout: 30_000 }, async () => {
+  const { writeFileSync, chmodSync } = await import("node:fs");
+  const sleeper = join(mkdtempSync(join(tmpdir(), "sb-sleep-")), "wait");
+  writeFileSync(sleeper, "#!/bin/sh\nexec sleep 600\n");
+  chmodSync(sleeper, 0o700);
+  const use = (q, id, input) => q.line(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id, name: "mcp__s__t", input }] } }));
+  // (multibyte: 50 "é" are 58 characters of canonical text but 108 bytes, over a 60-byte budget: not held)
+  const a = cliQuery({ prompt: "x", options: { canUseTool: async () => ({ behavior: "deny", message: "no" }) } }, { bin: sleeper, env: { PATH: process.env.PATH }, limits: { heldInputBytes: 60, connectMs: 600_000, killGraceMs: 200 } });
+  use(a, "toolu_m", { v: "é".repeat(50) });
+  assert.equal(a.pending.has("toolu_m"), false);
+  use(a, "toolu_s", { v: "x".repeat(40) });
+  assert.equal(a.pending.has("toolu_s"), true, "48 bytes fit");
+  a.abort.abort(); await a.return();
+  // (an Allow that grows the input past the budget is denied; with several held, the sum counts; a fitting one is allowed)
+  let answers = {};
+  const b = cliQuery({ prompt: "x", options: { canUseTool: async (n, input, { toolUseID }) => answers[toolUseID] } }, { bin: sleeper, env: { PATH: process.env.PATH }, limits: { heldInputBytes: 100, connectMs: 600_000, killGraceMs: 200 } });
+  use(b, "toolu_1", { v: "x" });
+  use(b, "toolu_2", { v: "x" });
+  answers = { toolu_1: { behavior: "allow", updatedInput: { v: "x".repeat(1000) } }, toolu_2: { behavior: "allow", updatedInput: { v: "y".repeat(80) } } };
+  const [r1, r2] = await Promise.all([b.permission({ tool_name: "mcp__s__t", input: { v: "x" }, tool_use_id: "toolu_1" }), b.permission({ tool_name: "mcp__s__t", input: { v: "x" }, tool_use_id: "toolu_2" })]);
+  assert.equal(JSON.parse(r1.content[0].text).behavior, "deny", "1008 bytes don't fit");
+  assert.equal(b.pending.get("toolu_1").state, "denied");
+  assert.equal(JSON.parse(r2.content[0].text).behavior, "allow", "88 bytes fit beside nothing else held");
+  assert.ok(b.heldBytes() <= 100, `held ${b.heldBytes()} bytes`);
+  use(b, "toolu_3", { v: "z".repeat(20) });
+  assert.equal(b.pending.has("toolu_3"), false, "88 + 28 bytes don't fit: the third isn't held");
+  b.abort.abort(); await b.return();
+});
+
+// (TESTS T6: the queue's caps hold within one chunk of output: parsing stops, not only the stream)
+test("cli: a burst of 1500 frames in one chunk, multibyte ones included, waits within the queue's count and byte caps; a slow consumer gets them all in order; a Stop while paused returns", { skip: process.platform === "win32" ? "a node stand-in" : false, timeout: 60_000 }, async () => {
+  const { writeFileSync, chmodSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "sb-burst-"));
+  const bin = join(dir, "burst");
+  writeFileSync(bin, `#!${process.execPath}\nconst lines = [];\nfor (let i = 0; i < 1500; i++) lines.push(JSON.stringify({ type: "stream_event", n: i, t: i % 3 ? "plain" : "é€😀".repeat(10) }));\nprocess.stdout.write(lines.join("\\n") + "\\n");\nsetTimeout(() => {}, 600000);\n`);
+  chmodSync(bin, 0o700);
+  for (const [label, limits] of [["count", { queueMax: 256 }], ["bytes", { queueMax: 100000, queueBytesMax: 4096 }]]) {
+    const q = cliQuery({ prompt: "x", options: { canUseTool: async () => ({ behavior: "deny", message: "no" }) } }, { bin, env: { PATH: process.env.PATH }, limits: { connectMs: 600_000, killGraceMs: 200, ...limits } });
+    await new Promise((r) => setTimeout(r, 1500));
+    assert.equal(q.paused, true, `${label}: paused`);
+    if (label === "count") assert.ok(q.queue.length <= 256, `${label}: ${q.queue.length} queued`);
+    else assert.ok(q.queueBytes < 4096 + 200, `${label}: ${q.queueBytes} bytes queued`);
+    // (a slow consumer: every frame, in order)
+    const got = [];
+    for (let i = 0; i < 1500; i++) {
+      const s = await q.next();
+      got.push(s.value.n);
+      if (i % 200 === 0) await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.deepEqual(got, Array.from({ length: 1500 }, (_, i) => i), `${label}: all, in order`);
+    q.abort.abort();
+    await q.return();
+  }
+  // (a Stop while paused)
+  const q = cliQuery({ prompt: "x", options: { canUseTool: async () => ({ behavior: "deny", message: "no" }) } }, { bin, env: { PATH: process.env.PATH }, limits: { connectMs: 600_000, killGraceMs: 200 } });
+  await new Promise((r) => setTimeout(r, 1500));
+  assert.equal(q.paused, true);
+  const t0 = Date.now();
+  q.abort.abort();
+  await q.return();
+  assert.ok(Date.now() - t0 < 1500);
 });

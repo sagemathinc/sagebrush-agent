@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { HostStore } from "../lib/fleet/host/host-store.mjs";
-import { PROJECT_RANGE, STORAGE_UID_RANGE, authKinds, checkProfiles } from "../lib/fleet/host/profiles.mjs";
+import { AUTH_TABLE, HARNESSES, PROJECT_RANGE, STORAGE_UID_RANGE, authKinds, checkProfiles } from "../lib/fleet/host/profiles.mjs";
 import { GID_RANGE, UID_RANGE } from "../lib/fleet/host/registry.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
@@ -87,7 +87,35 @@ test("the kind is checked against the harness table: a Claude subscription only 
   refused(() => p.beginCreate(newId(), { harness: "codex", auth: "cloud" }, newId()), "bad_form");
   refused(() => p.beginCreate(newId(), { harness: "claude", auth: "oauth" }, newId()), "bad_form");
   assert.deepEqual(authKinds("gemini", null), []);
+  // A provider the table doesn't list refuses, whatever it is called: an alias of Anthropic, an unknown provider.
+  for (const h of ["opencode", "pi"]) {
+    for (const provider of ["claude", "claude-ai", "Anthropic", "mistral", "", null]) {
+      for (const auth of ["subscription", "oauth", "api_key", "cloud"]) refused(() => p.beginCreate(newId(), { harness: h, provider, auth }, newId()), "bad_form");
+    }
+    assert.equal(p.beginCreate(newId(), { harness: h, provider: "openai", auth: "oauth" }, newId()).auth, "oauth");
+  }
   await p.close();
+});
+
+test("the auth table is closed and exactly this (a change is a reviewed change to this row)", () => {
+  assert.deepEqual(JSON.parse(JSON.stringify(AUTH_TABLE)), {
+    claude: { "": ["subscription", "api_key", "cloud"] },
+    codex: { "": ["subscription", "api_key"] },
+    opencode: { anthropic: ["api_key", "cloud"], openai: ["api_key", "oauth"] },
+    pi: { anthropic: ["api_key", "cloud"], openai: ["api_key", "oauth"] },
+  });
+  assert.deepEqual(HARNESSES, ["claude", "codex", "opencode", "pi"]);
+  // Only claude lists a subscription; nothing but claude lists any Anthropic sign-in other than an API key or cloud.
+  for (const [h, byProvider] of Object.entries(AUTH_TABLE)) {
+    for (const [prov, kinds] of Object.entries(byProvider)) {
+      if (h !== "claude" && prov === "anthropic") assert.deepEqual([...kinds].sort(), ["api_key", "cloud"]);
+      if (kinds.includes("subscription")) assert.ok(["claude", "codex"].includes(h) && prov === "");
+    }
+  }
+  assert.ok(Object.isFrozen(AUTH_TABLE) && Object.isFrozen(AUTH_TABLE.pi) && Object.isFrozen(AUTH_TABLE.pi.openai));
+  // A copy is returned: mutating it changes nothing.
+  const k = authKinds("pi", "anthropic"); k.push("subscription");
+  assert.deepEqual(authKinds("pi", "anthropic"), ["api_key", "cloud"]);
 });
 
 test("bad input refuses: an unknown harness, bad ids", async () => {
@@ -138,6 +166,7 @@ test("anything but the exact closed shape is refused at load", () => {
     "a provider on claude": (s) => { s.profiles[P].provider = "anthropic"; },
     "an auth kind the harness lacks": (s) => { s.profiles[P].auth = "oauth"; },
     "a Claude subscription in opencode": (s) => { Object.assign(s.profiles[P], { harness: "opencode", provider: "anthropic", auth: "subscription" }); },
+    "an unlisted provider": (s) => { Object.assign(s.profiles[P], { harness: "pi", provider: "claude", auth: "oauth" }); },
     "no auth": (s) => { delete s.profiles[P].auth; },
     "a bad sub": (s) => { s.profiles[P].sub = "nope"; },
     "a storage uid at or past next": (s) => { s.profiles[P].storage_uid = s.next_storage_uid; },

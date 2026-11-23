@@ -122,6 +122,7 @@ test("bindings: anything but the exact closed shape is refused", () => {
     "an extra field": (b) => { b.subs[S].auth = "api_key"; },
     "an unknown harness": (b) => { b.subs[S].harness = "gemini"; },
     "no provider on pi": (b) => { b.subs[S].provider = null; },
+    "an unlisted provider": (b) => { b.subs[S].provider = "claude"; },
     "a provider on claude": (b) => { b.subs[S] = { harness: "claude", provider: "anthropic" }; },
   };
   for (const [name, f] of Object.entries(cases)) { const b = ok(); f(b); assert.throws(() => checkBindings(b), (e) => e instanceof FleetError && e.code === "bad_form", name); }
@@ -152,6 +153,8 @@ test("anything but the exact closed shape is refused", () => {
     "a provider on claude": (s) => { s.subscriptions[0].provider = "anthropic"; },
     "no provider on a multi-provider harness": (s) => { s.subscriptions[1].provider = null; },
     "a bad provider": (s) => { s.subscriptions[1].provider = "Open AI"; },
+    "an unlisted provider": (s) => { s.subscriptions[1].provider = "mistral"; },
+    "an Anthropic alias": (s) => { s.subscriptions[1].provider = "claude"; },
     "an empty label": (s) => { s.subscriptions[0].label = ""; },
     "a long label": (s) => { s.subscriptions[0].label = "x".repeat(MAX_LABEL + 1); },
     "a control character in a label": (s) => { s.subscriptions[0].label = "a\nb"; },

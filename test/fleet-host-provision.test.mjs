@@ -128,6 +128,15 @@ test("the config tree: a crash after mkdir and before its label is finished, the
   assert.deepEqual(cmds(s.calls, "chattr").slice(before), [["chattr", "+P", "-p", String(UID), `${s.root}${cfg}`]]);
   await s.p.provision(A, UID, grantAgent(), 5000);
   assert.equal(cmds(s.calls, "chattr").length, before + 1, "labelled once: nothing redone");
+  // An empty config tree carrying a FOREIGN project (or a lone inherit flag) is refused, never relabelled.
+  for (const label of [{ id: 77777, inherit: true }, { id: 0, inherit: true }, { id: UID + 1, inherit: false }]) {
+    s.proj.set(`${s.root}${cfg}`, label);
+    const n = cmds(s.calls, "chattr").length;
+    await assert.rejects(s.p.provision(A, UID, grantAgent(), 5000), /another project state/, JSON.stringify(label));
+    assert.equal(cmds(s.calls, "chattr").length, n, "nothing relabelled");
+  }
+  s.proj.delete(`${s.root}${cfg}`);
+  await s.p.provision(A, UID, grantAgent(), 5000);
   // A populated config tree without its label is never relabelled (it wouldn't charge what's already there).
   s.fsx.writeFileSync(join(s.root, `${cfg}/current`), "gen-1");
   s.proj.delete(`${s.root}${cfg}`);

@@ -407,3 +407,9 @@ pub fn rename_noreplace_between(from_dir: &OwnedFd, from: &CStr, to_dir: &OwnedF
     let r = unsafe { libc::renameat2(from_dir.as_raw_fd(), from.as_ptr(), to_dir.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) };
     if r != 0 { Err(last()) } else { Ok(()) }
 }
+
+/// geteuid(): the A1 subcommands run as root only (an explicit guard; root is their sole qualified caller).
+pub fn is_root() -> bool {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}

@@ -262,11 +262,10 @@ fn a1_subcommands_refuse_bad_arguments_and_a_missing_anchor() {
         assert_eq!(code(&o), 64, "{bad:?}: {}", stderr(&o));
         assert!(o.stdout.is_empty());
     }
-    // A missing anchor (no /var/lib/sagebrush on a test runner) refuses before anything: 66, one fixed line.
-    if !Path::new("/var/lib/sagebrush/contract").exists() {
-        let o = run(&["identify", "--anchor", "/var/lib/sagebrush/contract", "--name", &json]);
-        assert_eq!(code(&o), 66, "{}", stderr(&o));
-        assert_eq!(stderr(&o).lines().count(), 1);
-        assert!(o.stdout.is_empty());
-    }
+    // Well-formed arguments as a non-root user: the root guard refuses (66) before anything is opened; as root (the
+    // qualification VM), a missing anchor refuses the same way.
+    let o = run(&["identify", "--anchor", "/var/lib/sagebrush/contract", "--name", &json]);
+    assert_eq!(code(&o), 66, "{}", stderr(&o));
+    assert_eq!(stderr(&o).lines().count(), 1);
+    assert!(o.stdout.is_empty());
 }

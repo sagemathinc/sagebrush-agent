@@ -58,9 +58,15 @@ fn run() -> err::Result<()> {
 
 fn a1(cmd: &str, rest: &[String]) -> err::Result<()> {
     let mut o = tree::RealOps;
+    // The arguments first (64), then the root guard (66): the supervisor is the only caller, as root.
+    let guard = || if sys::is_root() { Ok(()) } else { Err(err(Fail::Preflight, "root only")) };
     let out = match cmd {
         "identify" => {
             let v = args::flags(rest, &["anchor", "name"])?;
+            if !tree::anchor_name_ok(v[0], v[1]) {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            guard()?;
             tree::identify(&mut o, v[0], v[1])?
         }
         "inspect-home" => {
@@ -71,15 +77,29 @@ fn a1(cmd: &str, rest: &[String]) -> err::Result<()> {
             }
             let kept: Vec<String> = rest.iter().filter(|a| *a != "--archive").cloned().collect();
             let v = args::flags(&kept, &["mount", "agent", "tree"])?;
-            tree::inspect_home(&mut o, tree::parse_mount(v[0])?, v[1], tree::parse_tree(v[2])?, archive == 1)?
+            let (mount, t) = (tree::parse_mount(v[0])?, tree::parse_tree(v[2])?);
+            if !args::is_id(v[1]) {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            guard()?;
+            tree::inspect_home(&mut o, mount, v[1], t, archive == 1)?
         }
         "archive-home" => {
             let v = args::flags(rest, &["mount", "agent", "tree", "expect"])?;
-            tree::archive_home(&mut o, tree::parse_mount(v[0])?, v[1], tree::parse_tree(v[2])?, v[3])?;
+            let (mount, t) = (tree::parse_mount(v[0])?, tree::parse_tree(v[2])?);
+            if !args::is_id(v[1]) || args::rel(v[3]).is_none() {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            guard()?;
+            tree::archive_home(&mut o, mount, v[1], t, v[3])?;
             String::new()
         }
         _ => {
             let v = args::flags(rest, &["anchor", "name", "expect"])?;
+            if !tree::anchor_name_ok(v[0], v[1]) || args::rel(v[2]).is_none() {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            guard()?;
             tree::remove_tree(&mut o, v[0], v[1], v[2])?;
             String::new()
         }

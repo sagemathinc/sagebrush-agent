@@ -187,11 +187,11 @@ test("frames: closed schemas: a missing field, an extra field, or a value out of
     ["cdp.proxy_auth", { proxy_port: 1023 }], ["cdp.proxy_auth", { proxy_port: 65536 }], ["cdp.proxy_auth", { proxy_port: "50123" }], ["cdp.proxy_auth", { proxy_port: 0 }],
     ["rust.cdp_state", { state: "READY" }], ["cdp.takeover", { reason: 1 }],
     ["cdp.command", { seq: -1 }], ["cdp.command", { seq: "1" }], ["net.result", { seq: true }],
-    ["net.refused", { reason: "filter" }], ["net.refused", { reason: "credits" }], ["net.refused", { reason: "bad " }],
+    ["net.refused", { reason: "filter" }], ["net.refused", { reason: "credits" }], ["net.refused", { reason: "bad " }], ["net.refused", { reason: "Abandoned" }], ["net.refused", { reason: "unknown" }],
   ];
   for (const [kind, x] of out) assert.equal(dec(kind, head(kind, x)), "schema", `${kind} ${JSON.stringify(x).slice(0, 60)}`);
   // (at the caps: accepted)
-  for (const [kind, x] of [["net.start", { session: "s".repeat(64) }], ["net.start", { relay_url: "wss://" + "r".repeat(2042) }], ["rust.net_hello", { proxy_port: 1024 }], ["rust.net_hello", { proxy_port: 65535 }], ["cdp.proxy_auth", { proxy_port: 1024 }], ["cdp.proxy_auth", { proxy_port: 65535 }], ["rust.net_state", { reason: "r".repeat(256) }], ["cdp.start", { chrome_pid: 2 ** 31 - 1 }], ["net.refused", { reason: "bad" }]]) {
+  for (const [kind, x] of [["net.start", { session: "s".repeat(64) }], ["net.start", { relay_url: "wss://" + "r".repeat(2042) }], ["rust.net_hello", { proxy_port: 1024 }], ["rust.net_hello", { proxy_port: 65535 }], ["cdp.proxy_auth", { proxy_port: 1024 }], ["cdp.proxy_auth", { proxy_port: 65535 }], ["rust.net_state", { reason: "r".repeat(256) }], ["cdp.start", { chrome_pid: 2 ** 31 - 1 }], ["net.refused", { reason: "bad" }], ["net.refused", { reason: "takeover" }], ["net.refused", { reason: "abandoned" }]]) {
     assert.equal(dec(kind, head(kind, x)), "ok", `${kind} ${JSON.stringify(x).slice(0, 60)}`);
   }
 });
@@ -296,4 +296,15 @@ test("frames: a net.result body is the session's answer: {result: object} or {er
     assert.equal(codeOf(() => enc(head("net.result"), Buffer.from(bad))), "body", bad.slice(0, 40));
   }
   assert.ok(!isAnswer(Buffer.from([0x7b, 0xff, 0x7d])));
+});
+
+test("frames: net.refused's reasons are exactly takeover (not run), bad (not run) and abandoned (may have run)", () => {
+  const enc = createEncoder({ from: "cdp" }), dec = () => createDecoder({ to: "net", from: "cdp" });
+  for (const reason of ["takeover", "bad", "abandoned"]) {
+    const [f] = dec().push(enc(head("net.refused", { reason })));
+    assert.equal(f.head.reason, reason);
+  }
+  for (const reason of ["filter", "credits", "unknown", "abandon", "ABANDONED", "", "takeover,abandoned"]) {
+    assert.equal(codeOf(() => enc(head("net.refused", { reason }))), "schema", JSON.stringify(reason));
+  }
 });

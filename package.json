@@ -20,6 +20,7 @@
     "lib/canon.mjs",
     "lib/image.mjs",
     "lib/claude-cli.mjs",
+    "lib/node-check.mjs",
     "lib/claude-pin.json",
     "lib/tags.mjs",
     "schema/tags.schema.json",

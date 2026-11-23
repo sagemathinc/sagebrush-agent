@@ -3,7 +3,7 @@
 // the mount view and the Landlock ruleset come from one contract; anything unsafe to render is refused.
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
-import { test } from "node:test";
+import { test } from "./host-linux-only.mjs";
 import { FleetError } from "../lib/fleet/index.mjs";
 import { renderUnit, pathContract, landlockRules, LANDLOCK_ABI } from "../lib/fleet/host/unit.mjs";
 

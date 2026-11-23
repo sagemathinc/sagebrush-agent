@@ -484,3 +484,59 @@ test("takeover: a deadline command abandoned by the drain never fires its deadli
   assert.equal(cdp.find("Runtime.releaseObjectGroup").length, releases);
   assert.deepEqual(outcome, { unknown: true });
 });
+
+test("createTarget: CDP's answer arriving after the 30 s registers nothing, however many times (no waiter is left behind)", async () => {
+  const { cdp, session, clock } = await setup();
+  for (let i = 0; i < 5; i++) {
+    let outcome = "pending";
+    session.command({ method: "Target.createTarget", params: { url: "about:blank" } }).then((r) => { outcome = r; });
+    await clock.advance(DRAIN.attachMs);
+    assert.deepEqual(outcome, { error: { code: -32000, message: "timed out" } }, String(i));
+    cdp.last("Target.createTarget").ok({ targetId: `REAL-LATE${i}` }); // (the late answer; that page never attaches)
+    await settle();
+    assert.equal(session.waitingTargets, 0, String(i));
+  }
+  let outcome = "pending"; // (still answered at 29 s and then waiting for its attach: one waiter, removed at 30 s)
+  session.command({ method: "Target.createTarget", params: { url: "about:blank" } }).then((r) => { outcome = r; });
+  await clock.advance(29000);
+  cdp.last("Target.createTarget").ok({ targetId: "REAL-SLOW" });
+  await settle();
+  assert.equal(session.waitingTargets, 1);
+  await clock.advance(1000);
+  assert.deepEqual(outcome, { error: { code: -32000, message: "timed out" } });
+  assert.equal(session.waitingTargets, 0);
+});
+
+test("a command given up at its own 30 s leaves tracking then: an idle takeover terminates nothing, and its late answer is discarded", async () => {
+  const { cdp, seen, session, clock } = await setup();
+  await attach(cdp, { sessionId: "SESS-A", targetId: "REAL-TA" });
+  const pa = pageVid(seen);
+  let outcome = "pending";
+  session.command({ method: "Runtime.evaluate", params: { expression: "new Promise(()=>{})", awaitPromise: true }, sessionId: pa }).then((r) => { outcome = r; });
+  await settle();
+  assert.equal(session.inflight, 1);
+  await clock.advance(30000);
+  assert.deepEqual(outcome, { error: { code: -32000, message: "timed out" } });
+  assert.equal(session.inflight, 0); // (given up now, not when CDP someday answers)
+  cdp.last("Runtime.terminateExecution").ok({});
+  const terminates = cdp.find("Runtime.terminateExecution").length;
+  const t = session.takeover();
+  await clock.advance(DRAIN.waitMs + DRAIN.terminateMs);
+  assert.deepEqual(await t, { paused: true });
+  assert.equal(cdp.find("Runtime.terminateExecution").length, terminates); // (idle: no second terminate)
+  session.handback();
+  cdp.find("Runtime.evaluate")[0].ok({ result: { type: "object", objectId: "REAL-LATE" } }); // (the late answer)
+  await settle();
+  assert.deepEqual(outcome, { error: { code: -32000, message: "timed out" } });
+  assert.ok(!JSON.stringify(seen).includes("REAL-"));
+  for (let i = 0; i < 5; i++) { // (repeated deadlines: nothing accumulates)
+    session.command({ method: "Runtime.callFunctionOn", params: { functionDeclaration: "() => new Promise(() => {})", executionContextId: (() => { cdp.emit("Runtime.executionContextCreated", { context: { id: 900100 + i, origin: "", name: "", uniqueId: `REAL-U${i}`, auxData: { frameId: "REAL-F1", isDefault: false } } }, "SESS-A"); return seen.at(-1).params.context.id; })(), awaitPromise: true }, sessionId: pa });
+    await clock.advance(30000);
+  }
+  assert.equal(session.inflight, 0);
+  const { cdp: c2, session: s2, clock: k2 } = await setup(); // (createTarget's own timeout: the same)
+  s2.command({ method: "Target.createTarget", params: { url: "about:blank" } });
+  await k2.advance(DRAIN.attachMs);
+  assert.equal(s2.inflight, 0);
+  assert.equal(c2.find("Runtime.terminateExecution").length, 0);
+});

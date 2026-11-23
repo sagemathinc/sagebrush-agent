@@ -1,0 +1,63 @@
+// The fleet protocol's closed schema validator (lib/fleet/schema.mjs): every implemented keyword, refusal of any
+// other keyword at load time, and agent #23's tags schema compiled and checked with it.
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { test } from "node:test";
+import { compile, FleetError, newId, FREEZE } from "../lib/fleet/index.mjs";
+
+const bad = (fn) => { try { fn(); } catch (e) { if (e instanceof FleetError) return e.code; throw e; } return "ok"; };
+
+test("closed validator: object shape, types, enum/const, pattern, lengths in code points, numbers, arrays", () => {
+  const v = compile({
+    type: "object", additionalProperties: false, required: ["a", "b"],
+    properties: {
+      a: { type: "string", pattern: "^[a-z]+$", minLength: 1, maxLength: 3 },
+      b: { type: "integer", minimum: 0, maximum: 10 },
+      c: { enum: ["x", "y"] }, d: { const: true },
+      e: { type: "array", minItems: 1, maxItems: 2, uniqueItems: true, items: { type: "string" } },
+      f: { type: "string", maxLength: 2 },
+      g: { type: "array", prefixItems: [{ type: "integer" }], items: false },
+    },
+  });
+  assert.equal(v({ a: "ab", b: 3 }), true);
+  assert.equal(v({ a: "ab", b: 0, c: "y", d: true, e: ["q", "r"], f: "😀😀", g: [1] }), true, "two code points");
+  for (const x of [{ a: "ab" }, { a: "AB", b: 1 }, { a: "abcd", b: 1 }, { a: "", b: 1 }, { a: "a", b: 11 }, { a: "a", b: -1 },
+    { a: "a", b: 1.5 }, { a: "a", b: "1" }, { a: "a", b: 1, c: "z" }, { a: "a", b: 1, d: false }, { a: "a", b: 1, e: [] },
+    { a: "a", b: 1, e: ["q", "q"] }, { a: "a", b: 1, e: ["q", 1] }, { a: "a", b: 1, f: "😀😀😀" }, { a: "a", b: 1, g: [1, 2] },
+    { a: "a", b: 1, g: ["x"] }, { a: "a", b: 1, z: 1 }, null, [], "s"])
+    assert.equal(bad(() => v(x)), "bad_form", JSON.stringify(x));
+});
+
+test("closed validator: $ref, oneOf (exactly one), not", () => {
+  const v = compile({
+    $defs: { id: { type: "string", pattern: "^[a-z2-7]{25}[aeimquy4]$" }, n: { type: "integer" } },
+    oneOf: [{ $ref: "#/$defs/id" }, { $ref: "#/$defs/n" }],
+    not: { const: 0 },
+  });
+  assert.equal(v(newId()), true);
+  assert.equal(v(5), true);
+  assert.equal(bad(() => v(0)), "bad_form");
+  assert.equal(bad(() => v("nope")), "bad_form");
+  const both = compile({ oneOf: [{ type: "integer" }, { minimum: 0 }] });
+  assert.equal(bad(() => both(3)), "bad_form", "matches two");
+});
+
+test("closed validator: an unimplemented keyword, an open object or an outside ref refuses the schema itself", () => {
+  for (const s of [{ format: "email" }, { type: "object", additionalProperties: true }, { $ref: "https://x/y" },
+    { type: "number" }, { anyOf: [] }, { patternProperties: {} }, { properties: { a: { dependentRequired: {} } } }, { $ref: "#/$defs/missing" }])
+    assert.throws(() => compile(s), /schema/, JSON.stringify(s));
+});
+
+test("agent #23's tags schema compiles under the closed validator, and agrees with lib/tags.mjs", async () => {
+  const doc = JSON.parse(readFileSync(new URL("../schema/tags.schema.json", import.meta.url), "utf8"));
+  const v = compile(doc);
+  const { validTagName } = await import("../lib/tags.mjs");
+  const id = newId();
+  assert.equal(v({ id, name: "course-1" }), true);
+  assert.equal(v({ tags: [] }), true);
+  for (const name of ["own", "con", "Upper", "-x", "a".repeat(33), "lpt9"]) {
+    assert.equal(bad(() => v({ id, name })), "bad_form", name);
+    assert.equal(validTagName(name), false);
+  }
+  assert.equal(FREEZE.revision, "r2.3");
+});

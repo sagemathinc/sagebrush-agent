@@ -18,6 +18,7 @@
     "lib/canon.mjs",
     "lib/tags.mjs",
     "schema/tags.schema.json",
+    "lib/fleet/",
     "lib/stdio.mjs",
     "lib/pair-stdin.mjs",
     "lib/stdout-thread.mjs",

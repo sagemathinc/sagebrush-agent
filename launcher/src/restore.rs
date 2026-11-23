@@ -27,7 +27,9 @@ pub const STATE: &str = "/var/lib/sagebrush/backup/state";
 pub const SECRETS: &str = "/var/lib/sagebrush/host-secrets";
 pub const CACHE: &str = "/var/cache/sagebrush-backup";
 /// The closed system set (A2 r3.3 §3 step 6): the TLS roots and musl's resolver files, read-only; nothing else.
-pub const SYSTEM: [(&str, bool); 4] = [("etc/ssl/certs", false), ("etc/ca-certificates", false), ("etc/resolv.conf", true), ("etc/hosts", true)];
+/// Each entry: its path from the root, whether it is a file (else a directory), and whether a system service account
+/// may own it (only resolv.conf: systemd-resolved's stub file; every other entry stays root-owned).
+pub const SYSTEM: [(&str, bool, bool); 4] = [("etc/ssl/certs", false, false), ("etc/ca-certificates", false, false), ("etc/resolv.conf", true, true), ("etc/hosts", true, false)];
 /// The request's encoded bound (A2 r3.2): at most this many bytes as JSON, else usage.
 pub const MAX_REQUEST: usize = 4096;
 /// The child's stdout and kept stderr (A2 S-b).
@@ -37,9 +39,9 @@ const MAX_MARKER: usize = 64;
 const MAX_UIDS: usize = 64;
 const MARKER: &str = ".complete";
 const MAX_ELF_PHNUM: usize = 64;
-/// A system-set file may be owned by root or by a system service account below this uid: on a stock Ubuntu 24.04
-/// host, /etc/resolv.conf resolves to systemd-resolved's stub file, owned by `systemd-resolve`. Agents (70000+) and
-/// people (1000+) never own one. The bind is read-only to the child either way.
+/// resolv.conf (and only it) may be owned by a system service account below this uid: on a stock Ubuntu 24.04 host,
+/// /etc/resolv.conf resolves to systemd-resolved's stub file, owned by `systemd-resolve`. Agents (70000+) and people
+/// (1000+) never own one. Every other system-set entry must be owned by root. The bind is read-only either way.
 const SYSTEM_OWNER_MAX: u32 = 1000;
 /// CAP_SYS_RESOURCE.
 const SYS_RESOURCE: u32 = 24;
@@ -414,10 +416,10 @@ fn stage_inner<O: RestoreOps, R: Runner<O::H>>(o: &mut O, r: &mut R, a: &StageAr
     let state = anchor_policy(o, &root, STATE)?;
     let secrets = anchor_policy(o, &root, SECRETS)?;
     let cache = anchor_policy(o, &root, CACHE)?;
-    // The closed system set: each present entry owned by root or a system service account, not group- or
-    // other-writable, of its expected kind.
+    // The closed system set: each present entry of its expected kind, not group- or other-writable, and owned by root
+    // (resolv.conf alone may instead belong to a system service account, below uid 1000).
     let mut system = Vec::new();
-    for (rel, file) in SYSTEM {
+    for (rel, file, service_owned) in SYSTEM {
         let h = match o.open_system(&root, rel) {
             Ok(h) => h,
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
@@ -425,8 +427,9 @@ fn stage_inner<O: RestoreOps, R: Runner<O::H>>(o: &mut O, r: &mut R, a: &StageAr
         };
         let id = o.ident(&h).map_err(open_err)?;
         let want = if file { Kind::File } else { Kind::Dir };
-        if kind_of(&id) != Some(want) || id.uid >= SYSTEM_OWNER_MAX || id.mode & 0o022 != 0 {
-            return Err(pre("a system file isn't owned by root or a system account, or is writable by others"));
+        let owner_ok = id.uid == 0 || (service_owned && id.uid < SYSTEM_OWNER_MAX);
+        if kind_of(&id) != Some(want) || !owner_ok || id.mode & 0o022 != 0 {
+            return Err(pre("a system file has the wrong kind or owner, or is writable by others"));
         }
         system.push((rel, file, h, id));
     }
@@ -1513,15 +1516,22 @@ mod tests {
 
     #[test]
     fn restore_stage_own_mkdirs_out_of_space_are_attributed_not_preflight() {
-        // Found on a real host: a filesystem out of inodes fails the attempt's own mkdir, before the binary runs.
-        for (n, quota, space, want) in [(1usize, q(2 << 20, GIB_BLOCKS, 5, 100), (100u64, 0u64), 77), (4, q(0, 0, 100, 100), (100, 100), 76)] {
-            let mut f = host();
-            f.quota = Some(quota);
-            f.space = space;
-            f.errno_at = Some(("mkdir", n, libc::ENOSPC));
-            let mut r = exited(ok_reply());
-            assert_eq!(rcode(&restore_stage(&mut f, &mut r, &stage_args("home"))), want, "mkdir {n}");
-            assert!(r.seen.is_none(), "nothing ran");
+        // Found on a real host: a filesystem out of inodes fails restore-stage's own mkdirs, before the binary runs.
+        // Every one of them (the run, owner and class parents, the attempt, data), with either errno, attributed by
+        // §3.1: the project at its limit is 76; the project under it on a full filesystem is 77.
+        let names = ["run", "owner", "class", "attempt", "data"];
+        for (n, name) in names.iter().enumerate() {
+            for errno in [libc::ENOSPC, libc::EDQUOT] {
+                for (quota, space, want) in [(q(0, 0, 100, 100), (100u64, 100u64), 76), (q(2 << 20, GIB_BLOCKS, 5, 100), (100, 0), 77)] {
+                    let mut f = host();
+                    f.quota = Some(quota);
+                    f.space = space;
+                    f.errno_at = Some(("mkdir", n + 1, errno));
+                    let mut r = exited(ok_reply());
+                    assert_eq!(rcode(&restore_stage(&mut f, &mut r, &stage_args("home"))), want, "{name} mkdir, errno {errno}");
+                    assert!(r.seen.is_none(), "{name}: nothing ran");
+                }
+            }
         }
     }
 
@@ -1538,18 +1548,39 @@ mod tests {
     }
 
     #[test]
-    fn a_system_file_may_belong_to_a_system_account_never_to_a_person_or_agent_nor_be_writable_by_others() {
-        // systemd-resolved's stub resolv.conf (uid 991 on Ubuntu 24.04) is accepted; the bind is read-only either way.
-        let mut f = host();
-        f.node("etc/resolv.conf").id.uid = 991;
-        assert_eq!(rcode(&restore_stage(&mut f, &mut exited(ok_reply()), &stage_args("home"))), 0);
-        for (what, uid, mode) in [("a person's", 1000u32, 0o644u16), ("an agent's", UID, 0o644), ("group-writable", 0, 0o664), ("other-writable", 991, 0o646)] {
+    fn only_resolv_conf_may_belong_to_a_system_account_and_no_system_entry_to_a_person_or_agent_or_be_writable() {
+        // Every SYSTEM entry present, as on a stock host.
+        let full = || {
             let mut f = host();
-            f.node("etc/resolv.conf").id.uid = uid;
-            f.node("etc/resolv.conf").id.mode = S_IFREG | mode;
+            f.dir("etc/ca-certificates", 0, 0o755);
+            f.file("etc/hosts", 0, 0o644);
+            f
+        };
+        assert_eq!(rcode(&restore_stage(&mut full(), &mut exited(ok_reply()), &stage_args("home"))), 0, "all root-owned");
+        // systemd-resolved's stub resolv.conf (uid 991 on Ubuntu 24.04) is accepted.
+        let mut f = full();
+        f.node("etc/resolv.conf").id.uid = 991;
+        assert_eq!(rcode(&restore_stage(&mut f, &mut exited(ok_reply()), &stage_args("home"))), 0, "resolv.conf owned by 991");
+        // uid 991 on any OTHER system entry is refused, with zero effects.
+        for (rel, _, service) in SYSTEM.iter().filter(|e| !e.2) {
+            assert!(!service);
+            let mut f = full();
+            f.node(rel).id.uid = 991;
             let mut r = exited(ok_reply());
-            assert_eq!(rcode(&restore_stage(&mut f, &mut r, &stage_args("home"))), 66, "{what}");
-            assert!(r.seen.is_none() && f.count("mkdir") == 0, "{what}: zero effects");
+            assert_eq!(rcode(&restore_stage(&mut f, &mut r, &stage_args("home"))), 66, "{rel} owned by 991");
+            assert!(r.seen.is_none() && f.count("mkdir") == 0, "{rel}: zero effects");
+        }
+        // resolv.conf owned by a person or an agent, or any entry writable by group or other: refused.
+        for (rel, uid, mode) in [("etc/resolv.conf", 1000u32, None), ("etc/resolv.conf", UID, None), ("etc/resolv.conf", 0, Some(0o664u16)), ("etc/resolv.conf", 991, Some(0o646)), ("etc/hosts", 0, Some(0o664)), ("etc/ssl/certs", 0, Some(0o775)), ("etc/ca-certificates", 0, Some(0o757))] {
+            let mut f = full();
+            f.node(rel).id.uid = uid;
+            if let Some(m) = mode {
+                let t = f.node(rel).id.mode & crate::tree::S_IFMT;
+                f.node(rel).id.mode = t | m;
+            }
+            let mut r = exited(ok_reply());
+            assert_eq!(rcode(&restore_stage(&mut f, &mut r, &stage_args("home"))), 66, "{rel} uid {uid} mode {mode:?}");
+            assert!(r.seen.is_none() && f.count("mkdir") == 0, "{rel}: zero effects");
         }
     }
 

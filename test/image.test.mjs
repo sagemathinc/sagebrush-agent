@@ -140,6 +140,12 @@ test("workspace_read of an image: the picture, then one line of what it is; refu
     "/typed.png": { entry: { path: "/typed.png" }, rev: 1, image: { ...b64(pic), mimeType: "image/png" } },
     "/both.png": { entry: { path: "/both.png" }, rev: 1, image: b64(pic), content: "x" },
     "/norev.png": { entry: { path: "/norev.png" }, image: b64(pic) },
+    "/extra.png": { entry: { path: "/extra.png" }, rev: 1, image: b64(pic), ref: "R1" },
+    "/noentry.png": { rev: 1, image: b64(pic) },
+    "/entrystr.png": { entry: "/entrystr.png", rev: 1, image: b64(pic) },
+    "/negrev.png": { entry: { path: "/negrev.png" }, rev: -1, image: b64(pic) },
+    "/bigrev.png": { entry: { path: "/bigrev.png" }, rev: 2 ** 53, image: b64(pic) },
+    "/fracrev.png": { entry: { path: "/fracrev.png" }, rev: 1.5, image: b64(pic) },
     "/notes.md": { entry: { path: "/notes.md" }, rev: 2, content: "# hi" },
   };
   const p = await paired((path) => files[path]);
@@ -152,7 +158,7 @@ test("workspace_read of an image: the picture, then one line of what it is; refu
       { type: "image", data: pic.toString("base64"), mimeType: "image/png" },
       { type: "text", text: "/plots/a.png: PNG image, 320x200 pixels, rev 3" },
     ]);
-    for (const [path, reason] of [["/x.jpg", "header"], ["/typed.png", "shape"], ["/both.png", "shape"], ["/norev.png", "shape"]]) {
+    for (const [path, reason] of [["/x.jpg", "header"], ["/typed.png", "shape"], ["/both.png", "shape"], ["/norev.png", "shape"], ["/extra.png", "shape"], ["/noentry.png", "shape"], ["/entrystr.png", "shape"], ["/negrev.png", "shape"], ["/bigrev.png", "shape"], ["/fracrev.png", "shape"]]) {
       const e = await p.read(path);
       assert.deepEqual(e, { content: [{ type: "text", text: `refused: not a readable image (${reason})` }], isError: true }, path);
     }

@@ -18,6 +18,9 @@ const ga = (mode) => ({ agent: A, config: { network: { mode, allow: mode === "al
  * agent 7's and agent 70's owned chains and their shared-chain rules (each matching only its own veth), and a rule
  * inside in_7. */
 const meta = (key, right, op = "==") => ({ match: { op, left: { meta: { key } }, right } });
+/** nft -j's shapes for `ip saddr X` and `ct state established,related`, as net.mjs's rules list them. */
+const SADDR = (ip, op = "==") => ({ match: { op, left: { payload: { protocol: "ip", field: "saddr" } }, right: ip } });
+const CT_EST = { match: { op: "in", left: { ct: { key: "state" } }, right: ["established", "related"] } };
 const listing = () => ({ nftables: [
   { metainfo: { version: "1.0.9", json_schema_version: 1 } },
   { table: { family: "inet", name: "sagebrush", handle: 1 } },
@@ -31,9 +34,9 @@ const listing = () => ({ nftables: [
   { rule: { family: "inet", table: "sagebrush", chain: "forward", handle: 19, expr: [{ jump: { target: "agent_return" } }] } },
   { rule: { family: "inet", table: "sagebrush", chain: "input", handle: 21, comment: "sb-agent-7", expr: [meta("iifname", "sbv7"), { jump: { target: "in_7" } }] } },
   { rule: { family: "inet", table: "sagebrush", chain: "agent_ingress", handle: 22, comment: "sb-agent-7", expr: [meta("iifname", "sbv7"), { jump: { target: "fwd_7" } }] } },
-  { rule: { family: "inet", table: "sagebrush", chain: "agent_return", handle: 23, comment: "sb-agent-7", expr: [meta("oifname", "sbv7"), { accept: null }] } },
+  { rule: { family: "inet", table: "sagebrush", chain: "agent_return", handle: 23, comment: "sb-agent-7", expr: [meta("oifname", "sbv7"), CT_EST, { accept: null }] } },
   { rule: { family: "inet", table: "sagebrush", chain: "agent_return", handle: 24, comment: "sb-agent-7", expr: [meta("oifname", "sbv7"), { drop: null }] } },
-  { rule: { family: "inet", table: "sagebrush", chain: "postrouting", handle: 25, comment: "sb-agent-7", expr: [meta("oifname", "sbv7", "!="), { masquerade: null }] } },
+  { rule: { family: "inet", table: "sagebrush", chain: "postrouting", handle: 25, comment: "sb-agent-7", expr: [SADDR("10.250.0.30"), meta("oifname", "sbv7", "!="), { masquerade: null }] } },
   { rule: { family: "inet", table: "sagebrush", chain: "input", handle: 30, comment: "sb-agent-70", expr: [meta("iifname", "sbv70"), { jump: { target: "in_70" } }] } },
   { rule: { family: "inet", table: "sagebrush", chain: "in_7", handle: 40, expr: [{ drop: null }] } },
 ] });
@@ -289,4 +292,42 @@ test("only canonical agent indices 0..9999, and only chains and rules: anything 
   // The highest canonical index is fine.
   const hi = withItems((it) => it.push({ chain: { family: "inet", table: "sagebrush", name: "in_9999", handle: 80, comment: "sb-agent-9999" } }));
   assert.match(replaceTransaction(hi, 9999, ""), /^flush chain inet sagebrush in_9999$/m);
+});
+
+test("ownership is chain-specific and operator-aware: only the exact rule net.mjs generates for that agent", async () => {
+  const rule = (h) => (it) => it.find((i) => i.rule?.handle === h).rule;
+  const cases = {
+    "a negated input match": (it) => { rule(21)(it).expr[0] = meta("iifname", "sbv7", "!="); },
+    "a negated ingress match": (it) => { rule(22)(it).expr[0] = meta("iifname", "sbv7", "!="); },
+    "a negated return match": (it) => { rule(23)(it).expr[0] = meta("oifname", "sbv7", "!="); },
+    "input on oifname": (it) => { rule(21)(it).expr[0] = meta("oifname", "sbv7"); },
+    "input jumping to another agent's chain": (it) => { rule(21)(it).expr[1] = { jump: { target: "in_70" } }; },
+    "ingress jumping to in_ instead of fwd_": (it) => { rule(22)(it).expr[1] = { jump: { target: "in_7" } }; },
+    "an extra interface match": (it) => { rule(21)(it).expr.splice(1, 0, meta("oifname", "eth0")); },
+    "a return rule that jumps": (it) => { rule(23)(it).expr[2] = { jump: { target: "in_7" } }; },
+    "NAT without its source": (it) => { rule(25)(it).expr.shift(); },
+    "NAT for a foreign source": (it) => { rule(25)(it).expr[0] = SADDR("10.250.0.34"); },
+    "NAT with a negated source": (it) => { rule(25)(it).expr[0] = SADDR("10.250.0.30", "!="); },
+    "NAT with == on the interface": (it) => { rule(25)(it).expr[1] = meta("oifname", "sbv7"); },
+    "NAT accepting instead of masquerading": (it) => { rule(25)(it).expr[2] = { accept: null }; },
+    "NAT matching a destination instead of its source": (it) => { rule(25)(it).expr[0] = { match: { op: "==", left: { payload: { protocol: "ip", field: "daddr" } }, right: "10.250.0.30" } }; },
+    "a return rule with a second interface match": (it) => { rule(24)(it).expr.splice(1, 0, meta("oifname", "eth0")); },
+    "an accepting return rule without its ct state": (it) => { rule(23)(it).expr.splice(1, 1); },
+    "a return rule with another ct state": (it) => { rule(23)(it).expr[1] = { match: { op: "in", left: { ct: { key: "state" } }, right: ["new", "established"] } }; },
+    "a dropping return rule with a ct state": (it) => { rule(24)(it).expr.splice(1, 0, CT_EST); },
+    "an extra counter statement": (it) => { rule(21)(it).expr.splice(1, 0, { counter: { packets: 0, bytes: 0 } }); },
+    "an extra log statement in NAT": (it) => { rule(25)(it).expr.splice(2, 0, { log: { prefix: "x" } }); },
+  };
+  for (const [name, f] of Object.entries(cases)) {
+    assert.throws(() => replaceTransaction(withItems(f), 7, ""), host, name);
+    const s = setup({ "nft -a -j": () => ({ code: 0, stdout: JSON.stringify(withItems(f)) }) });
+    await assert.rejects(s.rt.applyNetwork(A, UID, ga("full"), left), host, name);
+    assert.ok(!s.calls.some((c) => c[0] === "nft" && c[1] === "-f"), `${name}: nothing applied`);
+  }
+  // The valid generated rules (the listing's: return with its ct state match, NAT with its source) are accepted, and a
+  // return rule without the ct match (net.mjs's drop rule) too.
+  // Positive: every generated shape (input, ingress, return accept with ct state, return drop, NAT) is accepted and
+  // removed by handle.
+  const tx = replaceTransaction(listing(), 7, "");
+  for (const h of [21, 22, 23, 24, 25]) assert.match(tx, new RegExp(`handle ${h}\\n`), String(h));
 });

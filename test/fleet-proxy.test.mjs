@@ -80,6 +80,13 @@ function client(port, bytes, { until, then } = {}) {
     s.on("close", () => resolve(got.toString("latin1")));
   });
 }
+/** Wait until `cond()` holds (sockets open and close a little later on Windows), or fail after `ms`. */
+async function until(cond, what, ms = 5000) {
+  for (const end = Date.now() + ms; !cond(); ) {
+    if (Date.now() > end) assert.fail(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
 const req = (line, ...headers) => Buffer.from(`${line}\r\n${headers.map((h) => h + "\r\n").join("")}\r\n`, "latin1");
 
 test("proxy: listens on loopback only: the machine's other addresses don't reach it", { timeout: 20000 }, async (t0) => {
@@ -196,8 +203,9 @@ test("proxy: a request that never completes is closed with nothing forwarded; th
     assert.ok(Date.now() - start >= 250);
     assert.deepEqual(t.connects, []);
     // (two connections held open; a third is closed at once)
+    await until(() => t.proxy.stats().open === 0, "the timed-out connection to close");
     const held = [0, 1].map(() => tcpConnect(t.port, "127.0.0.1"));
-    await new Promise((r) => setTimeout(r, 100));
+    await until(() => t.proxy.stats().open === 2, "both held connections to be accepted");
     const third = await client(t.port, Buffer.from("x"));
     assert.equal(third, "");
     assert.equal(t.proxy.stats().busy, 1);
@@ -214,7 +222,7 @@ test("proxy: closeAll ends every open tunnel at once", { timeout: 20000 }, async
     closed = true;
     assert.match(out, /^HTTP\/1\.1 200/);
     assert.ok(closed);
-    assert.equal(t.proxy.stats().open, 0);
+    await until(() => t.proxy.stats().open === 0, "every connection to close");
   } finally { await t.close(); }
 });
 

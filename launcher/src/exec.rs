@@ -12,8 +12,9 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 /// The credential files systemd's LoadCredential= provides, and the environment names the CLI receives them under.
-pub const CREDENTIALS: [(&str, &str); 2] =
-    [("broker-placeholder", "SAGEBRUSH_BROKER_PLACEHOLDER"), ("workspace-capability", "SAGEBRUSH_WORKSPACE_CAPABILITY")];
+/// The one credential the launcher passes on: the agent's Sagebrush workspace capability. There is no Claude credential
+/// of any kind (no placeholder, token or base URL): a Claude subscription is the unmodified CLI's own login on the host.
+pub const CREDENTIALS: [(&str, &str); 1] = [("workspace-capability", "SAGEBRUSH_WORKSPACE_CAPABILITY")];
 /// A credential is at most 16 KiB; the buffer is one byte larger so a full one is detected as too large.
 pub const CREDENTIAL_MAX: usize = 16 * 1024;
 
@@ -275,7 +276,7 @@ mod tests {
     fn env_entries_are_exact_and_nul_terminated() {
         let mut v = Secret::zeroed(CREDENTIAL_MAX + 1);
         assert!(v.push(b"tok"));
-        let e = env_entry("SAGEBRUSH_BROKER_PLACEHOLDER", &v).unwrap();
-        assert_eq!(e.as_bytes(), b"SAGEBRUSH_BROKER_PLACEHOLDER=tok\0");
+        let e = env_entry("SAGEBRUSH_WORKSPACE_CAPABILITY", &v).unwrap();
+        assert_eq!(e.as_bytes(), b"SAGEBRUSH_WORKSPACE_CAPABILITY=tok\0");
     }
 }

@@ -70,5 +70,4 @@ CPUWeight=100
 CPUQuota=200%
 IOWeight=100
 LimitNOFILE=65536
-LoadCredential=broker-placeholder:/var/lib/sagebrush/creds/abcdefghijklmnopqrstuvwxya/broker-placeholder
 LoadCredential=workspace-capability:/var/lib/sagebrush/creds/abcdefghijklmnopqrstuvwxya/workspace-capability

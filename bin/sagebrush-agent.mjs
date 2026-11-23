@@ -31,6 +31,14 @@ import { AgentServer, DEFAULT_ORIGINS, TEXT } from "../lib/server.mjs";
 import { stdinChunks } from "../lib/stdio.mjs";
 import { pairOrigin, readPairLine } from "../lib/pair-stdin.mjs";
 import { stdioOutput } from "../lib/stdout-thread.mjs";
+import { baseUrlSet, claudeMode, cliCreateServer, cliDeleteSession, cliQuery, sdkGuard } from "../lib/claude-cli.mjs";
+
+// (r2 §6: Claude is never pointed at another endpoint from here; refused before anything starts)
+const baseUrls = baseUrlSet();
+if (baseUrls.length) {
+  console.error(`${baseUrls.join(" and ")} ${baseUrls.length > 1 ? "are" : "is"} set: sagebrush-agent doesn't run Claude against another endpoint. Unset it, then start it again.`);
+  process.exit(2);
+}
 
 // An exact http(s) origin, like https://example.org or http://127.0.0.1:8000: no path, no wildcard.
 function exactOrigin(s) {
@@ -94,7 +102,13 @@ if (stdio && loopbackFlags) {
   process.exit(2);
 }
 
-let query, createServer, deleteSession;
+let query, createServer, deleteSession, client = "claude-agent-sdk", mcpSource = "sdk";
+// (r3 H1: an explicit credential request that is ambiguous refuses here, before any query; it never falls back)
+const claude = process.env.SAGEBRUSH_AGENT_FAKE === "1" ? null : claudeMode();
+if (claude?.mode === "refuse") {
+  console.error(claude.why);
+  process.exit(2);
+}
 // (native mode's permission mode: the SDK's own settings resolver and the CLI's trust filter, with the fake model too)
 const { resolveSettings, filterEscalatingDefaultMode } = await import("@anthropic-ai/claude-agent-sdk");
 const resolver = { resolveSettings, filterEscalatingDefaultMode };
@@ -104,16 +118,28 @@ if (process.env.SAGEBRUSH_AGENT_FAKE === "1") {
   const fake = await import("../lib/fake.mjs");
   ({ fakeQuery: query, fakeCreateServer: createServer } = fake);
   console.error("FAKE model: no Claude, for testing");
+} else if (claude.mode === "cli") {
+  // CLI mode (the default): every Claude turn runs the pinned Claude Code, unmodified, with this computer's own Claude
+  // login (lib/claude-cli.mjs). Nothing here reads, holds or passes that login.
+  client = "claude-code";
+  query = cliQuery;
+  createServer = cliCreateServer;
+  deleteSession = (id) => cliDeleteSession(id);
+  mcpSource = "dynamic";
 } else {
+  // SDK mode: only where the environment selects an API key or a cloud provider; each query is held until the SDK's
+  // initialize answer shows that credential and no Claude login (sdkGuard).
   const sdk = await import("@anthropic-ai/claude-agent-sdk");
-  query = sdk.query;
+  query = sdkGuard(sdk.query, claude.select);
   deleteSession = sdk.deleteSession;
   createServer = (spec) => sdk.createSdkMcpServer({ name: spec.name, version: spec.version, tools: spec.tools.map(([name, description, shape, handler]) => sdk.tool(name, description, shape, handler)) });
 }
 
 if (stdio) {
-  const server = new AgentServer({ query, deleteSession, stdio: true, resolver, ...(codex ? { name: "Codex", client: "codex-app-server" } : {}) });
+  const server = new AgentServer({ query, deleteSession, stdio: true, resolver, ...(codex ? { name: "Codex", client: "codex-app-server" } : { client }) });
   server.createServer = createServer;
+  server.mcpSource = mcpSource;
+if (client === "claude-code") { server.hooks = false; server.closedLaunch = true; } // (CLI mode: no hooks; native closed, N1)
   if (codex) {
     const { CodexBackend } = await import("../lib/codex.mjs");
     // (the fake app-server, for tests: chosen only by SAGEBRUSH_AGENT_FAKE=1, like the fake model)
@@ -159,8 +185,10 @@ await listenLoopback();
 }
 
 async function listenLoopback({ appCode = null, onStop = null } = {}) {
-const server = new AgentServer({ port, origins, query, deleteSession });
+const server = new AgentServer({ port, origins, query, deleteSession, client });
 server.createServer = createServer;
+server.mcpSource = mcpSource;
+if (client === "claude-code") { server.hooks = false; server.closedLaunch = true; } // (CLI mode: no hooks; native closed, N1)
 // Delegate tasks (design/workspace-agent-protocol.md §6), over this loopback pairing only: on where the tasks folder
 // (~/.sagebrush/tasks) can be used, else off, saying why.  The page shows Delegate only under the person's own switch.
 // (with the fake model, for tests: only in the folder SAGEBRUSH_TASKS_HOME names, else off; never the real home)

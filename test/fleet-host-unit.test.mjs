@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
 import { test } from "./host-linux-only.mjs";
 import { FleetError } from "../lib/fleet/index.mjs";
-import { renderUnit, pathContract, landlockRules, LANDLOCK_ABI } from "../lib/fleet/host/unit.mjs";
+import { renderUnit, pathContract, landlockRules, LANDLOCK_ABI, launcherContract, CONTRACT, CONTRACT_IN_VIEW } from "../lib/fleet/host/unit.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 
@@ -209,4 +209,45 @@ test("a root agent with no tags and a GPU still renders, with no tag groups and 
   assert.match(text, /^DevicePolicy=closed$/m);
   assert.doesNotMatch(text, /^SupplementaryGroups=/m);
   assert.doesNotMatch(text, /^PrivateDevices=/m);
+});
+
+test("merged-usr: the path contract names no /bin, /sbin, /lib or /lib64 row (symlinks into /usr, refused by the launcher)", () => {
+  const rows = pathContract({ ...agent(), id: A }, ctx());
+  for (const p of ["/bin", "/sbin", "/lib", "/lib64"]) assert.ok(!rows.some((r) => r.path === p), p);
+  assert.ok(rows.some((r) => r.path === "/usr" && r.landlock === "rx"), "/usr covers them");
+});
+
+test("freeze §4.6: /var/lib is hidden in the unit's view (closing part 3's gap), and the contract is bound at /run/sagebrush/contract.json", () => {
+  const { text, contract } = renderUnit(agent(), ctx());
+  const lines = text.split("\n");
+  assert.ok(lines.includes("TemporaryFileSystem=/var/lib:ro"));
+  assert.ok(lines.includes(`BindReadOnlyPaths=${CONTRACT(A)}:${CONTRACT_IN_VIEW}`));
+  // Nothing under /var/lib is bound INTO the view: only used as a bind source.
+  for (const l of lines.filter((x) => /^Bind(ReadOnly)?Paths=/.test(x))) {
+    const target = l.split("=")[1].split(":").pop();
+    assert.ok(!target.startsWith("/var/lib"), l);
+  }
+  const row = contract.find((r) => r.path === CONTRACT_IN_VIEW);
+  assert.deepEqual([row.mount, row.landlock], ["ro", ""], "readable by the launcher before it restricts itself; no Landlock right");
+  assert.ok(!landlockRules(contract).rules.some((r) => r.path === CONTRACT_IN_VIEW));
+});
+
+test("ExecStart is the launcher contract's exec, with the in-view contract and the pinned CLI", () => {
+  const { text } = renderUnit(agent(), ctx());
+  assert.ok(text.split("\n").includes(`ExecStart=/opt/sagebrush/1.2.3/bin/sagebrush-agent-launch exec --agent ${A} --contract ${CONTRACT_IN_VIEW} --cli /opt/sagebrush/cli/claude-2.1.0`));
+});
+
+test("launcherContract: the launcher's closed JSON (rules = the Landlock column, staged records, fixed env)", () => {
+  const recs = [{ index: 0, path: "/data/project", mode: "rw", dev: [8, 1], ino: 42 }, { index: 1, path: "/data/reference", mode: "ro", dev: [8, 1], ino: 43 }];
+  const doc = JSON.parse(launcherContract(agent(), ctx(), recs, null));
+  assert.deepEqual(Object.keys(doc), ["v", "agent", "rules", "staged", "env"]);
+  assert.equal(doc.v, 1);
+  assert.deepEqual(doc.rules, landlockRules(pathContract({ ...agent(), id: A }, ctx())).rules.map((r) => ({ path: r.path, access: r.access })));
+  assert.ok(!doc.rules.some((r) => ["/bin", "/sbin", "/lib", "/lib64", CONTRACT_IN_VIEW].includes(r.path)));
+  assert.deepEqual(doc.staged, recs);
+  assert.deepEqual(doc.env.map((e) => e[0]), ["HOME", "PATH", "LANG", "SAGEBRUSH_AGENT"]);
+  const withProxy = JSON.parse(launcherContract(agent(), ctx(), recs, { launcherEnv: { HTTPS_PROXY: "http://10.250.0.1:3128", HTTP_PROXY: "http://10.250.0.1:3128", NO_PROXY: "" } }));
+  assert.deepEqual(withProxy.env.slice(-3).map((e) => e[0]), ["HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]);
+  refused(() => launcherContract(agent(), ctx(), [{ index: 0, path: "/elsewhere", mode: "rw", dev: [8, 1], ino: 1 }], null), "bad_form");
+  refused(() => launcherContract(agent(), ctx(), [{ index: 64, path: "/data/project", mode: "rw", dev: [8, 1], ino: 1 }], null), "bad_form");
 });

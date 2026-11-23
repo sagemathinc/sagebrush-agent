@@ -126,6 +126,17 @@ mod tests {
     }
 
     #[test]
+    fn the_host_generators_output_parses() {
+        // Written by lib/fleet/host/unit.mjs launcherContract() (regenerate it when the generator changes).
+        let bytes = include_bytes!("../tests/fixtures/generated-contract.json");
+        let c = read(bytes, A).expect("the generator's contract is the closed shape");
+        assert_eq!(c.staged.len(), 2);
+        assert!(c.rules.iter().any(|r| r.path == "/usr" && r.access == "rx"));
+        assert!(!c.rules.iter().any(|r| ["/bin", "/sbin", "/lib", "/lib64"].contains(&r.path.as_str())));
+        assert!(c.env.iter().any(|(k, _)| k == "HTTPS_PROXY"));
+    }
+
+    #[test]
     fn closed_and_bounded() {
         let ok_rules = r#"{"path":"/usr","access":"rx"},{"path":"/data/x","access":"rwx"}"#;
         let st = r#"{"index":0,"path":"/data/x","mode":"rw","dev":[8,1],"ino":42}"#;

@@ -1,0 +1,235 @@
+// CLI mode with the real pinned Claude Code (design claude-cli-mode r3.2): cliQuery runs the binary unmodified against a
+// fake Messages API (test/fake-anthropic.mjs) that the test's own environment points it at, with a fresh HOME and
+// config folder and a test key, never a login. Rows named "cli: …". Skipped where this platform has no pinned binary.
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { z } from "zod";
+import { CLAUDE_PIN, claudeBinary, claudeVersionProblem, cliCreateServer, cliQuery } from "../lib/claude-cli.mjs";
+import { fakeAnthropic, toolResults } from "./fake-anthropic.mjs";
+
+const BIN = claudeBinary();
+const skip = !BIN || process.platform === "win32" ? "no pinned Claude Code binary here" : false;
+
+function freshEnv(api) {
+  const home = mkdtempSync(join(tmpdir(), "sb-cli-home-"));
+  return {
+    home,
+    env: {
+      PATH: process.env.PATH, HOME: home, CLAUDE_CONFIG_DIR: join(home, ".claude"),
+      ANTHROPIC_API_KEY: "test-key-not-a-credential", ANTHROPIC_BASE_URL: api.url,
+      DISABLE_AUTOUPDATER: "1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    },
+  };
+}
+
+// The echo tool, counting what its handler ran with.
+function echoServer() {
+  const ran = [];
+  const server = cliCreateServer({ name: "sagebrush", version: "1", tools: [["echo", "Echo text back", { text: z.string() }, async (a) => { ran.push(a.text); return { content: [{ type: "text", text: `echo: ${a.text}` }] }; }]] });
+  return { server, ran };
+}
+
+// A model that calls echo once (with `input`), then answers with what came back.
+const echoOnce = (input = { text: "hello" }) => (body) => {
+  const offered = (body.tools ?? []).some((t) => t.name === "mcp__sagebrush__echo");
+  const results = toolResults(body);
+  if (results.length) return [{ type: "text", text: `got: ${results.map((r) => (r.error ? "ERROR " : "") + r.text).join(" | ")}` }];
+  return offered ? [{ type: "tool_use", name: "mcp__sagebrush__echo", input }] : [{ type: "text", text: "ok" }];
+};
+
+async function drain(q) {
+  const msgs = [];
+  for await (const m of q) msgs.push(m);
+  return msgs;
+}
+
+// A direct MCP request to one of the listeners (a stand-in for anything that got hold of a token).
+async function mcpCall(l, server, method, params, token = l.token) {
+  const r = await fetch(`http://127.0.0.1:${l.port}/${server}`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
+  if (r.status !== 200) return { status: r.status };
+  const j = await r.json();
+  return { status: 200, text: j.result?.content?.map((c) => c.text).join("") ?? "", isError: !!j.result?.isError, result: j.result };
+}
+
+const baseOptions = (extra = {}) => ({ includePartialMessages: true, settingSources: [], strictMcpConfig: true, tools: [], permissionMode: "default", persistSession: true, ...extra });
+
+test("cli: the pinned binary is the SDK's own Claude Code release, and says so", { skip }, () => {
+  const sdkPkg = JSON.parse(readFileSync(new URL("../node_modules/@anthropic-ai/claude-agent-sdk/package.json", import.meta.url), "utf8"));
+  assert.equal(CLAUDE_PIN, sdkPkg.claudeCodeVersion);
+  assert.equal(claudeVersionProblem(BIN, { env: { PATH: process.env.PATH, HOME: mkdtempSync(join(tmpdir(), "sb-v-")) } }), null);
+});
+
+test("cli: a turn calls our tool after an Allow; ours is the dynamic server; the permission tool is hidden; the launch is closed; the config is gone before the first request; no token in argv", { skip, timeout: 90_000 }, async () => {
+  let configSeen = null, cmdline = null, child = null;
+  const api = await fakeAnthropic(echoOnce(), {
+    onRequest: (_b, n) => {
+      if (n !== 0) return;
+      cmdline = readFileSync(`/proc/${child.pid}/cmdline`, "utf8").split("\0");
+      const i = cmdline.indexOf("--mcp-config");
+      configSeen = existsSync(cmdline[i + 1]);
+    },
+  });
+  const { env } = freshEnv(api);
+  const { server, ran } = echoServer();
+  let listeners = null;
+  const asked = [];
+  const q = cliQuery({ prompt: "use echo", options: baseOptions({ cwd: env.HOME, mcpServers: { sagebrush: server }, canUseTool: async (name, input) => { asked.push(name); return { behavior: "allow", updatedInput: input }; } }) }, { bin: BIN, env, onListeners: (l) => { listeners = l; } });
+  const spawnWatch = setInterval(() => { if (q.child) { child = q.child; clearInterval(spawnWatch); } }, 1);
+  const msgs = await drain(q);
+  clearInterval(spawnWatch);
+  await api.close();
+  const init = msgs.find((m) => m.type === "system" && m.subtype === "init");
+  assert.deepEqual(init.mcp_servers.filter((s) => s.name === "sagebrush"), [{ name: "sagebrush", status: "connected", source: "dynamic" }]);
+  assert.ok(init.tools.includes("mcp__sagebrush__echo"));
+  assert.ok(!init.tools.some((t) => t === listeners.perm.tool), "the permission tool isn't the model's");
+  assert.deepEqual(asked, ["mcp__sagebrush__echo"]);
+  assert.deepEqual(ran, ["hello"]);
+  const result = msgs.find((m) => m.type === "result");
+  assert.equal(result.subtype, "success");
+  assert.match(msgs.filter((m) => m.type === "assistant").map((m) => JSON.stringify(m.message.content)).join(""), /got: echo: hello/);
+  assert.equal(configSeen, false, "the MCP config file was removed before the first Messages request");
+  const at = cmdline.indexOf("--setting-sources");
+  assert.equal(cmdline[at + 1], "", "closed launch: no setting sources");
+  for (const f of ["--strict-mcp-config", "--disable-slash-commands", "--replay-user-messages"]) assert.ok(cmdline.includes(f), f);
+  const argv = cmdline.join(" ");
+  assert.ok(!argv.includes(listeners.perm.token) && !argv.includes(listeners.tools.token), "no token in argv");
+});
+
+test("cli: a Deny runs nothing, and the model is told why", { skip, timeout: 90_000 }, async () => {
+  const api = await fakeAnthropic(echoOnce());
+  const { env } = freshEnv(api);
+  const { server, ran } = echoServer();
+  const msgs = await drain(cliQuery({ prompt: "use echo", options: baseOptions({ cwd: env.HOME, mcpServers: { sagebrush: server }, canUseTool: async () => ({ behavior: "deny", message: "no, says the person" }) }) }, { bin: BIN, env }));
+  await api.close();
+  assert.deepEqual(ran, []);
+  const second = api.requests.find((r) => toolResults(r.body).length);
+  assert.ok(second, "the model got a tool result");
+  assert.deepEqual(toolResults(second.body).map((r) => [r.error, r.text.includes("no, says the person")]), [[true, true]]);
+  assert.equal(msgs.at(-1).type === "result" || msgs.some((m) => m.type === "result"), true);
+});
+
+test("cli: a stolen token does nothing the person didn't allow: forged calls before the decision, mismatched decisions, a second run, crossed tokens", { skip, timeout: 120_000 }, async () => {
+  const api = await fakeAnthropic(echoOnce());
+  const { env } = freshEnv(api);
+  const { server, ran } = echoServer();
+  let L = null, release;
+  const held = new Promise((r) => { release = r; });
+  const seen = {};
+  const q = cliQuery({ prompt: "use echo", options: baseOptions({ cwd: env.HOME, mcpServers: { sagebrush: server }, canUseTool: async (name, input, { toolUseID }) => {
+    // (while the person hasn't decided: everything a token holder can try)
+    seen.id = toolUseID;
+    seen.forgedRun = await mcpCall(L.tools, "sagebrush", "tools/call", { name: "echo", arguments: { text: "hello" } });
+    seen.changedInput = await mcpCall(L.perm, L.perm.name, "tools/call", { name: "decide", arguments: { tool_name: name, input: { text: "other" }, tool_use_id: toolUseID } });
+    seen.changedName = await mcpCall(L.perm, L.perm.name, "tools/call", { name: "decide", arguments: { tool_name: "mcp__sagebrush__other", input, tool_use_id: toolUseID } });
+    seen.unknownId = await mcpCall(L.perm, L.perm.name, "tools/call", { name: "decide", arguments: { tool_name: name, input, tool_use_id: "toolu_nope" } });
+    seen.again = await mcpCall(L.perm, L.perm.name, "tools/call", { name: "decide", arguments: { tool_name: name, input, tool_use_id: toolUseID } });
+    seen.crossed = await mcpCall({ port: L.perm.port, token: L.tools.token }, L.perm.name, "tools/list", {});
+    seen.noToken = await mcpCall(L.tools, "sagebrush", "tools/list", {}, "x");
+    seen.ranBefore = ran.length;
+    await held;
+    return { behavior: "allow", updatedInput: input };
+  } }) }, { bin: BIN, env, onListeners: (l) => { L = l; } });
+  const turn = drain(q);
+  setTimeout(() => release(), 3000);
+  await turn;
+  // (after the genuine call ran: a replay of it is refused)
+  assert.equal(seen.forgedRun.isError, true);
+  assert.match(seen.forgedRun.text, /wasn't allowed/);
+  assert.equal(seen.ranBefore, 0, "nothing ran before the decision");
+  for (const k of ["changedInput", "changedName", "unknownId", "again"]) assert.equal(JSON.parse(seen[k].text).behavior, "deny", k);
+  assert.equal(seen.crossed.status, 401);
+  assert.equal(seen.noToken.status, 401);
+  assert.deepEqual(ran, ["hello"], "the allowed call ran exactly once");
+  await api.close();
+});
+
+test("cli: an Allow with a changed input authorizes that input only: the original is refused, the changed one runs once", { skip, timeout: 90_000 }, async () => {
+  const api = await fakeAnthropic(echoOnce());
+  const { env } = freshEnv(api);
+  const { server, ran } = echoServer();
+  let L = null;
+  const forged = [];
+  const q = cliQuery({ prompt: "use echo", options: baseOptions({ cwd: env.HOME, mcpServers: { sagebrush: server }, canUseTool: async () => {
+    // (the decision is made; right after it, a token holder races the original input and the changed one)
+    setImmediate(async () => {
+      forged.push(await mcpCall(L.tools, "sagebrush", "tools/call", { name: "echo", arguments: { text: "hello" } }));
+      forged.push(await mcpCall(L.tools, "sagebrush", "tools/call", { name: "echo", arguments: { text: "changed" } }));
+    });
+    return { behavior: "allow", updatedInput: { text: "changed" } };
+  } }) }, { bin: BIN, env, onListeners: (l) => { L = l; } });
+  await drain(q);
+  await new Promise((r) => setTimeout(r, 200));
+  await api.close();
+  assert.deepEqual(ran, ["changed"], "only the changed input ran, once");
+  assert.equal(forged[0].isError, true, "the original input is refused");
+  // (the changed one raced Claude Code's own call: whichever came second was refused)
+  assert.equal(ran.length, 1);
+});
+
+test("cli: a Stop while the person decides ends the run, its process group and its temp folder", { skip, timeout: 90_000 }, async () => {
+  const api = await fakeAnthropic(echoOnce());
+  const { env } = freshEnv(api);
+  const { server, ran } = echoServer();
+  const abort = new AbortController();
+  let pid = null;
+  const before = new Set(readdirSync(tmpdir()).filter((n) => n.startsWith("sb-claude-")));
+  const q = cliQuery({ prompt: "use echo", options: baseOptions({ cwd: env.HOME, mcpServers: { sagebrush: server }, abortController: abort, canUseTool: () => { pid = q.child.pid; setTimeout(() => abort.abort(), 100); return new Promise(() => {}); } }) }, { bin: BIN, env });
+  const t0 = Date.now();
+  await drain(q);
+  assert.ok(Date.now() - t0 < 30_000);
+  await new Promise((r) => setTimeout(r, 2500));
+  assert.throws(() => process.kill(-pid, 0), "the process group is gone");
+  const after = readdirSync(tmpdir()).filter((n) => n.startsWith("sb-claude-") && !before.has(n));
+  assert.deepEqual(after, [], "no temp folder left");
+  assert.deepEqual(ran, []);
+  await api.close();
+});
+
+test("cli: a steer mid-turn is replayed by its uuid, and a second turn resumes the first's session", { skip, timeout: 120_000 }, async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const api = await fakeAnthropic(async (body, n) => { if (n === 0) await gate; return [{ type: "text", text: `reply ${n}` }]; });
+  const { env } = freshEnv(api);
+  const uuids = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"];
+  let push, end;
+  const input = (async function* () {
+    yield { type: "user", message: { role: "user", content: "first" }, parent_tool_use_id: null, session_id: "", uuid: uuids[0] };
+    yield await new Promise((r) => { push = r; });
+    await new Promise((r) => { end = r; });
+  })();
+  const msgs = [];
+  const q = cliQuery({ prompt: input, options: baseOptions({ cwd: env.HOME, canUseTool: async () => ({ behavior: "deny", message: "no" }) }) }, { bin: BIN, env });
+  let results = 0;
+  for await (const m of q) {
+    msgs.push(m);
+    if (m.type === "system" && m.subtype === "init" && push) { push({ type: "user", message: { role: "user", content: "steer" }, parent_tool_use_id: null, session_id: "", uuid: uuids[1], priority: "next" }); push = null; setTimeout(() => release(), 300); }
+    if (m.type === "result") results++;
+    if (results >= 1 && msgs.some((x) => x.type === "user" && x.isReplay && x.uuid === uuids[1]) && msgs.filter((x) => x.type === "result").length >= 2) end?.();
+    if (results >= 1 && m.type === "result" && msgs.filter((x) => x.type === "result").length >= 2) end?.();
+  }
+  const replays = msgs.filter((m) => m.type === "user" && m.isReplay).map((m) => m.uuid);
+  for (const u of uuids) assert.equal(replays.filter((x) => x === u).length, 1, `one replay of ${u}`);
+  const session = msgs.find((m) => m.type === "system" && m.subtype === "init").session_id;
+  // (turn 2: resumes the session; the fake sees the earlier messages)
+  const before = api.requests.length;
+  const m2 = await drain(cliQuery({ prompt: "again", options: baseOptions({ cwd: env.HOME, resume: session, canUseTool: async () => ({ behavior: "deny", message: "no" }) }) }, { bin: BIN, env }));
+  assert.ok(m2.some((m) => m.type === "result"));
+  const r2 = api.requests.slice(before).find((r) => JSON.stringify(r.body.messages).includes("again"));
+  assert.ok(JSON.stringify(r2.body.messages).includes("first"), "turn 2 carries turn 1");
+  await api.close();
+});
+
+test("cli: options CLI mode can't honor are refused before anything starts: hooks (any, marked or not), setting sources, unknown options", () => {
+  const effortShaped = async () => ({});
+  effortShaped[Symbol.for("sagebrush.hook.reportOnly")] = true;
+  assert.throws(() => cliQuery({ prompt: "x", options: { hooks: { PreToolUse: [{ hooks: [effortShaped] }] } } }), /hooks can't run/);
+  assert.throws(() => cliQuery({ prompt: "x", options: { hooks: { Stop: [{ hooks: [async () => ({})] }] } } }), /hooks can't run/);
+  assert.throws(() => cliQuery({ prompt: "x", options: { settingSources: ["user", "project", "local"] } }), /closed launch/);
+  assert.throws(() => cliQuery({ prompt: "x", options: { canUseTool: () => {}, notAnOption: 1 } }), /isn't supported/);
+  // (brief's empty hooks pass the check)
+  const q = cliQuery({ prompt: "x", options: { hooks: {}, abortController: (() => { const a = new AbortController(); a.abort(); return a; })() } }, { bin: "/nonexistent" });
+  return drain(q);
+});

@@ -68,10 +68,10 @@ test("native: the system prompt is Claude Code's own, with the Sagebrush part ap
 test("nativeMode: a defaultMode that isn't one of the modes runs as the default", async () => {
   for (const mode of ["weird", "Default", "", 7, null]) {
     const resolver = { resolveSettings: async () => ({ permissions: { defaultMode: mode } }), filterEscalatingDefaultMode: (r) => r };
-    assert.deepEqual(await nativeMode("/tmp", resolver), { mode: "default", bypass: false }, JSON.stringify(mode));
+    assert.deepEqual(await nativeMode("/tmp", resolver), { mode: "default", bypass: false, rules: { allow: [], ask: [], deny: [] } }, JSON.stringify(mode));
   }
   const plan = { resolveSettings: async () => ({ permissions: { defaultMode: "plan" } }), filterEscalatingDefaultMode: (r) => r };
-  assert.deepEqual(await nativeMode("/tmp", plan), { mode: "plan", bypass: false }, "a mode that is one is kept");
+  assert.deepEqual(await nativeMode("/tmp", plan), { mode: "plan", bypass: false, rules: { allow: [], ask: [], deny: [] } }, "a mode that is one is kept");
 });
 
 test("native: a card's summary is the notebook's path (NotebookEdit) or the pattern (Grep, Glob)", { timeout: 20000 }, async () => {

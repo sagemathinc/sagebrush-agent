@@ -4,7 +4,9 @@
 // (TMPDIR) name hooks, MCP servers, an apiKeyHelper, a statusLine, settings env and CLAUDE.md, each running a sentinel
 // that appends its label to a marker file. A page pairs with the app's code, grants and sends a message, and the turn
 // runs; none of them may run. A control run of the same SDK with the settings loaded must run them, so the fixtures
-// are live. Offline: ANTHROPIC_BASE_URL (this test's only) points at a closed local port, so no model is reached.
+// are live. Offline: for the SDK control, ANTHROPIC_BASE_URL points at a closed local port; the app's launch (CLI mode,
+// the pinned Claude Code) has no login and no base URL (the release entry refuses one: checked here too), so its turn
+// fails before any model is reached.
 // Skipped where the SDK's CLI for this platform isn't installed.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -66,11 +68,12 @@ test("control: the same SDK with the settings loaded runs the fixtures (they are
   } finally { f.cleanup(); }
 });
 
-test("the app's launch: pairing, a grant and a turn with the real SDK run none of the hostile configuration", { skip }, async () => {
+test("the app's launch: pairing, a grant and a turn with the pinned Claude Code (CLI mode) run none of the hostile configuration", { skip }, async () => {
   const f = fixtures();
   const code = randomBytes(32).toString("base64url");
   // (the app's launch: a cleared environment, the workspace as the working folder; SAGEBRUSH_AGENT_FAKE is not set)
-  const p = spawn(process.execPath, [BIN, "--pair-stdin", "--origin", APP, "--port", "0"], { cwd: f.ws, env: f.env, stdio: ["pipe", "pipe", "pipe"] });
+  const { ANTHROPIC_BASE_URL: _control, ...appEnv } = f.env;
+  const p = spawn(process.execPath, [BIN, "--pair-stdin", "--origin", APP, "--port", "0"], { cwd: f.ws, env: appEnv, stdio: ["pipe", "pipe", "pipe"] });
   let out = "", err = "";
   p.stdout.on("data", (x) => { out += x; });
   p.stderr.on("data", (x) => { err += x; });
@@ -112,4 +115,17 @@ test("the app's launch: pairing, a grant and a turn with the real SDK run none o
     try { p.kill("SIGKILL"); } catch {}
     f.cleanup();
   }
+});
+
+test("the app's launch with a base URL set is refused before it starts anything", { skip }, async () => {
+  const f = fixtures();
+  try {
+    const p = spawn(process.execPath, [BIN, "--pair-stdin", "--origin", APP, "--port", "0"], { cwd: f.ws, env: f.env, stdio: ["pipe", "pipe", "pipe"] });
+    let err = "";
+    p.stderr.on("data", (x) => { err += x; });
+    const code = await new Promise((r) => p.on("exit", r));
+    assert.equal(code, 2);
+    assert.match(err, /ANTHROPIC_BASE_URL is set/);
+    assert.deepEqual(f.marks(), []);
+  } finally { f.cleanup(); }
 });

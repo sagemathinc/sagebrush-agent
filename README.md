@@ -10,7 +10,10 @@ It prints a link. Open it in Chrome or Firefox, and allow the folders Claude may
 
 ## What it does
 
-- It starts Claude through Anthropic's [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk), with **your own Claude login**. It uses the same login as Claude Code: if you have used Claude Code on this computer, you are logged in. Otherwise run `claude` once and log in.
+- It runs Claude with **your own Claude login**, through Claude Code itself: the Claude Code release this sagebrush-agent pins, unmodified, started as `claude -p` for each turn. It uses the same login as Claude Code: if you have used Claude Code on this computer, you are logged in. Otherwise run `claude` once and log in. sagebrush-agent never reads, keeps or passes your login.
+  - **With an API key or a cloud provider** instead (exactly one of `ANTHROPIC_API_KEY`, `CLAUDE_CODE_USE_BEDROCK=1`, `CLAUDE_CODE_USE_VERTEX=1` or `CLAUDE_CODE_USE_FOUNDRY=1` set), it uses Anthropic's [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk), and checks before each turn that the SDK found that credential and no Claude login. With more than one of them set it doesn't start.
+  - Claude runs with a closed launch: none of your Claude Code settings, hooks, plugins, MCP servers or CLAUDE.md files run under sagebrush-agent. In a native turn (shell and files on), your permission rules come along.
+  - It doesn't start with `ANTHROPIC_BASE_URL` (or another provider's base URL) set.
 - It listens **only on 127.0.0.1** (the loopback address). It accepts a connection only:
   - from the Sagebrush page's origin;
   - with the one-time code it prints, valid once, for 5 minutes (while no page is paired, a code that expires unused is replaced and the new link printed, so the newest link it printed always works);

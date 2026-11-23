@@ -34,12 +34,19 @@ function reachable(start) {
   return seen;
 }
 
-test("package: every file the bin reaches is in the published package (npm pack --dry-run)", () => {
-  const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+let packedList = null;
+/** The files `npm pack --dry-run` would publish (computed once). */
+function packedFilesOnce() {
+  if (packedList) return packedList;
   // (npm on Windows is npm.cmd, which Node starts only through the shell; the arguments here are fixed)
   const win = process.platform === "win32";
   const out = JSON.parse(execFileSync(win ? "npm.cmd" : "npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], shell: win }));
-  const packed = new Set(out[0].files.map((f) => f.path));
+  return (packedList = new Set(out[0].files.map((f) => f.path)));
+}
+
+test("package: every file the bin reaches is in the published package (npm pack --dry-run)", () => {
+  const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+  const packed = packedFilesOnce();
   const need = [...reachable(relative(root, join(root, pkg.bin["sagebrush-agent"])).replaceAll("\\", "/"))];
   // (a folder a module reads by its URL ("./tzdata/zoneinfo/"): every file under it on disk must be packed)
   const under = (d) => readdirSync(join(root, d), { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? under(`${d}${e.name}/`) : [`${d}${e.name}`]));
@@ -47,4 +54,14 @@ test("package: every file the bin reaches is in the published package (npm pack 
   assert.deepEqual(missing, [], `not in the package: ${missing.join(", ")}`);
   assert.ok(need.includes("lib/turn-info.mjs") && need.includes("lib/server.mjs"), `the walk reaches the modules (${need.length} files)`);
   assert.ok(need.includes("lib/tzdata/zoneinfo/") && under("lib/tzdata/zoneinfo/").length === 598, "the runner's zone data, every file");
+});
+
+test("package: server-only code stays out: no lib/fleet/relay/ file is published, and the bin never reaches one", () => {
+  const relay = readdirSync(join(root, "lib/fleet/relay")).filter((f) => f.endsWith(".mjs"));
+  assert.ok(relay.length >= 6, "the relay's files are on disk (so this check isn't vacuous)");
+  const inPackage = [...packedFilesOnce()].filter((f) => f.startsWith("lib/fleet/relay/"));
+  assert.deepEqual(inPackage, [], `server-only files in the package: ${inPackage.join(", ")}`);
+  const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+  const reached = [...reachable(relative(root, join(root, pkg.bin["sagebrush-agent"])).replaceAll("\\", "/"))].filter((f) => f.startsWith("lib/fleet/relay/"));
+  assert.deepEqual(reached, [], "the bin imports nothing from the relay");
 });

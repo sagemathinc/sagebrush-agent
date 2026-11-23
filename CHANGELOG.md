@@ -1,5 +1,16 @@
 # sagebrush-agent changes
 
+## 0.8.17
+
+**A Claude subscription is used only by Claude Code itself.** Each Claude turn (a Pair chat, a Delegate task, a chat brief) runs the Claude Code release this sagebrush-agent pins (2.1.330), unmodified, as `claude -p`, with your own Claude login. sagebrush-agent never reads, keeps or passes that login.
+
+- **An API key or a cloud provider instead:** with exactly one of `ANTHROPIC_API_KEY`, `CLAUDE_CODE_USE_BEDROCK=1`, `CLAUDE_CODE_USE_VERTEX=1` or `CLAUDE_CODE_USE_FOUNDRY=1` set, Claude runs through the Agent SDK. Before each turn's prompt is sent, the agent checks that the SDK found that credential and no Claude login; anything else ends the turn with nothing sent. With more than one of them set, sagebrush-agent doesn't start.
+- **A closed launch:** none of your Claude Code settings, hooks, plugins, MCP servers, slash commands or CLAUDE.md files run under sagebrush-agent. In a native turn (shell and files on), your permission rules come along, except any allow rule for an MCP tool.
+- **No other endpoint:** sagebrush-agent doesn't start with `ANTHROPIC_BASE_URL` (or another provider's base URL) set.
+- **The page is told which:** the hello says `claude-code` when Claude Code runs the turns, and `claude-agent-sdk` with an API key or a cloud provider. A page restoring a session made under the other connects again once.
+- **Not in this mode yet:** a turn's thinking level isn't reported when Claude Code runs it (its model still is).
+- **Autonomous agents groundwork:** the package now carries `lib/fleet/` (the protocol core, the host supervisor and the browser channel for Autonomous agents). Nothing in the `sagebrush-agent` command uses it yet.
+
 ## 0.8.16
 
 **The agent reads Sagebrush's own source, and a task's turns say their model.**

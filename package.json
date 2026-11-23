@@ -19,6 +19,7 @@
     "lib/task-notebook-edit.mjs",
     "lib/canon.mjs",
     "lib/claude-cli.mjs",
+    "lib/node-check.mjs",
     "lib/claude-pin.json",
     "lib/tags.mjs",
     "schema/tags.schema.json",

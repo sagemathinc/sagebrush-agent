@@ -381,7 +381,7 @@ test("takeover 4: a late result after an abandon and a resume is discarded; ever
 
 // ---- the bounds, each at the limit and one past it
 
-test("bounds: 32 credits, 64 retained outcomes, 8 MiB retained, 1 MiB of unadmitted command bytes", async () => {
+test("bounds: 32 credits; the broker holds what would pass 1 MiB of unadmitted command bytes", async () => {
   // credits: the broker never has more than 32 outstanding; the 33rd waits and then runs
   const a = sessions();
   const t = connect(a.broker, a.app);
@@ -391,45 +391,21 @@ test("bounds: 32 credits, 64 retained outcomes, 8 MiB retained, 1 MiB of unadmit
   assert.equal(a.broker.outstanding, 32, "32 sent, the 33rd held");
   assert.equal(a.brokerSent.filter((m) => m.kind === "cmd").length, 32);
   release();
-  await t.pump(200);
+  await t.pump(400);
   assert.ok((await Promise.all(out)).every((o) => o.outcome === "result"));
-  // the app refuses past 32 unresolved from a broker that ignores its credits
+  // the app refuses past 32 unresolved from a broker that ignores its credits (and racks what it gets)
   const b = sessions();
   const w = appVsRaw(b.app);
+  const r = racker(w);
   const rel = b.exec.barrier(1);
-  w.raw.l.send("ctl", 1, { ctl: "ping", t: 1 }, { recv: 0, rack: 0 });
-  for (let n = 1; n <= 33; n++) w.raw.l.send("cmd", n, { command: { n, hold: "before" } }, { recv: 0, rack: 0 });
+  for (let n = 1; n <= 33; n++) r.cmd(n, { n, hold: n === 1 ? "before" : undefined });
   await w.flush();
-  const refusals = w.raw.got.filter((m) => m.kind === "ctl" && m.value.ctl === "refused");
-  assert.deepEqual(refusals.map((m) => [m.value.seq, m.value.reason]), [], "none refused yet: they wait behind 1");
+  assert.deepEqual(refusalsOf(w), [], "none sent yet: they wait behind 1");
+  assert.deepEqual(b.app.held, { slots: 32, resultBytes: 0, arrivals: 1 }, "32 admitted, 33 refused on arrival");
   rel();
-  await w.flush();
-  // (32 unresolved at once was the limit: command 33 came while 1..32 were unresolved, so it is refused)
-  const after = w.raw.got.filter((m) => m.kind === "ctl" && m.value.ctl === "refused");
-  assert.deepEqual(after.map((m) => [m.value.seq, m.value.reason]), [[33, "credits"]]);
-  // retention: with no rack, 64 outcomes are retained and the 65th command is refused
-  const c = sessions();
-  const v = appVsRaw(c.app);
-  v.raw.l.send("ctl", 1, { ctl: "ping", t: 1 }, { recv: 0, rack: 0 });
-  for (let n = 1; n <= 65; n++) { v.raw.l.send("cmd", n, { command: { n } }, { recv: 0, rack: 0 }); await v.flush(); }
-  assert.equal(c.app.retained.count, 65, "64 results and the 65th command's refusal");
-  const last = v.raw.got.filter((m) => m.kind === "ctl" && m.value.ctl === "refused").map((m) => [m.value.seq, m.value.reason]);
-  assert.deepEqual(last, [[65, "credits"]]);
-  // (a broker that keeps sending without a rack: 32 more refusals at most, then the session ends)
-  for (let n = 66; n <= 96; n++) { v.raw.l.send("cmd", n, { command: { n } }, { recv: 0, rack: 0 }); await v.flush(); }
-  assert.equal(c.app.ended, null, "64 + 32 retained: at the bound");
-  v.raw.l.send("cmd", 97, { command: { n: 97 } }, { recv: 0, rack: 0 });
-  await v.flush();
-  assert.equal(c.app.ended, "limit", "one past it");
-  // 8 MiB: outcomes of ~1.2 MiB each; the command after the bytes pass 8 MiB is refused
-  const d = sessions();
-  d.exec.execute = async (command) => ({ data: "z".repeat(1_250_000) });
-  const app = (await import("../lib/fleet/channel/app.mjs")).appSession({ execute: d.exec.execute, clock: d.clock });
-  const u = appVsRaw(app);
-  u.raw.l.send("ctl", 1, { ctl: "ping", t: 1 }, { recv: 0, rack: 0 });
-  for (let n = 1; n <= 8; n++) { u.raw.l.send("cmd", n, { command: { n } }, { recv: 0, rack: 0 }); await u.flush(); }
-  assert.ok(app.retained.bytes >= 8 * 1024 * 1024 && app.retained.count === 8, `7 results past 8 MiB, and the refusal (${app.retained.bytes}, ${app.retained.count})`);
-  assert.deepEqual(u.raw.got.filter((m) => m.kind === "ctl" && m.value.ctl === "refused").map((m) => [m.value.seq, m.value.reason]), [[8, "credits"]]);
+  await r.all();
+  assert.deepEqual(refusalsOf(w), [[33, "credits"]], "command 33 came while 1..32 were unresolved");
+  assert.equal(w.raw.got.filter((m) => m.kind === "res").length, 32);
   // 1 MiB of unadmitted command bytes: the broker holds what would pass it
   const e = sessions();
   const x = brokerVsRaw(e.broker);
@@ -437,6 +413,276 @@ test("bounds: 32 credits, 64 retained outcomes, 8 MiB retained, 1 MiB of unadmit
   x.flush();
   const sent = x.raw.got.filter((m) => m.kind === "cmd").length;
   assert.equal(sent, 10, `10 commands of ~100 kB within 1 MiB, the 11th held (${sent})`);
+});
+
+// ---- the app's two retention bounds (r4.2 §6, as ruled for agent #76): result slots and bytes; the arrival-refusal
+// reserve. A takeover refusal uses its admitted command's result slot; paused/credits/bad on arrival use the reserve.
+
+// (a raw broker that racks on request: the highest contiguous outcome it has received, carried by a ctl ping)
+const refusalsOf = (w) => w.raw.got.filter((m) => m.kind === "ctl" && m.value.ctl === "refused").map((m) => [m.value.seq, m.value.reason]);
+function racker(w) {
+  let ctl = 0, rack = 0;
+  const outcomes = () => new Set(w.raw.got.flatMap((m) => (m.kind === "res" ? [m.seq] : m.kind === "ctl" && m.value.ctl === "refused" ? [m.value.seq] : [])));
+  const ping = () => w.raw.l.send("ctl", ++ctl, { ctl: "ping", t: 1 }, { recv: 0, rack });
+  ping(); // (the broker's first frame on the transport)
+  return {
+    get rack() { return rack; },
+    cmd(n, command) {
+      const c = Object.fromEntries(Object.entries(command).filter(([, v]) => v !== undefined));
+      w.raw.l.send("cmd", n, { command: c }, { recv: 0, rack });
+    },
+    async to(r) { rack = r; ping(); await w.flush(); },
+    async all() {
+      for (;;) {
+        await w.flush();
+        const o = outcomes();
+        let r = rack;
+        while (o.has(r + 1)) r++;
+        if (r === rack) return;
+        await this.to(r);
+      }
+    },
+  };
+}
+const resSize = (answer) => encodeBody("res", { answer }).length;
+
+test("result slots, at the count: the admitted (executing and queued) fill them, the next is refused on arrival; rack frees them and the next is admitted", async () => {
+  const s = sessions({ appOpts: { retainCount: 4 } });
+  const w = appVsRaw(s.app);
+  const r = racker(w);
+  const rel = s.exec.barrier(1);
+  for (let n = 1; n <= 4; n++) r.cmd(n, { n, hold: n === 1 ? "before" : undefined });
+  await w.flush();
+  assert.deepEqual(s.app.held, { slots: 4, resultBytes: 0, arrivals: 0 }, "1 executing and 3 queued: at the count");
+  r.cmd(5, { n: 5 });
+  await w.flush();
+  assert.deepEqual(s.app.held, { slots: 4, resultBytes: 0, arrivals: 1 }, "one past it: refused, in the reserve");
+  rel();
+  await w.flush();
+  // (with the default 8 MiB = the largest result, a retained result holds the queue until rack)
+  assert.deepEqual(s.exec.started, [1], "2 waits for rack");
+  assert.deepEqual(s.app.retained, { bytes: s.app.held.resultBytes + 64, count: 2, arrivalRefusals: 1 }, "result 1 and refusal 5");
+  await r.to(1);
+  assert.deepEqual(s.exec.started, [1, 2], "rack 1 released the result and restarted the queue");
+  await r.all();
+  assert.deepEqual(s.exec.started, [1, 2, 3, 4]);
+  assert.deepEqual(refusalsOf(w), [[5, "credits"]]);
+  assert.equal(r.rack, 5);
+  assert.deepEqual(s.app.held, { slots: 0, resultBytes: 0, arrivals: 0 }, "rack released everything");
+  r.cmd(6, { n: 6 });
+  await r.all();
+  assert.deepEqual(s.exec.started, [1, 2, 3, 4, 6], "admitted again, no seq skipped");
+  assert.equal(s.app.ended, null);
+});
+
+test("result bytes, at the limit: a command starts only if the largest result fits beside the retained ones; rack restarts the queue", async () => {
+  const { appSession } = await import("../lib/fleet/channel/app.mjs");
+  const small = resSize({ pad: "x".repeat(60) });
+  const resultBytes = 120;
+  // (two retained results plus the largest one fit exactly; three do not)
+  const app = appSession({ execute: async () => ({ pad: "x".repeat(60) }), clock: manualClock(), retainBytes: 2 * small + resultBytes, resultBytes });
+  const w = appVsRaw(app);
+  const r = racker(w);
+  for (let n = 1; n <= 5; n++) r.cmd(n, { n });
+  await w.flush();
+  const results = () => w.raw.got.filter((m) => m.kind === "res").length;
+  assert.equal(results(), 3, "3 started at the limit (2 retained + the largest)");
+  assert.deepEqual(app.held, { slots: 5, resultBytes: 3 * small, arrivals: 0 }, "4 waits: one past the limit");
+  await r.to(1);
+  assert.equal(results(), 4, "rack 1 restarted the queue: 4 ran");
+  await r.all();
+  assert.equal(results(), 5);
+  assert.equal(app.ended, null);
+  assert.throws(() => appSession({ execute: async () => ({}), retainBytes: 10, resultBytes: 11 }), /fit the retention bound/);
+});
+
+test("result bytes, the defaults: 8 MiB retained, 8 MiB the largest result; ~1.25 MB answers run one per rack, never past 8 MiB", async () => {
+  const c = sessions();
+  const app = (await import("../lib/fleet/channel/app.mjs")).appSession({ execute: async () => ({ data: "z".repeat(1_250_000) }), clock: c.clock });
+  const w = appVsRaw(app);
+  const r = racker(w);
+  for (let n = 1; n <= 8; n++) { r.cmd(n, { n }); await w.flush(); }
+  assert.equal(app.retained.count, 1, "one result retained; the rest wait for rack");
+  assert.equal(app.held.slots, 8);
+  for (let k = 1; k <= 8; k++) {
+    assert.ok(app.held.resultBytes <= 8 * 1024 * 1024);
+    await r.all();
+  }
+  assert.equal(w.raw.got.filter((m) => m.kind === "res").length, 8);
+  assert.deepEqual(refusalsOf(w), []);
+});
+
+test("the arrival-refusal reserve: 32 refusals held, the 33rd ends the session (limit), whichever bound came first", async () => {
+  // bytes first: one result holds the bytes, 32 more are admitted and wait (credits), then refusals take the reserve
+  const b = sessions({ appOpts: { retainBytes: 200, resultBytes: 200 } });
+  const w = appVsRaw(b.app);
+  const r = racker(w);
+  r.cmd(1, { n: 1 });
+  await w.flush();
+  for (let n = 2; n <= 33; n++) r.cmd(n, { n });
+  await w.flush();
+  assert.equal(b.app.retained.count, 1, "1 ran; its result holds the bytes, and 2..33 wait");
+  assert.deepEqual(b.app.held, { slots: 33, resultBytes: b.app.held.resultBytes, arrivals: 0 });
+  for (let n = 34; n <= 65; n++) r.cmd(n, { n });
+  await w.flush();
+  assert.equal(b.app.held.arrivals, 32, "32 refusals held");
+  assert.equal(b.app.ended, null, "at the reserve");
+  assert.ok(b.app.held.resultBytes <= 200);
+  r.cmd(66, { n: 66 });
+  await w.flush();
+  assert.equal(b.app.ended, "limit", "the 33rd ends it");
+  // count first: 4 slots, then 32 refusals, then the end
+  const c = sessions({ appOpts: { retainCount: 4 } });
+  const v = appVsRaw(c.app);
+  const q = racker(v);
+  for (let n = 1; n <= 36; n++) q.cmd(n, { n });
+  await v.flush();
+  assert.deepEqual(c.app.held, { slots: 4, resultBytes: c.app.held.resultBytes, arrivals: 32 });
+  assert.equal(c.app.ended, null);
+  q.cmd(37, { n: 37 });
+  await v.flush();
+  assert.equal(c.app.ended, "limit");
+  // paused on arrival uses the reserve too; takeover of an admitted command uses its own result slot
+  const d = sessions({ appOpts: { retainCount: 4 } });
+  const u = appVsRaw(d.app);
+  const p = racker(u);
+  const rel = d.exec.barrier(1);
+  for (let n = 1; n <= 3; n++) p.cmd(n, { n, hold: n === 1 ? "before" : undefined });
+  await u.flush();
+  d.app.pause();
+  assert.deepEqual(d.app.held, { slots: 3, resultBytes: 0, arrivals: 0 }, "2 and 3: takeover refusals in their own slots");
+  for (let n = 4; n <= 35; n++) p.cmd(n, { n });
+  await u.flush();
+  assert.equal(d.app.held.arrivals, 32, "32 paused refusals in the reserve");
+  assert.equal(d.app.ended, null);
+  p.cmd(36, { n: 36 });
+  await u.flush();
+  assert.equal(d.app.ended, "limit");
+  rel();
+});
+
+test("the broker's fingerprints cover the app's whole replay window: 64 results and 32 arrival refusals, rack lost, all replayed", async () => {
+  const run = async (fingerprints) => {
+    const s = sessions({ brokerOpts: { credits: 96, ...(fingerprints ? { fingerprints } : {}) } });
+    const x = brokerVsRaw(s.broker);
+    const out = Array.from({ length: 96 }, (_, i) => s.broker.submit({ n: i + 1 }));
+    x.flush();
+    assert.equal(x.raw.got.filter((m) => m.kind === "cmd").length, 96);
+    // (the app's outcomes: results for 1..64, refusals on arrival for 65..96)
+    const send = (raw) => {
+      let ctl = 0;
+      for (let n = 1; n <= 96; n++) {
+        if (n <= 64) raw.l.send("res", n, { answer: { n } }, { recv: 96, rack: 0 });
+        else raw.l.send("ctl", ++ctl, { ctl: "refused", seq: n, reason: "credits" }, { recv: 96, rack: 0 });
+      }
+    };
+    send(x.raw);
+    x.flush();
+    assert.equal(s.broker.rack, 96);
+    const outcomes = await Promise.all(out);
+    // (the broker's rack never reached the app: on a new transport it replays all 96)
+    const y = brokerVsRaw(s.broker);
+    y.flush();
+    send(y.raw);
+    y.flush();
+    return { ended: s.broker.ended, outcomes, held: s.broker.held };
+  };
+  const ok = await run();
+  assert.equal(ok.ended, null, "every replay was an exact duplicate with its fingerprint");
+  assert.equal(ok.outcomes.filter((o) => o.outcome === "result").length, 64);
+  assert.equal(ok.outcomes.filter((o) => o.outcome === "not_run").length, 32);
+  assert.deepEqual(ok.held, { records: 0, fingerprints: 96, unsent: { count: 0, bytes: 0 } }, "settled commands keep only their fingerprints");
+  const short = await run(95);
+  assert.equal(short.ended, "bad_form", "one fingerprint short: the oldest replay can't be judged, and ends the session");
+});
+
+test("the broker's state is bounded: settled commands are dropped; unsent submissions past 64 or 1 MiB are not run at once, without a seq", async () => {
+  // a long session: 200 commands, then only the fingerprints are left
+  const s = sessions();
+  const t = connect(s.broker, s.app);
+  for (let n = 1; n <= 200; n++) { const o = s.broker.submit({ n }); await t.pump(); assert.equal((await o).outcome, "result"); }
+  assert.deepEqual(s.broker.held, { records: 0, fingerprints: 96, unsent: { count: 0, bytes: 0 } });
+  // a blocked submitter (no transport): 64 held, the 65th not run, "limit"
+  const b = sessions();
+  const held = Array.from({ length: 64 }, (_, i) => b.broker.submit({ n: i + 1 }));
+  assert.equal(b.broker.held.unsent.count, 64);
+  assert.deepEqual(await b.broker.submit({ n: 65 }), { outcome: "not_run", reason: "limit" }, "one past it");
+  assert.equal(b.broker.held.records, 64, "nothing stored for it");
+  // drained, then submitted again: the wire's cmd seqs have no hole
+  const u = connect(b.broker, b.app);
+  await u.pump(400);
+  assert.ok((await Promise.all(held)).every((o) => o.outcome === "result"));
+  const again = b.broker.submit({ n: 66 });
+  await u.pump();
+  assert.equal((await again).outcome, "result");
+  const seqs = b.brokerSent.filter((m) => m.kind === "cmd").map((m) => m.seq);
+  assert.deepEqual(seqs, Array.from({ length: 65 }, (_, i) => i + 1), "1..65 on the wire: the refused submission used none");
+  // bytes: ~100 kB commands, 10 within 1 MiB, the 11th not run
+  const c = sessions();
+  for (let n = 1; n <= 10; n++) c.broker.submit({ n, pad: "p".repeat(100_000) });
+  assert.deepEqual(await c.broker.submit({ n: 11, pad: "p".repeat(100_000) }), { outcome: "not_run", reason: "limit" });
+  assert.equal(c.broker.held.unsent.count, 10);
+  assert.ok(c.broker.held.unsent.bytes <= 1024 * 1024);
+});
+
+test("an answer that isn't a result (undefined, null, an array, a float, over resultBytes) is one unknown/abandoned; no unhandled rejection, nothing stranded", async () => {
+  const rejections = [];
+  const onRejection = (e) => rejections.push(e);
+  process.on("unhandledRejection", onRejection);
+  try {
+    const answers = [undefined, null, [1], 7, { x: 1.5 }, { big: "b".repeat(300) }, { ok: true }];
+    const s = sessions({ appOpts: { retainBytes: 1000, resultBytes: 200, execute: async (c) => answers[c.n - 1] } });
+    const t = connect(s.broker, s.app);
+    const out = answers.map((_, i) => s.broker.submit({ n: i + 1 }));
+    await t.pump(200);
+    const got = await Promise.all(out);
+    assert.deepEqual(got.slice(0, 6), Array(6).fill({ outcome: "unknown", reason: "abandoned" }), "each exactly one unknown, never not_run");
+    assert.deepEqual(got[6], { outcome: "result", answer: { ok: true } }, "and the session goes on");
+    assert.equal(s.app.ended, null);
+    assert.equal(s.broker.ended, null);
+    assert.equal(s.app.executing, null);
+    assert.equal(s.broker.rack, 7);
+    assert.deepEqual(s.app.held, { slots: 0, resultBytes: 0, arrivals: 0 });
+    await settle();
+    assert.deepEqual(rejections, []);
+  } finally {
+    process.off("unhandledRejection", onRejection);
+  }
+});
+
+test("a validator that throws ends the session (bad_form) before anything runs; nothing escapes the transport", async () => {
+  const s = sessions({ appOpts: { validate: () => { throw new Error("the validator broke"); } } });
+  const t = connect(s.broker, s.app);
+  const o = s.broker.submit({ n: 1 });
+  await t.pump();
+  assert.equal(s.app.ended, "bad_form");
+  assert.equal(s.exec.calls, 0, "never ran");
+  t.bl.lost("cut");
+  s.clock.advance(60_000);
+  assert.deepEqual(await o, { outcome: "unknown", reason: "not resumed" }, "sent, so unknown: never not_run, never retried");
+});
+
+test("the default clock (no clock given): both ends attach, ping, run a command and end", async () => {
+  const { brokerSession } = await import("../lib/fleet/channel/broker.mjs");
+  const { appSession } = await import("../lib/fleet/channel/app.mjs");
+  // (a short ping interval, so each end's health tick and pong handling read the real clock too)
+  const health = [], states = [];
+  const broker = brokerSession({ pingMs: 20, onHealth: (h) => health.push(h) });
+  const app = appSession({ execute: async (c) => ({ n: c.n }), pingMs: 20, onState: (s) => states.push(s) });
+  const t = connect(broker, app);
+  const o = broker.submit({ n: 1 });
+  await t.pump();
+  assert.deepEqual(await o, { outcome: "result", answer: { n: 1 } });
+  for (let i = 0; i < 10 && !(health.some((h) => h.state === "ok") && states.some((s) => s.state === "ok")); i++) {
+    await new Promise((r) => setTimeout(r, 30));
+    await t.pump();
+  }
+  assert.ok(health.some((h) => h.state === "ok" && h.rtt >= 0), "the broker's ping, answered, timed on the real clock");
+  assert.ok(states.some((s) => s.state === "ok" && s.rtt >= 0), "the app's ping, answered, timed on the real clock");
+  broker.end("done");
+  app.end("done");
+  // (their links' bounded closes are real timers too: let them run out)
+  for (const l of [t.bl, t.al]) clearTimeout(l.closeTimer);
 });
 
 // ---- the blocked transport (r4.2 §7 (c)), health and the resume window

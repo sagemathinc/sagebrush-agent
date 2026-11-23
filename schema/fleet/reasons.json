@@ -227,6 +227,31 @@
       "name": "audit_full",
       "owner": "host",
       "meaning": "a durable intent couldn't be appended (full); refused fail-closed"
+    },
+    {
+      "name": "program_mismatch",
+      "owner": "browser",
+      "meaning": "the browser program doesn't match the pinned one"
+    },
+    {
+      "name": "unknown_owner",
+      "owner": "browser",
+      "meaning": "a browser object without a known owner"
+    },
+    {
+      "name": "unmappable",
+      "owner": "browser",
+      "meaning": "a browser id that can't be mapped"
+    },
+    {
+      "name": "bad_kind",
+      "owner": "browser",
+      "meaning": "a browser object of the wrong kind"
+    },
+    {
+      "name": "stale_handle",
+      "owner": "browser",
+      "meaning": "a browser handle no longer live"
     }
   ]
 }

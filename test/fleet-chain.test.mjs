@@ -170,3 +170,25 @@ test("the service's auth_time check: a sign-in more than 5 minutes old is stale_
   assert.equal(code(() => apply(c.state, e, { ...c.ctx, checkAuthTime: true, now: 1000 + 5 * 60_000 })), "ok");
   assert.equal(code(() => apply(c.state, e, { ...c.ctx, checkAuthTime: true, now: 1001 + 5 * 60_000 })), "stale_auth");
 });
+
+test("a chain is bound to its own fleet and audience: another context can't extend it, and the state is unchanged", () => {
+  const c = chain(), nat = c.dev("native"), rec = key();
+  c.genesis(nat, rec);
+  const before = c.state;
+  for (const other of [{ aud: AUD, fleet: newId() }, { aud: "https://sagebrush.space", fleet: c.fleet }]) {
+    // a validly signed entry, made for the other context, extending this chain's head
+    const body = { fleet: other.fleet, aud: other.aud, seq: 1, prev: before.head, op: "policy", at_ms: 1, auth_time_ms: 1, policy: { require_native_for_widening: true } };
+    const bytes = seal("sb.device-chain.v1", c.signerOf(nat), body, nat.k);
+    const got = code(() => apply(before, bytes, other));
+    assert.ok(got === "bad_audience" || got === "bad_form", got);
+    assert.equal(before.seq, 0, "the state is unchanged");
+    assert.equal(before.fleet, c.fleet);
+  }
+  // the matching context still extends it
+  c.push(c.sign(nat, "policy", { policy: { require_native_for_widening: true } }));
+  assert.equal(c.state.seq, 1);
+  // a pin of another chain refuses a replay
+  assert.equal(code(() => replay(c.entries, c.ctx, { fleet: newId(), aud: AUD, seq: 0, hash: c.state.hashes[0] })), "chain_fork");
+  assert.equal(code(() => replay(c.entries, c.ctx, { fleet: c.fleet, aud: "https://sagebrush.space", seq: 0, hash: c.state.hashes[0] })), "chain_fork");
+  assert.equal(replay(c.entries, c.ctx, { fleet: c.fleet, aud: AUD, seq: 1, hash: c.state.head }).seq, 1);
+});

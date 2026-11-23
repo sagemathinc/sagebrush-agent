@@ -73,11 +73,12 @@ test("reasons.json: closed, unique, and every code the fleet library raises is i
   const names = reg.reasons.map((r) => r.name);
   assert.equal(new Set(names).size, names.length);
   for (const n of names) assert.match(n, /^[a-z][a-z0-9_]{0,47}$/);
+  // (every module under lib/fleet/, browser/ included, recursively)
   const dir = new URL("../lib/fleet/", import.meta.url);
-  for (const f of readdirSync(dir).filter((f) => f.endsWith(".mjs"))) {
-    for (const [, c] of readFileSync(new URL(f, dir), "utf8").matchAll(/refuse\("([a-z_]+)"/g)) assert.ok(names.includes(c), `${f}: ${c}`);
+  for (const f of readdirSync(dir, { recursive: true }).filter((f) => String(f).endsWith(".mjs"))) {
+    for (const [, c] of readFileSync(new URL(String(f), dir), "utf8").matchAll(/refuse\("([a-z_]+)"/g)) assert.ok(names.includes(c), `${f}: ${c}`);
   }
-  for (const c of ["not_found", "limit", "in_progress", "idem_expired", "device_tier", "browser_gen_stale", "preflight_missing", "audit_full"]) assert.ok(names.includes(c), c);
+  for (const c of ["not_found", "limit", "in_progress", "idem_expired", "device_tier", "browser_gen_stale", "preflight_missing", "audit_full", "program_mismatch", "stale_handle"]) assert.ok(names.includes(c), c);
 });
 
 test("purpose codes: the schema's enum and the display list agree", () => {

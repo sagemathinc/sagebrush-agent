@@ -389,6 +389,21 @@ test("source tar (H1): implied parent folders count toward the folder cap, befor
   // (a folder named by its header and implied by a file counts once)
   assert.equal(sink(tarOf([ent(`${ROOT()}/a/`, "", "5"), ent(`${ROOT()}/a/x.txt`, "x")]), SHA, { ...TAR, dirs: 1 }).files.length, 1);
 });
+test("source tar (H1): one folder spelled two ways, up to case, refuses the archive: implied or named, either order", () => {
+  const r = (n, d = "x", t = "0") => ent(`${ROOT()}/${n}`, d, t);
+  const cases = [
+    [r("a/x.txt"), r("A/y.txt")], [r("A/y.txt"), r("a/x.txt")],            // (both implied)
+    [r("a/", "", "5"), r("A/y.txt")], [r("A/y.txt"), r("a/", "", "5")],    // (named, then implied; implied, then named)
+    [r("a/", "", "5"), r("A/", "", "5")],                                  // (both named)
+    [r("p/a/x.txt"), r("p/A/y.txt")], [r("P/a/x.txt"), r("p/a/y.txt")],    // (deeper, and at the top)
+  ];
+  for (const c of cases) {
+    for (const dirs of [1, 2, TAR.dirs]) assert.throws(() => sink(tarOf(c), SHA, { ...TAR, dirs }), /twice|too many folders/, JSON.stringify(dirs));
+    assert.throws(() => sink(tarOf(c)), /twice/);
+  }
+  // (one spelling, used again: fine, and counted once)
+  assert.equal(sink(tarOf([r("a/x.txt"), r("a/y.txt"), r("a/", "", "5")]), SHA, { ...TAR, dirs: 1 }).files.length, 2);
+});
 
 test("source tool (H2): a failed download is one attempt a turn: later calls answer the same failure with no request", { skip: NO_SQLITE }, async () => {
   let n = 0;

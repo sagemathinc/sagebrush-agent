@@ -975,3 +975,108 @@ test("SEC r4 (astra4b): a person's delete while the proof is pending doesn't let
   assert.equal(fx.units[A].active, true, "(the fake's cgroup really is still populated)");
   await close();
 });
+
+// ---- fifth review round: a pending proof survives supersession
+
+for (const listed of [true, false]) {
+  test(`supersede carries the pending proof (agent ${listed ? "listed" : "absent"} in the new grant, deleted): no applied, no ack until a real 0`, async () => {
+    const root = tmp("state"), fenceDir = tmp("fence"), fx = fakeFx();
+    let stuck = true, g1valid = true;
+    fx.start = async (id) => { fx.u(id).active = true; throw new FleetError("unit_failed", "exited"); };
+    const sysStop = fx.sys.stop, sysCount = fx.sys.procCount;
+    fx.sys.stop = (u) => { if (stuck) throw new Error("EIO"); return sysStop(u); };
+    fx.sys.procCount = (u) => (stuck ? 1 : sysCount(u));
+    const v = (b) => { const r = verify(b); if (r.body.gen === 1 && !g1valid) throw new FleetError("grant_expired", "expired"); return r; };
+    let s = await setup({ fx, root, fenceDir });
+    s.sup.verify = v;
+    assert.equal((await s.sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) })).reason, "not_empty");
+    await s.sup.submit({ kind: "delete", authority: "person", agent: A });
+    g1valid = false; // grant 1 expires: grant 2 supersedes the held application
+    const g2 = grant(2, listed ? [entry(A), entry(B)] : [entry(B)]);
+    const r = await s.sup.submit({ kind: "grant", bytes: g2 });
+    assert.deepEqual([r.status, r.step, r.reason], ["failed", `prove:${A}`, "not_empty"]);
+    assert.equal(s.store.grants.highwater.gen, 2);
+    assert.equal(s.store.grants.steps()[0], `prove:${A}`, "carried durably as the new plan's first step");
+    assert.deepEqual(s.store.grants.pendingProofs(), [A], "the host-level pending proof");
+    assert.deepEqual(fx.acks, []);
+    await s.close();
+    // Recovery: still pending while the count is 1.
+    s = await setup({ fx, root, fenceDir }); s.sup.verify = v;
+    assert.equal((await s.sup.recover()).reason, "not_empty");
+    assert.deepEqual(fx.acks, []);
+    await s.close();
+    // A real 0 completes it.
+    stuck = false;
+    fx.start = async (id) => { if (fx.u(id).masked) throw new Error("masked"); if (!fx.fenced(id)) fx.u(id).active = true; };
+    s = await setup({ fx, root, fenceDir }); s.sup.verify = v;
+    const rec = await s.sup.recover();
+    assert.equal(rec.status, "applied");
+    assert.deepEqual(fx.acks.map((x) => x[0]), [2]);
+    assert.equal(fx.units[A].active, false);
+    assert.deepEqual(s.store.grants.pendingProofs(), [], "cleared only by the passing proof");
+    await s.close();
+  });
+}
+
+test("plan: prove steps parse; the planner itself never makes one", () => {
+  assert.deepEqual(parseStep(`prove:${A}`), { kind: "prove", agent: A });
+  const p = planGrant({ agents: [entry(A)] }, { agents: [entry(B)] }, { agent: (id) => (id === A ? { state: "running", start_failed: null } : null) });
+  assert.ok(!p.steps.some((x) => x.startsWith("prove:")));
+});
+
+test("pendingProof: a failed containment anywhere (here revoke-caps) blocks every later applied and ack until proven", async () => {
+  const fx = fakeFx();
+  const { sup, store, close } = await setup({ fx });
+  const g1 = grant(1, [entry(A), entry(B)]);
+  await sup.submit({ kind: "grant", bytes: g1 });
+  let stuck = true;
+  const sysStop = fx.sys.stop, sysCount = fx.sys.procCount;
+  fx.sys.stop = (u) => { if (stuck && u.includes(A)) throw new Error("EIO"); return sysStop(u); };
+  fx.sys.procCount = (u) => (stuck && u.includes(A) ? 1 : sysCount(u));
+  const r = await sup.submit({ kind: "revoke-caps", authority: "service", agent: A });
+  assert.equal(r.status, "failed");
+  assert.deepEqual(store.grants.pendingProofs(), [A]);
+  // The same grant again: no re-sent acknowledgement while a proof is pending.
+  const re = await sup.submit({ kind: "grant", bytes: g1 });
+  assert.deepEqual([re.status, re.reason], ["refused", "in_progress"]);
+  // A next grant that doesn't touch A (or lists only B) still starts with A's proof and can't finish.
+  const acks = fx.acks.length;
+  fx.log.length = 0;
+  const r2 = await sup.submit({ kind: "grant", bytes: grant(2, [entry(B), entry(C)]) });
+  assert.deepEqual([r2.status, r2.step], ["failed", `prove:${A}`]);
+  assert.equal(r2.step, store.grants.steps()[0], "the pending proof is the new plan's FIRST step");
+  assert.ok(!fx.log.some((l) => ["provision", "start", "broker-gen"].includes(l[0])), "nothing of the new plan ran before it");
+  assert.equal(fx.acks.length, acks);
+  stuck = false;
+  const r3 = await sup.submit({ kind: "grant", bytes: grant(3, [entry(B), entry(C)]) });
+  assert.equal(r3.status, "applied");
+  assert.deepEqual(store.grants.pendingProofs(), []);
+  await close();
+});
+
+test("pendingProof raised DURING an application (a preempting revoke-caps) blocks that application's applied and ack", async () => {
+  const fx = fakeFx();
+  let sup, stuck = false, armed = false;
+  const sysStop = fx.sys.stop, sysCount = fx.sys.procCount;
+  fx.sys.stop = (u) => { if (stuck && u.includes(A)) throw new Error("EIO"); return sysStop(u); };
+  fx.sys.procCount = (u) => (stuck && u.includes(A) ? 1 : sysCount(u));
+  const s = await setup({ fx, barrier: async (n) => { if (armed && n === "after_broker_gen") { armed = false; sup.submit({ kind: "revoke-caps", authority: "service", agent: A }); } } });
+  sup = s.sup;
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
+  stuck = true; armed = true;
+  const g2 = grant(2, [entry(A), entry(B, { x: 2 })]);
+  assert.equal((await sup.submit({ kind: "grant", bytes: g2 })).status, "preempted");
+  // The continued application can't finish: A's proof is pending.
+  const r = await sup.submit({ kind: "grant", bytes: g2 });
+  assert.equal(r.status, "refused");
+  assert.equal(r.previous.step, `prove:${A}`);
+  assert.equal(s.store.grants.pending().phase, "applying");
+  assert.deepEqual(fx.acks.map((x) => x[0]), [1]);
+  stuck = false;
+  // The same grant again: the held application is finished first (now proven), then it is a re-apply.
+  assert.equal((await sup.submit({ kind: "grant", bytes: g2 })).status, "reapplied");
+  assert.equal(s.store.grants.pending().phase, "applied");
+  assert.deepEqual(fx.acks.map((x) => x[0]), [1, 2, 2]);
+  assert.deepEqual(s.store.grants.pendingProofs(), []);
+  await s.close();
+});

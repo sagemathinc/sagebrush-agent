@@ -97,7 +97,7 @@ test("begin: the intent first; then grant bytes; then ONE atomic state commit; s
   await s.begin(1, bytes, digest, ["broker-gen", "start:a"], intent);
   assert.equal(intent.log.length, 1);
   assert.equal(intent.log[0].gen, 1);
-  assert.deepEqual(stateOnDisk(dir), { v: 1, gen: 1, digest, phase: "applying", plan: [{ step: "broker-gen", done: false }, { step: "start:a", done: false }], ack: null });
+  assert.deepEqual(stateOnDisk(dir), { v: 1, gen: 1, digest, phase: "applying", plan: [{ step: "broker-gen", done: false }, { step: "start:a", done: false }], ack: null, proof: {} });
   assert.deepEqual(s.steps(), ["broker-gen", "start:a"]);
   assert.equal(s.ack, null);
   s.done(0);
@@ -240,7 +240,7 @@ for (const step of ["open", "write", "fsync", "rename", "dirfsync"]) {
     await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a"], okIntent()), /ENOSPC/);
     assert.equal(s.poisoned, false);
     assert.deepEqual(s.pending(), { phase: "applied", gen: 0, remaining: [] });
-    assert.deepEqual(stateOnDisk(dir), { v: 1, gen: 0, digest: null, phase: "applied", plan: [], ack: null });
+    assert.deepEqual(stateOnDisk(dir), { v: 1, gen: 0, digest: null, phase: "applied", plan: [], ack: null, proof: {} });
     assert.deepEqual(readdirSync(join(dir, "grant", "grants")), []); // no partial file left to block a retry
     await s.close();
     const again = await GrantState.open(dir);
@@ -301,25 +301,29 @@ test("anything but the exact closed state is refused at load and left as found",
   const d43 = "A".repeat(43);
   const variants = [
     "{",
-    { v: 1, gen: 7, digest: null, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] } },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: "false" }] , ack: null },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: "yes" }] , ack: null },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: 12, done: false }] , ack: null },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: false, extra: 1 }] , ack: null },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "", done: false }] , ack: null },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [{ step: "a", done: true }] , ack: { narrowed: false, restarted: [] } },
-    { v: 1, gen: 0, digest: null, phase: "applying", plan: [] , ack: null },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], extra: 1 , ack: { narrowed: false, restarted: [] } },
-    { v: 1, gen: 1, digest: "short", phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] } },
-    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] } },
-    { v: 1, gen: -1, digest: null, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] } },
-    { v: 1, gen: 1, digest: d43, phase: "done", plan: [] , ack: { narrowed: false, restarted: [] } },
+    { v: 1, gen: 7, digest: null, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {} },
+    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: "false" }] , ack: null, proof: {} },
+    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: "yes" }] , ack: null, proof: {} },
+    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: 12, done: false }] , ack: null, proof: {} },
+    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: false, extra: 1 }] , ack: null, proof: {} },
+    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "", done: false }] , ack: null, proof: {} },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [{ step: "a", done: true }] , ack: { narrowed: false, restarted: [] }, proof: {} },
+    { v: 1, gen: 0, digest: null, phase: "applying", plan: [] , ack: null, proof: {} },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], extra: 1 , ack: { narrowed: false, restarted: [] }, proof: {} },
+    { v: 1, gen: 1, digest: "short", phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {} },
+    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {} },
+    { v: 1, gen: -1, digest: null, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {} },
+    { v: 1, gen: 1, digest: d43, phase: "done", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {} },
     { v: 1, gen: 1, digest: d43, phase: "applied", plan: [] },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: null },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [], ack: { narrowed: false, restarted: [] } },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: "no", restarted: [] } },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: ["x"] } },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [], extra: 1 } },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: null, proof: {} },
+    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [], ack: { narrowed: false, restarted: [] }, proof: {} },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: "no", restarted: [] }, proof: {} },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: ["x"] }, proof: {} },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [], extra: 1 }, proof: {} },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] } },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: [] },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: { x: "not_empty" } },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: { abcdefghijklmnopqrstuvwxya: "maybe" } },
   ];
   for (const v of variants) {
     const dir = fresh();
@@ -422,4 +426,26 @@ test("crash-retry: if fsyncing the existing blob fails, the state is not accepte
   await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a"], okIntent()), /EIO/);
   assert.equal(stateOnDisk(dir).gen, 0);
   await s.close();
+});
+
+test("pending proofs: durable, host-level; finish refuses while any is pending; cleared one by one", async () => {
+  const dir = fresh();
+  const s = await GrantState.open(dir);
+  const A = "abcdefghijklmnopqrstuvwxya", B = "bbbbbbbbbbbbbbbbbbbbbbbbbe";
+  for (const [id, why] of [["x", "not_empty"], [A, "maybe"]]) refused(() => s.markProof(id, why), "bad_form");
+  const { bytes, digest } = g(1);
+  await s.begin(1, bytes, digest, ["map"], okIntent());
+  s.markProof(A); s.markProof(B); s.markProof(A);
+  assert.deepEqual(s.pendingProofs(), [A, B].sort());
+  s.done(0);
+  refused(() => s.finish({ narrowed: false, restarted: [] }), "in_progress");
+  await s.close();
+  const again = await GrantState.open(dir);
+  assert.deepEqual(again.pendingProofs(), [A, B].sort(), "durable across a restart");
+  again.clearProof(A); again.clearProof(A);
+  refused(() => again.finish({ narrowed: false, restarted: [] }), "in_progress");
+  again.clearProof(B);
+  again.finish({ narrowed: false, restarted: [] });
+  assert.deepEqual(again.pendingProofs(), []);
+  await again.close();
 });

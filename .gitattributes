@@ -8,3 +8,5 @@ lib/tzdata/** -text
 # The fleet protocol's shared vectors and schemas: other implementations compare them byte for byte.
 test/fixtures/fleet-fixtures.json text eol=lf
 schema/fleet/*.json text eol=lf
+# IANA's registry files, byte-pinned (their sha256s are in schema/fleet/browser/special-addresses.json): never converted
+schema/fleet/browser/iana/*.csv -text

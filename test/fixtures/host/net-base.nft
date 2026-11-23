@@ -1,0 +1,4 @@
+add table inet sagebrush
+add chain inet sagebrush input { type filter hook input priority 0 ; policy accept ; }
+add chain inet sagebrush forward { type filter hook forward priority 0 ; policy drop ; }
+add chain inet sagebrush postrouting { type nat hook postrouting priority 100 ; policy accept ; }

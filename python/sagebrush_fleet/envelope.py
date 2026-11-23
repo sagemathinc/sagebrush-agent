@@ -55,7 +55,8 @@ def check_signer(type_, signer):
         refuse("bad_form", "an unknown type")
     if not exact_keys(signer, ["kind", "id", "alg", "key"]):
         refuse("bad_form", "a signer is {kind, id, alg, key}")
-    if signer["kind"] not in KINDS or not is_id(signer["id"]) or signer["alg"] != "ed25519":
+    # (a str before any set or dict lookup: a list or object there must be a refusal, never a TypeError)
+    if not isinstance(signer["kind"], str) or signer["kind"] not in KINDS or not is_id(signer["id"]) or signer["alg"] != "ed25519":
         refuse("bad_form", "a bad signer")
     unb64(signer["key"], 16)
     if signer["kind"] not in TYPES[type_]:

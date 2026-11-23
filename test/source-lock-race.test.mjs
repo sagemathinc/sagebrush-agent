@@ -36,7 +36,7 @@ async function race(end) {
   }
 }
 
-const NO_SQLITE = await import("node:sqlite").then((m) => typeof m.DatabaseSync !== "function", () => true) && "needs node:sqlite (Node 22.13 or later)";
+const NO_SQLITE = process.platform === "win32" ? "the source tool isn't available on Windows in v1" : await import("node:sqlite").then((m) => typeof m.DatabaseSync !== "function", () => true) && "needs node:sqlite (Node 22.13 or later)";
 
 test("source cache lock: one holder at a time across processes; a normal release lets the next in", { skip: NO_SQLITE }, async () => {
   await race(async (_a, touch, wait) => { touch("A-end"); await wait("A-done"); });

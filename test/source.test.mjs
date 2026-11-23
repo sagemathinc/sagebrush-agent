@@ -13,7 +13,7 @@ import { LIMITS, searchPool, sourcePath, sourceVerbs } from "../lib/source.mjs";
 import { CardlessBudget } from "../lib/netverbs.mjs";
 
 // (node:sqlite is Node 22.13 or later; on Node 20 only the refusal row below runs for the cache and the tool)
-const NO_SQLITE = await import("node:sqlite").then((m) => typeof m.DatabaseSync !== "function", () => true) && "needs node:sqlite (Node 22.13 or later)";
+const NO_SQLITE = process.platform === "win32" ? "the source tool isn't available on Windows in v1" : await import("node:sqlite").then((m) => typeof m.DatabaseSync !== "function", () => true) && "needs node:sqlite (Node 22.13 or later)";
 
 const SHA = "1111111111111111111111111111111111111111";
 const SHA2 = "2222222222222222222222222222222222222222";
@@ -511,7 +511,7 @@ test("source tool: a turn's lease is given back when the turn ends: its commit i
   } finally { cleanup(home); }
 });
 
-test("source tool on a Node without node:sqlite: a plain refusal, nothing fetched", { skip: !NO_SQLITE && "node:sqlite is here" }, async () => {
+test("source tool on a Node without node:sqlite: a plain refusal, nothing fetched", { skip: (process.platform === "win32" && "Windows answers first") || (!NO_SQLITE && "node:sqlite is here") }, async () => {
   const home = tmp();
   try {
     const f = fakeGet({ archive: () => gz(tarOf([ent(`${ROOT()}/a.txt`, "a\n")])) });
@@ -548,4 +548,21 @@ test("source tool: after close, a call makes no request at all", async () => {
   await v.close();
   assert.match(text(await v.sagebrush_source({ op: "index" })), /turn ended/);
   assert.deepEqual(f.calls, []);
+});
+
+test("source tool on Windows: a fixed refusal, with no request and no cache", async () => {
+  const home = tmp();
+  try {
+    const f = fakeGet();
+    const cache = cacheAt(home);
+    // (on windows-latest the real platform answers; elsewhere the same path, with the platform given)
+    const v = sourceVerbs({ budget: new CardlessBudget(), get: f.get, cache, limits: LIMITS, ...(process.platform === "win32" ? {} : { platform: "win32" }) });
+    for (const op of ["index", "list", "read", "search"]) {
+      const r = await v.sagebrush_source({ op, path: "a", pattern: "a" });
+      assert.ok(r.isError && /isn't available on Windows yet/.test(text(r)), text(r));
+    }
+    assert.deepEqual(f.calls, []);
+    assert.equal(existsSync(cache.root), false, "the cache was never touched");
+    await v.close();
+  } finally { cleanup(home); }
 });

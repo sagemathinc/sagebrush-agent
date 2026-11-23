@@ -37,6 +37,10 @@ const MAX_MARKER: usize = 64;
 const MAX_UIDS: usize = 64;
 const MARKER: &str = ".complete";
 const MAX_ELF_PHNUM: usize = 64;
+/// A system-set file may be owned by root or by a system service account below this uid: on a stock Ubuntu 24.04
+/// host, /etc/resolv.conf resolves to systemd-resolved's stub file, owned by `systemd-resolve`. Agents (70000+) and
+/// people (1000+) never own one. The bind is read-only to the child either way.
+const SYSTEM_OWNER_MAX: u32 = 1000;
 /// CAP_SYS_RESOURCE.
 const SYS_RESOURCE: u32 = 24;
 
@@ -402,7 +406,8 @@ fn stage_inner<O: RestoreOps, R: Runner<O::H>>(o: &mut O, r: &mut R, a: &StageAr
     let state = anchor_policy(o, &root, STATE)?;
     let secrets = anchor_policy(o, &root, SECRETS)?;
     let cache = anchor_policy(o, &root, CACHE)?;
-    // The closed system set: each present entry root-owned, not group- or other-writable, of its expected kind.
+    // The closed system set: each present entry owned by root or a system service account, not group- or
+    // other-writable, of its expected kind.
     let mut system = Vec::new();
     for (rel, file) in SYSTEM {
         let h = match o.open_system(&root, rel) {
@@ -412,8 +417,8 @@ fn stage_inner<O: RestoreOps, R: Runner<O::H>>(o: &mut O, r: &mut R, a: &StageAr
         };
         let id = o.ident(&h).map_err(open_err)?;
         let want = if file { Kind::File } else { Kind::Dir };
-        if kind_of(&id) != Some(want) || id.uid != 0 || id.mode & 0o022 != 0 {
-            return Err(pre("a system file isn't root-only"));
+        if kind_of(&id) != Some(want) || id.uid >= SYSTEM_OWNER_MAX || id.mode & 0o022 != 0 {
+            return Err(pre("a system file isn't owned by root or a system account, or is writable by others"));
         }
         system.push((rel, file, h, id));
     }
@@ -1503,6 +1508,22 @@ mod tests {
         f.fail = Some("marker");
         assert_eq!(rcode(&restore_stage(&mut f, &mut exited(ok_reply()), &stage_args("home"))), 75);
         assert!(!f.nodes.contains_key(&format!("{}/.complete", attempt_path("home"))));
+    }
+
+    #[test]
+    fn a_system_file_may_belong_to_a_system_account_never_to_a_person_or_agent_nor_be_writable_by_others() {
+        // systemd-resolved's stub resolv.conf (uid 991 on Ubuntu 24.04) is accepted; the bind is read-only either way.
+        let mut f = host();
+        f.node("etc/resolv.conf").id.uid = 991;
+        assert_eq!(rcode(&restore_stage(&mut f, &mut exited(ok_reply()), &stage_args("home"))), 0);
+        for (what, uid, mode) in [("a person's", 1000u32, 0o644u16), ("an agent's", UID, 0o644), ("group-writable", 0, 0o664), ("other-writable", 991, 0o646)] {
+            let mut f = host();
+            f.node("etc/resolv.conf").id.uid = uid;
+            f.node("etc/resolv.conf").id.mode = S_IFREG | mode;
+            let mut r = exited(ok_reply());
+            assert_eq!(rcode(&restore_stage(&mut f, &mut r, &stage_args("home"))), 66, "{what}");
+            assert!(r.seen.is_none() && f.count("mkdir") == 0, "{what}: zero effects");
+        }
     }
 
     #[test]

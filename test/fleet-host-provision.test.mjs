@@ -82,6 +82,14 @@ test("its directories: exact owners and modes; tag folders setgid to the tag gro
   assert.deepEqual(s.stat(`/srv/sagebrush/agents/${A}`), [0, 0, 0o755]);
   assert.deepEqual(s.stat(HOME), [UID, UID, 0o700]);
   assert.deepEqual(s.stat(`/srv/sagebrush/agents/${A}/var-tmp`), [UID, UID, 0o700]);
+  // Exactly home, var-tmp and sessions in the agent directory; the config tree beside it, root-owned (L1).
+  assert.deepEqual(s.stat(`/srv/sagebrush/agents/${A}/sessions`), [UID, UID, 0o700]);
+  assert.deepEqual(s.fsx.readdirSync(join(s.root, `/srv/sagebrush/agents/${A}`)).sort(), ["home", "sessions", "var-tmp"]);
+  assert.deepEqual(s.stat("/srv/sagebrush/agent-config"), [0, 0, 0o755]);
+  assert.deepEqual(s.stat(`/srv/sagebrush/agent-config/${A}`), [0, 0, 0o700]);
+  // The archive parents deprovision moves into: root-only.
+  assert.deepEqual(s.stat("/srv/sagebrush/archive"), [0, 0, 0o700]);
+  assert.deepEqual(s.stat("/srv/sagebrush/archive-config"), [0, 0, 0o700]);
   assert.deepEqual(s.stat(`/srv/sagebrush/tags/${T1}`), [0, G1, 0o2770]);
   assert.deepEqual(s.stat(`/srv/sagebrush/tags/${T2}`), [0, G2, 0o2770]);
 });
@@ -92,6 +100,8 @@ test("project quotas: the agent's id on home and var-tmp, each tag's on its fold
   const r = s.root;
   assert.deepEqual(cmds(s.calls, "chattr"), [
     ["chattr", "+P", "-p", String(UID), `${r}${HOME}`], ["chattr", "+P", "-p", String(UID), `${r}/srv/sagebrush/agents/${A}/var-tmp`],
+    ["chattr", "+P", "-p", String(UID), `${r}/srv/sagebrush/agents/${A}/sessions`],
+    ["chattr", "+P", "-p", String(UID), `${r}/srv/sagebrush/agent-config/${A}`], // the config tree is charged to the agent (L1)
     ["chattr", "+P", "-p", String(G1), `${r}/srv/sagebrush/tags/${T1}`], ["chattr", "+P", "-p", String(G2), `${r}/srv/sagebrush/tags/${T2}`],
   ]);
   const sq = cmds(s.calls, "setquota");
@@ -105,6 +115,23 @@ test("project quotas: the agent's id on home and var-tmp, each tag's on its fold
   assert.equal(cmds(n.calls, "setquota").length, 0);
   await s.p.requota(A, UID, grantAgent({ config: { resources: { disk_gb: 9 } } }), () => 1000);
   assert.deepEqual(cmds(s.calls, "setquota").at(-1), ["setquota", "-P", String(UID), "0", String(9 * 1024 * 1024), "0", String(QUOTA_INODES), "/srv"]);
+});
+
+test("the config tree: a crash after mkdir and before its label is finished, then left alone; populated and unlabelled is refused", async () => {
+  const cfg = `/srv/sagebrush/agent-config/${A}`;
+  const s = setup();
+  await s.p.provision(A, UID, grantAgent(), 5000);
+  // A crash right after making it (root:root 0700, as final) and before chattr: the label is missing, the tree empty.
+  s.proj.delete(`${s.root}${cfg}`);
+  const before = cmds(s.calls, "chattr").length;
+  await s.p.provision(A, UID, grantAgent(), 5000);
+  assert.deepEqual(cmds(s.calls, "chattr").slice(before), [["chattr", "+P", "-p", String(UID), `${s.root}${cfg}`]]);
+  await s.p.provision(A, UID, grantAgent(), 5000);
+  assert.equal(cmds(s.calls, "chattr").length, before + 1, "labelled once: nothing redone");
+  // A populated config tree without its label is never relabelled (it wouldn't charge what's already there).
+  s.fsx.writeFileSync(join(s.root, `${cfg}/current`), "gen-1");
+  s.proj.delete(`${s.root}${cfg}`);
+  await assert.rejects(s.p.provision(A, UID, grantAgent(), 5000), /another project state/);
 });
 
 test("a redone provision creates nothing and changes nothing", async () => {

@@ -344,7 +344,7 @@ test("cli: the bound counts every unsettled tool call, waiting, being decided or
 });
 
 // (SEC H3 on the implementation: what a query retains per tool call is bounded in bytes, not only in count)
-test("cli: retained state is bounded in bytes: id and name formats closed at 64 characters, settled entries keep neither name nor input, a measured ceiling for 65,536 ids, the held-input budget", { timeout: 60_000 }, async () => {
+test("cli: retained state is bounded in bytes: id and name formats closed at 64 characters, settled entries keep neither name nor input, a measured ceiling for 65,536 ids, the held-input budget", { timeout: 60_000 }, async (t) => {
   const { CLI_LIMITS } = await import("../lib/claude-cli.mjs");
   // (the registered caps)
   assert.deepEqual({ pendingMax: CLI_LIMITS.pendingMax, seenMax: CLI_LIMITS.seenMax, heldInputBytes: CLI_LIMITS.heldInputBytes, lineMax: CLI_LIMITS.lineMax, bodyMax: CLI_LIMITS.bodyMax, queueMax: CLI_LIMITS.queueMax, queueBytesMax: CLI_LIMITS.queueBytesMax }, { pendingMax: 64, seenMax: 65536, heldInputBytes: 64 * 1024 * 1024, lineMax: 16 * 1024 * 1024, bodyMax: 32 * 1024 * 1024, queueMax: 256, queueBytesMax: 32 * 1024 * 1024 });
@@ -353,7 +353,10 @@ test("cli: retained state is bounded in bytes: id and name formats closed at 64 
   const sleeper = join(mkdtempSync(join(tmpdir(), "sb-sleep-")), "wait");
   writeFileSync(sleeper, "#!/bin/sh\nexec sleep 600\n");
   chmodSync(sleeper, 0o700);
-  const run = (limits = {}) => cliQuery({ prompt: "x", options: { abortController: new AbortController(), canUseTool: () => new Promise(() => {}) } }, { bin: sleeper, env: { PATH: process.env.PATH }, limits: { connectMs: 600_000, killGraceMs: 200, ...limits } });
+  // (every run is ended in the end, also when a row fails: a failed row never leaves a child or a listener behind)
+  const runs = [];
+  t.after(async () => { for (const r of runs) { r.abort.abort(); await r.return().catch(() => {}); } });
+  const run = (limits = {}) => { const r = cliQuery({ prompt: "x", options: { abortController: new AbortController(), canUseTool: () => new Promise(() => {}) } }, { bin: sleeper, env: { PATH: process.env.PATH }, limits: { connectMs: 600_000, killGraceMs: 200, ...limits } }); runs.push(r); return r; };
   const use = (q, id, name = "mcp__s__t", input = {}) => q.line(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id, name, input }] } }));
   const ended = async (q) => { try { for await (const _ of q) {} return null; } catch (e) { return e.message; } };
   // (the boundaries: 64 characters pass, 65 end the query; so does anything outside [A-Za-z0-9_-])
@@ -376,7 +379,9 @@ test("cli: retained state is bounded in bytes: id and name formats closed at 64 
   }
   global.gc?.();
   const grew = process.memoryUsage().heapUsed - before;
-  assert.ok(grew < 24 * 1024 * 1024, `retained ${Math.round(grew / 1048576)} MiB for 65,536 ids`);
+  // (measured 11 MiB here and 28 MiB on another machine, with its heap's own overhead: the ceiling is a bound on
+  //  growth that a retained input (1 KB each, 64 MiB in all) would break by far, not the measurement)
+  assert.ok(grew < 48 * 1024 * 1024, `retained ${Math.round(grew / 1048576)} MiB for 65,536 ids`);
   assert.ok([...q.pending.values()].every((e) => e.name === null && e.input === null), "settled entries keep neither name nor input");
   use(q, "z".repeat(64));
   assert.match(await ended(q), /more tool calls/);
@@ -531,4 +536,37 @@ test("cli: a child that exits while its output waits unparsed: all 1500 frames a
   await q2.return();
   assert.ok(Date.now() - t0 < 1500);
   assert.equal(q2.done, true);
+});
+
+// (SEC H5: an exited child whose output a descendant holds open past exitEofMs, and whose group outlives every KILL:
+//  the run settles with the reaper's failure, never hangs and never calls the group empty)
+test("cli: output held open after exit by a group that outlives its KILLs: the run settles, return() rejects with the reap failure, no timer is left", { skip: process.platform === "win32" ? "POSIX groups" : false, timeout: 60_000 }, async () => {
+  const { writeFileSync, chmodSync } = await import("node:fs");
+  const proc = await import("../lib/proc-start.mjs");
+  const dir = mkdtempSync(join(tmpdir(), "sb-h5-"));
+  const bin = join(dir, "held");
+  writeFileSync(bin, "#!/bin/sh\n(trap '' TERM; while :; do sleep 1; done) &\nsleep 0.2\nexit 3\n");
+  chmodSync(bin, 0o700);
+  const q = cliQuery({ prompt: "x", options: { canUseTool: async () => ({ behavior: "deny", message: "no" }) } }, { bin, env: { PATH: process.env.PATH }, limits: { connectMs: 600_000, killGraceMs: 100, exitEofMs: 300 } });
+  // (the group stays "alive" for the reaper: KILL is stubbed out for this group only, so the bound is reached)
+  const realKill = process.kill;
+  let pg = null;
+  process.kill = (pid, sig) => { if (pg !== null && pid === -pg && sig === "SIGKILL") return true; return realKill.call(process, pid, sig); };
+  try {
+    const t0 = Date.now();
+    let err = null;
+    try { for await (const _ of q) {} } catch (e) { err = e; }
+    pg = q.child.pid;
+    assert.match(String(err?.message), /output stayed open/);
+    let reap = null;
+    try { await q.return(); } catch (e) { reap = e; }
+    assert.ok(Date.now() - t0 < 30_000, "settled within the bound");
+    // (the stub hid KILL only; TERM was ignored by the stand-in, so the group is really still there: the run says so)
+    assert.equal(proc.groupAlive(pg), true, "the group really outlived the bound");
+    assert.match(String(reap?.message), /still running after 10 s/);
+    assert.equal(q.eofTimer ?? null, null);
+  } finally {
+    process.kill = realKill;
+    if (pg !== null) { try { process.kill(-pg, "SIGKILL"); } catch {} }
+  }
 });

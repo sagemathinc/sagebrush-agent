@@ -753,3 +753,83 @@ test("containment raises the fence when it can't mask, or can't prove the cgroup
     await close();
   }
 });
+
+// ---- second review round: no authority-giving effect after an unsettled one; an unproven containment is host-side
+
+test("a thaw that doesn't settle stops the resume there: contained with a fence, nothing written or started after it", async () => {
+  const fx = fakeFx();
+  const { sup, store, fenceDir, close } = await setup({ fx, deadlines: { freeze: 20, grace: 20 } });
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  await sup.submit({ kind: "pause", authority: "service", agent: A });
+  fx.thaw = async () => lateBy(150); // ignores its abort
+  fx.log.length = 0;
+  const r = await sup.submit({ kind: "resume", authority: "person", agent: A });
+  assert.deepEqual([r.status, r.settled, r.fenced], ["failed", false, true]);
+  assert.ok(!fx.log.some((l) => ["unit", "daemon-reload", "unmask", "start"].includes(l[0])), "no widening effect after the unsettled thaw");
+  assert.deepEqual([store.registry.agent(A).state, fx.units[A].active, existsSync(join(fenceDir, A))], ["stopped", false, true]);
+  // Until it settles, an authority-giving effect is refused even inside an emergency's own sequence.
+  assert.equal(sup.unsettled, 1);
+  await new Promise((res) => setTimeout(res, 200));
+  assert.equal(sup.unsettled, 0);
+  await close();
+});
+
+test("a failed start whose containment can't prove the cgroup empty is host-side: applying(N) stays, no ack", async () => {
+  const fx = fakeFx();
+  fx.start = async (id) => { fx.u(id).active = true; throw new FleetError("unit_failed", "exited"); };
+  fx.sys.stop = () => { throw new Error("EIO"); };
+  fx.sys.procCount = () => 1;
+  const { sup, store, fenceDir, close } = await setup({ fx });
+  const r = await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  assert.deepEqual([r.status, r.step, r.reason], ["failed", `start:${A}`, "not_empty"]);
+  assert.equal(store.grants.pending().phase, "applying");
+  assert.deepEqual(fx.acks, []);
+  assert.ok(existsSync(join(fenceDir, A)), "fenced");
+  await close();
+});
+
+test("after any effect goes unsettled, the running operation does no authority-giving effect (revoke-caps with a hung mask)", async () => {
+  const fx = fakeFx();
+  const { sup, fenceDir, close } = await setup({ fx, deadlines: { mask: 20, grace: 20 } });
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  const mask = fx.mask;
+  fx.mask = async (id, ...rest) => { await lateBy(150); return mask(id, ...rest); }; // ignores its abort
+  fx.log.length = 0;
+  const r = await sup.submit({ kind: "revoke-caps", authority: "service", agent: A });
+  assert.equal(r.status, "failed");
+  assert.ok(!fx.log.some((l) => ["unit", "daemon-reload", "unmask", "start"].includes(l[0])), "no unit write, reload or start");
+  assert.ok(existsSync(join(fenceDir, A)));
+  assert.equal(fx.units[A].active, false);
+  await new Promise((res) => setTimeout(res, 400));
+  await close();
+});
+
+test("SEC H3-new: a grant is verified again after the previous application finishes, and after its intent; never carried", async () => {
+  // astra4b's probe: N+1 verifies; N's remaining work then flips N+1 to expired; N+1 must not be accepted.
+  for (const where of ["redo", "intent"]) {
+    const fx = fakeFx();
+    let g2valid = true, failMap = true;
+    fx.publishMap = async (g) => { if (failMap) { failMap = false; throw new Error("first map fails"); } if (where === "redo") g2valid = false; };
+    if (where === "intent") { const ai = fx.appendIntent; fx.appendIntent = async (r) => { await ai(r); if (r.gen === 2) g2valid = false; }; failMap = false; }
+    const { sup, store, close } = await setup({ fx });
+    sup.verify = (b) => { const v = verify(b); if (v.body.gen === 2 && !g2valid) throw new FleetError("grant_expired", "expired"); return v; };
+    await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+    await rejects(sup.submit({ kind: "grant", bytes: grant(2, [entry(A, { x: 2 })]) }), "grant_expired");
+    assert.equal(store.grants.highwater.gen, 1, `${where}: N+1 not accepted`);
+    assert.equal(store.grants.pending().phase, "applied");
+    await close();
+  }
+});
+
+test("SEC H3-new: a grant that expires while its own unfinished application is redone is refused, not re-applied", async () => {
+  const fx = fakeFx();
+  let valid = true, failMap = true;
+  fx.publishMap = async () => { if (failMap) { failMap = false; throw new Error("first map fails"); } valid = false; };
+  const { sup, close } = await setup({ fx });
+  sup.verify = (b) => { const v = verify(b); if (!valid) throw new FleetError("grant_expired", "expired"); return v; };
+  const g1 = grant(1, [entry(A)]);
+  assert.equal((await sup.submit({ kind: "grant", bytes: g1 })).status, "failed");
+  // Verified again after the redo: refused, not "reapplied" with a re-sent acknowledgement.
+  await rejects(sup.submit({ kind: "grant", bytes: g1 }), "grant_expired");
+  await close();
+});

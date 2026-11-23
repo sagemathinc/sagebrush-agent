@@ -11,7 +11,7 @@
 // requests the server saw and the end of Chromium's stderr.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -19,6 +19,7 @@ import { test } from "node:test";
 
 const ROOT = new URL("..", import.meta.url);
 const DEADLINE_MS = 60_000;
+const SLOW_MS = 3000; // (a page asked for later than this, though the test passes, prints how Chromium started)
 const RECOVERY_KNOWN = ["QIgcRL3kWMdpVNtbHP7lkw", "8f8Zi-ibteyHFwp-PnAVfGC6-_75Je6BNI9mNkG6PM0"];
 
 function findChrome() {
@@ -94,14 +95,11 @@ test("headless Chromium: the core with the WebCrypto backend passes every shared
   // loads nothing but the files above, from this loopback server)
   const args = ["--headless=new", "--no-sandbox", "--disable-gpu", "--no-first-run", "--no-default-browser-check", `--user-data-dir=${profile}`,
     `http://127.0.0.1:${server.address().port}/harness.html`];
-  // (what Chromium does before it asks for the page, kept out of its way; the page needs none of it. On CI runners it
-  // asked after 7.5-38 s, and some runs not in 60 s; here, after 0.35 s:
-  //  - D-Bus at addresses that fail at once: it waits on a bus that accepts and doesn't answer (seen with a silent
-  //    socket; not shown to be the runners' cause: the 7.5-38 s stayed with these addresses);
-  //  - fontconfig with no font directories, its cache in the profile: it scans every font a stale or missing cache
-  //    leaves uncached, 385 MB of them taking 2.7 s on a warm disk here)
-  writeFileSync(join(profile, "fonts.conf"), `<?xml version="1.0"?>\n<fontconfig><cachedir>${join(profile, "fontconfig")}</cachedir></fontconfig>\n`);
-  const env = { ...process.env, DBUS_SYSTEM_BUS_ADDRESS: "unix:path=/nonexistent/dbus", DBUS_SESSION_BUS_ADDRESS: "unix:path=/nonexistent/dbus", FONTCONFIG_FILE: join(profile, "fonts.conf") };
+  // (D-Bus at addresses that fail at once: Chromium waits on a bus that accepts and doesn't answer (seen with a silent
+  // socket). Not shown to be the runners' cause: there it still asks for the page 7.5-38 s after the spawn, and some
+  // runs not in 60 s, against 0.35 s here; the stamped stderr below is to say where those seconds go. The page needs
+  // nothing from either bus.)
+  const env = { ...process.env, DBUS_SYSTEM_BUS_ADDRESS: "unix:path=/nonexistent/dbus", DBUS_SESSION_BUS_ADDRESS: "unix:path=/nonexistent/dbus" };
   // (its own process group, so that the whole of Chromium, helpers included, is killed together)
   started = performance.now();
   const child = spawn(chrome, args, { stdio: ["ignore", "ignore", "pipe"], detached: true, env });
@@ -133,6 +131,8 @@ test("headless Chromium: the core with the WebCrypto backend passes every shared
     assert.deepEqual(r.hpke.fleet.bad, []);
     assert.ok(r.hpke.fleet.n > 25, `${r.hpke.fleet.n} HPKE cases`);
     console.log(`# ${r.n} cases, HPKE ${r.hpke.vector.n} + ${r.hpke.fleet.n}, in ${r.ua}; ${chrome} asked for the page after ${pageMs} ms`);
+    // (a slow start, though it passed: the stamped start of Chromium's stderr, to say where the seconds went)
+    if (pageMs > SLOW_MS) console.log(`# slow: over ${SLOW_MS} ms; Chromium's stderr from its start:\n` + head.slice(0, 2000).split("\n").map((l) => `#   ${l}`).join("\n"));
   } finally {
     clearTimeout(timer);
     kill();

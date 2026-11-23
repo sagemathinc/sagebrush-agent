@@ -7,13 +7,7 @@
 // Each case gives its inputs as exact bytes or JSON, and its expected result: "ok" or a reason code from
 // schema/fleet/reasons.json. Stateful cases carry everything a verifier needs (the chain entries, the context).
 
-import { b64, enc, idOfBytes } from "../lib/fleet/bytes.mjs";
-import { canonText } from "../lib/fleet/canonical.mjs";
-import { keyFromSeed } from "../lib/fleet/ed25519.mjs";
-import { seal, sealAdd, signedBytes } from "../lib/fleet/envelope.mjs";
-import { FREEZE } from "../lib/fleet/index.mjs";
-import { hostFingerprint, preimageHash } from "../lib/fleet/verify.mjs";
-import { sha256b64 } from "../lib/fleet/bytes.mjs";
+import { b64, enc, idOfBytes, canonText, keyFromSeed, seal, sealAdd, signedBytes, FREEZE, hostFingerprint, preimageHash, sha256b64 } from "../lib/fleet/index.mjs";
 
 const AUD = "https://dev.sagebrush.space";
 const NOW = 1_800_000_000_000;
@@ -22,7 +16,7 @@ const id = (n) => idOfBytes(Uint8Array.from({ length: 16 }, (_, i) => (n * 31 + 
 const seed = (n) => Uint8Array.from({ length: 32 }, (_, i) => (n * 13 + i) & 255);
 const hex = (s) => Uint8Array.from(Buffer.from(s, "hex"));
 
-export function build() {
+export async function build() {
   const keys = {};
   const key = (name, s) => {
     const k = keyFromSeed(s);
@@ -140,7 +134,7 @@ export function build() {
 
   // ---- 6. envelopes and objects outside the chain (§1.3, §3, §4), against the honest chain
   const encRaw = new Uint8Array(32).fill(9);
-  const certBody = { fleet, aud: AUD, chain_seq: headAt.seq, host, sign_key: b64(H.raw), enc_key: b64(encRaw), fingerprint: b64(hostFingerprint(host, H.raw, encRaw)), name: "lab-box", at_ms: NOW };
+  const certBody = { fleet, aud: AUD, chain_seq: headAt.seq, host, sign_key: b64(H.raw), enc_key: b64(encRaw), fingerprint: b64(await hostFingerprint(host, H.raw, encRaw)), name: "lab-box", at_ms: NOW };
   const cert = txt(seal("sb.host-cert.v1", signer(N, nId), certBody, N));
   const grantBody = (extra = {}) => ({
     fleet, aud: AUD, chain_seq: headAt.seq, host, gen: 1, cert: null, at_ms: NOW - 1000, not_before_ms: NOW - 1000, not_after_ms: NOW + 3_600_000, auth_time_ms: NOW,
@@ -172,7 +166,7 @@ export function build() {
     { name: "an old generation", bytes: op(N, nId, "stop", { gen: 2 }), current_gen: 3, expect: "stale_generation" },
     { name: "a life over 10 minutes", bytes: op(N, nId, "stop", { not_after_ms: NOW + 600_001 }), current_gen: 3, expect: "bad_form" },
   ];
-  const subject = { agent, host, paths_hash: preimageHash(["/tmp/a", "/tmp/b"]), count: 2 };
+  const subject = { agent, host, paths_hash: await preimageHash(["/tmp/a", "/tmp/b"]), count: 2 };
   const approval = (k, kid, extra = {}) => txt(seal("sb.approval.v1", signer(k, kid), {
     fleet, aud: AUD, chain_seq: headAt.seq, approval: id(80), kind: "delete-outside", requester: { host, agent }, gen: 4, life: 2, question: id(81),
     subject, subject_hash: sha256b64(enc(canonText(subject))), at_ms: NOW, not_after_ms: NOW + 600_000, auth_time_ms: NOW, ...extra,
@@ -206,4 +200,4 @@ export function build() {
   };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) process.stdout.write(canonText(build(), 4 << 20) + "\n");
+if (import.meta.url === `file://${process.argv[1]}`) process.stdout.write(canonText(await build(), 4 << 20) + "\n");

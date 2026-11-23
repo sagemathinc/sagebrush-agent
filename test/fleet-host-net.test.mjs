@@ -3,7 +3,7 @@
 // no DNS and no forwarding in allowlist mode; none has no veth at all; bad inputs refused.
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
-import { test } from "node:test";
+import { test } from "./host-linux-only.mjs";
 import { FleetError } from "../lib/fleet/index.mjs";
 import { planNetwork, addresses, vethNames, baseTable, PROXY_PORT, BLOCKED_V4 } from "../lib/fleet/host/net.mjs";
 

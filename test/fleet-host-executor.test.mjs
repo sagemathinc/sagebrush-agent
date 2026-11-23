@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test } from "./host-linux-only.mjs";
 import { FleetError, newId, sha256b64 } from "../lib/fleet/index.mjs";
 import { Supervisor } from "../lib/fleet/host/executor.mjs";
 import { raiseFence } from "../lib/fleet/host/fence.mjs";

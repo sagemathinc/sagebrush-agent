@@ -5,7 +5,11 @@
   "$comment": "IDs are immutable opaque identities, never names or filesystem paths. global is an ordinary opt-in display name: it confers no implicit membership. Enabled IDs are strictly ascending (an additional runtime constraint). Validate the complete enclosing grant/reload record against its 4096-byte encoded limit; the tag field alone cannot guarantee that fit.",
   "oneOf": [{ "$ref": "#/$defs/tag" }, { "$ref": "#/$defs/memory" }],
   "$defs": {
-    "id": { "type": "string", "minLength": 32, "maxLength": 32, "pattern": "^[0-9a-f]{32}$" },
+    "id": {
+      "type": "string", "minLength": 26, "maxLength": 26,
+      "pattern": "^[a-z2-7]{25}[aeimquy4]$",
+      "$comment": "128 random bits encoded as lowercase RFC 4648 base32 without padding: 26 characters, with two zero low bits in the last character. Generation must use cryptographic randomness; validation cannot prove entropy. Person, device, host, agent, tag and grant IDs use this format. Type belongs in the field/envelope, not the ID. Unix users: sb-<id>; tag groups: sbt-<id>; units: sagebrush-agent-<id>.service; directories: /srv/sagebrush/agents/<id>/. Never truncate or translate a display name into an ID."
+    },
     "name": {
       "type": "string", "minLength": 1, "maxLength": 32,
       "pattern": "^[a-z0-9][a-z0-9-]{0,31}$",

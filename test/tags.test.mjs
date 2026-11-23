@@ -3,13 +3,14 @@ import { test } from "node:test";
 import { readFileSync } from "node:fs";
 import { validTagId, validTagName, parseTag, parseEnabledTags, parseMemoryGrant, encodeTag, encodeMemoryGrant, encodeBoundedGrant, GLOBAL_TAG_NAME, TAG_LIMITS } from "../lib/tags.mjs";
 
-const ids = Array.from({ length: 17 }, (_, i) => i.toString(16).padStart(32, "0"));
+const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+const ids = Array.from({ length: 17 }, (_, i) => "a".repeat(24) + alphabet[i] + "a");
 const refuses = (f) => assert.throws(f, /invalid tags v1 value/);
 test("opaque IDs and display slugs are separate; global is only an opt-in name", () => {
   assert.equal(validTagId("global"), false);
-  assert.equal(validTagId(ids[0].toUpperCase()), true); // all digits: case-independent by accident
-  assert.equal(validTagId("a".repeat(31) + "A"), false);
-  assert.equal(validTagId("a".repeat(32) + "\n"), false);
+  assert.equal(validTagId(ids[0].toUpperCase()), false);
+  assert.equal(validTagId("a".repeat(32)), false); // old hex shape is not an ID
+  assert.equal(validTagId("a".repeat(26) + "\n"), false);
   assert.equal(validTagName("global"), true);
   assert.equal(GLOBAL_TAG_NAME, "global");
   assert.deepEqual(parseMemoryGrant({ tags: [] }), { tags: [] });
@@ -18,6 +19,17 @@ test("opaque IDs and display slugs are separate; global is only an opt-in name",
   const original = parseTag({ id: ids[0], name: "global" });
   assert.equal(parseTag({ ...original, name: "renamed" }).id, original.id);
   assert.notEqual(parseTag({ id: ids[1], name: "global" }).id, original.id);
+});
+test("RFC 4648 base32 IDs have exactly 128 bits plus two zero bits, no type prefix", () => {
+  assert.equal(validTagId("a".repeat(26)), true); // all-zero encoding, syntax fixture only
+  assert.equal(validTagId("7".repeat(25) + "4"), true); // 16 bytes of ff
+  for (let i = 0; i < alphabet.length; i++) {
+    assert.equal(validTagId("a".repeat(25) + alphabet[i]), i % 4 === 0, `last symbol ${alphabet[i]}`);
+    assert.equal(validTagId(alphabet[i] + "a".repeat(25)), true);
+  }
+  for (const id of ["a".repeat(25), "a".repeat(27), "0" + "a".repeat(25), "1" + "a".repeat(25), "a".repeat(26) + "=", `sb-${ids[0]}`, `sbt-${ids[0]}`]) assert.equal(validTagId(id), false);
+  assert.equal(`sb-${ids[0]}`.length, 29);
+  assert.equal(`sbt-${ids[0]}`.length, 30);
 });
 test("slug grammar and reserved names are platform-independent", () => {
   for (const name of ["a", "course-1", "a".repeat(32), "global"]) assert.equal(validTagName(name), true);
@@ -41,7 +53,7 @@ test("canonical encoding and the complete 4 KiB record bound", () => {
   assert.equal(encodeTag({ name: "global", id: ids[0] }), `{"id":"${ids[0]}","name":"global"}`);
   const memory = { tags: ids.slice(0, 16) };
   const encoded = encodeMemoryGrant(memory);
-  assert.equal(Buffer.byteLength(encoded), 570);
+  assert.equal(Buffer.byteLength(encoded), 474);
   assert.ok(Buffer.byteLength(`{"memory":${encoded}}`) < 700);
   const record = { grant: { memory }, padding: "" };
   record.padding = "x".repeat(4096 - Buffer.byteLength(encodeBoundedGrant(record)));

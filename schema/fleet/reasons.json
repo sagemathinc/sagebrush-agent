@@ -231,27 +231,42 @@
     {
       "name": "program_mismatch",
       "owner": "browser",
-      "meaning": "the browser program doesn't match the pinned one"
+      "meaning": "the rewrite program's bytes aren't the reviewed, pinned program"
     },
     {
       "name": "unknown_owner",
       "owner": "browser",
-      "meaning": "a browser object without a known owner"
+      "meaning": "no rewrite program for this CDP result or event"
     },
     {
       "name": "unmappable",
       "owner": "browser",
-      "meaning": "a browser id that can't be mapped"
+      "meaning": "a CDP result or event isn't the shape the rewrite program expects; it's dropped, never forwarded"
     },
     {
       "name": "bad_kind",
       "owner": "browser",
-      "meaning": "a browser object of the wrong kind"
+      "meaning": "not a virtual handle kind"
     },
     {
       "name": "stale_handle",
       "owner": "browser",
-      "meaning": "a browser handle no longer live"
+      "meaning": "a virtual handle that's revoked, unknown, of another kind or from another target"
+    },
+    {
+      "name": "bad_scope",
+      "owner": "browser",
+      "meaning": "a target-local handle without its target's scope, or a page handle with one"
+    },
+    {
+      "name": "handle_budget",
+      "owner": "browser",
+      "meaning": "the session has allocated its whole handle budget (live and revoked); it's retired"
+    },
+    {
+      "name": "bad_params",
+      "owner": "browser",
+      "meaning": "an agent's CDP command parameters are missing, extra, of the wrong type or out of their bounds"
     }
   ]
 }

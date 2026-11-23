@@ -20,6 +20,7 @@
     "schema/tags.schema.json",
     "lib/fleet/",
     "schema/fleet/",
+    "!schema/fleet/browser/cft-*.json",
     "lib/stdio.mjs",
     "lib/pair-stdin.mjs",
     "lib/stdout-thread.mjs",

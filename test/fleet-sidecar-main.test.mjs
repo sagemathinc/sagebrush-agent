@@ -267,9 +267,9 @@ test("the cap: commands before start (each answered) against a stalled app end t
   const outMax = 256 * 1024, out = heldStdout(), t = run({ stdout: out, outMax });
   const many = Buffer.concat(Array.from({ length: 5000 }, (_, i) => command(i + 1, { method: "Target.getTargets" })));
   t.stdin.write(many);
-  assert.ok(out.writableLength <= outMax - OUT_RESERVE, `queued ${out.writableLength}`);
+  assert.equal(t.sidecar.state, "ended", "at once");
+  assert.ok(out.writableLength <= outMax, `queued ${out.writableLength}`); // (answers within outMax - OUT_RESERVE, then the terminal frame in the reserve)
   await settle();
-  assert.equal(t.sidecar.state, "ended");
   assert.ok(out.writableLength <= outMax, `queued ${out.writableLength}`);
   t.stdin.write(many); // (more while ended: nothing is taken)
   await settle();
@@ -282,6 +282,25 @@ test("the cap: commands before start (each answered) against a stalled app end t
   assert.deepEqual(t.exits, [0]);
 });
 
+test("the cap ends the sidecar at once: right after the write that overflows, before anything yields, it has ended (and its session retired)", async () => {
+  const out = heldStdout(), t = run({ stdout: out, outMax: OUT_RESERVE + 1 });
+  t.stdin.write(command(1, { method: "Target.getTargets" })); // (its answer doesn't fit)
+  assert.equal(t.sidecar.state, "ended");
+  assert.equal(t.stdin.isPaused(), true);
+  await drainAll(out);
+  assert.deepEqual(out.frames().map((f) => f.head.kind), ["rust.cdp_state"]);
+  assert.equal(out.frames()[0].head.reason, "the app isn't reading its channel");
+});
+
+test("the cap counts only what the app hasn't taken: a reading app gets any number of frames under a small cap", async () => {
+  const t = run({ outMax: OUT_RESERVE + 400 }); // (room for about three answers at a time)
+  t.stdin.write(Buffer.concat([auth(), start()]));
+  await settle();
+  for (let seq = 1; seq <= 40; seq++) { t.stdin.write(command(seq, { method: "Target.getTargets" })); await settle(2); }
+  assert.equal(t.sidecar.state, "ready");
+  assert.equal(t.frames.filter((f) => f.head.kind === "net.result").length, 40);
+});
+
 test("the cap: Chrome's events go through the same writer; a stalled app ends the sidecar, and later events send nothing", async () => {
   const outMax = 256 * 1024, out = heldStdout(), t = run({ stdout: out, outMax });
   t.stdin.write(Buffer.concat([auth(), start()]));
@@ -289,9 +308,10 @@ test("the cap: Chrome's events go through the same writer; a stalled app ends th
   t.chrome.event("Target.attachedToTarget", { sessionId: "SESS-A", targetInfo: { targetId: "REAL-TA", type: "page", title: "", url: "about:blank", attached: true, browserContextId: "REAL-CTX" }, waitingForDebugger: true });
   await settle();
   assert.equal(t.sidecar.state, "ready");
-  for (let i = 0; i < 5000 && t.sidecar.state !== "ended"; i++) { const e = loadEvent(); t.chrome.event(e.method, e.params, "SESS-A"); if (i % 100 === 0) { await settle(2); assert.ok(out.writableLength <= outMax); } }
-  await settle();
-  assert.equal(t.sidecar.state, "ended");
+  let i = 0;
+  for (; i < 5000; i++) { const e = loadEvent(); t.chrome.event(e.method, e.params, "SESS-A"); if (t.sidecar.state === "ended") break; }
+  assert.equal(t.sidecar.state, "ended", "ended by the event that didn't fit, synchronously");
+  assert.ok(out.writableLength <= outMax);
   const queued = out.writableLength;
   assert.ok(queued <= outMax, `queued ${queued}`);
   for (let i = 0; i < 1000; i++) { const e = loadEvent(); t.chrome.event(e.method, e.params, "SESS-A"); }
@@ -299,7 +319,7 @@ test("the cap: Chrome's events go through the same writer; a stalled app ends th
   assert.equal(out.writableLength, queued, "nothing after the end");
   await drainAll(out);
   const frames = out.frames();
-  assert.ok(frames.filter((f) => f.head.kind === "net.event").length > 100);
+  assert.equal(frames.filter((f) => f.head.kind === "net.event").length - 1, i, "every event before the one that didn't fit, and none after"); // (- 1: the page's targetCreated)
   assert.deepEqual(frames.at(-1).head, { to: "rust", kind: "rust.cdp_state", state: "ended", reason: "the app isn't reading its channel" });
   assert.deepEqual(t.exits, [0]);
 });

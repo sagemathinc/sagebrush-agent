@@ -202,6 +202,27 @@ test("takeover: a command the session hasn't settled is swept by the drain as 'a
   assert.deepEqual(toNet(t.frames).map((f) => f.head.seq), [1]); // (exactly one answer for seq 1)
 });
 
+test("takeover: a refusal that ends the sidecar at once (its output full) leaves it ended, never paused, with no takeover_done", async () => {
+  let t, failed = false;
+  const frames = [], made = [];
+  const sidecar = new CdpSidecar({
+    send: (head, body) => { frames.push({ head, body }); if (head.kind === "net.refused" && !failed) { failed = true; sidecar.fail("the app isn't reading its channel"); } },
+    openPipe: async ({ pid }) => ({ pid, close: async () => {} }),
+    makeSession: ({ sink }) => { const s = new FakeSession(sink); made.push(s); return s; },
+  });
+  t = { sidecar, frames, session: () => made[0] };
+  await ready(t);
+  t.session().takeover = async function () { this.takeovers++; this.state = "paused"; return { paused: true }; }; // (settles nothing: the sweep refuses)
+  t.sidecar.frame({ kind: "cdp.command", seq: 1 }, bytes({ method: "Runtime.evaluate", params: { expression: "x" } }));
+  t.sidecar.frame({ kind: "cdp.command", seq: 2 }, bytes({ method: "Runtime.evaluate", params: { expression: "y" } }));
+  await settle();
+  t.sidecar.frame({ kind: "cdp.takeover" });
+  await settle();
+  assert.equal(t.sidecar.state, "ended");
+  assert.deepEqual(t.frames.filter((f) => f.head.to === "rust").map((f) => f.head.kind + ":" + (f.head.state ?? "")), ["rust.cdp_state:starting", "rust.cdp_state:ready", "rust.takeover_failed:", "rust.cdp_state:ended"]);
+  assert.equal(t.session().retiredWith, "the app isn't reading its channel");
+});
+
 test("takeover in progress: duplicate takeovers wait for the same drain and each get one takeover_done after it; resume during the drain ends the sidecar; commands are refused at once", async () => {
   const held = () => { let release; const p = new Promise((r) => { release = r; }); return { p, release }; };
   const t = setup();

@@ -4,9 +4,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { B64LEN, FleetError, bytesOfId, idOfBytes, isId, newId, unb64, utf8 } from "../lib/fleet/bytes.mjs";
-import { canonText, parseCanonical } from "../lib/fleet/canonical.mjs";
-import { canonicalPoint, checkPublicKey, keyFromSeed, keyId, smallOrder, verifyStrict } from "../lib/fleet/ed25519.mjs";
+import { canonText, parseCanonical } from "../lib/fleet/index.mjs";
+import { canonicalPoint, checkPublicKey, keyFromSeed, keyId, smallOrder, strictShape, verifyStrict } from "../lib/fleet/ed25519.mjs";
 import { open, seal, signedBytes, TYPES } from "../lib/fleet/envelope.mjs";
+import { nodeCrypto, nodeSync } from "../lib/fleet/node-crypto.mjs";
 
 const code = (fn) => { try { fn(); } catch (e) { if (e instanceof FleetError) return e.code; throw e; } return "ok"; };
 const enc = (s) => new TextEncoder().encode(s);
@@ -117,6 +118,28 @@ test("Ed25519: RFC 8032 test 1; S + L, a small-order key's forgery, a non-canoni
   const badR = Uint8Array.from(sig); badR.set(enc32(p + 1n > (1n << 255n) - 1n ? p : p, 0), 0);
   assert.equal(verifyStrict(k.raw, new Uint8Array(0), badR), false, "non-canonical R");
   assert.equal(keyId("ed25519", k.raw).length, 22);
+  // the strict rules alone, with no library: every Node and browser refuses some of these itself, and which ones
+  // differs by version, so the rules are checked here directly
+  assert.equal(strictShape(k.raw, sig), true);
+  assert.equal(strictShape(k.raw, big), false, "S + L");
+  assert.equal(strictShape(k.raw, badR), false, "non-canonical R");
+  assert.equal(strictShape(ident, forged), false, "a small-order key");
+  assert.equal(strictShape(enc32(p, 0), sig), false, "a non-canonical key (y = p)");
+  assert.equal(strictShape(k.raw.subarray(0, 31), sig), false);
+  assert.equal(strictShape(k.raw, sig.subarray(0, 63)), false);
+});
+
+test("the backend's verify (Node's, sync and async) is a boolean: false for bytes it can't use, never a throw", async () => {
+  const k = keyFromSeed(SEEDS.device), msg = enc("m"), sig = k.sign(msg);
+  // (a y with no x on the curve: the strict rules pass it, the library says no)
+  const offCurve = enc32(2n, 0);
+  assert.equal(strictShape(offCurve, sig), true);
+  assert.equal(verifyStrict(offCurve, msg, sig), false);
+  for (const [raw, s] of [[k.raw.subarray(0, 31), sig], [k.raw, sig.subarray(0, 63)], [new Uint8Array(0), new Uint8Array(0)], [offCurve, sig]]) {
+    assert.equal(nodeSync.ed25519Verify(raw, msg, s), false);
+    assert.equal(await nodeCrypto.ed25519Verify(raw, msg, s), false);
+  }
+  assert.equal(await nodeCrypto.ed25519Verify(k.raw, msg, sig), true);
 });
 
 const AUD = "https://dev.sagebrush.space";
@@ -147,5 +170,10 @@ test("envelope: the type and signer are in the signed bytes; signer kinds per ty
   assert.equal(code(() => open(enc(new TextDecoder().decode(bytes).replace(',"type"', ', "type"')), ctx)), "bad_form");
   assert.equal(code(() => open(swap({ ...env, extra: 1 }), ctx)), "bad_form");
   assert.equal(code(() => open(swap({ ...env, v: 2 }), ctx)), "bad_form");
+  // sig2 exists only on a device-chain "add": another type whose body says op "add" can't carry one
+  const addish = seal("sb.revocation.v1", signer, { ...body, op: "add" }, dev);
+  const withSig2 = swap({ ...JSON.parse(new TextDecoder().decode(addish)), sig2: env.sig });
+  assert.equal(code(() => open(addish, ctx)), "ok");
+  assert.equal(code(() => open(withSig2, ctx)), "bad_form");
   assert.equal(Object.keys(TYPES).length, 13);
 });

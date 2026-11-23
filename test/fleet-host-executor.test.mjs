@@ -508,6 +508,142 @@ test("recovery: every deleted agent not done gets a pass, from the registry (eve
   await s.close();
 });
 
+test("recovery's deprovision lane needs no grant: gen 0, an invalid grant, an applying one invalid, held by expiry or continued; each proves the agent down first and starts nothing it shouldn't", async () => {
+  const passes = (fx) => fx.log.filter((l) => l[0] === "deprovision").map((l) => l[1]);
+  // The deleted agent's proof comes before its pass: its mask and drain, then the pass.
+  const provedFirst = (fx, id) => {
+    const i = fx.log.findIndex((l) => l[0] === "deprovision" && l[1] === id);
+    return i > 0 && fx.log.slice(0, i).some((l) => l[0] === "mask" && l[1] === id) && fx.log.slice(0, i).some((l) => l[0] === "sys-stop" && l[1].includes(id));
+  };
+  // gen 0: a registry agent recorded deleted with nothing else (as after a crash before any grant settled).
+  {
+    const root = tmp("state"), fenceDir = tmp("fence"), fx = fakeFx();
+    let s = await setup({ fx, root, fenceDir });
+    s.store.registry.addAgent(A, 1);
+    s.store.registry.setState(A, "deleted", "delete");
+    await s.close();
+    fx.dpResult = () => ({ status: "pending", step: "channels", reason: "parked" });
+    s = await setup({ fx, root, fenceDir });
+    assert.deepEqual(await s.sup.recover(), { status: "empty", deprovisioning: [A] });
+    fx.dpResult = undefined;
+    assert.deepEqual(await s.sup.recover(), { status: "empty" });
+    assert.deepEqual(passes(fx), [A, A]);
+    assert.ok(provedFirst(fx, A));
+    assert.equal(s.store.deprovision.record(A).done, true);
+    await s.close();
+  }
+  // The others: A deleted with its pass pending, then grant 2 crashes mid-application (applying), or is applied.
+  for (const mode of ["applied-invalid", "applying-invalid", "applying-expired", "applying-continue"]) {
+    const root = tmp("state"), fenceDir = tmp("fence"), fx = fakeFx();
+    fx.dpResult = () => ({ status: "pending", step: "accounts", reason: "parked" });
+    let crash = false;
+    let s = await setup({ fx, root, fenceDir, barrier: async (n) => { if (crash && n === "after_unit_write") { crash = false; throw new Error("crash"); } } });
+    await s.sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
+    await s.sup.submit({ kind: "delete", authority: "person", agent: A });
+    crash = mode.startsWith("applying");
+    await s.sup.submit({ kind: "grant", bytes: grant(2, [entry(B, { x: 2 })]) }).catch(() => {});
+    assert.equal(s.store.grants.pending().phase, mode.startsWith("applying") ? "applying" : "applied", mode);
+    await s.close();
+    for (const u of Object.values(fx.units)) u.active = false;
+    if (mode === "applying-expired") raiseFence("expiry", null, { dir: fenceDir });
+    fx.dpResult = undefined;
+    fx.log.length = 0;
+    s = await setup({ fx, root, fenceDir });
+    if (mode.endsWith("invalid")) s.sup.verify = () => { throw new FleetError("grant_expired", "expired"); };
+    const r = await s.sup.recover();
+    assert.deepEqual(passes(fx), [A], mode);
+    assert.ok(provedFirst(fx, A), `${mode}: proven down before its pass`);
+    assert.equal(s.store.deprovision.record(A).done, true, mode);
+    if (mode === "applying-continue") assert.equal(r.status, "applied", mode);
+    else {
+      assert.deepEqual([r.status, r.reason], { "applied-invalid": ["not_started", "grant_not_valid"], "applying-invalid": ["not_started", "grant_not_valid"], "applying-expired": ["held", "expired"] }[mode], mode);
+      assert.ok(!fx.log.some((l) => l[0] === "start" || l[0] === "unit"), `${mode}: nothing started or written`);
+    }
+    await s.close();
+  }
+});
+
+test("recovery proves an out-of-grant deleted agent afresh (a crash between \"deleted\" and its stop left no pending proof): masked, drained, proven, then the pass; a failed proof means no pass", async () => {
+  for (const proofFails of [false, true]) {
+    const root = tmp("state"), fenceDir = tmp("fence"), fx = fakeFx();
+    let s = await setup({ fx, root, fenceDir });
+    await s.sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
+    await s.sup.submit({ kind: "grant", bytes: grant(2, [entry(B)]) }); // A retired: out of the grant
+    // The crash seam: `deleted` committed, then the supervisor died before #stopProved; something of A runs.
+    s.store.registry.setState(A, "deleted", "delete");
+    assert.ok(!s.store.grants.pendingProofs().includes(A), "no pending-proof marker");
+    await s.close();
+    fx.units[A].active = true;
+    fx.units[A].masked = false;
+    const sysStop = fx.sys.stop;
+    if (proofFails) fx.sys.stop = (u) => { if (u.includes(A)) throw new Error("EIO"); return sysStop(u); };
+    fx.log.length = 0;
+    s = await setup({ fx, root, fenceDir });
+    const r = await s.sup.recover();
+    const dp = fx.log.findIndex((l) => l[0] === "deprovision" && l[1] === A);
+    if (proofFails) {
+      assert.equal(dp, -1, "no pass without a proof");
+      assert.deepEqual([r.unproven, r.deprovisioning], [[A], undefined]);
+      assert.equal(s.store.deprovision.record(A), null);
+    } else {
+      assert.ok(dp > 0);
+      const before = fx.log.slice(0, dp);
+      assert.ok(before.some((l) => l[0] === "mask" && l[1] === A) && before.some((l) => l[0] === "sys-stop" && l[1].includes(A)));
+      assert.deepEqual([fx.units[A].active, fx.units[A].masked], [false, true]);
+      assert.equal(r.unproven, undefined);
+    }
+    fx.sys.stop = sysStop;
+    await s.close();
+  }
+});
+
+test("a deprovision pass is owned: past its deadline its signal aborts; one that never settles is abandoned, normal input is refused meanwhile, and the agent is contained again when it settles", async () => {
+  const fx = fakeFx();
+  let settle, seen;
+  const { sup, store, close } = await setup({ fx, deadlines: { deprovision: 60, grace: 30 } });
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
+  fx.deprovision = (id, ms, signal) => { seen = { id, ms, signal }; return new Promise((r) => { settle = r; }); };
+  const t0 = Date.now();
+  await sup.submit({ kind: "delete", authority: "person", agent: A }); // returns: the pass is abandoned
+  assert.ok(Date.now() - t0 < 5000);
+  assert.deepEqual([seen.id, seen.ms, seen.signal.aborted], [A, 60, true]);
+  assert.deepEqual(fx.audits.filter((r) => r.kind === "agent.deprovision").map((r) => r.phase), ["unknown_effect"]);
+  assert.equal(sup.unsettled, 1);
+  assert.equal(store.registry.agent(A).state, "deleted");
+  // Meanwhile: ordinary input refused; an emergency still runs.
+  assert.equal((await sup.submit({ kind: "pause", authority: "service", agent: B })).reason, "in_progress");
+  await sup.submit({ kind: "stop-all", authority: "local" });
+  // It settles late: A is contained again (mask, drain) ahead of anything else, and normal input runs again.
+  fx.log.length = 0;
+  settle({ status: "done", step: null, reason: null });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.ok(fx.log.some((l) => l[0] === "mask" && l[1] === A), "recontained");
+  assert.equal(sup.unsettled, 0);
+  assert.notEqual((await sup.submit({ kind: "pause", authority: "service", agent: B })).reason, "in_progress");
+  await close();
+});
+
+test("no pass starts while an effect is abandoned: a delete whose own mask hangs runs no pass; recovery runs it later", async () => {
+  const fx = fakeFx();
+  const { sup, store, close } = await setup({ fx, deadlines: { mask: 40, grace: 20 } });
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
+  let release;
+  const mask = fx.mask;
+  fx.mask = (id, ms, signal) => (id === A ? new Promise((r) => { release = r; }) : mask(id, ms, signal));
+  await sup.submit({ kind: "delete", authority: "person", agent: A });
+  assert.equal(sup.unsettled, 1);
+  assert.ok(!fx.log.some((l) => l[0] === "deprovision"), "no pass while the mask is abandoned");
+  assert.equal(store.deprovision.record(A), null);
+  fx.mask = mask;
+  release();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(sup.unsettled, 0);
+  const r = await sup.recover();
+  assert.deepEqual(fx.log.filter((l) => l[0] === "deprovision").map((l) => l[1]), [A]);
+  assert.equal(r.deprovisioning, undefined);
+  await close();
+});
+
 // ---- recovery and crashes
 
 test("recovery from applied(N): only running agents the grant allows; none when the grant no longer verifies", async () => {

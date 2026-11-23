@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError } from "../lib/fleet/index.mjs";
 import { planNetwork } from "../lib/fleet/host/net.mjs";
-import { NFT_DIR, ipArgv, replaceTransaction, runtime } from "../lib/fleet/host/runtime.mjs";
+import { NFT_DIR, ipArgv, nftAbsent, replaceTransaction, runtime } from "../lib/fleet/host/runtime.mjs";
 
 const A = "abcdefghijklmnopqrstuvwxya", UID = 70007, NS = `sb-${A}`;
 const host = (e) => !(e instanceof FleetError) && e.code === "effect_failed";
@@ -131,7 +131,7 @@ test("applyNetwork: tear down first, build from the plan, then one nft transacti
 });
 
 test("applyNetwork: a missing base table is created first; no namespace to remove is fine; a failing command stops it", async () => {
-  const s = setup({ "nft list table inet sagebrush": () => ({ code: 1 }), "ip -j netns list": () => ({ code: 0, stdout: JSON.stringify([{ name: "sb-other", id: 4 }]) }) });
+  const s = setup({ "nft list table inet sagebrush": () => ({ code: 1, stderr: "Error: No such file or directory\nlist table inet sagebrush\n                ^^^^^^^^^\n" }), "ip -j netns list": () => ({ code: 0, stdout: JSON.stringify([{ name: "sb-other", id: 4 }]) }) });
   await s.rt.applyNetwork(A, UID, ga("none"), left);
   const seqs = s.calls.map(line);
   assert.ok(!seqs.includes(`ip netns del ${NS}`));
@@ -342,10 +342,23 @@ test("removeNetwork: the same identity-checked teardown, then the agent's rules 
   assert.deepEqual(nftF, [["nft", "-f", join(s.root, NFT_DIR, "agent-7.nft")]]);
   assert.equal(fs.readFileSync(join(s.root, NFT_DIR, "agent-7.nft"), "utf8"), replaceTransaction(listing(), 7, ""));
   // Already gone (no namespace, no veth, no table): nothing to do, nothing created.
-  const g = setup({ "nft list table inet sagebrush": () => ({ code: 1 }), "ip -j netns list": () => ({ code: 0, stdout: "[]" }) });
+  const g = setup({ "nft list table inet sagebrush": () => ({ code: 1, stderr: "Error: No such file or directory\nlist table inet sagebrush\n                ^^^^^^^^^\n" }), "ip -j netns list": () => ({ code: 0, stdout: "[]" }) });
   await g.rt.removeNetwork(A, UID, left);
   assert.ok(!g.calls.some((c) => c[0] === "nft" && c[1] === "-f"), "no base table is created to remove from");
   assert.ok(!g.calls.some((c) => line(c).startsWith("ip netns del")));
+  // Any other nft failure isn't absence: refused (the step parks), and nothing written. Also while applying.
+  for (const stderr of ["Error: Operation not permitted\n", "netlink: Error: cache initialization failed: Permission denied\n", ""]) {
+    for (const code of [1, 2]) {
+      const p = setup({ "nft list table inet sagebrush": () => ({ code, stderr }) });
+      await assert.rejects(p.rt.removeNetwork(A, UID, left), host, `${code} ${stderr}`);
+      assert.ok(!p.calls.some((c) => c[0] === "nft" && c[1] !== "list"), "nothing written");
+    }
+  }
+  const q = setup({ "nft list table inet sagebrush": () => ({ code: 1, stderr: "Error: Operation not permitted\n" }) });
+  await assert.rejects(q.rt.applyNetwork(A, UID, ga("full"), left), host);
+  assert.ok(!q.calls.some((c) => c[0] === "nft" && c[1] === "-f"), "no base table created on an unknown listing");
+  assert.equal(nftAbsent({ code: 1, stderr: "Error: Could not process rule: No such file or directory\n" }), true);
+  assert.equal(nftAbsent({ code: 2, stderr: "Error: No such file or directory\n" }), false);
   // A foreign namespace or veth under the agent's names: refused, nothing deleted.
   const f = setup({ "ip -d -j addr show dev": () => ({ code: 0, stdout: JSON.stringify([{ ifname: "sbv7", linkinfo: { info_kind: "bridge" } }]) }) });
   await assert.rejects(f.rt.removeNetwork(A, UID, left), host);

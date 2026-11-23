@@ -36,7 +36,8 @@ async function setup({ procs = 0, uidEmpty = true, pool = false } = {}) {
     [`/var/lib/sagebrush/resolv/${A}.conf`, obj({ type: "file", mode: 0o644, ino: 35 })], [`/var/lib/sagebrush/managed/${A}`, obj({ ino: 36 })],
   ]);
   const trees = { home: { live: homeTree, archive: null }, config: { live: cfgTree, archive: null } };
-  const m = { objects, trees, epoch, calls: [], refuse: {}, A, uid, unitFile: null };
+  // syncFail[cmd]: how many of cmd's next syncs fail (a 75 after its effect); syncs: every successful sync, in order.
+  const m = { objects, trees, epoch, calls: [], refuse: {}, syncFail: {}, syncs: [], A, uid, unitFile: null };
   const run = async (argv) => {
     m.calls.push(argv);
     if (argv[0] === LAUNCH) return launcher(m, argv.slice(1));
@@ -65,7 +66,7 @@ async function setup({ procs = 0, uidEmpty = true, pool = false } = {}) {
     brokerRevoke: async () => { effects.push("broker-revoke"); },
     inPool: () => m.pool ?? pool,
   });
-  return { h, A, uid, m, dp, effects, root, close: () => h.close() };
+  return { h, A, uid, m, dp, effects, root, run, fsx, close: () => h.close() };
 }
 
 /** The fake launcher's four subcommands over the model. */
@@ -73,6 +74,12 @@ function launcher(m, args) {
   const ok = (o) => ({ code: 0, stdout: JSON.stringify(o), stderr: "" });
   const flag = (n) => args[args.indexOf(`--${n}`) + 1];
   const head = { epoch: m.epoch, fsid: FSID };
+  /** After the effect: the syncs, or a 75 when one fails. */
+  const sync = (cmd, dirs) => {
+    if (m.syncFail[cmd] > 0) { m.syncFail[cmd]--; return { code: 75, stdout: "", stderr: "partial" }; }
+    m.syncs.push(...dirs.map((d) => `${cmd} ${d}`));
+    return { code: 0, stdout: "", stderr: "" };
+  };
   switch (args[0]) {
     case "identify": return ok({ ...head, object: m.objects.get(`${flag("anchor")}/${flag("name")}`) ?? null });
     case "remove-tree": {
@@ -81,8 +88,8 @@ function launcher(m, args) {
       const x = JSON.parse(fs.readFileSync(join(m.root, flag("expect")), "utf8"));
       if (JSON.stringify(x.epoch) !== JSON.stringify(m.epoch)) return { code: 73, stdout: "", stderr: "stale epoch" };
       if (m.objects.has(p) && JSON.stringify(m.objects.get(p)) !== JSON.stringify(x.root)) return { code: 73, stdout: "", stderr: "differs" };
-      m.objects.delete(p);
-      return { code: 0, stdout: "", stderr: "" };
+      m.objects.delete(p); // (absent already: nothing removed, the anchor still synced)
+      return sync("remove-tree", [flag("anchor")]);
     }
     case "inspect-home": {
       const t = m.trees[flag("tree")];
@@ -93,10 +100,17 @@ function launcher(m, args) {
       if (m.refuse["archive-home"]) return { code: m.refuse["archive-home"], stdout: "", stderr: "x" };
       const t = m.trees[flag("tree")];
       const x = JSON.parse(fs.readFileSync(join(m.root, flag("expect")), "utf8"));
+      const parents = flag("tree") === "home" ? ["archive", "agents"] : ["archive-config", "agent-config"];
+      if (JSON.stringify(x.epoch) !== JSON.stringify(m.epoch)) return { code: 73, stdout: "", stderr: "stale epoch" };
+      if (args.includes("--finish")) {
+        // No rename: the archive exactly the expected tree, the source absent; then both parents synced again.
+        if (t.live || JSON.stringify(t.archive) !== JSON.stringify(x)) return { code: 73, stdout: "", stderr: "differs" };
+        return sync("archive-home", parents);
+      }
       if (t.archive) return { code: 74, stdout: "", stderr: "exists" };
       if (JSON.stringify(t.live) !== JSON.stringify(x)) return { code: 73, stdout: "", stderr: "differs" };
       t.archive = t.live; t.live = null;
-      return { code: 0, stdout: "", stderr: "" };
+      return sync("archive-home", parents);
     }
     default: return { code: 64, stdout: "", stderr: "usage" };
   }
@@ -176,10 +190,10 @@ test("a partial removal (75) leaves the step pending; the next pass retries and 
 test("the archive's retry table: moved before its mark; both present; neither; a source that isn't the provisioned tree", async () => {
   // A crash right after the rename: the next pass finds the exact recorded object in the archive and marks it.
   const s = await setup();
-  s.m.refuse["archive-home"] = 75; // the move happened but wasn't confirmed
+  s.m.syncFail["archive-home"] = 1; // the move happened; a sync after it failed (75)
   let r = await go(s);
   assert.equal(r.step, "home");
-  s.m.trees.home.archive = s.m.trees.home.live; s.m.trees.home.live = null; delete s.m.refuse["archive-home"];
+  assert.ok(s.m.trees.home.archive && !s.m.trees.home.live, "moved");
   assert.equal((await go(s)).status, "done");
   await s.close();
   // Moved before its mark, but the archive isn't the recorded object (a substitute in the archive): parked.
@@ -210,6 +224,110 @@ test("the archive's retry table: moved before its mark; both present; neither; a
   assert.match((await go(x)).reason, /not the provisioned tree/);
   assert.equal(x.h.deprovision.record(x.A).identities.home, undefined);
   await x.close();
+});
+
+test("an archive moved with a 75 at a sync: done only after archive-home --finish syncs both parents again; a failing finish stays pending", async () => {
+  const s = await setup();
+  s.m.syncFail["archive-home"] = 1;
+  assert.match((await go(s)).reason, /home: moved, not yet confirmed/);
+  // The next two finishes fail at their own syncs: still pending, never marked.
+  s.m.syncFail["archive-home"] = 2;
+  for (let i = 0; i < 2; i++) {
+    const r = await go(s);
+    assert.deepEqual([r.step, /not yet confirmed durable/.test(r.reason)], ["home", true]);
+    assert.ok(!s.h.deprovision.record(s.A).steps_done.includes("home"));
+  }
+  s.m.syncs.length = 0;
+  assert.equal((await go(s)).status, "done");
+  const finishes = s.m.calls.filter((c) => c[1] === "archive-home" && c.includes("--finish"));
+  assert.equal(finishes.length, 3, "every retry of a moved tree goes through --finish");
+  assert.deepEqual(s.m.syncs.slice(0, 2), ["archive-home archive", "archive-home agents"], "both parents synced before the mark");
+  await s.close();
+  // A finish in another epoch (a reboot after the move): parked (requalify), not marked.
+  const e = await setup();
+  e.m.syncFail["archive-home"] = 1;
+  await go(e);
+  e.m.epoch = { boot_id: BOOT, mnt_id: 31 };
+  e.m.trees.home.archive = { ...e.m.trees.home.archive, epoch: e.m.epoch };
+  assert.match((await go(e)).reason, /stale epoch/);
+  assert.ok(!e.h.deprovision.record(e.A).steps_done.includes("home"));
+  await e.close();
+});
+
+test("a 75 at remove-tree's final sync, then the object is absent: the recorded identity still goes to the launcher, which syncs the anchor; a stale epoch parks", async () => {
+  const s = await setup();
+  s.m.syncFail["remove-tree"] = 2; // the first object's remove-tree, then its first retry
+  const r1 = await go(s);
+  assert.match(r1.reason, /partly removed/);
+  const first = r1.reason.split(":")[0];
+  assert.ok(s.h.deprovision.record(s.A).identities[first], "its identity recorded");
+  // Absent now, with a recorded identity: remove-tree is still called (and fails its sync again): pending.
+  const before = s.m.calls.filter((c) => c[1] === "remove-tree").length;
+  assert.match((await go(s)).reason, /partly removed/);
+  assert.equal(s.m.calls.filter((c) => c[1] === "remove-tree").length, before + 1);
+  assert.equal((await go(s)).status, "done");
+  await s.close();
+  // Removed with a 75, then a reboot: the absent object's stale recorded epoch parks; never marked.
+  const t = await setup();
+  t.m.syncFail["remove-tree"] = 1;
+  const r = await go(t);
+  const key = r.reason.split(":")[0];
+  t.m.epoch = { boot_id: "11111111-2222-3333-4444-555555555555", mnt_id: 30 };
+  const p = await go(t);
+  assert.match(p.reason, new RegExp(`${key}: remove-tree refused \\(73\\)`));
+  assert.equal(t.h.deprovision.record(t.A).steps_done.length, STEPS.indexOf(r.step));
+  await t.close();
+  // Never recorded and absent: nothing to do, no remove-tree for it.
+  const n = await setup();
+  n.m.objects.delete(`/var/lib/sagebrush/creds/${n.A}`);
+  assert.equal((await go(n)).status, "done");
+  assert.ok(!n.m.calls.some((c) => c[1] === "remove-tree" && c.includes("/var/lib/sagebrush/creds")));
+  await n.close();
+});
+
+test("every seam takes the pass's remaining time and its signal; an aborted signal ends a hung proof or broker revoke, with nothing marked", async () => {
+  const s = await setup();
+  s.m.root = s.root;
+  const seen = [];
+  const ac = new AbortController();
+  const note = (name) => (...a) => { const sig = a.at(-1); const ms = a.at(-2); seen.push([name, sig === ac.signal, typeof ms === "number" && ms > 0 && ms <= 10000]); };
+  const wrap = (name, f) => async (...a) => { note(name)(...a); return f(...a); };
+  // Re-make the pass with recording seams (the same model).
+  const { deprovisioner: mk } = await import("../lib/fleet/host/deprovision.mjs");
+  const effects = [];
+  const run0 = async (argv, o) => { seen.push([`run ${argv[0] === LAUNCH ? argv[1] : argv[0]}`, o.signal === ac.signal, typeof o.ms === "number" && o.ms > 0]); return s.run(argv, o); };
+  const dp = mk({
+    store: s.h, run: run0, launcher: LAUNCH, mount: "/", fsx: s.fsx, root: s.root, rootUid: 0,
+    procCount: wrap("procCount", async () => 0),
+    uidProof: wrap("uidProof", async () => ({ empty: true, holders: [] })),
+    daemonReload: wrap("daemonReload", async () => { effects.push("daemon-reload"); }),
+    removeNetwork: async (agent, uid, left, signal) => { seen.push(["removeNetwork", signal === ac.signal, left() > 0]); },
+    brokerRevoke: wrap("brokerRevoke", async () => {}),
+    inPool: () => false,
+  });
+  assert.equal((await dp.pass(s.A, 10000, ac.signal)).status, "done");
+  for (const [name, sig, ms] of seen) assert.ok(sig && ms, `${name}: signal ${sig}, time ${ms}`);
+  for (const k of ["procCount", "uidProof", "daemonReload", "removeNetwork", "brokerRevoke", "run identify", "run remove-tree", "run archive-home", "run inspect-home", "run getent", "run userdel"]) {
+    assert.ok(seen.some((x) => x[0] === k), k);
+  }
+  await s.close();
+  // A hung broker revoke and a hung proof, each honouring only its signal: the abort ends the pass, nothing marked.
+  for (const hung of ["brokerRevoke", "procCount", "uidProof"]) {
+    const t = await setup();
+    t.m.root = t.root;
+    const a2 = new AbortController();
+    const wait = (sig) => new Promise((_, rej) => sig.addEventListener("abort", () => rej(new Error("aborted")), { once: true }));
+    const seams = {
+      procCount: async () => 0, uidProof: async () => ({ empty: true, holders: [] }), brokerRevoke: async () => {},
+      [hung]: async (...a) => wait(a.at(-1)),
+    };
+    const dp2 = mk({ store: t.h, run: t.run, launcher: LAUNCH, mount: "/", fsx: t.fsx, root: t.root, rootUid: 0, ...seams, daemonReload: async () => {}, removeNetwork: async () => {}, inPool: () => false });
+    setTimeout(() => a2.abort(), 30);
+    const r = await dp2.pass(t.A, 10000, a2.signal).then((x) => x, (e) => ({ threw: e.message }));
+    assert.ok(r.threw || r.status === "pending", `${hung}: ${JSON.stringify(r)}`);
+    assert.deepEqual(t.h.deprovision.record(t.A).steps_done, [], hung);
+    await t.close();
+  }
 });
 
 test("the accounts step parks while the agent is in a harness pool; another uid on the name is refused", async () => {

@@ -5,12 +5,16 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const A: &str = "abcdefghijklmnopqrstuvwxya";
 const BIN: &str = env!("CARGO_BIN_EXE_sagebrush-agent-launch");
 
+static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// A fresh directory per call (tests run in parallel: never shared).
 fn tmp(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("sbl-test-{}-{name}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("sbl-test-{}-{name}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst)));
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(d.join("work")).unwrap();
     fs::create_dir_all(d.join("creds")).unwrap();
@@ -46,13 +50,31 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+/// The kernel's Landlock ABI, asked INDEPENDENTLY of the launcher under test: landlock_create_ruleset(NULL, 0,
+/// LANDLOCK_CREATE_RULESET_VERSION) straight from this test (test code, not part of the binary's inventory).
+fn kernel_abi() -> i64 {
+    // SAFETY: the documented ABI query; a NULL attr with size 0 and the VERSION flag reads nothing.
+    unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<u8>(), 0usize, 1u32) }
+}
+
+/// Where the kernel supports ABI 4, the launcher's positive control MUST succeed: a skip there is a failure.
 fn landlock_abi4() -> bool {
-    // The binary itself is the probe: a valid exec of /usr/bin/true exits 0 only with ABI 4.
+    if kernel_abi() < 4 {
+        eprintln!("this kernel has no Landlock ABI 4 (independent query): the Landlock rows run on the VM");
+        return false;
+    }
     let d = tmp("probe");
-    let c = contract(&d, "");
-    let o = exec(&d, &c, "/usr/bin/true", &[]);
+    let o = exec(&d, &contract(&d, ""), "/usr/bin/true", &[]);
     let _ = fs::remove_dir_all(&d);
-    code(&o) == 0
+    assert_eq!(code(&o), 0, "the kernel has ABI 4, so the launcher's positive control must succeed: {}", stderr(&o));
+    true
+}
+
+#[test]
+fn the_positive_control_succeeds_wherever_the_kernel_has_abi_4() {
+    if kernel_abi() >= 4 {
+        assert!(landlock_abi4());
+    }
 }
 
 #[test]
@@ -160,8 +182,15 @@ env | cut -d= -f1 | sort | tr '\n' ' '"#,
         w = d.join("work").display(),
         pid = std::process::id()
     );
-    let o = exec(&d, &contract(&d, ""), "/usr/bin/sh", &["-c", &script]);
+    // Spawned through a shell that opens a NON-CLOEXEC descriptor 42 first, which the launcher inherits: it must be
+    // closed before the CLI runs.
+    let mut cmd = Command::new("/usr/bin/bash"); // (dash only redirects single-digit descriptors)
+    cmd.env_clear().env("CREDENTIALS_DIRECTORY", d.join("creds"));
+    cmd.args(["-c", "exec 42</usr/bin/true; exec \"$0\" \"$@\"", BIN, "exec", "--agent", A, "--contract"]);
+    cmd.arg(contract(&d, "")).args(["--cli", "/usr/bin/sh", "--", "-c"]).arg(format!("[ -e /proc/self/fd/42 ] && echo fd42-leaked || echo fd42-closed\n{script}"));
+    let o = cmd.output().unwrap();
     let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("fd42-closed"), "an inherited descriptor 42 is closed before exec: {out}");
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(out.contains("p=placeholder-123 c=cap-456 d=unset"), "{out}");
     assert!(out.contains("hello") && out.contains("work-rw"), "{out}");
@@ -171,5 +200,30 @@ env | cut -d= -f1 | sort | tr '\n' ' '"#,
     assert!(out.contains("NoNewPrivs:\t1"), "{out}");
     assert!(out.contains("PATH PWD SAGEBRUSH_BROKER_PLACEHOLDER SAGEBRUSH_WORKSPACE_CAPABILITY"), "a fresh environment: {out}");
     assert!(!Path::new(&format!("/tmp/sbl-escape-{}", std::process::id())).exists());
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_panic_prints_only_the_fixed_72_line_and_every_secret_is_zeroed() {
+    if !cfg!(debug_assertions) || !landlock_abi4() {
+        return; // the injection hook exists only in debug builds; the credentials are read after the Landlock steps
+    }
+    let d = tmp("panic");
+    let log = d.join("drops.log");
+    let o = Command::new(BIN)
+        .env_clear()
+        .env("CREDENTIALS_DIRECTORY", d.join("creds"))
+        .env("SAGEBRUSH_LAUNCH_TEST_PANIC", "1")
+        .env("SAGEBRUSH_LAUNCH_TEST_DROPLOG", &log)
+        .args(["exec", "--agent", A, "--contract", contract(&d, "").to_str().unwrap(), "--cli", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&o), 72);
+    assert_eq!(stderr(&o), "sagebrush-agent-launch: internal: internal error\n", "nothing but the fixed line");
+    assert!(o.stdout.is_empty());
+    // The Landlock ruleset doesn't allow writing the log after restrict_self, unless it is under the rw work dir:
+    // so the test reads whatever the Drop could write, and requires every recorded drop to have been zeroed.
+    let drops = fs::read_to_string(&log).unwrap_or_default();
+    assert!(drops.lines().all(|l| l.contains("zeroed=true")), "{drops}");
     let _ = fs::remove_dir_all(&d);
 }

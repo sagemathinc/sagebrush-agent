@@ -164,25 +164,11 @@ pub fn unlinkat(dir: &OwnedFd, name: &CStr) -> io::Result<()> {
     if r != 0 { Err(last()) } else { Ok(()) }
 }
 
-/// fsync(fd) (a directory handle too).
-pub fn fsync(fd: &OwnedFd) -> io::Result<()> {
-    // SAFETY: `fd` is open.
-    let r = unsafe { libc::fsync(fd.as_raw_fd()) };
+/// fsync(dir): a DIRECTORY handle only (contract §6). Files are written and synced through std's File (safe).
+pub fn fsync_dir(dir: &OwnedFd) -> io::Result<()> {
+    // SAFETY: `dir` is open.
+    let r = unsafe { libc::fsync(dir.as_raw_fd()) };
     if r != 0 { Err(last()) } else { Ok(()) }
-}
-
-/// read(fd, buf): bytes read (0 at EOF), EINTR retried by the caller's loop.
-pub fn read(fd: &OwnedFd, buf: &mut [u8]) -> io::Result<usize> {
-    // SAFETY: `fd` is open; `buf` is writable (and initialized) for its length.
-    let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-    if n < 0 { Err(last()) } else { Ok(n as usize) }
-}
-
-/// write(fd, buf): bytes written.
-pub fn write(fd: &OwnedFd, buf: &[u8]) -> io::Result<usize> {
-    // SAFETY: `fd` is open; `buf` is readable for its length.
-    let n = unsafe { libc::write(fd.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
-    if n < 0 { Err(last()) } else { Ok(n as usize) }
 }
 
 /// prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0).

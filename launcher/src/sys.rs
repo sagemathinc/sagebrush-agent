@@ -260,17 +260,21 @@ pub struct Ident {
     pub uid: u32,
     pub gid: u32,
     pub mode: u16,
+    /// The UNIQUE mount id (STATX_MNT_ID_UNIQUE): never reused while the system runs.
     pub mnt_id: u64,
     pub nlink: u32,
     pub size: u64,
 }
 
+/// STATX_MNT_ID_UNIQUE, not STATX_MNT_ID: the plain mount id is reused (a remount can get the same number back), so
+/// an epoch or a mount-identity check on it could take a remounted filesystem for the same mount. The unique id
+/// (Linux 6.8+) is never reused while the system runs; a kernel without it fails closed (66).
 const IDENT_MASK: u32 = libc::STATX_TYPE
     | libc::STATX_MODE
     | libc::STATX_UID
     | libc::STATX_GID
     | libc::STATX_INO
-    | libc::STATX_MNT_ID
+    | libc::STATX_MNT_ID_UNIQUE
     | libc::STATX_NLINK
     | libc::STATX_SIZE;
 

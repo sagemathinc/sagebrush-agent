@@ -34,7 +34,7 @@ test("uids and gids come from their ranges, in order, and survive a reopen", asy
   assert.deepEqual(readdirSync(join(dir, "registry")), ["registry.json"]); // no temp file left behind
   await r.close();
   const again = await Registry.open(dir);
-  assert.deepEqual(again.agent(b), { uid: UID_RANGE[0] + 1, state: "provisioned", life: 0, gen: 1, tags: [t] });
+  assert.deepEqual(again.agent(b), { uid: UID_RANGE[0] + 1, state: "provisioned", life: 0, gen: 1, tags: [t], start_failed: null });
   assert.equal(again.addAgent(newId(), 2), UID_RANGE[0] + 2);
   await again.close();
 });
@@ -100,6 +100,32 @@ test("recovery starts only agents recorded as running; paused and stopped stay d
   await again.close();
 });
 
+test("start_failed: a closed reason; set and cleared durably; cleared by a grant update or a resume; never runnable", async () => {
+  const dir = fresh();
+  const r = await Registry.open(dir);
+  const a = newId(), b = newId();
+  r.addAgent(a, 1); r.addAgent(b, 1);
+  r.setState(a, "running"); r.setState(b, "running");
+  for (const bad of ["crashed", "", 1, undefined]) refused(() => r.setStartFailed(a, bad), "bad_form");
+  refused(() => r.setStartFailed(newId(), "unit_failed"), "not_granted");
+  assert.equal(r.setStartFailed(a, "unit_failed").start_failed, "unit_failed");
+  assert.deepEqual(r.runnable(), [b], "recovery never retries a failed start");
+  await r.close();
+  const again = await Registry.open(dir);
+  assert.equal(again.agent(a).start_failed, "unit_failed", "durable");
+  again.setGrant(a, 2, []);
+  assert.equal(again.agent(a).start_failed, null, "the next grant clears it");
+  again.setStartFailed(a, "start_timeout");
+  again.setState(a, "stopped", "stop");
+  assert.equal(again.agent(a).start_failed, "start_timeout", "a stop doesn't clear it");
+  again.setState(a, "running", "resume");
+  assert.equal(again.agent(a).start_failed, null, "a resume clears it");
+  again.setStartFailed(a, "preflight_missing");
+  again.setStartFailed(a, null);
+  assert.deepEqual(again.runnable(), [a, b].sort());
+  await again.close();
+});
+
 test("grant updates move the generation forward only", async () => {
   const r = await Registry.open(fresh());
   const a = newId(), t = newId();
@@ -154,7 +180,7 @@ test("the reviewers' probe: a temp path that is a directory (EISDIR) leaves disk
   mkdirSync(join(dir, "registry", `.registry.json.${process.pid}.tmp`));
   assert.throws(() => r.setState(a, "running", "resume"));
   refused(() => r.runnable(), "outcome_unknown");
-  assert.deepEqual(disk(dir).agents[a], { uid: UID_RANGE[0], state: "paused", life: 1, gen: 1, tags: [] });
+  assert.deepEqual(disk(dir).agents[a], { uid: UID_RANGE[0], state: "paused", life: 1, gen: 1, tags: [], start_failed: null });
   r.reload();
   assert.deepEqual(r.runnable(), []);
   await r.close();
@@ -238,6 +264,9 @@ test("anything but the exact closed shape is refused at load and left as found",
     (j, a) => { const t = newId(); j.agents[a].tags = [t, t]; return j; },
     (j, a) => { j.agents[a].tags = Array.from({ length: 17 }, () => newId()); return j; },
     (j, a) => { j.agents[a].note = "x"; return j; },
+    (j, a) => { delete j.agents[a].start_failed; return j; },
+    (j, a) => { j.agents[a].start_failed = "crashed"; return j; },
+    (j, a) => { j.agents[a].start_failed = false; return j; },
     (j) => { j.tags[newId()] = { gid: GID_RANGE[0], extra: 1 }; j.next_gid += 1; return j; },
     (j) => ({ ...j, agents: [] }),
   ];

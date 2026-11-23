@@ -97,14 +97,21 @@ test("begin: the intent first; then grant bytes; then ONE atomic state commit; s
   await s.begin(1, bytes, digest, ["broker-gen", "start:a"], intent);
   assert.equal(intent.log.length, 1);
   assert.equal(intent.log[0].gen, 1);
-  assert.deepEqual(stateOnDisk(dir), { v: 1, gen: 1, digest, phase: "applying", plan: [{ step: "broker-gen", done: false }, { step: "start:a", done: false }] });
+  assert.deepEqual(stateOnDisk(dir), { v: 1, gen: 1, digest, phase: "applying", plan: [{ step: "broker-gen", done: false }, { step: "start:a", done: false }], ack: null });
+  assert.deepEqual(s.steps(), ["broker-gen", "start:a"]);
+  assert.equal(s.ack, null);
   s.done(0);
   assert.deepEqual(s.pending(), { phase: "applying", gen: 1, remaining: [1] });
-  refused(() => s.finish(), "bad_form");
-  s.done(1); s.finish();
+  refused(() => s.finish({ narrowed: false, restarted: [] }), "bad_form");
+  s.done(1);
+  for (const bad of [null, { narrowed: 1, restarted: [] }, { narrowed: true, restarted: ["a"] }, { narrowed: true }]) refused(() => s.finish(bad), "bad_form");
+  const A = "abcdefghijklmnopqrstuvwxya";
+  s.finish({ narrowed: true, restarted: [A] });
   await s.close();
   const again = await GrantState.open(dir);
   assert.deepEqual(again.pending(), { phase: "applied", gen: 1, remaining: [] });
+  assert.deepEqual(again.ack, { narrowed: true, restarted: [A] }, "the acknowledgement survives a restart");
+  assert.deepEqual(again.steps(), []);
   assert.deepEqual([...again.currentBytes()], [...bytes]);
   await again.close();
 });
@@ -124,7 +131,7 @@ test("the generation rule: lower or equal-but-different refused; byte-identical 
   const s = await GrantState.open(fresh());
   const g2 = g(2);
   await s.begin(2, g2.bytes, g2.digest, ["a"], okIntent());
-  s.done(0); s.finish();
+  s.done(0); s.finish({ narrowed: false, restarted: [] });
   assert.deepEqual(s.admit(2, g2.digest), { reapply: true });
   refused(() => s.admit(2, g(2, { at_ms: 1001 }).digest), "stale_generation");
   refused(() => s.admit(1, g(1).digest), "stale_generation");
@@ -148,7 +155,7 @@ test("highwater only increases: astra2's sequence (gen 2 intent held, gen 3 begu
   release();
   await p2;
   assert.equal(stateOnDisk(dir).gen, 2);
-  s.done(0); s.finish();
+  s.done(0); s.finish({ narrowed: false, restarted: [] });
   await s.begin(3, g3.bytes, g3.digest, ["a"], okIntent());
   assert.equal(stateOnDisk(dir).gen, 3);
   await rejects(s.begin(2, g2.bytes, g2.digest, ["a"], okIntent()), "stale_generation"); // a stale release never lowers it
@@ -216,7 +223,7 @@ for (const step of ["open", "write", "fsync", "rename", "dirfsync"]) {
     await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a"], okIntent()), /ENOSPC/);
     assert.equal(s.poisoned, false);
     assert.deepEqual(s.pending(), { phase: "applied", gen: 0, remaining: [] });
-    assert.deepEqual(stateOnDisk(dir), { v: 1, gen: 0, digest: null, phase: "applied", plan: [] });
+    assert.deepEqual(stateOnDisk(dir), { v: 1, gen: 0, digest: null, phase: "applied", plan: [], ack: null });
     assert.deepEqual(readdirSync(join(dir, "grant", "grants")), []); // no partial file left to block a retry
     await s.close();
     const again = await GrantState.open(dir);
@@ -231,7 +238,7 @@ for (const step of ["open", "write", "fsync", "rename", "dirfsync"]) {
     const s = await GrantState.open(dir, { io: failAt(step) });
     assert.throws(() => s.done(0), /ENOSPC/);
     refused(() => s.pending(), "outcome_unknown");
-    refused(() => s.finish(), "outcome_unknown");
+    refused(() => s.finish({ narrowed: false, restarted: [] }), "outcome_unknown");
     s.reload();
     assert.deepEqual(s.pending().remaining, step === "dirfsync" ? [1] : [0, 1]);
     await s.close();
@@ -251,7 +258,7 @@ test("one host store: registry and grant state open together; commit both; crash
   const h2 = await HostStore.open(dir);
   assert.deepEqual(h2.registry.runnable(), [a]);
   assert.deepEqual(h2.grants.pending(), { phase: "applying", gen: 1, remaining: [0] });
-  h2.grants.done(0); h2.grants.finish();
+  h2.grants.done(0); h2.grants.finish({ narrowed: false, restarted: [] });
   await h2.close();
 });
 
@@ -277,19 +284,25 @@ test("anything but the exact closed state is refused at load and left as found",
   const d43 = "A".repeat(43);
   const variants = [
     "{",
-    { v: 1, gen: 7, digest: null, phase: "applied", plan: [] },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: "false" }] },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: "yes" }] },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: 12, done: false }] },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: false, extra: 1 }] },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "", done: false }] },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [{ step: "a", done: true }] },
-    { v: 1, gen: 0, digest: null, phase: "applying", plan: [] },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], extra: 1 },
-    { v: 1, gen: 1, digest: "short", phase: "applied", plan: [] },
-    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [] },
-    { v: 1, gen: -1, digest: null, phase: "applied", plan: [] },
-    { v: 1, gen: 1, digest: d43, phase: "done", plan: [] },
+    { v: 1, gen: 7, digest: null, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] } },
+    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: "false" }] , ack: null },
+    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: "yes" }] , ack: null },
+    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: 12, done: false }] , ack: null },
+    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: false, extra: 1 }] , ack: null },
+    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "", done: false }] , ack: null },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [{ step: "a", done: true }] , ack: { narrowed: false, restarted: [] } },
+    { v: 1, gen: 0, digest: null, phase: "applying", plan: [] , ack: null },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], extra: 1 , ack: { narrowed: false, restarted: [] } },
+    { v: 1, gen: 1, digest: "short", phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] } },
+    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] } },
+    { v: 1, gen: -1, digest: null, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] } },
+    { v: 1, gen: 1, digest: d43, phase: "done", plan: [] , ack: { narrowed: false, restarted: [] } },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [] },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: null },
+    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [], ack: { narrowed: false, restarted: [] } },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: "no", restarted: [] } },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: ["x"] } },
+    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [], extra: 1 } },
   ];
   for (const v of variants) {
     const dir = fresh();
@@ -314,7 +327,7 @@ test("astra2's interleaving: a stale begin across lock loss can't touch a replac
   for (let i = 0; i < 50 && !rep; i++) { try { rep = await GrantState.open(dir); } catch { await new Promise((r) => setTimeout(r, 100)); } }
   assert.ok(rep, "a replacement opened");
   await rep.begin(1, B.bytes, B.digest, ["a"], okIntent());
-  rep.done(0); rep.finish();
+  rep.done(0); rep.finish({ narrowed: false, restarted: [] });
   release();
   await rejects(p, "outcome_unknown");
   // Fresh-disk oracle: the accepted state and its bytes are B's, and the replacement is healthy.

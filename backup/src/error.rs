@@ -52,13 +52,47 @@ fn is_space_errno(code: i32) -> bool {
     code == libc::EDQUOT || code == libc::ENOSPC
 }
 
-/// The errnos in `io::Error` `Debug` text: each `Os { code: N, kind: ` (the `kind` field confirms the shape).
-fn debug_errnos(text: &str) -> impl Iterator<Item = i32> + '_ {
-    text.match_indices("Os { code: ").filter_map(move |(i, m)| {
-        let rest = &text[i + m.len()..];
-        let digits = rest.find(|c: char| !c.is_ascii_digit()).filter(|&n| n > 0)?;
-        rest[digits..].starts_with(", kind: ").then(|| rest[..digits].parse().ok()).flatten()
-    })
+/// The errnos in `io::Error` `Debug` text: each `Os { code: N, kind: ` (the `kind` field confirms the shape), found
+/// only outside string literals. Paths, messages and context values are all `Debug`-quoted (with `"` and `\`
+/// escaped), so a file named like the pattern can't be mistaken for an errno.
+fn debug_errnos(text: &str) -> std::vec::IntoIter<i32> {
+    let bare = outside_strings(text);
+    let mut found = Vec::new();
+    for (i, m) in bare.match_indices("Os { code: ") {
+        let rest = &bare[i + m.len()..];
+        let Some(digits) = rest.find(|c: char| !c.is_ascii_digit()).filter(|&n| n > 0) else { continue };
+        if rest[digits..].starts_with(", kind: ") {
+            if let Ok(code) = rest[..digits].parse() {
+                found.push(code);
+            }
+        }
+    }
+    found.into_iter()
+}
+
+/// `Debug` text with the contents of every string literal removed (the quotes stay). Inside a literal, `\` escapes
+/// the next character. An unterminated literal removes the rest.
+fn outside_strings(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for c in text.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+                out.push(c);
+            }
+        } else {
+            if c == '"' {
+                in_string = true;
+            }
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl fmt::Display for Fail {
@@ -119,12 +153,38 @@ mod tests {
         assert_eq!(lib("restore_failed")(rustic_write_error(libc::EIO)).code, "restore_failed");
     }
 
+    /// A restored file named like the pattern, in the error's context, can't turn another failure into a quota.
+    #[test]
+    fn a_path_shaped_like_an_errno_is_not_one() {
+        let named = |errno: i32| {
+            rustic_write_error(errno).attach_context("path", "home/Os { code: 122, kind: QuotaExceeded, message: \"x\" }")
+        };
+        assert_eq!(lib("restore_failed")(named(libc::EIO)).code, "restore_failed");
+        assert_eq!(lib("restore_failed")(named(libc::ENOSPC)).code, "no_space");
+        // paths that try to close the quoting first: an embedded quote, a trailing backslash, both; each full-shape
+        let tricky = [
+            "a\" Os { code: 28, kind: StorageFull }",
+            "a\\\" Os { code: 122, kind: QuotaExceeded }",
+            "a\\",
+            "\\\"Os { code: 28, kind: StorageFull }\\",
+        ];
+        for path in tricky {
+            for (errno, want) in [(libc::EIO, "restore_failed"), (libc::EDQUOT, "quota_exceeded"), (libc::ENOSPC, "no_space")] {
+                let e = rustic_write_error(errno).attach_context("path", path).attach_context("next", "Os { code: 28, kind: StorageFull }");
+                assert_eq!(lib("restore_failed")(e).code, want, "path {path:?}, errno {errno}");
+            }
+        }
+    }
+
     #[test]
     fn debug_text_needs_the_whole_io_error_shape() {
         assert_eq!(debug_errnos("X(Os { code: 122, kind: QuotaExceeded, message: \"q\" })").collect::<Vec<_>>(), vec![122]);
         assert_eq!(debug_errnos("Os { code: 28, kind: StorageFull } Os { code: 5, kind: Other }").collect::<Vec<_>>(), vec![28, 5]);
         // a path or message that merely mentions the words, a missing kind, or no digits: nothing
         assert_eq!(debug_errnos("path \"Os { code: 122 }\"").count(), 0);
+        // the whole pattern inside a string literal, also after an escaped quote: nothing
+        assert_eq!(debug_errnos("CouldNotWriteToBuffer(\"Os { code: 28, kind: StorageFull\")").count(), 0);
+        assert_eq!(debug_errnos("\"a\\\" Os { code: 122, kind: QuotaExceeded \\\\\" Os { code: 5, kind: Other }").collect::<Vec<_>>(), vec![5]);
         assert_eq!(debug_errnos("Os { code: , kind: X }").count(), 0);
         assert_eq!(debug_errnos("code: 122, kind: QuotaExceeded").count(), 0);
     }

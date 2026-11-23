@@ -8,12 +8,15 @@
 //!    in-namespace path re-opened and checked against the identity verified before the pivot;
 //! 3. reduces the bounding, permitted and effective sets to exactly CHOWN, FOWNER and DAC_OVERRIDE, inheritable and
 //!    ambient empty, and verifies the whole mask;
-//! 4. sets no_new_privs, then Landlock (ABI 4+; every filesystem right handled; BIND_TCP handled with no rule);
+//! 4. sets no_new_privs, then Landlock (ABI 4+; every filesystem right handled; BIND_TCP handled with no rule, so a
+//!    TCP bind is denied and a TCP connect is left unrestricted, the only wildcard connect Landlock ABI 4 can express;
+//!    UDP stays unhandled, for ordinary DNS: the network policy is NOT "TCP only");
 //! 5. puts the request on fd 0 and its pipes on 1 and 2, marks every other descriptor close-on-exec;
 //! 6. execveat()s the binary through the post-pivot `/release` handle with an empty environment.
 //!
 //! A failure at any step writes `{stage, errno}` (8 bytes) to the close-on-exec status pipe and _exits; the parent
-//! maps the stage to a launcher code. EOF with no bytes means the exec happened, and from then on only the binary's
+//! maps the stage to a launcher code. The attempt is then left without a marker, and the supervisor discards it with
+//! remove-tree on EVERY pre-exec failure path: the launcher itself removes nothing. EOF with no bytes means the exec happened, and from then on only the binary's
 //! JSON classifies the outcome (A2 O6).
 //!
 //! The steps are generic over `ChildOps`, so the tests run them against a fake that models the capability sets, the
@@ -379,7 +382,8 @@ impl ChildOps for RealChild {
 /// The parent's wait (A2 §3 steps 5, 9): poll on the child's stdout, stderr and status pipe plus a signalfd for
 /// SIGTERM (blocked in the parent, unblocked in the child before its exec), so the child never blocks on a full pipe.
 /// stdout is kept up to MAX_OUT bytes: one more byte kills the child (`overflow`). stderr's first MAX_OUT bytes are
-/// read and discarded (the launcher's own stderr is one fixed line by contract, so there is no channel to relay it). A SIGTERM is forwarded, then SIGKILL 10 s later. The transient scope bounds the whole.
+/// drained continuously and discarded, never buffered: relaying an arbitrary diagnostic through the launcher's fixed
+/// stderr line could leak paths or credentials. A SIGTERM is forwarded, then SIGKILL 10 s later. The transient scope bounds the whole.
 pub struct RealRunner;
 
 pub const MAX_OUT: usize = 64 * 1024;
@@ -391,6 +395,8 @@ pub struct Seen {
     pub stdout: Vec<u8>,
     pub overflow: bool,
     pub lost: bool,
+    /// The child's wait status, once reaped.
+    pub exit: Option<libc::c_int>,
 }
 
 impl RealRunner {
@@ -410,17 +416,32 @@ impl RealRunner {
             sys::exit_now(1);
         }
         drop((st_w, req_r, req_w, out_w, err_w));
-        Some(wait(pid, &st_r, &out_r, &err_r, &sig))
+        let Ok(pidfd) = sys::pidfd_open(pid) else {
+            let _ = sys::kill(pid, libc::SIGKILL);
+            let _ = sys::waitpid(pid, 0);
+            return Some(Seen { status: Vec::new(), stdout: Vec::new(), overflow: false, lost: true, exit: None });
+        };
+        Some(wait(pid, &pidfd, &st_r, &out_r, &err_r, &sig, KILL_AFTER))
     }
 }
 
-fn wait(pid: libc::pid_t, st: &OwnedFd, out: &OwnedFd, errp: &OwnedFd, sig: &OwnedFd) -> Seen {
-    let mut seen = Seen { status: Vec::new(), stdout: Vec::new(), overflow: false, lost: false };
+/// The parent's one loop (A2 §3 steps 5, 9; TESTS T1 on rev 1): the child's exit (its pidfd), its three pipes and the
+/// signal source are polled together until the child is reaped AND every pipe is at EOF. A child that closes its pipes
+/// and keeps running still gets the forwarded SIGTERM and, `kill_after` later, SIGKILL; a reaped pid is never
+/// signalled (its number may be reused). `sig` is the SIGTERM signalfd (any readable descriptor in the tests).
+pub fn wait(pid: libc::pid_t, pidfd: &OwnedFd, st: &OwnedFd, out: &OwnedFd, errp: &OwnedFd, sig: &OwnedFd, kill_after: std::time::Duration) -> Seen {
+    let mut seen = Seen { status: Vec::new(), stdout: Vec::new(), overflow: false, lost: false, exit: None };
     let mut open = [true, true, true];
+    let mut exited = false;
     let mut kill_at: Option<std::time::Instant> = None;
     let mut buf = vec![0u8; 16 * 1024];
     let fds = [st, out, errp];
-    while open.iter().any(|o| *o) {
+    let kill = |exited: bool, sig: libc::c_int| {
+        if !exited {
+            let _ = sys::kill(pid, sig);
+        }
+    };
+    while !exited || open.iter().any(|o| *o) {
         let mut pfds: Vec<libc::pollfd> = Vec::new();
         let mut which = Vec::new();
         for (i, fd) in fds.iter().enumerate() {
@@ -429,26 +450,46 @@ fn wait(pid: libc::pid_t, st: &OwnedFd, out: &OwnedFd, errp: &OwnedFd, sig: &Own
                 which.push(i);
             }
         }
+        let sig_at = pfds.len();
         pfds.push(libc::pollfd { fd: sig.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+        let pid_at = pfds.len();
+        if !exited {
+            pfds.push(libc::pollfd { fd: pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+        }
         let timeout = kill_at.map_or(-1, |t| t.saturating_duration_since(std::time::Instant::now()).as_millis().min(i32::MAX as u128) as i32);
         match sys::poll(&mut pfds, timeout) {
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
             Err(_) => {
                 seen.lost = true;
-                let _ = sys::kill(pid, libc::SIGKILL);
+                kill(exited, libc::SIGKILL);
                 break;
             }
         }
         if kill_at.is_some_and(|t| std::time::Instant::now() >= t) {
-            let _ = sys::kill(pid, libc::SIGKILL);
+            kill(exited, libc::SIGKILL);
             kill_at = None;
         }
-        if pfds.last().is_some_and(|p| p.revents & libc::POLLIN != 0) {
+        if pfds[sig_at].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             let mut si = [0u8; 128];
-            let _ = sys::read(sig, &mut si);
-            let _ = sys::kill(pid, libc::SIGTERM);
-            kill_at.get_or_insert(std::time::Instant::now() + KILL_AFTER);
+            match sys::read(sig, &mut si) {
+                Ok(n) if n > 0 => {
+                    kill(exited, libc::SIGTERM);
+                    if !exited {
+                        kill_at.get_or_insert(std::time::Instant::now() + kill_after);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !exited && pfds.get(pid_at).is_some_and(|p| p.revents != 0) {
+            if let Ok((r, status)) = sys::waitpid(pid, libc::WNOHANG) {
+                if r == pid {
+                    exited = true;
+                    kill_at = None;
+                    seen.exit = Some(status);
+                }
+            }
         }
         for (k, i) in which.iter().enumerate() {
             if pfds[k].revents == 0 {
@@ -467,7 +508,7 @@ fn wait(pid: libc::pid_t, st: &OwnedFd, out: &OwnedFd, errp: &OwnedFd, sig: &Own
                     1 => {
                         if seen.overflow || seen.stdout.len() + n > MAX_OUT {
                             if !seen.overflow {
-                                let _ = sys::kill(pid, libc::SIGKILL);
+                                kill(exited, libc::SIGKILL);
                             }
                             seen.overflow = true;
                         } else {
@@ -479,13 +520,16 @@ fn wait(pid: libc::pid_t, st: &OwnedFd, out: &OwnedFd, errp: &OwnedFd, sig: &Own
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) || e.raw_os_error() == Some(libc::EAGAIN) => {}
                 Err(_) => {
                     seen.lost = true;
-                    let _ = sys::kill(pid, libc::SIGKILL);
+                    kill(exited, libc::SIGKILL);
                     open = [false; 3];
                 }
             }
         }
     }
-    let _ = sys::waitpid(pid, 0);
+    if !exited {
+        // Only after a lost wait (poll or read failure): the child was killed; reap it.
+        seen.exit = sys::waitpid(pid, 0).ok().map(|(_, s)| s);
+    }
     seen
 }
 
@@ -846,6 +890,120 @@ mod tests {
             assert_eq!(steps(&mut f, &plan(&SRCS)), (Stage::Mountns, libc::EXDEV), "{path}");
             assert!(!f.calls.iter().any(|c| c.starts_with("drop") || c == "capset"), "{path}");
         }
+    }
+
+    // ---- the parent's one loop (TESTS T1 on rev 1), with real child processes: a pipe stands in for the SIGTERM
+    // signalfd, and the SIGKILL delay is scaled down.
+
+    use std::os::fd::OwnedFd;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const KILL: Duration = Duration::from_millis(300);
+
+    struct Probe {
+        seen: Seen,
+        took: Duration,
+    }
+
+    /// Run `script` under sh, send the "SIGTERM" notification after `term_at` (if any), and wait as the parent does. A
+    /// watchdog turns a wait that never ends (a broken loop) into a test failure, never a hung run.
+    fn probe(script: &str, term_at: Option<Duration>) -> Probe {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let script = script.to_string();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe_inner(&script, term_at));
+        });
+        rx.recv_timeout(Duration::from_secs(20)).expect("the parent's wait never ended")
+    }
+
+    fn probe_inner(script: &str, term_at: Option<Duration>) -> Probe {
+        let mut ch = Command::new("sh").arg("-c").arg(script).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let out = OwnedFd::from(ch.stdout.take().unwrap());
+        let err = OwnedFd::from(ch.stderr.take().unwrap());
+        let (st_r, st_w) = sys::pipe().unwrap();
+        drop(st_w); // the exec "happened": the status pipe is at EOF
+        let (sig_r, sig_w) = sys::pipe().unwrap();
+        let pid = ch.id() as libc::pid_t;
+        let pidfd = sys::pidfd_open(pid).unwrap();
+        // The notifier keeps its write end open until the end, as a signalfd never hangs up.
+        let notifier = std::thread::spawn(move || {
+            if let Some(d) = term_at {
+                std::thread::sleep(d);
+                sys::write(&sig_w, b"t").unwrap();
+            }
+            std::thread::sleep(Duration::from_secs(8));
+            drop(sig_w);
+        });
+        let t0 = Instant::now();
+        let seen = wait(pid, &pidfd, &st_r, &out, &err, &sig_r, KILL);
+        let took = t0.elapsed();
+        drop(notifier); // detached: it only holds the pipe open
+        Probe { seen, took }
+    }
+
+    fn signalled(p: &Probe) -> Option<i32> {
+        p.seen.exit.filter(|s| libc::WIFSIGNALED(*s)).map(|s| libc::WTERMSIG(s))
+    }
+
+    #[test]
+    fn eof_before_term_the_child_still_gets_the_forwarded_term() {
+        // The child closes all its pipes and keeps running: the loop must not stop at EOF.
+        let p = probe("exec sleep 5 >&- 2>&-", Some(Duration::from_millis(100)));
+        assert_eq!(signalled(&p), Some(libc::SIGTERM), "{:?}", p.seen.exit);
+        assert!(p.took < Duration::from_millis(2500), "{:?}", p.took);
+    }
+
+    #[test]
+    fn a_child_ignoring_term_gets_sigkill_after_the_delay_even_after_eof() {
+        let p = probe("trap '' TERM; exec sleep 5 >&- 2>&-", Some(Duration::from_millis(100)));
+        assert_eq!(signalled(&p), Some(libc::SIGKILL), "{:?}", p.seen.exit);
+        assert!(p.took >= Duration::from_millis(100) + KILL && p.took < Duration::from_millis(2500), "{:?}", p.took);
+    }
+
+    #[test]
+    fn term_before_eof_ends_a_child_that_holds_its_pipes() {
+        let p = probe("exec sleep 5", Some(Duration::from_millis(100)));
+        assert_eq!(signalled(&p), Some(libc::SIGTERM), "{:?}", p.seen.exit);
+        assert!(p.took < Duration::from_millis(2500), "{:?}", p.took);
+        let p = probe("trap '' TERM; exec sleep 5", Some(Duration::from_millis(100)));
+        assert_eq!(signalled(&p), Some(libc::SIGKILL), "{:?}", p.seen.exit);
+    }
+
+    #[test]
+    fn a_child_that_exits_is_reaped_and_its_output_drained_whole() {
+        let p = probe("head -c 50000 /dev/zero | tr '\\000' a; echo err >&2", None);
+        assert_eq!(p.seen.stdout.len(), 50000);
+        assert!(p.seen.stdout.iter().all(|b| *b == b'a'));
+        assert!(!p.seen.overflow && !p.seen.lost);
+        assert!(p.seen.exit.is_some_and(|s| libc::WIFEXITED(s) && libc::WEXITSTATUS(s) == 0), "{:?}", p.seen.exit);
+    }
+
+    #[test]
+    fn an_overflowing_child_is_killed_and_its_output_bounded() {
+        let p = probe("head -c 70000 /dev/zero | tr '\\000' a; exec sleep 5", None);
+        assert!(p.seen.overflow);
+        assert!(p.seen.stdout.len() <= MAX_OUT);
+        assert_eq!(signalled(&p), Some(libc::SIGKILL), "{:?}", p.seen.exit);
+        assert!(p.took < Duration::from_millis(2500), "{:?}", p.took);
+    }
+
+    #[test]
+    fn a_stderr_flood_is_drained_continuously_and_never_blocks_the_child() {
+        // 4 MiB on stderr (far past any pipe buffer), then a line on stdout and a clean exit: a wait that doesn't drain
+        // stderr leaves the child blocked for ever (probe's watchdog fails it).
+        let p = probe("head -c 4194304 /dev/zero >&2; echo ok", None);
+        assert_eq!(p.seen.stdout, b"ok\n");
+        assert!(p.seen.exit.is_some_and(|s| libc::WIFEXITED(s) && libc::WEXITSTATUS(s) == 0), "{:?}", p.seen.exit);
+        assert!(p.took < Duration::from_millis(5000), "{:?}", p.took);
+    }
+
+    #[test]
+    fn a_term_after_the_child_exited_signals_nothing() {
+        // The child exits at once; the late notification must not be sent to a reaped (reusable) pid.
+        let p = probe("exit 3", Some(Duration::from_millis(50)));
+        assert!(p.seen.exit.is_some_and(|s| libc::WIFEXITED(s) && libc::WEXITSTATUS(s) == 3));
+        assert!(p.took < Duration::from_millis(2500));
     }
 
     #[test]

@@ -231,7 +231,8 @@ fn is_space_error(e: &io::Error) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
-    Ok,
+    /// The snapshot the binary restored (its full id) and how many specials it skipped.
+    Ok(String, u64),
     Failed(String),
 }
 
@@ -243,7 +244,12 @@ pub fn reply(out: &[u8]) -> Option<Reply> {
     }
     let v = json::parse_with(body, MAX_OUT)?;
     if let Some(f) = v.exact(&["ok", "snapshot", "skipped_special"]) {
-        return (f[0] == &Value::Bool(true) && f[1].str().is_some_and(snapshot_ok) && f[2].int().is_some()).then_some(Reply::Ok);
+        if f[0] != &Value::Bool(true) {
+            return None;
+        }
+        let snap = f[1].str().filter(|s| snapshot_ok(s))?;
+        // A non-negative integer: the reader refuses signs, fractions and exponents.
+        return Some(Reply::Ok(snap.to_string(), f[2].int()?));
     }
     let f = v.exact(&["ok", "error"])?;
     if f[0] != &Value::Bool(false) {
@@ -479,7 +485,8 @@ fn stage_inner<O: RestoreOps, R: Runner<O::H>>(o: &mut O, r: &mut R, a: &StageAr
             Err(limit_error(classify(q, s, now)))
         }
         Some(Reply::Failed(_)) => Ok(Done { out: stdout, result: Err(err(Fail::Partial, "the restore failed")) }),
-        Some(Reply::Ok) => {
+        Some(Reply::Ok(snap, _)) if snap != a.snapshot => Err(err(Fail::Partial, "the restored snapshot isn't the requested one")),
+        Some(Reply::Ok(..)) => {
             // 11. The marker, written by the launcher only, once the data is durable (O1, O2).
             o.syncfs(&att).map_err(|_| err(Fail::Partial, "the staged data can't be made durable"))?;
             o.create_marker(&att, MARKER, n.path().as_bytes()).map_err(|_| err(Fail::Partial, "the marker can't be written"))?;
@@ -1278,7 +1285,7 @@ mod tests {
 
     #[test]
     fn exactly_one_closed_json_object_on_one_line() {
-        assert_eq!(reply(&ok_reply()), Some(Reply::Ok));
+        assert_eq!(reply(&ok_reply()), Some(Reply::Ok(SNAP.into(), 0)));
         assert_eq!(reply(&failed("quota_exceeded")), Some(Reply::Failed("quota_exceeded".into())));
         let long = format!("{{\"ok\":false,\"error\":{{\"code\":\"no_space\",\"message\":\"{}\"}}}}\n", "m".repeat(10_000));
         assert_eq!(reply(long.as_bytes()), Some(Reply::Failed("no_space".into())), "a long message still classifies");
@@ -1299,6 +1306,10 @@ mod tests {
         }
         let extra = format!("{{\"snapshot\":\"{SNAP}\",\"skipped_special\":0,\"ok\":true,\"x\":1}}\n");
         assert_eq!(reply(extra.as_bytes()), None);
+        for skipped in ["-1", "1.5", "1e3", "\"3\"", "null"] {
+            let r = format!("{{\"snapshot\":\"{SNAP}\",\"skipped_special\":{skipped},\"ok\":true}}\n");
+            assert_eq!(reply(r.as_bytes()), None, "{skipped}");
+        }
     }
 
     // ---- the release binary (S-a, O8)
@@ -1449,6 +1460,20 @@ mod tests {
         assert_eq!(rcode(&d), 75);
         assert_eq!(d.out, failed("capability_refused"));
         assert_eq!(f.count("marker"), 0);
+    }
+
+    #[test]
+    fn only_the_requested_snapshot_completes_the_attempt() {
+        // SEC H2: the binary reports which snapshot it restored; a different full id is never marked complete.
+        let other = format!("{{\"snapshot\":\"{}\",\"skipped_special\":0,\"ok\":true}}\n", "f".repeat(64));
+        let mut f = host();
+        let d = restore_stage(&mut f, &mut exited(other.into_bytes()), &stage_args("home"));
+        assert_eq!(rcode(&d), 75);
+        assert!(f.count("syncfs") == 0 && f.count("marker") == 0, "neither synced as complete nor marked");
+        let mut f = host();
+        let d = restore_stage(&mut f, &mut exited(ok_reply()), &stage_args("home"));
+        assert_eq!(rcode(&d), 0, "the exact requested id completes");
+        assert_eq!(f.count("marker"), 1);
     }
 
     #[test]

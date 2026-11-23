@@ -494,9 +494,10 @@ pub fn create_excl(dir: &OwnedFd, name: &CStr, mode: libc::mode_t) -> io::Result
     own(fd)
 }
 
-/// openat2(root, rel, { flags | O_CLOEXEC, 0, RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV... }): the
-/// restore child's closed system set only (A2 §3 step 6). Ordinary symlinks are followed INSIDE the root (a distro's
-/// /etc/resolv.conf is often one); magic links never are. The caller checks what it opened.
+/// openat2(root, rel, { flags | O_CLOEXEC, 0, RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS }): the restore child's closed
+/// system set only (A2 §3 step 6). Ordinary symlinks are followed INSIDE the root (a distro's /etc/resolv.conf is
+/// often one); magic links never are. RESOLVE_NO_XDEV is deliberately NOT used: resolv.conf may end on /run. The
+/// caller checks the opened object (its kind, root ownership, no group or other write).
 pub fn open_system(root: &OwnedFd, rel: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
     let how = OpenHow { flags: (flags | libc::O_CLOEXEC) as u64, mode: 0, resolve: libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS };
     // SAFETY: `root` is open, `rel` is NUL-terminated, `how` lives across the call and its size is passed.
@@ -878,4 +879,10 @@ pub fn execveat(dir: &OwnedFd, name: &CStr, argv: &[*const libc::c_char], envp: 
     // SAFETY: `dir` is open; `name` is NUL-terminated; both arrays end with NULL and point to live strings.
     unsafe { libc::syscall(libc::SYS_execveat, dir.as_raw_fd(), name.as_ptr(), argv.as_ptr(), envp.as_ptr(), 0) };
     last()
+}
+
+/// pidfd_open(pid, 0): a descriptor that polls readable when the child exits (A2 §3 step 9: the parent's one loop).
+pub fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
+    // SAFETY: plain integer arguments.
+    own(unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) })
 }

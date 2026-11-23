@@ -348,3 +348,48 @@ test("grant bytes are created exclusively: an existing different file under the 
   assert.deepEqual([...s.currentBytes()], [...g1.bytes]);
   await s.close();
 });
+
+test("crash-retry: the same bytes already present are fsynced (file and directory) before the state is accepted", async () => {
+  const dir = fresh();
+  const g1 = g(1);
+  // An earlier attempt left the exact bytes but crashed before its fsyncs; the state was never accepted.
+  { const s = await GrantState.open(dir); await s.close(); }
+  writeFileSync(join(dir, "grant", "grants", `1-${g1.digest}`), Buffer.from(g1.bytes));
+  const synced = [];
+  let fileSyncedBeforeState = false, dirSyncedBeforeState = false;
+  const path = join(dir, "grant", "grants", `1-${g1.digest}`);
+  const fds = new Map();
+  const io = {
+    ...realIo,
+    open: (p, f, m) => { const fd = realIo.open(p, f, m); fds.set(fd, p); return fd; },
+    fsync: (fd) => { synced.push(fds.get(fd)); return realIo.fsync(fd); },
+    rename: (a, b) => {
+      if (b.endsWith("state.json")) { fileSyncedBeforeState = synced.includes(path); dirSyncedBeforeState = synced.includes(join(dir, "grant", "grants")); }
+      return realIo.rename(a, b);
+    },
+  };
+  const s = await GrantState.open(dir, { io });
+  await s.begin(1, g1.bytes, g1.digest, ["a"], okIntent());
+  assert.equal(fileSyncedBeforeState, true, "the existing blob was fsynced before state.json was renamed in");
+  assert.equal(dirSyncedBeforeState, true, "grants/ was fsynced before state.json was renamed in");
+  assert.deepEqual([...s.currentBytes()], [...g1.bytes]);
+  await s.close();
+});
+
+test("crash-retry: if fsyncing the existing blob fails, the state is not accepted", async () => {
+  const dir = fresh();
+  const g1 = g(1);
+  { const s = await GrantState.open(dir); await s.close(); }
+  const path = join(dir, "grant", "grants", `1-${g1.digest}`);
+  writeFileSync(path, Buffer.from(g1.bytes));
+  const fds = new Map();
+  const io = {
+    ...realIo,
+    open: (p, f, m) => { const fd = realIo.open(p, f, m); fds.set(fd, p); return fd; },
+    fsync: (fd) => { if (fds.get(fd) === path) throw Object.assign(new Error("EIO"), { code: "EIO" }); return realIo.fsync(fd); },
+  };
+  const s = await GrantState.open(dir, { io });
+  await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a"], okIntent()), /EIO/);
+  assert.equal(stateOnDisk(dir).gen, 0);
+  await s.close();
+});

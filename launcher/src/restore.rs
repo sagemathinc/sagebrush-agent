@@ -227,6 +227,13 @@ fn limit_error(l: Limit) -> Error {
     }
 }
 
+/// restore-stage's own mkdirs hitting EDQUOT or ENOSPC (a full filesystem before the binary even runs): attributed by
+/// §3.1 like the binary's own quota_exceeded or no_space, never a preflight refusal.
+fn stage_space<O: RestoreOps>(o: &mut O, at: &O::H, projid: u32) -> Error {
+    let (q, s, now) = (o.quota(at, projid), o.space(at), o.now());
+    limit_error(classify(q, s, now))
+}
+
 fn is_space_error(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::EDQUOT) | Some(libc::ENOSPC))
 }
@@ -306,7 +313,7 @@ fn done(r: Result<()>) -> Done {
 
 /// A staging parent (`<run>`, `<owner>`, `<class>`): opened, or made 0700 when absent; root:root 0700 on the anchor's
 /// mount, else 73.
-fn staging_dir<O: RestoreOps>(o: &mut O, parent: &O::H, name: &str, mnt: u64) -> Result<O::H> {
+fn staging_dir<O: RestoreOps>(o: &mut O, parent: &O::H, name: &str, mnt: u64, projid: u32) -> Result<O::H> {
     if tchild(o, parent, name, mnt)?.is_none() {
         match o.mkdir(parent, name, 0o700) {
             Ok(()) => {
@@ -315,6 +322,7 @@ fn staging_dir<O: RestoreOps>(o: &mut O, parent: &O::H, name: &str, mnt: u64) ->
                 }
             }
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+            Err(e) if is_space_error(&e) => return Err(stage_space(o, parent, projid)),
             Err(_) => return Err(pre("a staging directory can't be made")),
         }
     }
@@ -427,12 +435,13 @@ fn stage_inner<O: RestoreOps, R: Runner<O::H>>(o: &mut O, r: &mut R, a: &StageAr
 
     // 3. The attempt directory, and data beneath it.
     let [run, owner, class, attempt] = n.parts();
-    let run_h = staging_dir(o, &ra, &run, mnt)?;
-    let owner_h = staging_dir(o, &run_h, &owner, mnt)?;
-    let class_h = staging_dir(o, &owner_h, &class, mnt)?;
+    let run_h = staging_dir(o, &ra, &run, mnt, a.projid)?;
+    let owner_h = staging_dir(o, &run_h, &owner, mnt, a.projid)?;
+    let class_h = staging_dir(o, &owner_h, &class, mnt, a.projid)?;
     match o.mkdir(&class_h, &attempt, 0o700) {
         Ok(()) => {}
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => return Err(err(Fail::Exists, "the attempt exists")),
+        Err(e) if is_space_error(&e) => return Err(stage_space(o, &class_h, a.projid)),
         Err(_) => return Err(pre("the attempt can't be made")),
     }
     let (ax, ah) = tchild(o, &class_h, &attempt, mnt)?.ok_or(identity("the attempt vanished"))?;
@@ -446,7 +455,9 @@ fn stage_inner<O: RestoreOps, R: Runner<O::H>>(o: &mut O, r: &mut R, a: &StageAr
     if att_x.projid != Some(a.projid) || att_x.inherit != Some(true) || att_x.mode != 0o700 {
         return Err(identity("the attempt's project id didn't read back"));
     }
-    o.mkdir(&att, "data", 0o700).map_err(|_| identity("data can't be made"))?;
+    if let Err(e) = o.mkdir(&att, "data", 0o700) {
+        return Err(if is_space_error(&e) { stage_space(o, &att, a.projid) } else { identity("data can't be made") });
+    }
     let (_, dh) = tchild(o, &att, "data", mnt)?.ok_or(identity("data vanished"))?;
     let data = dh.ok_or(identity("data isn't a directory"))?;
     o.chmod(&data, 0o700).map_err(|_| identity("data's mode can't be set"))?;
@@ -1498,6 +1509,20 @@ mod tests {
         let d = restore_stage(&mut f, &mut exited(failed("no_space")), &stage_args("home"));
         assert_eq!(rcode(&d), 77);
         assert_eq!(f.count("marker"), 0);
+    }
+
+    #[test]
+    fn restore_stage_own_mkdirs_out_of_space_are_attributed_not_preflight() {
+        // Found on a real host: a filesystem out of inodes fails the attempt's own mkdir, before the binary runs.
+        for (n, quota, space, want) in [(1usize, q(2 << 20, GIB_BLOCKS, 5, 100), (100u64, 0u64), 77), (4, q(0, 0, 100, 100), (100, 100), 76)] {
+            let mut f = host();
+            f.quota = Some(quota);
+            f.space = space;
+            f.errno_at = Some(("mkdir", n, libc::ENOSPC));
+            let mut r = exited(ok_reply());
+            assert_eq!(rcode(&restore_stage(&mut f, &mut r, &stage_args("home"))), want, "mkdir {n}");
+            assert!(r.seen.is_none(), "nothing ran");
+        }
     }
 
     #[test]

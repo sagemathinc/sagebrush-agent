@@ -30,7 +30,7 @@ const body = (over = {}) => ({
   fleet, aud: AUD, host, gen: 1, cert, chain_seq: 1, at_ms: 1000, not_before_ms: 1000, not_after_ms: 10_000, auth_time_ms: 1000,
   agents: [{ agent, name: "worker-1", client: "claude", root: false, tags: [tag], workspace: [{ path: "/Course", access: "write" }],
     broker: ["messages"], spend_cap_cents: 0, config_schema: 1, config: config() }],
-  tags: [{ tag, name: "course-1" }], subscriptions: [{ sub: newId(), provider: "claude", use: [agent], home: false }],
+  tags: [{ tag, name: "course-1" }], subscriptions: [{ sub: newId(), provider: "codex", use: [agent], home: false }],
   offline: { revocation_check_s: 900, horizon_s: 3600 }, ...over,
 });
 const grant = (over, k = dev, type = "sb.host-grant.v1") => seal(type, signer(k), body(over), k);
@@ -74,7 +74,9 @@ test("refused: cross-field rules and every agent's config_schema 1", () => {
   refused(() => verifyGrant(grant({ agents: [{ ...b.agents[0], tags: [newId()] }] }), ctx()), "bad_form");
   refused(() => verifyGrant(grant({ agents: [b.agents[0], b.agents[0]] }), ctx()), "bad_form");
   refused(() => verifyGrant(grant({ tags: [b.tags[0], b.tags[0]] }), ctx()), "bad_form");
-  refused(() => verifyGrant(grant({ subscriptions: [{ sub: newId(), provider: "claude", use: [newId()], home: false }] }), ctx()), "bad_form");
+  refused(() => verifyGrant(grant({ subscriptions: [{ sub: newId(), provider: "codex", use: [newId()], home: false }] }), ctx()), "bad_form");
+  // (no Claude subscription in a grant: Claude logins are host-local)
+  refused(() => verifyGrant(grant({ subscriptions: [{ ...b.subscriptions[0], provider: "claude" }] }), ctx()), "bad_form");
   refused(() => verifyGrant(grant({ agents: [{ ...b.agents[0], config: { ...config(), extra: 1 } }] }), ctx()), "bad_form");
   refused(() => verifyGrant(grant({ agents: [{ ...b.agents[0], config: { ...config(), files: { rw: ["/etc/x"], ro: [] } } }] }), ctx()), "bad_form");
   refused(() => verifyGrant(grant({ agents: [{ ...b.agents[0], config: {} }] }), ctx()), "bad_form");

@@ -44,7 +44,8 @@ export async function build() {
   const E = await deriveKeyPair(host_enc_ikm);
   const fp = await hostFingerprint(host, H.raw, E.raw);
   const host_cert = txt(seal("sb.host-cert.v1", sN, { fleet, aud: AUD, chain_seq: 1, host, sign_key: b64(H.raw), enc_key: b64(E.raw), fingerprint: b64(fp), name: "lab-box", at_ms: 1 }, N));
-  const grant = { host, subscriptions: [{ sub, provider: "claude", use: [agent], home: false }, { sub: sub2, provider: "codex", use: [agent], home: false }] };
+  // (no Claude subscription: a grant never lists one; sub is a subscription the grant doesn't list)
+  const grant = { host, subscriptions: [{ sub: sub2, provider: "codex", use: [agent], home: false }] };
   const ctx = { current_gen: 3, now_ms: NOW, revoked: [], opened: [], host_revoked: false };
 
   let eph = 10;
@@ -66,7 +67,7 @@ export async function build() {
   const packages = [
     { name: "a package for this host, signed by the native device", bytes: p1, ctx, expect: "ok", plaintext: plaintext() },
     { name: "signed by the browser device", bytes: await sealed(await header(2), plaintext(), [sB, B]), ctx, expect: "ok", plaintext: plaintext() },
-    // (a Claude login is never sealed: an honestly signed claude-setup-token package, for the grant's claude subscription, is refused)
+    // (a Claude login is never sealed: an honestly signed claude-setup-token package is refused)
     { name: "a claude-setup-token package (no Claude purpose)", bytes: await forged(await header(3, { sub, provider: "claude", purpose: "claude-setup-token" }), enc(canonText(plaintext({ provider: "claude", purpose: "claude-setup-token" })))), ctx, expect: "bad_form" },
     { name: "a newer generation than the package's", bytes: p1, ctx: { ...ctx, current_gen: 4 }, expect: "package_stale" },
     { name: "an older generation than the package's", bytes: p1, ctx: { ...ctx, current_gen: 2 }, expect: "package_stale" },

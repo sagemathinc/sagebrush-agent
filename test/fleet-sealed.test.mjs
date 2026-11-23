@@ -34,7 +34,8 @@ async function setup() {
   const certBytes = seal("sb.host-cert.v1", N.signer, { fleet, aud: AUD, chain_seq: chain.seq, host, sign_key: b64(hk.raw), enc_key: b64(encKey.raw), fingerprint: b64(fp), name: "lab-box", at_ms: 1 }, N.k);
   const cert = await verifyHostCert(certBytes, { ...ctx, chain });
   const sub = newId(), sub2 = newId();
-  const grant = { host, subscriptions: [{ sub, provider: "claude", use: [], home: false }, { sub: sub2, provider: "codex", use: [], home: false }] };
+  // (sub: a subscription no grant lists, as a Claude subscription never is; sub2: the grant's codex subscription)
+  const grant = { host, subscriptions: [{ sub: sub2, provider: "codex", use: [], home: false }] };
   const s = {
     fleet, ctx, N, B, chain, host, hk, encKey, cert, sub, sub2, grant,
     async header(extra = {}) {
@@ -119,9 +120,9 @@ test("its own host, key and fingerprint; the subscription, provider and purpose 
   const codex = (purpose) => [{ purpose }, s.plaintext({ purpose })];
   assert.equal(await ok(...codex("codex-access-token")), "ok");
   assert.equal(await ok(...codex("codex-refresh-home")), "not_granted", "codex-refresh-home needs home: true");
-  const homed = { ...s.grant, subscriptions: [s.grant.subscriptions[0], { ...s.grant.subscriptions[1], home: true }] };
+  const homed = { ...s.grant, subscriptions: [{ ...s.grant.subscriptions[0], home: true }] };
   assert.equal(await ok(...codex("codex-refresh-home"), { grant: homed }), "ok");
-  assert.equal(await ok({ sub: s.sub }), "not_granted", "a codex package for the grant's claude subscription");
+  assert.equal(await ok({ sub: s.sub }), "not_granted", "a package for a subscription the grant doesn't list");
   // (signed anyway past the app's own refusal, then given to the host)
   const signedAnyway = async (extra) => {
     const h = await s.header(extra);
@@ -131,8 +132,8 @@ test("its own host, key and fingerprint; the subscription, provider and purpose 
   // a purpose of another provider is refused at sealing; signed anyway, the host refuses it too
   assert.equal(await code(async () => sealPackage(await s.header({ purpose: "claude-setup-token" }), s.plaintext({ purpose: "claude-setup-token" }), s.encKey.raw, s.N.signer, s.N.k)), "bad_form");
   assert.equal(await code(async () => verifyPackage(await signedAnyway({ purpose: "claude-setup-token" }), s.vctx())), "bad_form");
-  // no Claude purpose at all: a Claude login is never sealed to a host. A claude-setup-token package for the grant's
-  // claude subscription is refused at sealing, and, signed anyway, by the host
+  // no Claude purpose at all: a Claude login is never sealed to a host. A claude-setup-token package is refused at
+  // sealing, and, signed anyway, by the host
   const claude = { sub: s.sub, provider: "claude", purpose: "claude-setup-token" };
   assert.equal(await code(async () => sealPackage(await s.header(claude), s.plaintext({ provider: "claude", purpose: "claude-setup-token" }), s.encKey.raw, s.N.signer, s.N.k)), "bad_form", "sealing a Claude login");
   assert.equal(await code(async () => verifyPackage(await signedAnyway(claude), s.vctx())), "bad_form", "a Claude login, signed anyway");

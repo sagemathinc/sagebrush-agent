@@ -262,6 +262,11 @@
       "name": "handle_budget",
       "owner": "browser",
       "meaning": "the session has allocated its whole handle budget (live and revoked); it's retired"
+    },
+    {
+      "name": "bad_params",
+      "owner": "browser",
+      "meaning": "an agent's CDP command parameters are missing, extra, of the wrong type or out of their bounds"
     }
   ]
 }

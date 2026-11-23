@@ -239,3 +239,36 @@ fn a_panic_prints_only_the_fixed_72_line_and_every_secret_is_zeroed() {
     assert_eq!(drops.lines().collect::<Vec<_>>(), want, "{drops}");
     let _ = fs::remove_dir_all(&d);
 }
+
+/// Launcher contract amendment A1: the four deprovision subcommands' argument contract, and a missing anchor.
+#[test]
+fn a1_subcommands_refuse_bad_arguments_and_a_missing_anchor() {
+    let run = |args: &[&str]| Command::new(BIN).env_clear().args(args).output().unwrap();
+    let json = format!("{A}.json");
+    for bad in [
+        vec!["identify", "--anchor", "/etc", "--name", A],
+        vec!["identify", "--anchor", "/var/lib/sagebrush/contract", "--name", A], // the contract anchor wants <id>.json
+        vec!["identify", "--anchor", "/srv/sagebrush/agents", "--name", A],       // a live tree is never an anchor
+        vec!["identify", "--anchor", "/run/sagebrush/binds"],
+        vec!["inspect-home", "--mount", "/etc", "--agent", A, "--tree", "home"],
+        vec!["inspect-home", "--mount", "/", "--agent", A, "--tree", "other"],
+        vec!["inspect-home", "--mount", "/", "--agent", A, "--tree", "home", "--archive", "--archive"],
+        vec!["inspect-home", "--mount", "/", "--agent", "nope", "--tree", "home"],
+        vec!["archive-home", "--mount", "/", "--agent", A, "--tree", "home"],
+        vec!["check-parents", "--mount", "/etc"],
+        vec!["check-parents", "--mount", "/", "--allow-missing", "--allow-missing"],
+        vec!["check-parents"],
+        vec!["remove-tree", "--anchor", "/srv/sagebrush/archive", "--name", A, "--expect", "relative.json"],
+        vec!["remove-tree", "--anchor", "/srv/sagebrush/archive", "--name", A, "--expect", "/x", "--", "y"],
+    ] {
+        let o = run(&bad);
+        assert_eq!(code(&o), 64, "{bad:?}: {}", stderr(&o));
+        assert!(o.stdout.is_empty());
+    }
+    // Well-formed arguments as a non-root user: the root guard refuses (66) before anything is opened; as root (the
+    // qualification VM), a missing anchor refuses the same way.
+    let o = run(&["identify", "--anchor", "/var/lib/sagebrush/contract", "--name", &json]);
+    assert_eq!(code(&o), 66, "{}", stderr(&o));
+    assert_eq!(stderr(&o).lines().count(), 1);
+    assert!(o.stdout.is_empty());
+}

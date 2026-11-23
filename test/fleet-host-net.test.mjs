@@ -54,11 +54,16 @@ test("every mode drops IPv6 and spoofed sources, and judges every packet from it
   for (const mode of ["allowlist", "full"]) {
     const p = planNetwork(agent({ mode, allow: [], lan_allow: [] }), { uid: 70002 });
     for (const line of [
-      'add rule inet sagebrush input iifname "sbv2" jump in_2', 'add rule inet sagebrush agent_ingress iifname "sbv2" jump fwd_2',
+      'add rule inet sagebrush input iifname "sbv2" jump in_2 comment "sb-agent-2"', 'add rule inet sagebrush agent_ingress iifname "sbv2" jump fwd_2 comment "sb-agent-2"',
       "add rule inet sagebrush in_2 meta nfproto ipv6 drop", "add rule inet sagebrush fwd_2 meta nfproto ipv6 drop",
       "add rule inet sagebrush in_2 ip saddr != 10.250.0.10 drop", "add rule inet sagebrush fwd_2 ip saddr != 10.250.0.10 drop",
-      'add rule inet sagebrush agent_return oifname "sbv2" drop', "add rule inet sagebrush in_2 drop",
+      'add rule inet sagebrush agent_return oifname "sbv2" drop comment "sb-agent-2"', "add rule inet sagebrush in_2 drop",
     ]) assert.ok(p.nft.split("\n").includes(line), `${mode}: ${line}`);
+    // Exactly the rules in the shared chains carry the agent's comment (a later apply finds and replaces them by it).
+    for (const line of p.nft.split("\n").filter(Boolean)) {
+      const shared = /^add rule inet sagebrush (input|agent_ingress|agent_return|postrouting) /.test(line);
+      assert.equal(line.endsWith(' comment "sb-agent-2"'), shared, `${mode}: ${line}`);
+    }
   }
 });
 

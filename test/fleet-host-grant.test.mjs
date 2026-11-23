@@ -95,6 +95,16 @@ test("a grant naming a Claude subscription is refused whole: the pool is host-lo
   assert.deepEqual(verifyGrant(grant({ subscriptions: [] }), ctx()).body.subscriptions, []);
 });
 
+test("a grant giving any agent the claude-subscription right is refused whole; the other rights verify", () => {
+  const b = body();
+  for (const broker of [["claude-subscription"], ["messages", "claude-subscription"]]) {
+    refused(() => verifyGrant(grant({ agents: [{ ...b.agents[0], broker }] }), ctx()), "bad_form");
+  }
+  for (const broker of [[], ["messages"], ["codex-access-token", "messages", "memory", "workspace"]]) {
+    assert.deepEqual(verifyGrant(grant({ agents: [{ ...b.agents[0], broker }] }), ctx()).body.agents[0].broker, broker);
+  }
+});
+
 const fresh = () => join(mkdtempSync(join(tmpdir(), "sb-grant-")), "state");
 const okIntent = () => { const log = []; const f = async (r) => { log.push(r); }; f.log = log; return f; };
 const stateFile = (root) => join(root, "grant", "state.json");

@@ -10,7 +10,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 Slice=sagebrush-agents.slice
-ExecStart=/opt/sagebrush/1.2.3/bin/sagebrush-agent-launch --agent abcdefghijklmnopqrstuvwxya
+ExecStart=/opt/sagebrush/1.2.3/bin/sagebrush-agent-launch exec --agent abcdefghijklmnopqrstuvwxya --contract /run/sagebrush/contract.json --cli /opt/sagebrush/cli/claude-2.1.0
 Restart=on-failure
 RestartSec=5
 KillMode=control-group
@@ -30,6 +30,7 @@ ProtectSystem=strict
 ProtectHome=yes
 TemporaryFileSystem=/srv/sagebrush:ro
 TemporaryFileSystem=/run:ro
+TemporaryFileSystem=/var/lib:ro
 TemporaryFileSystem=/tmp:size=1536M,nr_inodes=1048576,mode=1777
 TemporaryFileSystem=/dev/shm:size=1536M,nr_inodes=1048576,mode=1777
 BindReadOnlyPaths=/var/lib/sagebrush/managed/abcdefghijklmnopqrstuvwxya/managed-settings.json:/etc/claude-code/managed-settings.json
@@ -41,6 +42,7 @@ BindPaths=/run/sagebrush/binds/abcdefghijklmnopqrstuvwxya/0:/data/project
 BindReadOnlyPaths=/run/sagebrush/binds/abcdefghijklmnopqrstuvwxya/1:/data/reference
 BindReadOnlyPaths=/run/sagebrush/broker/abcdefghijklmnopqrstuvwxya:/run/sagebrush/self
 BindReadOnlyPaths=/var/lib/sagebrush/resolv/abcdefghijklmnopqrstuvwxya.conf:/etc/resolv.conf
+BindReadOnlyPaths=/var/lib/sagebrush/contract/abcdefghijklmnopqrstuvwxya.json:/run/sagebrush/contract.json
 PrivateIPC=yes
 ProtectProc=invisible
 ProcSubset=all

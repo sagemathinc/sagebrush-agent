@@ -45,7 +45,14 @@ async function setup({ limits, connectHang = false } = {}) {
     "down.test": [{ address: "93.184.215.15", family: 4 }],
     "raw.test": [{ address: "93.184.215.16", family: 4 }],
   };
-  const lookup = async (host) => { lookups.push(host); if (!(host in table)) throw new Error("ENOTFOUND"); return table[host]; };
+  const lookup = async (host) => {
+    lookups.push(host);
+    if (host === "hang.test") return new Promise(() => {}); // (a lookup that never settles)
+    if (host === "late.test") return new Promise((r) => setTimeout(() => r([{ address: PUBLIC, family: 4 }]), 600)); // (settles after the deadline)
+    if (host === "slow.test") return new Promise((r) => setTimeout(() => r([{ address: PUBLIC, family: 4 }]), 400)); // (settles after closeAll)
+    if (!(host in table)) throw new Error("ENOTFOUND");
+    return table[host];
+  };
   const connect = ({ host, port }) => {
     connects.push(`${host}:${port}`);
     if (connectHang) return tcpConnect({ host: "10.255.255.1", port: 9 }); // (never answers: a connect timeout)
@@ -152,9 +159,10 @@ test("proxy: a name that doesn't resolve, or an upstream that refuses, gets 502;
     assert.deepEqual(t.connects, []);
     assert.match(await client(t.port, req("CONNECT down.test:443 HTTP/1.1", AUTH)), /^HTTP\/1\.1 502 /);
   } finally { await t.close(); }
-  t = await setup({ connectHang: true, limits: { connectMs: 300 } });
+  t = await setup({ connectHang: true, limits: { upstreamMs: 300 } });
   try {
     assert.match(await client(t.port, req("CONNECT example.test:443 HTTP/1.1", AUTH)), /^HTTP\/1\.1 504 /);
+    assert.deepEqual(t.proxy.stats().upstreamTimeouts, { resolve: 0, connect: 1 });
   } finally { await t.close(); }
 });
 
@@ -207,5 +215,44 @@ test("proxy: closeAll ends every open tunnel at once", { timeout: 20000 }, async
     assert.match(out, /^HTTP\/1\.1 200/);
     assert.ok(closed);
     assert.equal(t.proxy.stats().open, 0);
+  } finally { await t.close(); }
+});
+
+test("proxy: one deadline spans resolve and connect: a lookup that never settles, or settles late, connects to nothing", { timeout: 20000 }, async () => {
+  const t = await setup({ limits: { upstreamMs: 300, connections: 1 } });
+  try {
+    assert.match(await client(t.port, req("CONNECT hang.test:443 HTTP/1.1", AUTH)), /^HTTP\/1\.1 504 /);
+    assert.ok(t.logs.some((e) => e.event === "timeout" && e.stage === "resolve"));
+    // (the slot is free again: with a cap of one, the next request goes through)
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(t.proxy.stats().open, 0);
+    const next = await client(t.port, req("CONNECT example.test:443 HTTP/1.1", AUTH), { until: /\r\n\r\n/, then: (s) => s.end() });
+    assert.match(next, /^HTTP\/1\.1 200/);
+    assert.deepEqual(t.connects, [`${PUBLIC}:443`], "only the second request connected");
+    // (a lookup that succeeds after the deadline: 504, and no connect even once it settles)
+    assert.match(await client(t.port, req("CONNECT late.test:443 HTTP/1.1", AUTH)), /^HTTP\/1\.1 504 /);
+    await new Promise((r) => setTimeout(r, 700));
+    assert.deepEqual(t.connects, [`${PUBLIC}:443`], "the late answer connected nothing");
+    assert.deepEqual(t.proxy.stats().upstreamTimeouts, { resolve: 2, connect: 0 });
+    assert.equal(t.proxy.stats().open, 0);
+  } finally { await t.close(); }
+});
+
+test("proxy: closeAll during a lookup releases the slot and the socket, and the answer that comes later connects nothing", { timeout: 20000 }, async () => {
+  const t = await setup({ limits: { upstreamMs: 5000, connections: 1 } });
+  try {
+    const out = client(t.port, req("CONNECT slow.test:443 HTTP/1.1", AUTH));
+    await new Promise((r) => setTimeout(r, 100));
+    assert.deepEqual(t.lookups, ["slow.test"]);
+    assert.equal(t.proxy.stats().open, 1);
+    t.proxy.closeAll();
+    assert.equal(await out, "", "the client was closed");
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(t.proxy.stats().open, 0, "the slot is free");
+    await new Promise((r) => setTimeout(r, 500));
+    assert.deepEqual(t.connects, [], "the lookup settled after closeAll and connected nothing");
+    // (and with a cap of one, the freed slot takes the next request)
+    const next = await client(t.port, req("CONNECT example.test:443 HTTP/1.1", AUTH), { until: /\r\n\r\n/, then: (s) => s.end() });
+    assert.match(next, /^HTTP\/1\.1 200/);
   } finally { await t.close(); }
 });

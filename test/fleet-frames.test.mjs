@@ -20,7 +20,7 @@ const SAMPLE = {
   "rust.net_hello": { app_session_pub: "k".repeat(43), proxy_port: 50123, proxy_username: "u1", proxy_password: "p".repeat(128) },
   "rust.net_state": { state: "open" },
   "cdp.start": { chrome_pid: 4242 },
-  "cdp.proxy_auth": { username: "u1", password: "pw" },
+  "cdp.proxy_auth": { username: "u1", password: "pw", proxy_port: 50123 },
   "cdp.takeover": {},
   "cdp.resume": {},
   "cdp.retire": { reason: "budget spent" },
@@ -184,13 +184,14 @@ test("frames: closed schemas: a missing field, an extra field, or a value out of
     ["rust.net_state", { state: "closed" }], ["rust.net_state", { reason: "r".repeat(257) }], ["rust.net_state", { reason: "" }],
     ["cdp.start", { chrome_pid: 0 }], ["cdp.start", { chrome_pid: 2 ** 31 }], ["cdp.start", { chrome_pid: -5 }],
     ["cdp.proxy_auth", { username: "" }], ["cdp.proxy_auth", { password: null }],
+    ["cdp.proxy_auth", { proxy_port: 1023 }], ["cdp.proxy_auth", { proxy_port: 65536 }], ["cdp.proxy_auth", { proxy_port: "50123" }], ["cdp.proxy_auth", { proxy_port: 0 }],
     ["rust.cdp_state", { state: "READY" }], ["cdp.takeover", { reason: 1 }],
     ["cdp.command", { seq: -1 }], ["cdp.command", { seq: "1" }], ["net.result", { seq: true }],
     ["net.refused", { reason: "filter" }], ["net.refused", { reason: "credits" }], ["net.refused", { reason: "bad " }],
   ];
   for (const [kind, x] of out) assert.equal(dec(kind, head(kind, x)), "schema", `${kind} ${JSON.stringify(x).slice(0, 60)}`);
   // (at the caps: accepted)
-  for (const [kind, x] of [["net.start", { session: "s".repeat(64) }], ["net.start", { relay_url: "wss://" + "r".repeat(2042) }], ["rust.net_hello", { proxy_port: 1024 }], ["rust.net_hello", { proxy_port: 65535 }], ["rust.net_state", { reason: "r".repeat(256) }], ["cdp.start", { chrome_pid: 2 ** 31 - 1 }], ["net.refused", { reason: "bad" }]]) {
+  for (const [kind, x] of [["net.start", { session: "s".repeat(64) }], ["net.start", { relay_url: "wss://" + "r".repeat(2042) }], ["rust.net_hello", { proxy_port: 1024 }], ["rust.net_hello", { proxy_port: 65535 }], ["cdp.proxy_auth", { proxy_port: 1024 }], ["cdp.proxy_auth", { proxy_port: 65535 }], ["rust.net_state", { reason: "r".repeat(256) }], ["cdp.start", { chrome_pid: 2 ** 31 - 1 }], ["net.refused", { reason: "bad" }]]) {
     assert.equal(dec(kind, head(kind, x)), "ok", `${kind} ${JSON.stringify(x).slice(0, 60)}`);
   }
 });

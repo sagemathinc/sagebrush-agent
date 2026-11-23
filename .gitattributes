@@ -3,3 +3,6 @@
 lib/*.json text eol=lf
 # The pinned zone data: compared byte for byte against lib/runner-pin.json, never converted.
 lib/tzdata/** -text
+# The fleet protocol's shared vectors and schemas: other implementations compare them byte for byte.
+test/fixtures/fleet-fixtures.json text eol=lf
+schema/fleet/*.json text eol=lf

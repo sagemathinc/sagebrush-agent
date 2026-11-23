@@ -1,0 +1,21 @@
+{
+  "$comment": "Display strings for spend.purpose_code (§4). The codes are the closed enum in fleet.schema.json $defs.purpose_code; the two lists must agree (tested).",
+  "purpose_codes": [
+    {
+      "code": "provider-usage",
+      "display": "Model provider usage"
+    },
+    {
+      "code": "cloud-compute",
+      "display": "Cloud compute"
+    },
+    {
+      "code": "cloud-storage",
+      "display": "Cloud storage"
+    },
+    {
+      "code": "other",
+      "display": "Other (see the payee)"
+    }
+  ]
+}

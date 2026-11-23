@@ -503,3 +503,32 @@ test("cli: a burst of 1500 frames in one chunk, multibyte ones included, waits w
   await q.return();
   assert.ok(Date.now() - t0 < 1500);
 });
+
+// (TESTS T7: a child that writes a burst and its result, then exits while parsing is paused: every frame and the
+//  result are delivered, and the run ends as a success, not "stopped")
+test("cli: a child that exits while its output waits unparsed: all 1500 frames and the result are delivered, then a clean end; a Stop in that state still returns promptly", { skip: process.platform === "win32" ? "a node stand-in" : false, timeout: 60_000 }, async () => {
+  const { writeFileSync, chmodSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "sb-exitp-"));
+  const bin = join(dir, "burst-exit");
+  writeFileSync(bin, `#!${process.execPath}\nconst lines = [];\nfor (let i = 0; i < 1500; i++) lines.push(JSON.stringify({ type: "stream_event", n: i, t: i % 3 ? "plain" : "é€😀".repeat(10) }));\nlines.push(JSON.stringify({ type: "result", subtype: "success", is_error: false }));\nprocess.stdout.write(lines.join("\\n") + "\\n", () => process.exit(0));\n`);
+  chmodSync(bin, 0o700);
+  const q = cliQuery({ prompt: "x", options: { canUseTool: async () => ({ behavior: "deny", message: "no" }) } }, { bin, env: { PATH: process.env.PATH }, limits: { connectMs: 600_000, killGraceMs: 200 } });
+  await new Promise((r) => setTimeout(r, 1500));
+  assert.equal(q.paused, true, "paused, with the child already gone");
+  const got = [];
+  let err = null;
+  try { for await (const m of q) got.push(m); } catch (e) { err = e; }
+  assert.equal(err, null, String(err?.message));
+  assert.equal(got.length, 1501, "every frame and the result");
+  assert.equal(got.at(-1).type, "result");
+  assert.deepEqual(got.slice(0, 1500).map((m) => m.n), Array.from({ length: 1500 }, (_, i) => i));
+  await q.return();
+  // (a Stop while the exited child's output waits)
+  const q2 = cliQuery({ prompt: "x", options: { canUseTool: async () => ({ behavior: "deny", message: "no" }) } }, { bin, env: { PATH: process.env.PATH }, limits: { connectMs: 600_000, killGraceMs: 200 } });
+  await new Promise((r) => setTimeout(r, 1500));
+  const t0 = Date.now();
+  q2.abort.abort();
+  await q2.return();
+  assert.ok(Date.now() - t0 < 1500);
+  assert.equal(q2.done, true);
+});

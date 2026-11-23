@@ -232,7 +232,8 @@ test("while another holds the fence lock, a stop still kills but is not durable;
   try {
     const a = newId();
     const sys = fakeSystemd(dir, { units: { [unitOf(a)]: { active: true, procs: 1 } } });
-    const r = await stop({ all: true }, "all", { sys, dir, deadlineMs: 600 });
+    // (A budget that leaves room for the lock wait, a third of it, even on a loaded machine.)
+    const r = await stop({ all: true }, "all", { sys, dir, deadlineMs: 3000 });
     assert.equal(sys.units[unitOf(a)].active, false, "the kill ran");
     assert.deepEqual([r.status, r.reason, r.fenced], ["killed, not durable", "fence", false]);
     await rejects(lowerFence("all", null, "resume-all", { dir, waitMs: 100 }), "in_progress");

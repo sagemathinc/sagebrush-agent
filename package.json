@@ -16,6 +16,8 @@
     "lib/brief.mjs",
     "lib/task-notebook-edit.mjs",
     "lib/canon.mjs",
+    "lib/tags.mjs",
+    "schema/tags.schema.json",
     "lib/stdio.mjs",
     "lib/pair-stdin.mjs",
     "lib/stdout-thread.mjs",

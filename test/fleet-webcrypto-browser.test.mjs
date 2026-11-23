@@ -19,6 +19,7 @@ import { test } from "node:test";
 
 const ROOT = new URL("..", import.meta.url);
 const DEADLINE_MS = 60_000;
+const SLOW_MS = 3000; // (a page asked for later than this, though the test passes, prints how Chromium started)
 const RECOVERY_KNOWN = ["QIgcRL3kWMdpVNtbHP7lkw", "8f8Zi-ibteyHFwp-PnAVfGC6-_75Je6BNI9mNkG6PM0"];
 
 function findChrome() {
@@ -94,15 +95,17 @@ test("headless Chromium: the core with the WebCrypto backend passes every shared
   // loads nothing but the files above, from this loopback server)
   const args = ["--headless=new", "--no-sandbox", "--disable-gpu", "--no-first-run", "--no-default-browser-check", `--user-data-dir=${profile}`,
     `http://127.0.0.1:${server.address().port}/harness.html`];
-  // (D-Bus at addresses that fail at once: Chromium calls the system and session buses before it loads the page, and
-  // waits on a bus that doesn't answer. CI runners' buses sometimes don't, and Chromium then never asked for the page
-  // in 60 s. The page needs nothing from either bus.)
+  // (D-Bus at addresses that fail at once: Chromium waits on a bus that accepts and doesn't answer (seen with a silent
+  // socket). Not shown to be the runners' cause: there it still asks for the page 7.5-38 s after the spawn, and some
+  // runs not in 60 s, against 0.35 s here; the stamped stderr below is to say where those seconds go. The page needs
+  // nothing from either bus.)
   const env = { ...process.env, DBUS_SYSTEM_BUS_ADDRESS: "unix:path=/nonexistent/dbus", DBUS_SESSION_BUS_ADDRESS: "unix:path=/nonexistent/dbus" };
   // (its own process group, so that the whole of Chromium, helpers included, is killed together)
   started = performance.now();
   const child = spawn(chrome, args, { stdio: ["ignore", "ignore", "pipe"], detached: true, env });
-  let stderr = "";
-  child.stderr.on("data", (d) => { stderr = (stderr + d).slice(-4096); });
+  // (its stderr's start and end, each chunk stamped with the ms since the spawn: a failure says what it did, and when)
+  let head = "", stderr = "";
+  child.stderr.on("data", (d) => { const t = `[+${Math.round(performance.now() - started)} ms] ${d}`; if (head.length < 4096) head += t; stderr = (stderr + t).slice(-4096); });
   const kill = () => { try { process.kill(-child.pid, "SIGKILL"); } catch {} try { child.kill("SIGKILL"); } catch {} };
   process.once("exit", kill);
   const closed = new Promise((ok) => child.once("close", (code, signal) => ok({ exited: `${code ?? signal}` })));
@@ -113,7 +116,7 @@ test("headless Chromium: the core with the WebCrypto backend passes every shared
     const got = await Promise.race([result.then((body) => ({ body })), exited, deadline]);
     if (got.body === undefined) {
       const stage = seen.some((r) => r.endsWith("/harness.html")) ? "the page loaded but never reported" : "Chromium never asked for the page";
-      assert.fail(`${stage} (${got.deadline ? `deadline ${DEADLINE_MS} ms` : `Chromium exited: ${got.exited}`}); requests: ${seen.join(", ") || "none"}; stderr: ${stderr.slice(-800)}`);
+      assert.fail(`${stage} (${got.deadline ? `deadline ${DEADLINE_MS} ms` : `Chromium exited: ${got.exited}`}); requests: ${seen.join(", ") || "none"}; ${chrome}; stderr's start: ${head.slice(0, 1500)}; its end: ${stderr.slice(-1500)}`);
     }
     const r = JSON.parse(got.body);
     assert.equal(r.error, undefined, r.error);
@@ -127,7 +130,9 @@ test("headless Chromium: the core with the WebCrypto backend passes every shared
     assert.equal(r.hpke.vector.n, 257);
     assert.deepEqual(r.hpke.fleet.bad, []);
     assert.ok(r.hpke.fleet.n > 25, `${r.hpke.fleet.n} HPKE cases`);
-    console.log(`# ${r.n} cases, HPKE ${r.hpke.vector.n} + ${r.hpke.fleet.n}, in ${r.ua}; Chromium asked for the page after ${pageMs} ms`);
+    console.log(`# ${r.n} cases, HPKE ${r.hpke.vector.n} + ${r.hpke.fleet.n}, in ${r.ua}; ${chrome} asked for the page after ${pageMs} ms`);
+    // (a slow start, though it passed: the stamped start of Chromium's stderr, to say where the seconds went)
+    if (pageMs > SLOW_MS) console.log(`# slow: over ${SLOW_MS} ms; Chromium's stderr from its start:\n` + head.slice(0, 2000).split("\n").map((l) => `#   ${l}`).join("\n"));
   } finally {
     clearTimeout(timer);
     kill();

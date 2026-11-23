@@ -1,0 +1,813 @@
+{
+ "$comment": "O11 browser freeze, the CDP filter's closed schemas (draft 3, Nov 22 2026, @sagebrush-space). Machine-readable companion to agent-autonomous-browser-o11.md §4. Types follow the pinned Chrome for Testing build's own protocol JSON (browser_protocol.json / js_protocol.json of that build); this file is the SUBSET and the BOUNDS: a parameter not listed is refused, every listed parameter has a closed type, and every string/array/number has both bounds. 'vid' = a virtual handle (see handles). Results are the pinned protocol's result types, with every handle rewritten to a vid, privileged ids removed, and the size cap applied; a result over its cap is refused (error) and nothing else is sent.",
+ "version": "o11-cdp-3.3",
+ "defs": {
+  "url": {
+   "type": "string",
+   "minBytes": 1,
+   "maxBytes": 8192,
+   "scheme": [
+    "http",
+    "https"
+   ],
+   "orExactly": "about:blank",
+   "note": "absolute; parsed with the WHATWG URL parser; host IDNA-normalized and trailing dot removed before any policy check"
+  },
+  "vid": {
+   "type": "string",
+   "pattern": "^[a-z]{1,3}_[0-9a-z]{16}$",
+   "note": "virtual handle; kinds below"
+  },
+  "text4k": {
+   "type": "string",
+   "minBytes": 0,
+   "maxBytes": 4096
+  },
+  "code64k": {
+   "type": "string",
+   "minBytes": 1,
+   "maxBytes": 65536
+  },
+  "selector": {
+   "type": "string",
+   "minBytes": 1,
+   "maxBytes": 4096
+  },
+  "objectGroup": {
+   "type": "string",
+   "pattern": "^[A-Za-z0-9_-]{1,64}$",
+   "note": "the agent's group names; the app prefixes them so they never collide with its own"
+  },
+  "modifiers": {
+   "type": "integer",
+   "min": 0,
+   "max": 15
+  },
+  "coord": {
+   "type": "number",
+   "min": -100000,
+   "max": 100000
+  },
+  "depth": {
+   "type": "integer",
+   "min": -1,
+   "max": 64,
+   "note": "-1 = whole subtree, still subject to the result cap"
+  }
+ },
+ "handles": {
+  "pg": {
+   "of": "page target (and its sessionId)",
+   "valid": "until the page closes, the session ends, or takeover starts (all handles are revoked at takeover; pages get new pg ids at handback)"
+  },
+  "fr": {
+   "of": "frameId",
+   "valid": "until that frame detaches or the page closes; takeover revokes"
+  },
+  "cx": {
+   "of": "executionContextId",
+   "valid": "until Runtime.executionContextDestroyed for it (navigation destroys it); takeover revokes"
+  },
+  "nd": {
+   "of": "DOM nodeId",
+   "valid": "until the next DOM.documentUpdated or getDocument on that page (CDP's own rule); takeover revokes"
+  },
+  "bn": {
+   "of": "backendNodeId",
+   "valid": "until the node is garbage-collected or the page navigates; takeover revokes"
+  },
+  "ob": {
+   "of": "Runtime remote objectId",
+   "valid": "until released, its context is destroyed, or takeover (the app releases every agent object group at takeover)"
+  },
+  "rq": {
+   "of": "Network requestId",
+   "valid": "until the page navigates away or 120 s after loadingFinished/loadingFailed, whichever is first"
+  },
+  "he": {
+   "of": "navigation history entry id (Page.NavigationEntry.id, untyped integer)",
+   "valid": "while the entry is in the page's history; takeover revokes"
+  },
+  "stale": "A revoked or expired vid gets error -32000 'stale handle' and is never mapped to a reused real id; vids are random per session and never reused.",
+  "ld": {
+   "of": "loaderId",
+   "valid": "until that frame's next navigation commits (a new loaderId) or the frame detaches or the page closes; takeover revokes. Only ever an output (in results and events); no command takes one."
+  },
+  "ax": {
+   "of": "Accessibility AXNodeId",
+   "valid": "until the next getFullAXTree/getPartialAXTree call on that page replaces the tree, or the page navigates or closes; takeover revokes. Output only, like ld."
+  }
+ },
+ "commands": {
+  "Page.enable": {
+   "params": {},
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Page.navigate": {
+   "params": {
+    "url": "url",
+    "frameId": "vid:fr?"
+   },
+   "result": {
+    "maxBytes": 1024
+   }
+  },
+  "Page.reload": {
+   "params": {
+    "ignoreCache": "boolean?"
+   },
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Page.stopLoading": {
+   "params": {},
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Page.getFrameTree": {
+   "params": {},
+   "result": {
+    "maxBytes": 1048576
+   }
+  },
+  "Page.getLayoutMetrics": {
+   "params": {},
+   "result": {
+    "maxBytes": 4096
+   }
+  },
+  "Page.getNavigationHistory": {
+   "params": {},
+   "result": {
+    "maxBytes": 262144,
+    "filter": "entries whose url is not http(s)/about:blank are shown as url 'about:blank#hidden'"
+   }
+  },
+  "Page.navigateToHistoryEntry": {
+   "params": {
+    "entryId": "vid:he"
+   },
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Page.handleJavaScriptDialog": {
+   "params": {
+    "accept": "boolean",
+    "promptText": "text4k?"
+   },
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Page.setLifecycleEventsEnabled": {
+   "params": {
+    "enabled": "boolean"
+   },
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Page.captureScreenshot": {
+   "params": {
+    "format": {
+     "enum": [
+      "png",
+      "jpeg",
+      "webp"
+     ],
+     "optional": true
+    },
+    "quality": {
+     "type": "integer",
+     "min": 0,
+     "max": 100,
+     "optional": true
+    },
+    "clip": {
+     "optional": true,
+     "object": {
+      "x": "coord",
+      "y": "coord",
+      "width": {
+       "type": "number",
+       "min": 1,
+       "max": 8192
+      },
+      "height": {
+       "type": "number",
+       "min": 1,
+       "max": 16384
+      },
+      "scale": {
+       "type": "number",
+       "min": 0.1,
+       "max": 3
+      }
+     }
+    },
+    "fromSurface": "boolean?"
+   },
+   "result": {
+    "maxBytes": 8388608
+   }
+  },
+  "Runtime.enable": {
+   "params": {},
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Runtime.evaluate": {
+   "params": {
+    "expression": "code64k",
+    "objectGroup": "objectGroup?",
+    "returnByValue": "boolean?",
+    "awaitPromise": "boolean?",
+    "userGesture": "boolean?",
+    "contextId": "vid:cx?",
+    "timeout": {
+     "type": "integer",
+     "min": 1,
+     "max": 30000,
+     "optional": true,
+     "note": "the app always sends a timeout: the agent's, or 30000"
+    }
+   },
+   "result": {
+    "maxBytes": 1048576
+   },
+   "deadline": "§4.4"
+  },
+  "Runtime.callFunctionOn": {
+   "params": {
+    "functionDeclaration": "code64k",
+    "objectId": "vid:ob?",
+    "executionContextId": "vid:cx?",
+    "arguments": {
+     "optional": true,
+     "array": {
+      "maxItems": 32,
+      "items": {
+       "oneOf": [
+        {
+         "value": "json, encoded ≤ 65536 bytes, depth ≤ 32"
+        },
+        {
+         "objectId": "vid:ob"
+        },
+        {
+         "unserializableValue": {
+          "enum": [
+           "Infinity",
+           "-Infinity",
+           "NaN",
+           "-0"
+          ]
+         }
+        }
+       ]
+      }
+     }
+    },
+    "objectGroup": "objectGroup?",
+    "returnByValue": "boolean?",
+    "awaitPromise": "boolean?",
+    "userGesture": "boolean?"
+   },
+   "exactlyOneOf": [
+    "objectId",
+    "executionContextId"
+   ],
+   "result": {
+    "maxBytes": 1048576
+   },
+   "deadline": "§4.4"
+  },
+  "Runtime.getProperties": {
+   "params": {
+    "objectId": "vid:ob",
+    "ownProperties": "boolean?"
+   },
+   "result": {
+    "maxBytes": 1048576
+   }
+  },
+  "Runtime.releaseObject": {
+   "params": {
+    "objectId": "vid:ob"
+   },
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Runtime.releaseObjectGroup": {
+   "params": {
+    "objectGroup": "objectGroup"
+   },
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "DOM.enable": {
+   "params": {},
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "DOM.getDocument": {
+   "params": {
+    "depth": "depth?",
+    "pierce": "boolean?"
+   },
+   "result": {
+    "maxBytes": 4194304
+   }
+  },
+  "DOM.querySelector": {
+   "params": {
+    "nodeId": "vid:nd",
+    "selector": "selector"
+   },
+   "result": {
+    "maxBytes": 128
+   }
+  },
+  "DOM.querySelectorAll": {
+   "params": {
+    "nodeId": "vid:nd",
+    "selector": "selector"
+   },
+   "result": {
+    "maxBytes": 262144,
+    "maxItems": 5000
+   }
+  },
+  "DOM.describeNode": {
+   "params": {
+    "nodeId": "vid:nd?",
+    "backendNodeId": "vid:bn?",
+    "objectId": "vid:ob?",
+    "depth": "depth?",
+    "pierce": "boolean?"
+   },
+   "exactlyOneOf": [
+    "nodeId",
+    "backendNodeId",
+    "objectId"
+   ],
+   "result": {
+    "maxBytes": 1048576
+   }
+  },
+  "DOM.resolveNode": {
+   "params": {
+    "nodeId": "vid:nd?",
+    "backendNodeId": "vid:bn?",
+    "objectGroup": "objectGroup?",
+    "executionContextId": "vid:cx?"
+   },
+   "exactlyOneOf": [
+    "nodeId",
+    "backendNodeId"
+   ],
+   "result": {
+    "maxBytes": 4096
+   }
+  },
+  "DOM.getBoxModel": {
+   "params": {
+    "nodeId": "vid:nd?",
+    "backendNodeId": "vid:bn?",
+    "objectId": "vid:ob?"
+   },
+   "exactlyOneOf": [
+    "nodeId",
+    "backendNodeId",
+    "objectId"
+   ],
+   "result": {
+    "maxBytes": 4096
+   }
+  },
+  "DOM.getContentQuads": {
+   "params": {
+    "nodeId": "vid:nd?",
+    "backendNodeId": "vid:bn?",
+    "objectId": "vid:ob?"
+   },
+   "exactlyOneOf": [
+    "nodeId",
+    "backendNodeId",
+    "objectId"
+   ],
+   "result": {
+    "maxBytes": 65536
+   }
+  },
+  "DOM.getOuterHTML": {
+   "params": {
+    "nodeId": "vid:nd?",
+    "backendNodeId": "vid:bn?"
+   },
+   "exactlyOneOf": [
+    "nodeId",
+    "backendNodeId"
+   ],
+   "result": {
+    "maxBytes": 4194304
+   }
+  },
+  "DOM.getAttributes": {
+   "params": {
+    "nodeId": "vid:nd"
+   },
+   "result": {
+    "maxBytes": 262144
+   }
+  },
+  "DOM.scrollIntoViewIfNeeded": {
+   "params": {
+    "nodeId": "vid:nd?",
+    "backendNodeId": "vid:bn?"
+   },
+   "exactlyOneOf": [
+    "nodeId",
+    "backendNodeId"
+   ],
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "DOM.focus": {
+   "params": {
+    "nodeId": "vid:nd?",
+    "backendNodeId": "vid:bn?"
+   },
+   "exactlyOneOf": [
+    "nodeId",
+    "backendNodeId"
+   ],
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Accessibility.getFullAXTree": {
+   "params": {
+    "depth": {
+     "type": "integer",
+     "min": 1,
+     "max": 64,
+     "optional": true
+    },
+    "frameId": "vid:fr?"
+   },
+   "result": {
+    "maxBytes": 8388608
+   }
+  },
+  "Accessibility.getPartialAXTree": {
+   "params": {
+    "nodeId": "vid:nd?",
+    "backendNodeId": "vid:bn?",
+    "fetchRelatives": "boolean?"
+   },
+   "exactlyOneOf": [
+    "nodeId",
+    "backendNodeId"
+   ],
+   "result": {
+    "maxBytes": 1048576
+   }
+  },
+  "Input.dispatchMouseEvent": {
+   "params": {
+    "type": {
+     "enum": [
+      "mousePressed",
+      "mouseReleased",
+      "mouseMoved",
+      "mouseWheel"
+     ]
+    },
+    "x": "coord",
+    "y": "coord",
+    "button": {
+     "enum": [
+      "none",
+      "left",
+      "middle",
+      "right"
+     ],
+     "optional": true
+    },
+    "clickCount": {
+     "type": "integer",
+     "min": 0,
+     "max": 3,
+     "optional": true
+    },
+    "deltaX": "coord?",
+    "deltaY": "coord?",
+    "modifiers": "modifiers?"
+   },
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Input.dispatchKeyEvent": {
+   "params": {
+    "type": {
+     "enum": [
+      "keyDown",
+      "keyUp",
+      "rawKeyDown",
+      "char"
+     ]
+    },
+    "key": {
+     "type": "string",
+     "maxBytes": 32,
+     "optional": true
+    },
+    "code": {
+     "type": "string",
+     "maxBytes": 32,
+     "optional": true
+    },
+    "text": {
+     "type": "string",
+     "maxBytes": 16,
+     "optional": true
+    },
+    "unmodifiedText": {
+     "type": "string",
+     "maxBytes": 16,
+     "optional": true
+    },
+    "windowsVirtualKeyCode": {
+     "type": "integer",
+     "min": 0,
+     "max": 255,
+     "optional": true
+    },
+    "modifiers": "modifiers?"
+   },
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Input.insertText": {
+   "params": {
+    "text": "text4k"
+   },
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Network.enable": {
+   "params": {
+    "maxTotalBufferSize": {
+     "type": "integer",
+     "min": 0,
+     "max": 67108864,
+     "optional": true
+    },
+    "maxResourceBufferSize": {
+     "type": "integer",
+     "min": 0,
+     "max": 8388608,
+     "optional": true
+    }
+   },
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Network.getResponseBody": {
+   "params": {
+    "requestId": "vid:rq"
+   },
+   "result": {
+    "maxBytes": 8388608
+   }
+  },
+  "Emulation.setDeviceMetricsOverride": {
+   "params": {
+    "width": {
+     "type": "integer",
+     "min": 0,
+     "max": 4096
+    },
+    "height": {
+     "type": "integer",
+     "min": 0,
+     "max": 4096
+    },
+    "deviceScaleFactor": {
+     "type": "number",
+     "min": 0,
+     "max": 3
+    },
+    "mobile": "boolean"
+   },
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Emulation.clearDeviceMetricsOverride": {
+   "params": {},
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Target.getTargets": {
+   "virtual": true,
+   "params": {},
+   "result": {
+    "maxBytes": 65536,
+    "note": "only the agent's own pages: {targetId: vid:pg, type: 'page', url, title ≤ 1024 bytes}"
+   }
+  },
+  "Target.createTarget": {
+   "virtual": true,
+   "params": {
+    "url": "url",
+    "background": "boolean?"
+   },
+   "result": {
+    "maxBytes": 128,
+    "note": "{targetId: vid:pg}; refused beyond 16 open pages"
+   }
+  },
+  "Target.activateTarget": {
+   "virtual": true,
+   "params": {
+    "targetId": "vid:pg"
+   },
+   "result": {
+    "maxBytes": 64
+   }
+  },
+  "Target.closeTarget": {
+   "virtual": true,
+   "params": {
+    "targetId": "vid:pg"
+   },
+   "result": {
+    "maxBytes": 64
+   }
+  }
+ },
+ "events": {
+  "Page.loadEventFired": {
+   "maxBytes": 128
+  },
+  "Page.domContentEventFired": {
+   "maxBytes": 128
+  },
+  "Page.frameNavigated": {
+   "maxBytes": 16384
+  },
+  "Page.frameStartedLoading": {
+   "maxBytes": 256
+  },
+  "Page.frameStoppedLoading": {
+   "maxBytes": 256
+  },
+  "Page.lifecycleEvent": {
+   "maxBytes": 512
+  },
+  "Page.javascriptDialogOpening": {
+   "maxBytes": 16384
+  },
+  "Page.javascriptDialogClosed": {
+   "maxBytes": 256
+  },
+  "Runtime.executionContextCreated": {
+   "maxBytes": 4096
+  },
+  "Runtime.executionContextDestroyed": {
+   "maxBytes": 256
+  },
+  "Runtime.consoleAPICalled": {
+   "maxBytes": 65536,
+   "note": "objectIds in args are the agent's own (page-world) objects, rewritten to vid:ob in a per-session event group the app releases after 60 s"
+  },
+  "Runtime.exceptionThrown": {
+   "maxBytes": 65536
+  },
+  "Network.requestWillBeSent": {
+   "maxBytes": 65536,
+   "redactHeaders": true
+  },
+  "Network.responseReceived": {
+   "maxBytes": 65536,
+   "redactHeaders": true
+  },
+  "Network.loadingFinished": {
+   "maxBytes": 256
+  },
+  "Network.loadingFailed": {
+   "maxBytes": 1024
+  },
+  "Target.targetCreated": {
+   "virtual": true,
+   "maxBytes": 2048,
+   "note": "own pages only"
+  },
+  "Target.targetDestroyed": {
+   "virtual": true,
+   "maxBytes": 256,
+   "note": "own pages only"
+  }
+ },
+ "redaction": {
+  "headers": [
+   "cookie",
+   "set-cookie",
+   "authorization",
+   "proxy-authorization",
+   "proxy-authenticate",
+   "www-authenticate"
+  ],
+  "match": "case-insensitive, every occurrence, including headersText, redirectResponse.headers, associatedCookies (dropped), and the request's postData is dropped",
+  "value": "[redacted]"
+ },
+ "never": "No result or event ever carries a real targetId, sessionId, browserContextId, frameId, loaderId, executionContextId, uniqueId, nodeId, backendNodeId, objectId or requestId, nor anything from the app's privileged session; an unmappable id drops the event or fails the command.",
+ "pinnedProtocol": {
+  "version": "Chrome for Testing 158.0.8127.36 (Stable, revision 1727472), /json/protocol of its headless shell",
+  "file": "cft-158.0.8127.36-protocol.json",
+  "sha256": "abc8592fa073e87d8ace0ff81e1df0984583d713b422cad61e6f039e54b19c0c"
+ },
+ "rewrite": {
+  "idTypes": {
+   "Runtime.RemoteObjectId": "ob",
+   "DOM.BackendNodeId": "bn",
+   "Page.FrameId": "fr",
+   "Runtime.ExecutionContextId": "cx",
+   "Network.LoaderId": "ld",
+   "DOM.NodeId": "nd",
+   "Accessibility.AXNodeId": "ax",
+   "Network.RequestId": "rq"
+  },
+  "dropIdTypes": [
+   "Runtime.ScriptId",
+   "Runtime.StackTraceId",
+   "Security.CertificateId",
+   "Network.AdScriptIdentifier",
+   "DOM.StyleSheetId"
+  ],
+  "untypedIds": {
+   "Page.NavigationEntry.id": "map:he",
+   "Page.navigateToHistoryEntry.entryId": "map:he",
+   "Runtime.DeepSerializedValue.objectId": "drop",
+   "Runtime.ExceptionDetails.exceptionId": "drop",
+   "Runtime.ExecutionContextDescription.uniqueId": "drop",
+   "DOM.Node.publicId": "keep: the doctype's public identifier, document data, not a handle",
+   "DOM.Node.systemId": "keep: the doctype's system identifier, document data, not a handle",
+   "Network.SignedCertificateTimestamp.logId": "keep: a public Certificate Transparency log id, not a handle",
+   "Runtime.executionContextDestroyed.executionContextUniqueId": "drop"
+  },
+  "$comment": "Type-driven and total. Every field whose pinned-protocol type is in idTypes is replaced, at every depth, by the session's vid of that kind (created on first sight). Every field whose type is in dropIdTypes is removed. Untyped fields that look like ids follow untypedIds: map:<kind>, drop, or keep:<reason>. Recursive types are walked to any depth (the resolver's 'recurse:<Type>' rows). o11-resolver.mjs checks the rules against the pinned protocol: any id-typed or id-named field reachable from an allowed result or forwarded event without a rule fails the build, and the app runs the same rules from the generated table o11-cdp-expanded.json. A vid parameter must be of the kind its protocol type maps to. Opaque objects: see opaque (default deny). Top-level result and event fields go through the same classification as nested ones.",
+  "opaque": {
+   "$comment": "Default deny (ruled by @sagebrush): every protocol-owned object the pinned protocol leaves without declared properties, and every 'any', reachable from an allowed result or forwarded event, is listed here as drop, or as keep with a reviewed reason. An unlisted one fails the resolver; nothing opaque is forwarded by default. A kept value is content: it is forwarded as is and never name-scanned or reclassified.",
+   "Runtime.ExecutionContextDescription.auxData": {
+    "action": "drop",
+    "reason": "embedder data (frameId, type, isDefault): dropped whole, ruled; the frame is known from the target"
+   },
+   "Runtime.ExceptionDetails.exceptionMetaData": {
+    "action": "drop",
+    "reason": "embedder exception metadata, not needed"
+   },
+   "Runtime.DeepSerializedValue.value": {
+    "action": "drop",
+    "reason": "deep serialization is not requested; its objectId is dropped too"
+   },
+   "Runtime.RemoteObject.value": {
+    "action": "keep",
+    "reason": "the page's own value (returnByValue JSON, or a primitive): page content, never scanned"
+   },
+   "Accessibility.AXValue.value": {
+    "action": "keep",
+    "reason": "the page's accessible name/role/value: page content, never scanned"
+   },
+   "DOM.ShapeOutsideInfo.shape[]": {
+    "action": "keep",
+    "reason": "CSS shape-outside geometry tokens: page content"
+   },
+   "DOM.ShapeOutsideInfo.marginShape[]": {
+    "action": "keep",
+    "reason": "CSS shape-outside geometry tokens: page content"
+   },
+   "Network.Headers": {
+    "action": "keep",
+    "reason": "HTTP header map: forwarded only after the 'redaction' rule"
+   }
+  }
+ }
+}

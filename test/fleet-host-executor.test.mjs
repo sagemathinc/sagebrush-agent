@@ -1080,3 +1080,65 @@ test("pendingProof raised DURING an application (a preempting revoke-caps) block
   assert.deepEqual(s.store.grants.pendingProofs(), []);
   await s.close();
 });
+
+// ---- sixth review round: the pending-proof mark lives in the one stop primitive, so every lifecycle op gets it
+
+const OPS = [
+  ["stop (service)", (sup) => sup.submit({ kind: "stop", authority: "service", agent: A })],
+  ["stop (local)", (sup) => sup.submit({ kind: "stop", authority: "local", agent: A })],
+  ["stop-all (local)", (sup) => sup.submit({ kind: "stop-all", authority: "local" })],
+  ["expiry", (sup) => sup.submit({ kind: "expiry", authority: "host" })],
+  ["delete (person)", (sup) => sup.submit({ kind: "delete", authority: "person", agent: A })],
+  ["revoke-caps (service)", (sup) => sup.submit({ kind: "revoke-caps", authority: "service", agent: A })],
+  ["pause with a failing freeze", (sup, fx) => { fx.freeze = async () => { throw Object.assign(new Error("EIO"), { code: "EIO" }); }; return sup.submit({ kind: "pause", authority: "service", agent: A }); }],
+  ["resume with a failing start", async (sup, fx, store) => {
+    store.registry.setState(A, "stopped");
+    fx.start = async (id) => { fx.u(id).active = true; throw new FleetError("unit_failed", "exited"); };
+    return sup.submit({ kind: "resume", authority: "person", agent: A });
+  }],
+];
+
+for (const [name, op] of OPS) {
+  test(`every lifecycle op marks the pending proof when its stop fails: ${name}; no ack, fresh or re-sent, until a real 0`, async () => {
+    const root = tmp("state"), fenceDir = tmp("fence"), fx = fakeFx();
+    let s = await setup({ fx, root, fenceDir });
+    const g1 = grant(1, [entry(A)]);
+    await s.sup.submit({ kind: "grant", bytes: g1 });
+    const acks = fx.acks.length;
+    let stuck = true;
+    const sysStop = fx.sys.stop, sysCount = fx.sys.procCount;
+    fx.sys.stop = (u) => { if (stuck) throw new Error("EIO"); return sysStop(u); };
+    fx.sys.procCount = (u) => (stuck ? 1 : sysCount(u));
+    fx.u(A).active = true;
+    await op(s.sup, fx, s.store);
+    assert.ok(s.store.grants.pendingProofs().includes(A), `${name}: A is a pending proof`);
+    const re = await s.sup.submit({ kind: "grant", bytes: g1 });
+    assert.deepEqual([re.status, re.reason], ["refused", "in_progress"], `${name}: no re-sent acknowledgement`);
+    assert.equal(fx.acks.length, acks);
+    await s.close();
+    // Only a passing proof clears it (here recovery's, once the count really reaches 0).
+    stuck = false;
+    s = await setup({ fx, root, fenceDir });
+    await s.sup.recover();
+    assert.deepEqual(s.store.grants.pendingProofs(), []);
+    await s.close();
+  });
+}
+
+test("TESTS r6 (astra2): a person's stop or delete that can't prove the cgroup empty marks the proof; the same grant isn't re-acknowledged", async () => {
+  for (const kind of ["stop", "delete"]) {
+    const fx = fakeFx();
+    const { sup, store, close } = await setup({ fx });
+    const g1 = grant(1, [entry(A)]);
+    await sup.submit({ kind: "grant", bytes: g1 });
+    fx.sys.stop = () => { throw new Error("EIO"); };
+    fx.sys.procCount = () => 1;
+    const r = await sup.submit({ kind, authority: "person", agent: A });
+    assert.equal(r.status, "not empty");
+    assert.deepEqual(store.grants.pendingProofs(), [A]);
+    const re = await sup.submit({ kind: "grant", bytes: g1 });
+    assert.equal(re.status, "refused");
+    assert.deepEqual(fx.acks.map((x) => x[0]), [1], "only the original acknowledgement");
+    await close();
+  }
+});

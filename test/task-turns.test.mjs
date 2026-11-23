@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TaskStore } from "../lib/tasks.mjs";
+import { TaskStore, eventProblem } from "../lib/tasks.mjs";
 import { TaskTurns, TASK_SERVER } from "../lib/task-turns.mjs";
 import { checkRequest } from "../lib/tasks-schema.mjs";
 import { blobId, readCommit } from "../lib/task-git.mjs";
@@ -647,4 +647,44 @@ test("reason codes: a completed turn with no change, an error, the person's Stop
   await until(() => d.store.state(td).status === "interrupted", "d", 5000);
   assert.deepEqual(codeOf(d.store, td), ["limit", "the turn reached its 24 hour limit"]);
   d.done();
+});
+
+// (W3, #1551: a task's turn says the model it runs, as Claude's init says it, once, as a Pair turn does; nothing for an
+//  init with no model or a malformed one; the task log takes exactly that event and refuses any other shape of it)
+const withInit = (inits) => () => (async function* () {
+  for (const init of inits) yield { type: "system", subtype: "init", session_id: "s", tools: [], mcp_servers: [], ...init };
+  yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "done" }] }, parent_tool_use_id: null };
+  yield { type: "result", subtype: "success", is_error: false, result: "ok", usage: { input_tokens: 1, output_tokens: 1 } };
+})();
+const infos = (h, task) => h.store.get({ task, after: 0 }).events.map((e) => e.event).filter((e) => e.type === "turn_info");
+
+test("a task's turn says its model once, from Claude's init (W3, #1551)", WIN_DELEGATE, async () => {
+  const h = setup();
+  h.turns.query = withInit([{ model: "claude-opus-5-5" }, { model: "claude-sonnet-5-5" }]);
+  const task = h.start();
+  h.turns.begin(task, "start");
+  await until(() => !h.turns.isRunning(task), "the turn over");
+  assert.deepEqual(infos(h, task), [{ type: "turn_info", model: "claude-opus-5-5" }]);
+  const ty = h.types(task);
+  assert.ok(ty.indexOf("turn_info") > ty.indexOf("turn_started"), ty.join(","));
+  h.done();
+});
+
+test("a task's turn says nothing for an init with no model, or a malformed one (W3, #1551)", WIN_DELEGATE, async () => {
+  for (const init of [{}, { model: "" }, { model: "a model with spaces" }, { model: 42 }]) {
+    const h = setup();
+    h.turns.query = withInit([init]);
+    const task = h.start();
+    h.turns.begin(task, "start");
+    await until(() => !h.turns.isRunning(task), "the turn over");
+    assert.deepEqual(infos(h, task), [], JSON.stringify(init));
+    h.done();
+  }
+});
+
+test("the task log takes exactly a turn_info event, and refuses any other shape of it (W3, #1551)", () => {
+  for (const good of [{ type: "turn_info", model: "claude-opus-5-5" }, { type: "turn_info", effort: "high" }, { type: "turn_info", model: "claude-opus-5-5[1m]", effort: "medium" }])
+    assert.equal(eventProblem(good), null, JSON.stringify(good));
+  for (const bad of [{ type: "turn_info" }, { type: "turn_info", model: "x", extra: 1 }, { type: "turn_info", model: "bad model" }, { type: "turn_info", effort: "HIGH" }, { type: "turn_info", model: 1 }, { type: "turn_info", model: "x".repeat(129) }])
+    assert.notEqual(eventProblem(bad), null, JSON.stringify(bad));
 });

@@ -12,7 +12,14 @@ import * as core from "../lib/fleet/core/index.mjs";
 const read = (f) => JSON.parse(readFileSync(new URL(f, import.meta.url), "utf8"));
 const F = read("./fixtures/fleet-fixtures.json");
 const RECOVERY_KNOWN = ["QIgcRL3kWMdpVNtbHP7lkw", "8f8Zi-ibteyHFwp-PnAVfGC6-_75Je6BNI9mNkG6PM0"];
-const backend = core.webCrypto();
+// (the installed backend is WebCrypto's, watched: the recovery rows see the HKDF output and can refuse the key import)
+const real = core.webCrypto();
+const spy = { hkdf: [], refuseImport: false };
+const backend = {
+  ...real,
+  async hkdf(...args) { const out = await real.hkdf(...args); spy.hkdf.push(out); return out; },
+  async ed25519FromSeed(seed) { if (spy.refuseImport) throw new Error("import refused"); return real.ed25519FromSeed(seed); },
+};
 const loader = (name) => read(`../schema/fleet/${name}`);
 
 // (first: the tests after it use what it installs)
@@ -25,7 +32,13 @@ test("schemas of another revision are refused and install nothing; then the back
   assert.throws(() => core.newId(), /no fleet crypto backend/);
   core.useCrypto(backend);
   core.useSchemas(loader);
-  assert.equal(typeof core.bodyValidator("host-grant"), "function");
+  // the installed schema can't be changed through what fleetSchema() hands out, before or after the first compile
+  const doc = core.fleetSchema();
+  assert.throws(() => { doc.$defs["host-grant"] = {}; }, TypeError);
+  assert.throws(() => { doc.$defs["host-grant"].required = []; }, TypeError);
+  assert.throws(() => { delete doc.$defs["host-grant"].additionalProperties; }, TypeError);
+  assert.throws(() => { core.reasonNames().push("x"); }, TypeError);
+  assert.throws(() => core.bodyValidator("host-grant")({}), (e) => e.code === "bad_form");
 });
 
 test("every case, through the core with the WebCrypto backend", async () => {
@@ -73,6 +86,48 @@ test("the WebCrypto backend's verify is a boolean: false for bytes it can't use,
   for (const [raw, s] of [[k.raw.subarray(0, 31), sig], [k.raw, sig.subarray(0, 63)], [new Uint8Array(0), new Uint8Array(0)], [offCurve, sig]])
     assert.equal(await backend.ed25519Verify(raw, msg, s), false);
   assert.equal(await backend.ed25519Verify(k.raw, msg, sig), true);
+});
+
+test("ed25519FromSeed clears its PKCS#8 copy of the seed when an import or the export fails (and leaves the caller's seed)", async () => {
+  for (const failAt of ["first import", "export", "second import"]) {
+    let der = null, imports = 0;
+    const subtle = {
+      async importKey(fmt, data) {
+        imports++;
+        if (imports === 1) der = data;
+        if ((failAt === "first import" && imports === 1) || (failAt === "second import" && imports === 2)) throw new Error(failAt);
+        return {};
+      },
+      async exportKey() {
+        if (failAt === "export") throw new Error(failAt);
+        return { x: core.b64(new Uint8Array(32).fill(9)) };
+      },
+    };
+    const w = core.webCrypto({ subtle, getRandomValues: (b) => b });
+    const seed = new Uint8Array(32).fill(7);
+    await assert.rejects(w.ed25519FromSeed(seed), new RegExp(failAt));
+    assert.equal(der.length, 48, failAt);
+    assert.ok(der.every((x) => x === 0), `${failAt}: the PKCS#8 copy is cleared`);
+    assert.ok(seed.every((x) => x === 7), `${failAt}: the caller's seed is the caller's`);
+  }
+});
+
+test("recoveryKey clears the seed HKDF derived, when the key is made and when its import is refused", async () => {
+  const code = core.idOfBytes(new Uint8Array(16).fill(7));
+  spy.hkdf.length = 0;
+  const k = await core.recoveryKey(code, F.ids.fleet);
+  assert.equal(spy.hkdf.length, 1);
+  assert.ok(spy.hkdf[0].every((x) => x === 0), "cleared after success");
+  assert.deepEqual([k.key, core.b64(k.raw)], RECOVERY_KNOWN, "and the key still is the code's");
+  assert.equal(await core.verifyStrict(k.raw, new Uint8Array(1), await k.sign(new Uint8Array(1))), true, "and still signs");
+  spy.refuseImport = true;
+  try {
+    await assert.rejects(core.recoveryKey(code, F.ids.fleet), /import refused/);
+  } finally {
+    spy.refuseImport = false;
+  }
+  assert.equal(spy.hkdf.length, 2);
+  assert.ok(spy.hkdf[1].every((x) => x === 0), "cleared after a refused import");
 });
 
 test("random bytes and SHA-256: the sizes asked for, and a known hash", async () => {

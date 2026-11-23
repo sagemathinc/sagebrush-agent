@@ -5,7 +5,7 @@ import { mkdtempSync, existsSync, readFileSync, writeFileSync, readdirSync } fro
 import { realIo } from "../lib/fleet/host/store.mjs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test } from "./host-linux-only.mjs";
 import { FleetError, newId, keyFromSeed, seal, sha256b64 } from "../lib/fleet/index.mjs";
 import { verifyGrant } from "../lib/fleet/host/grant.mjs";
 import { HostStore } from "../lib/fleet/host/host-store.mjs";

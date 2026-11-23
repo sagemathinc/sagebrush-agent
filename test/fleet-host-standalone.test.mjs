@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test } from "./host-linux-only.mjs";
 
 const url = (p) => new URL(p, import.meta.url).href;
 

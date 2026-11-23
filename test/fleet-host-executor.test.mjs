@@ -1027,7 +1027,11 @@ test("after any effect goes unsettled, the running operation does no authority-g
   const { sup, fenceDir, close } = await setup({ fx, deadlines: { mask: 20, grace: 20 } });
   await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
   const mask = fx.mask;
-  fx.mask = async (id, ...rest) => { await lateBy(150); return mask(id, ...rest); }; // ignores its abort
+  // The mask ignores its abort and settles only when the test releases it, after the assertions: never by a clock,
+  // so a stalled runner can't let it settle within the grace.
+  let release;
+  const held = new Promise((res) => { release = res; });
+  fx.mask = async (id, ...rest) => { await held; return mask(id, ...rest); };
   fx.log.length = 0;
   const r = await sup.submit({ kind: "revoke-caps", authority: "service", agent: A });
   assert.equal(r.status, "failed");
@@ -1037,7 +1041,8 @@ test("after any effect goes unsettled, the running operation does no authority-g
   // Teardown: a mask that works again, then wait for the late one to settle and its re-containment to finish (it
   // would otherwise reschedule itself for ever, keeping an unforced test run alive).
   fx.mask = mask;
-  for (let i = 0; i < 100 && sup.unsettled > 0; i++) await new Promise((res) => setTimeout(res, 20));
+  release();
+  for (let i = 0; i < 250 && sup.unsettled > 0; i++) await new Promise((res) => setTimeout(res, 20));
   assert.equal(sup.unsettled, 0);
   await sup.submit({ kind: "resume-all", authority: "person" }); // a normal input: runs after the queued re-containment
   await close();

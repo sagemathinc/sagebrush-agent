@@ -3,12 +3,13 @@
 // session driver, Filter and hardening. In-process with injected streams, and once as a spawned process on real fds.
 
 import assert from "node:assert/strict";
-import { test } from "node:test";
-import { PassThrough } from "node:stream";
+import { test, afterEach } from "node:test";
+import { PassThrough, Writable } from "node:stream";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { createEncoder } from "../lib/fleet/browser/frames.mjs";
-import { main } from "../lib/fleet/browser/sidecar-cdp-main.mjs";
+import { readFileSync } from "node:fs";
+import { createEncoder, LIMITS } from "../lib/fleet/browser/frames.mjs";
+import { main, OUT_MAX, OUT_RESERVE, FLUSH_MS } from "../lib/fleet/browser/sidecar-cdp-main.mjs";
 import { pinnedPermissions } from "../lib/fleet/browser/harden.mjs";
 import { PINS } from "../lib/fleet/browser/pins.mjs";
 
@@ -55,11 +56,46 @@ function fakeChrome({ build = BUILD } = {}) {
   return { chromeRead: () => fromChrome, chromeWrite: () => toChrome, seen, event: (method, params, sessionId) => out({ method, params, ...(sessionId ? { sessionId } : {}) }) };
 }
 function run(opts = {}) {
-  const stdin = new PassThrough(), stdout = new PassThrough(), chrome = fakeChrome(opts.chrome), exits = [];
-  const frames = frameReader(stdout);
-  const sidecar = main({ stdin, stdout, chromeRead: chrome.chromeRead, chromeWrite: chrome.chromeWrite, permissions: opts.permissions ?? (() => LIST), exit: (c) => exits.push(c) });
-  return { stdin, stdout, frames, chrome, exits, sidecar };
+  const stdin = new PassThrough(), stdout = opts.stdout ?? new PassThrough(), chrome = fakeChrome(opts.chrome), exits = [], logs = [];
+  const frames = opts.stdout ? null : frameReader(stdout);
+  const sidecar = main({
+    stdin, stdout, chromeRead: chrome.chromeRead, chromeWrite: chrome.chromeWrite, permissions: opts.permissions ?? (() => LIST),
+    exit: (c) => exits.push(c), log: (l) => logs.push(l), ...(opts.clock ? { clock: opts.clock } : {}), ...(opts.outMax ? { outMax: opts.outMax } : {}),
+  });
+  live.push({ sidecar, stdout });
+  return { stdin, stdout, frames, chrome, exits, logs, sidecar };
 }
+// Every sidecar a test started ends with it (and a held stdout lets go), so no session timer outlives the test.
+const live = [];
+afterEach(() => {
+  for (const { sidecar, stdout } of live.splice(0)) {
+    if (sidecar.state !== "ended") sidecar.fail("the test is over");
+    stdout.release?.();
+  }
+});
+// A real Writable (highWaterMark 1) that takes no chunk until the test releases it: a stalled app. Every chunk it
+// was handed is kept, so the test can read the frames the app would have seen, in order.
+function heldStdout({ holding = true } = {}) {
+  const pending = [], chunks = [];
+  const take = (cb) => (holding ? pending.push(cb) : cb());
+  const w = new Writable({ highWaterMark: 1, write(chunk, _enc, cb) { chunks.push(chunk); take(cb); }, final(cb) { take(cb); } });
+  w.hold = () => { holding = true; };
+  w.release = () => { while (pending.length) pending.shift()(); };
+  w.frames = () => { const r = new PassThrough(), out = frameReader(r); r.write(Buffer.concat(chunks)); return out; };
+  return w;
+}
+async function drainAll(w) { for (let i = 0; i < 200; i++) { w.release(); await settle(2); } }
+function manualClock() {
+  let now = 0;
+  const timers = new Set();
+  return {
+    setTimeout: (f, ms) => { const h = { f, at: now + ms }; timers.add(h); return h; },
+    clearTimeout: (h) => { timers.delete(h); },
+    advance(ms) { now += ms; for (const h of [...timers]) if (h.at <= now) { timers.delete(h); h.f(); } },
+    pending: () => timers.size,
+  };
+}
+const loadEvent = () => ({ method: "Page.loadEventFired", params: { timestamp: 1 } });
 const states = (frames) => frames.filter((f) => f.head.kind === "rust.cdp_state").map((f) => f.head.state + (f.head.reason ? `:${f.head.reason}` : ""));
 
 test("wired end to end: credentials and start over real frames; Chrome's pipe opens and the context is hardened; a command's answer and a page's event go to net; retire ends and exits 0", async () => {
@@ -117,6 +153,111 @@ test("the app's output: if stdout breaks (Rust is gone), the session retires and
   t.stdin.write(command(1, { method: "Target.getTargets" }));
   await settle();
   assert.ok(!t.chrome.seen.some((m) => m.method === "Target.getTargets"));
+});
+
+test("the bounds: the cap holds two of the largest answers the spec allows, and its reserve holds the largest terminal frame", () => {
+  const spec = JSON.parse(readFileSync(new URL("../schema/fleet/browser/o11-cdp.json", import.meta.url)));
+  let largest = 0;
+  const walk = (o) => { if (o && typeof o === "object") { if (typeof o.maxBytes === "number") largest = Math.max(largest, o.maxBytes); for (const k in o) walk(o[k]); } };
+  walk(spec);
+  assert.equal(largest, 8 * 1024 * 1024);
+  const answer = 8 + LIMITS.headBytes + `{"result":}`.length + largest; // (a frame: lengths, a head, the answer's JSON)
+  assert.ok(OUT_MAX - OUT_RESERVE >= 2 * answer, "two of the largest answers fit outside the reserve");
+  const ended = createEncoder({ from: "cdp" })({ to: "rust", kind: "rust.cdp_state", state: "ended", reason: "r".repeat(LIMITS.reasonBytes) });
+  assert.ok(ended.length <= OUT_RESERVE);
+  assert.equal(FLUSH_MS, 5000);
+});
+
+test("backpressure: while stdout wants a drain no input is read, so no command reaches Chrome; the drain resumes it", async () => {
+  const out = heldStdout(), t = run({ stdout: out });
+  t.stdin.write(Buffer.concat([auth(), start()]));
+  await settle();
+  assert.equal(out.writableNeedDrain, true);
+  assert.equal(t.stdin.isPaused(), true);
+  const cmd = command(1, { method: "Target.getTargets" });
+  t.stdin.write(cmd);
+  await settle();
+  assert.equal(t.stdin.readableLength, cmd.length, "not read while the app isn't reading");
+  await drainAll(out);
+  assert.equal(t.stdin.readableLength, 0, "read after the drain");
+  assert.equal(t.stdin.isPaused(), false);
+  const frames = out.frames();
+  assert.deepEqual(states(frames), ["starting", "ready"]);
+  assert.equal(JSON.parse(frames.find((f) => f.head.kind === "net.result" && f.head.seq === 1).body).result.targetInfos.length, 0);
+  assert.equal(t.sidecar.state, "ready");
+});
+
+test("the cap: commands before start (each answered) against a stalled app end the sidecar; the queue stays bounded; the terminal frame is last", async () => {
+  const outMax = 256 * 1024, out = heldStdout(), t = run({ stdout: out, outMax });
+  const many = Buffer.concat(Array.from({ length: 5000 }, (_, i) => command(i + 1, { method: "Target.getTargets" })));
+  t.stdin.write(many);
+  assert.ok(out.writableLength <= outMax - OUT_RESERVE, `queued ${out.writableLength}`);
+  await settle();
+  assert.equal(t.sidecar.state, "ended");
+  assert.ok(out.writableLength <= outMax, `queued ${out.writableLength}`);
+  t.stdin.write(many); // (more while ended: nothing is taken)
+  await settle();
+  assert.ok(out.writableLength <= outMax);
+  await drainAll(out);
+  const frames = out.frames();
+  assert.ok(frames.length < 5000);
+  assert.deepEqual(frames.at(-1).head, { to: "rust", kind: "rust.cdp_state", state: "ended", reason: "the app isn't reading its channel" });
+  assert.equal(frames.filter((f) => f.head.kind === "rust.cdp_state").length, 1);
+  assert.deepEqual(t.exits, [0]);
+});
+
+test("the cap: Chrome's events go through the same writer; a stalled app ends the sidecar, and later events send nothing", async () => {
+  const outMax = 256 * 1024, out = heldStdout(), t = run({ stdout: out, outMax });
+  t.stdin.write(Buffer.concat([auth(), start()]));
+  await settle();
+  t.chrome.event("Target.attachedToTarget", { sessionId: "SESS-A", targetInfo: { targetId: "REAL-TA", type: "page", title: "", url: "about:blank", attached: true, browserContextId: "REAL-CTX" }, waitingForDebugger: true });
+  await settle();
+  assert.equal(t.sidecar.state, "ready");
+  for (let i = 0; i < 5000 && t.sidecar.state !== "ended"; i++) { const e = loadEvent(); t.chrome.event(e.method, e.params, "SESS-A"); if (i % 100 === 0) { await settle(2); assert.ok(out.writableLength <= outMax); } }
+  await settle();
+  assert.equal(t.sidecar.state, "ended");
+  const queued = out.writableLength;
+  assert.ok(queued <= outMax, `queued ${queued}`);
+  for (let i = 0; i < 1000; i++) { const e = loadEvent(); t.chrome.event(e.method, e.params, "SESS-A"); }
+  await settle();
+  assert.equal(out.writableLength, queued, "nothing after the end");
+  await drainAll(out);
+  const frames = out.frames();
+  assert.ok(frames.filter((f) => f.head.kind === "net.event").length > 100);
+  assert.deepEqual(frames.at(-1).head, { to: "rust", kind: "rust.cdp_state", state: "ended", reason: "the app isn't reading its channel" });
+  assert.deepEqual(t.exits, [0]);
+});
+
+test("the final flush has a deadline: a stalled app (on retire, or on stdin's end) still gets an exit 0 at FLUSH_MS, never before; a flush that finishes exits at once", async () => {
+  for (const [what, finish] of [
+    ["retire", (t) => t.stdin.write(fromRust({ to: "cdp", kind: "cdp.retire" }))],
+    ["stdin's end", (t) => t.stdin.end()],
+  ]) {
+    const clock = manualClock(), out = heldStdout({ holding: false }), t = run({ stdout: out, clock });
+    t.stdin.write(Buffer.concat([auth(), start()]));
+    await settle();
+    assert.equal(t.sidecar.state, "ready", what);
+    out.hold(); // (the app stops reading now)
+    finish(t);
+    await settle();
+    assert.equal(t.sidecar.state, "ended", what);
+    clock.advance(FLUSH_MS - 1);
+    await settle();
+    assert.deepEqual(t.exits, [], what);
+    clock.advance(1);
+    assert.deepEqual(t.exits, [0], what);
+    assert.deepEqual(t.logs, ["cdp sidecar: the final flush didn't finish in time"], what);
+    await drainAll(out); // (a late flush changes nothing)
+    assert.deepEqual(t.exits, [0], what);
+    assert.equal(out.frames().at(-1).head.state, "ended", what);
+  }
+  const clock = manualClock(), out = heldStdout(), t = run({ stdout: out, clock });
+  t.stdin.write(fromRust({ to: "cdp", kind: "cdp.retire" }));
+  await settle();
+  await drainAll(out);
+  assert.deepEqual(t.exits, [0]);
+  assert.equal(clock.pending(), 0, "the deadline is cleared");
+  assert.deepEqual(t.logs, []);
 });
 
 test("the permission list must be the pinned one for the running build: none pinned (today's PINS), another build or tampered bytes end the session before anything attaches", async () => {

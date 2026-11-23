@@ -4,16 +4,22 @@
 # an ELF executable with no PT_INTERP segment. A static-pie build keeps a PT_DYNAMIC segment for its own relocations,
 # which is fine; it must not need any library (no DT_NEEDED).
 #   scripts/backup-static-check.sh BINARY
+# Each readelf output is captured whole before it is matched, and a readelf that fails or reports anything on stderr
+# fails the check: a match never reads from a pipe that a failure could cut short.
 set -euo pipefail
 bin=${1:?usage: scripts/backup-static-check.sh BINARY}
-headers=$(readelf -hlW -- "$bin")
-grep -Eq '^ *Type: +(EXEC|DYN) ' <<<"$headers" || { echo "backup-static-check: $bin is not an ELF executable" >&2; exit 1; }
-if grep -Eq '^ *INTERP ' <<<"$headers"; then
-  echo "backup-static-check: $bin names a dynamic loader (PT_INTERP); build it with --target x86_64-unknown-linux-musl" >&2
-  exit 1
-fi
-if readelf -dW -- "$bin" | grep -q '(NEEDED)'; then
-  echo "backup-static-check: $bin needs shared libraries (DT_NEEDED)" >&2
-  exit 1
-fi
+fail() { echo "backup-static-check: $bin $1" >&2; exit 1; }
+errs=$(mktemp)
+trap 'rm -f "$errs"' EXIT
+inspect() {
+  local out
+  out=$(readelf "$@" -- "$bin" 2>"$errs") || fail "can't be inspected (readelf $*: $(head -c 300 "$errs"))"
+  [ ! -s "$errs" ] || fail "can't be inspected cleanly (readelf $*: $(head -c 300 "$errs"))"
+  printf '%s' "$out"
+}
+headers=$(inspect -hlW)
+[[ $headers =~ (^|$'\n')\ *Type:\ +(EXEC|DYN)\  ]] || fail "is not an ELF executable"
+[[ $headers =~ (^|$'\n')\ *INTERP\  ]] && fail "names a dynamic loader (PT_INTERP); build it with --target x86_64-unknown-linux-musl"
+dynamic=$(inspect -dW)
+[[ $dynamic == *"(NEEDED)"* ]] && fail "needs shared libraries (DT_NEEDED)"
 echo "backup-static-check: $bin is static (no PT_INTERP, no DT_NEEDED)"

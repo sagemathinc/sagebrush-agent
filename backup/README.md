@@ -24,7 +24,7 @@ sagebrush-agent-backup --state DIR --secrets DIR [--cache DIR] < request.json > 
 - `THIRD-PARTY.txt` lists every linked crate (`node scripts/backup-third-party.mjs` regenerates it).
 - `deny.toml` holds the license allowlist and the one named exception.
 
-**The release build is static:** `cargo build --locked --release --target x86_64-unknown-linux-musl` (it needs `musl-tools`, for the C parts of zstd and aws-lc). The launcher runs a restore in a filesystem view with no loader or libraries, and refuses a binary that names one. `scripts/backup-static-check.sh BINARY` checks a build the same way: no `PT_INTERP`, no `DT_NEEDED`.
+**The release build is static:** `cargo build --locked --release --target x86_64-unknown-linux-musl` (it needs `musl-tools`, for the C parts of zstd and aws-lc). The launcher runs a restore in a filesystem view with no loader or libraries, and refuses a binary that names one. `scripts/backup-static-check.sh BINARY` checks a build the same way: no `PT_INTERP`, no `DT_NEEDED`. `scripts/backup-static-check-test.sh [BINARY]` tests that check on generated ELF files, then checks BINARY.
 
 **Tests:**
 - `cargo test --locked` runs the unit tests.

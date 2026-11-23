@@ -1,0 +1,86 @@
+//! `sagebrush-agent-backup`: the host's backup engine (host backup design r3.3).
+//!
+//!     sagebrush-agent-backup --state <dir> --secrets <dir> [--cache <dir>]  < request.json  > result.json
+//!
+//! One JSON request on stdin (at most 64 KiB), one JSON result on stdout: `{"ok":true,...}` with exit 0, or
+//! `{"ok":false,"error":{"code","message"}}` with exit 1. Argv carries only directories; the destination, its
+//! credential and the repository password are read from root-owned files by handle, never from argv or the
+//! environment.
+
+mod caps;
+mod config;
+mod error;
+mod logcap;
+mod ops;
+mod s3;
+
+use std::{
+    io::{Read, Write},
+    path::PathBuf,
+    process::ExitCode,
+};
+
+use error::{Fail, Result};
+use serde_json::{json, Value};
+
+const MAX_REQUEST: u64 = 64 * 1024;
+
+struct Args {
+    state: PathBuf,
+    secrets: PathBuf,
+    cache: Option<PathBuf>,
+}
+
+fn args() -> Result<Args> {
+    let mut it = std::env::args_os().skip(1);
+    let (mut state, mut secrets, mut cache) = (None, None, None);
+    while let Some(flag) = it.next() {
+        let value = it.next().map(PathBuf::from);
+        let slot = match flag.to_str() {
+            Some("--state") => &mut state,
+            Some("--secrets") => &mut secrets,
+            Some("--cache") => &mut cache,
+            _ => return Err(Fail::new("usage", "usage: sagebrush-agent-backup --state DIR --secrets DIR [--cache DIR] < request.json")),
+        };
+        match value {
+            Some(v) if v.is_absolute() && slot.is_none() => *slot = Some(v),
+            _ => return Err(Fail::new("usage", "each flag takes one absolute directory, once")),
+        }
+    }
+    match (state, secrets) {
+        (Some(state), Some(secrets)) => Ok(Args { state, secrets, cache }),
+        _ => Err(Fail::new("usage", "--state and --secrets are required")),
+    }
+}
+
+fn main_inner() -> Result<Value> {
+    let a = args()?;
+    let mut raw = Vec::new();
+    std::io::stdin()
+        .take(MAX_REQUEST + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| Fail::new("request_invalid", format!("stdin: {e}")))?;
+    if raw.len() as u64 > MAX_REQUEST {
+        return Err(Fail::new("request_invalid", "the request is larger than 64 KiB"));
+    }
+    let req: ops::Request = serde_json::from_slice(&raw).map_err(|e| Fail::new("request_invalid", e.to_string()))?;
+    let ctx = ops::Ctx { state: config::State::new(&a.state, &a.secrets), cache: a.cache };
+    ops::run(&ctx, req)
+}
+
+fn main() -> ExitCode {
+    logcap::init();
+    let (out, code) = match main_inner() {
+        Ok(mut v) => {
+            if let Value::Object(m) = &mut v {
+                m.insert("ok".into(), Value::Bool(true));
+            }
+            (v, ExitCode::SUCCESS)
+        }
+        Err(f) => (json!({ "ok": false, "error": { "code": f.code, "message": f.message } }), ExitCode::FAILURE),
+    };
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{out}");
+    let _ = stdout.flush();
+    code
+}

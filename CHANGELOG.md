@@ -1,5 +1,13 @@
 # sagebrush-agent changes
 
+## 0.8.16
+
+**The agent reads Sagebrush's own source, and a task's turns say their model.**
+
+- **Sagebrush's source:** a new tool, `sagebrush_source`, lists, reads and searches Sagebrush's own source at the exact commit of the site you're paired with. The site comes from the connection, never from what the model names. The tool fetches one archive and caches at most two commits, with bounded reads and searches. It needs Node 22.13 or later; on older Node it says so and fetches nothing.
+- **A task's model:** a Delegate task's turns now say which model they run, as a Pair chat's turns already do.
+- **Tags:** the agent ships the tag schema that memory and Autonomous agents will share (opaque ids, at most 16 enabled, "global" an ordinary opt-in tag). Nothing uses it yet.
+
 ## 0.8.15
 
 **The agent reads Sagebrush's own doc pages, and a failed task keeps its reason.**

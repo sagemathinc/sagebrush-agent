@@ -2,7 +2,7 @@
 name = "sagebrush-agent-backup"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0 OR MIT"
 description = "Encrypted backup of an Autonomous agent host: one JSON request on stdin, one JSON result on stdout (host backup design r3.3)"
 publish = false
 

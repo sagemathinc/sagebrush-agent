@@ -85,4 +85,7 @@ jobs:
         env:
           SB_TEST_WEED: ${{ runner.temp }}/weed/bin/weed
           SB_TEST_REQUIRE_WEED: "1"
-      - run: cargo build --locked --release --manifest-path backup/Cargo.toml
+      # The shipped build: static musl, checked to name no dynamic loader (the launcher refuses one that does).
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools && rustup target add x86_64-unknown-linux-musl
+      - run: cargo build --locked --release --manifest-path backup/Cargo.toml --target x86_64-unknown-linux-musl
+      - run: scripts/backup-static-check-test.sh backup/target/x86_64-unknown-linux-musl/release/sagebrush-agent-backup

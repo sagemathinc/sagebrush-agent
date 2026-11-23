@@ -117,7 +117,7 @@ test("prereq: an expired Claude login is one reason, claude_login_expired, in ou
 // (astra5's hold on the first cut: only the pinned Claude Code's own sign-in texts are sign-in failures; an error result
 //  about any other time limit, authentication or token is said as before, with its text)
 test("prereq: only the pinned Claude Code's sign-in texts are sign-in failures; other timeout, auth and token errors keep their text", async () => {
-  const { signInFailure, keyFailure } = await import("../lib/claude-cli.mjs");
+  const { signInFailure } = await import("../lib/claude-cli.mjs");
   for (const t of [
     "Login reached its time limit \u00b7 Please run /login",
     "Login expired \u00b7 Please run /login",
@@ -144,9 +144,23 @@ test("prereq: only the pinned Claude Code's sign-in texts are sign-in failures; 
     assert.deepEqual(ev.filter((e) => e.type === "turn_error"), [{ type: "turn_error", code: "is_error", message: "Claude ended the turn with an error" }], t);
     assert.equal(ev.find((e) => e.type === "turn_finished").code, "is_error", t);
   }
-  // (an authentication_failed about a key the person set isn't called an expired sign-in)
-  assert.ok(keyFailure("Invalid API key \u00b7 Fix external API key") && keyFailure("Invalid auth token \u00b7 Fix external auth token"));
-  const k = new Turn("k"); k.start();
-  const rk = k.feed({ type: "assistant", error: "authentication_failed", message: { content: [{ type: "text", text: "Invalid API key \u00b7 Fix external API key" }] } });
-  assert.deepEqual(rk.filter((e) => e.type === "turn_error").map((e) => e.code), ["authentication_failed"]);
+  // (an authentication_failed that isn't one of the sign-in texts (a key, a header, a cloud credential the person set, or
+  //  anything else) stays authentication_failed, and its own text reaches the page with the result that follows)
+  for (const [i, t] of [
+    "Invalid API key \u00b7 Fix external API key",
+    "Invalid auth token \u00b7 Fix external auth token",
+    "Invalid ANTHROPIC_CUSTOM_HEADERS \u00b7 Fix the environment variable \u00b7 each header must be Name: value",
+    "Failed to authenticate. API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"}}",
+    "API Error: 403 The security token included in the request is invalid. (Bedrock credentials)",
+    "Something about authentication we have never seen",
+  ].entries()) {
+    const k = new Turn(`k${i}`); k.start();
+    const ev = [
+      ...k.feed({ type: "assistant", error: "authentication_failed", message: { content: [{ type: "text", text: t }] } }),
+      ...k.feed({ type: "result", subtype: "success", is_error: true, result: t }),
+    ];
+    assert.deepEqual(ev.filter((e) => e.type === "turn_error").map((e) => e.code), ["authentication_failed", "is_error"], t);
+    assert.ok(ev.some((e) => e.type === "text_delta" && e.text === t), t);
+    assert.ok(!ev.some((e) => /claude_login_expired|claude_not_signed_in/.test(e.code ?? "")), t);
+  }
 });

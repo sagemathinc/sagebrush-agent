@@ -9,7 +9,7 @@ import { FleetError, b64, enc, newId } from "../lib/fleet/index.mjs";
 import { canonText } from "../lib/fleet/core/canonical.mjs";
 import { COMMIT_ROUTE, RECORD_HEADER_MAX } from "../lib/fleet/core/relay.mjs";
 import {
-  ADMIT_ROUTE, ANSWER_MAX, EPOCHS_ROUTE, FEED_MAX, REQUEST_MAX, controlKey, epochsTarget, parseAdmitRequest, parseControlAuth, parseEpochsTarget,
+  ADMIT_REFUSALS, ADMIT_ROUTE, ANSWER_MAX, CURSOR_EXPIRED, EPOCHS_ROUTE, FEED_MAX, REQUEST_MAX, controlKey, epochsTarget, parseAdmitRequest, parseControlAuth, parseEpochsTarget,
   signControlAnswer, signControlRequest, verifyControlAnswer, verifyControlRequest,
 } from "../lib/fleet/core/control.mjs";
 
@@ -74,7 +74,7 @@ const ANSWERS = {
     chain_seq: 0, not_after_ms: NOW + 1000, epochs: EPOCHS },
   commit: { result: "ok", role: "commit", ...TUPLE, nonce: id22(), host_nonce: id22(), app_request: id22(), account: "acct-1", epochs: EPOCHS },
 };
-const FEED = { since: 7, cursor: 8, at_ms: NOW, more: false, agents: [{ id: agent, epoch: 5 }], accounts: [{ id: "acct-1", epoch: 4 }], hosts: [] };
+const FEED = { result: "ok", since: 7, cursor: 8, at_ms: NOW, more: false, agents: [{ id: agent, epoch: 5 }], accounts: [{ id: "acct-1", epoch: 4 }], hosts: [] };
 
 test("answers: the MAC over status and body (an independent computation), bound to the one call, closed", async () => {
   const call = { id: id22(), digest: sha(enc("x")) };
@@ -104,6 +104,12 @@ test("answers: the MAC over status and body (an independent computation), bound 
     ["a refusal with facts", { v: 1, answer: "admit", call: call.id, call_sha256: call.digest, ...ANSWERS.refused, fleet }], ["another version", { ...base, v: 2 }]])
     assert.equal(await code(async () => verifyControlAnswer(await resign(canonText(JSON.parse(JSON.stringify(v)))), { key: KEY, call, answer: "admit" })), "bad_form", why);
   assert.equal(await code(() => signControlAnswer({ key: KEY, call, answer: "admit", fields: { ...ANSWERS.host, extra: 1 } })), "bad_form", "the Worker can't send one either");
+  // (refusals: only the closed list's codes; a host answer's not_after_ms may be null, a grant without an end)
+  for (const c of ADMIT_REFUSALS) assert.equal(await code(() => signControlAnswer({ key: KEY, call, answer: "admit", fields: { result: "refused", code: c } })), "ok", c);
+  for (const c of ["replay", "in_progress", "not_found", "cursor_expired", "Bad_form", ""])
+    assert.equal(await code(() => signControlAnswer({ key: KEY, call, answer: "admit", fields: { result: "refused", code: c } })), "bad_form", `the refusal ${c}`);
+  assert.equal(await code(() => signControlAnswer({ key: KEY, call, answer: "admit", fields: { ...ANSWERS.host, not_after_ms: null } })), "ok", "a host's grant without an end");
+  assert.equal(await code(() => signControlAnswer({ key: KEY, call, answer: "admit", fields: { ...ANSWERS.app, not_after_ms: null } })), "bad_form", "an app's record always ends");
   const big = { status: 200, body: new Uint8Array(ANSWER_MAX + 1), header: "v1 mac=" + "A".repeat(43) };
   assert.equal(await code(() => verifyControlAnswer(big, { key: KEY, call, answer: "admit" })), "limit", "over 16 KiB, before the MAC");
   assert.equal(await code(() => verifyControlAnswer({ ...big, body: enc("{}"), header: "v2 mac=x" }, { key: KEY, call, answer: "admit" })), "bad_form", "the answer header's form");
@@ -122,6 +128,12 @@ test("the feed's answer: a cursor ahead of since, each identity once per list, a
   assert.equal(await ok({ ...FEED, hosts: [{ id: host, epoch: 1 }, { id: host, epoch: 2 }] }), "bad_form", "a host twice");
   assert.equal(await ok({ ...FEED, agents: [{ id: "x", epoch: 1 }] }), "bad_form", "an agent id out of form");
   assert.equal(await ok({ ...FEED, more: undefined }), "bad_form", "more missing");
+  assert.equal(await ok({ ...FEED, result: undefined }), "bad_form", "result missing");
+  // (the feed's one refusal: cursor_expired, naming the since it refuses, with no cursor)
+  assert.equal(await ok({ result: "refused", since: 7, code: CURSOR_EXPIRED }), "ok", "cursor_expired");
+  assert.equal(await ok({ result: "refused", since: 7, code: "bad_form" }), "bad_form", "another feed refusal");
+  assert.equal(await ok({ result: "refused", since: 7, code: CURSOR_EXPIRED, cursor: 8 }), "bad_form", "a refusal with a cursor");
+  assert.equal(await ok({ result: "refused", code: CURSOR_EXPIRED }), "bad_form", "a refusal without its since");
   const full = (k) => Array.from({ length: k }, () => ({ id: newId(), epoch: Number.MAX_SAFE_INTEGER }));
   const accounts = Array.from({ length: FEED_MAX }, () => ({ id: "x".repeat(26), epoch: Number.MAX_SAFE_INTEGER }));
   assert.equal(await ok({ ...FEED, agents: full(FEED_MAX + 1) }), "bad_form", "81 agents");

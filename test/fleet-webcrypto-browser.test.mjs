@@ -68,6 +68,7 @@ const TYPES = { mjs: "text/javascript", json: "application/json" };
 
 test("headless Chromium: the core with the WebCrypto backend passes every shared vector", { skip: !chrome && "no Chromium or Chrome on PATH (Linux only)" }, async () => {
   const seen = [];
+  let pageMs, started;
   let resolveResult;
   const result = new Promise((ok) => { resolveResult = ok; });
   const server = createServer((req, res) => {
@@ -80,7 +81,10 @@ test("headless Chromium: the core with the WebCrypto backend passes every shared
       req.on("end", () => { res.writeHead(204).end(); resolveResult(body); });
       return;
     }
-    if (path === "/harness.html") return res.writeHead(200, { "content-type": "text/html" }).end(HARNESS);
+    if (path === "/harness.html") {
+      pageMs ??= Math.round(performance.now() - started);
+      return res.writeHead(200, { "content-type": "text/html" }).end(HARNESS);
+    }
     if (!SERVED.test(path)) return res.writeHead(404).end();
     res.writeHead(200, { "content-type": TYPES[path.split(".").pop()] }).end(readFileSync(new URL("." + path, ROOT)));
   });
@@ -90,8 +94,13 @@ test("headless Chromium: the core with the WebCrypto backend passes every shared
   // loads nothing but the files above, from this loopback server)
   const args = ["--headless=new", "--no-sandbox", "--disable-gpu", "--no-first-run", "--no-default-browser-check", `--user-data-dir=${profile}`,
     `http://127.0.0.1:${server.address().port}/harness.html`];
+  // (D-Bus at addresses that fail at once: Chromium calls the system and session buses before it loads the page, and
+  // waits on a bus that doesn't answer. CI runners' buses sometimes don't, and Chromium then never asked for the page
+  // in 60 s. The page needs nothing from either bus.)
+  const env = { ...process.env, DBUS_SYSTEM_BUS_ADDRESS: "unix:path=/nonexistent/dbus", DBUS_SESSION_BUS_ADDRESS: "unix:path=/nonexistent/dbus" };
   // (its own process group, so that the whole of Chromium, helpers included, is killed together)
-  const child = spawn(chrome, args, { stdio: ["ignore", "ignore", "pipe"], detached: true });
+  started = performance.now();
+  const child = spawn(chrome, args, { stdio: ["ignore", "ignore", "pipe"], detached: true, env });
   let stderr = "";
   child.stderr.on("data", (d) => { stderr = (stderr + d).slice(-4096); });
   const kill = () => { try { process.kill(-child.pid, "SIGKILL"); } catch {} try { child.kill("SIGKILL"); } catch {} };
@@ -118,7 +127,7 @@ test("headless Chromium: the core with the WebCrypto backend passes every shared
     assert.equal(r.hpke.vector.n, 257);
     assert.deepEqual(r.hpke.fleet.bad, []);
     assert.ok(r.hpke.fleet.n > 25, `${r.hpke.fleet.n} HPKE cases`);
-    console.log(`# ${r.n} cases, HPKE ${r.hpke.vector.n} + ${r.hpke.fleet.n}, in ${r.ua}`);
+    console.log(`# ${r.n} cases, HPKE ${r.hpke.vector.n} + ${r.hpke.fleet.n}, in ${r.ua}; Chromium asked for the page after ${pageMs} ms`);
   } finally {
     clearTimeout(timer);
     kill();

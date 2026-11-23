@@ -2,7 +2,7 @@
 // audit. One queue, emergencies first; the plan's steps in order with durable progress; narrowing; agent-side and
 // host-side failures; expiry; the lifecycle ops and who may submit them; recovery; and a crash at every barrier.
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
@@ -1141,4 +1141,73 @@ test("TESTS r6 (astra2): a person's stop or delete that can't prove the cgroup e
     assert.deepEqual(fx.acks.map((x) => x[0]), [1], "only the original acknowledgement");
     await close();
   }
+});
+
+// ---- seventh review round: a pending agent never starts, whoever asks; recovery proves every pending agent first
+
+
+for (const count of ["positive", "unreadable"]) {
+  test(`SEC r7: a failed stop-all with no durable fence (count ${count}), then a restart: recovery proves first and starts nothing`, async () => {
+    const root = tmp("state"), fenceDir = tmp("fence"), fx = fakeFx();
+    let s = await setup({ fx, root, fenceDir });
+    await s.sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+    let stuck = true;
+    const sysStop = fx.sys.stop, sysCount = fx.sys.procCount;
+    fx.sys.stop = (u) => { if (stuck) throw new Error("EIO"); return sysStop(u); };
+    fx.sys.procCount = (u) => { if (stuck) { if (count === "unreadable") throw new Error("EIO"); return 1; } return sysCount(u); };
+    chmodSync(fenceDir, 0o500); // the fence can't be written
+    const r = await s.sup.submit({ kind: "stop-all", authority: "local" });
+    chmodSync(fenceDir, 0o700);
+    assert.notEqual(r.status, "stopped and fenced");
+    assert.equal(r.fenced, false);
+    assert.deepEqual(s.store.grants.pendingProofs(), [A]);
+    assert.equal(s.store.registry.agent(A).state, "running");
+    // Still running in the registry and with no fence: only the guard in #start keeps a person's resume-all from
+    // starting it.
+    fx.log.length = 0;
+    assert.deepEqual((await s.sup.submit({ kind: "resume-all", authority: "person" })).started, []);
+    assert.ok(!fx.log.some((l) => l[0] === "start"), "the #start guard");
+    await s.close();
+    fx.u(A).active = true;
+    fx.log.length = 0;
+    s = await setup({ fx, root, fenceDir });
+    const rec = await s.sup.recover();
+    assert.deepEqual([rec.started, rec.unproven], [[], [A]]);
+    assert.ok(!fx.log.some((l) => l[0] === "start" || l[0] === "unmask"), "no start for a pending agent");
+    assert.deepEqual(s.store.grants.pendingProofs(), [A]);
+    // Nor through a person's resume-all, or a resume.
+    assert.deepEqual((await s.sup.submit({ kind: "resume-all", authority: "person" })).started, []);
+    assert.ok(!fx.log.some((l) => l[0] === "start"));
+    await s.close();
+    // A real 0: recovery proves it and clears the pending proof. The failed proof had escalated (state stopped, A's own
+    // fence), so A stays down until a person resumes it, and then it starts.
+    stuck = false;
+    s = await setup({ fx, root, fenceDir });
+    const rec2 = await s.sup.recover();
+    assert.deepEqual([rec2.started, rec2.unproven], [[], undefined]);
+    assert.deepEqual(s.store.grants.pendingProofs(), []);
+    assert.equal(s.store.registry.agent(A).state, "stopped");
+    assert.equal((await s.sup.submit({ kind: "resume", authority: "person", agent: A })).started, true);
+    assert.equal(fx.u(A).active, true);
+    await s.close();
+  });
+}
+
+test("SEC r7: recovery proves EVERY pending agent first, also one the current grant no longer lists", async () => {
+  const root = tmp("state"), fenceDir = tmp("fence"), fx = fakeFx();
+  let s = await setup({ fx, root, fenceDir });
+  await s.sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  await s.sup.submit({ kind: "grant", bytes: grant(2, [entry(B)]) }); // A retired
+  let stuck = true;
+  const sysStop = fx.sys.stop, sysCount = fx.sys.procCount;
+  fx.sys.stop = (u) => { if (stuck) throw new Error("EIO"); return sysStop(u); };
+  fx.sys.procCount = (u) => (stuck ? 1 : sysCount(u));
+  await s.sup.submit({ kind: "stop-all", authority: "local" });
+  assert.deepEqual(s.store.grants.pendingProofs(), [A, B].sort());
+  await s.close();
+  stuck = false;
+  s = await setup({ fx, root, fenceDir });
+  await s.sup.recover();
+  assert.deepEqual(s.store.grants.pendingProofs(), [], "A too, though grant 2 doesn't list it");
+  await s.close();
 });

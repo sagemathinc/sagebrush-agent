@@ -67,9 +67,10 @@ test("the three stop fences are start conditions (§3.3), one per cause", () => 
 test("secrets arrive only by LoadCredential", () => {
   const { text } = renderUnit(agent(), ctx());
   assert.deepEqual(text.split("\n").filter((l) => l.startsWith("LoadCredential=")), [
-    `LoadCredential=broker-placeholder:/var/lib/sagebrush/creds/${A}/broker-placeholder`,
     `LoadCredential=workspace-capability:/var/lib/sagebrush/creds/${A}/workspace-capability`,
   ]);
+  // No Claude credential of any kind reaches the unit (the Claude host-credential delta): no placeholder, token or URL.
+  assert.doesNotMatch(text, /broker-placeholder|ANTHROPIC|CLAUDE_CODE_OAUTH/);
 });
 
 test("one contract: every bind comes from a contract row and every Landlock rule matches its row", () => {
@@ -191,7 +192,7 @@ test("root unit = the non-root unit minus exactly the Privilege and Namespaces r
   for (const l of [`ConditionPathExists=!/var/lib/sagebrush/fence/all`, "ProtectSystem=strict", "TemporaryFileSystem=/srv/sagebrush:ro",
     "SystemCallFilter=~@mount @swap @reboot @raw-io @module @obsolete @cpu-emulation @privileged", "PrivateIPC=yes", "ProtectKernelModules=yes",
     `NetworkNamespacePath=/run/netns/sb-${A}`, "MemoryMax=6144M", "Delegate=no", "KillMode=control-group",
-    `LoadCredential=broker-placeholder:/var/lib/sagebrush/creds/${A}/broker-placeholder`]) assert.ok(root.includes(l), l);
+    `LoadCredential=workspace-capability:/var/lib/sagebrush/creds/${A}/workspace-capability`]) assert.ok(root.includes(l), l);
   assert.ok(!root.some((l) => /^Environment/.test(l)));
 });
 

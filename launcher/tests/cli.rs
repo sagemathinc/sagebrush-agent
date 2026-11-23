@@ -18,6 +18,7 @@ fn tmp(name: &str) -> PathBuf {
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(d.join("work")).unwrap();
     fs::create_dir_all(d.join("creds")).unwrap();
+    // A stray old Claude placeholder file: the launcher must neither need nor pass it on.
     fs::write(d.join("creds/broker-placeholder"), "placeholder-123").unwrap();
     fs::write(d.join("creds/workspace-capability"), "cap-456").unwrap();
     d
@@ -138,13 +139,13 @@ fn credentials_missing_empty_or_too_large_are_69() {
         .unwrap();
     assert_eq!(code(&o), 69, "no CREDENTIALS_DIRECTORY");
     if landlock_abi4() {
-        fs::write(d.join("creds/broker-placeholder"), "").unwrap();
+        fs::write(d.join("creds/workspace-capability"), "").unwrap();
         o = exec(&d, &c, "/usr/bin/true", &[]);
         assert_eq!(code(&o), 69, "empty: {}", stderr(&o));
-        fs::write(d.join("creds/broker-placeholder"), vec![b'x'; 16 * 1024 + 1]).unwrap();
+        fs::write(d.join("creds/workspace-capability"), vec![b'x'; 16 * 1024 + 1]).unwrap();
         o = exec(&d, &c, "/usr/bin/true", &[]);
         assert_eq!(code(&o), 69, "too large: {}", stderr(&o));
-        fs::write(d.join("creds/broker-placeholder"), vec![b'x'; 16 * 1024]).unwrap();
+        fs::write(d.join("creds/workspace-capability"), vec![b'x'; 16 * 1024]).unwrap();
         o = exec(&d, &c, "/usr/bin/true", &[]);
         assert_eq!(code(&o), 0, "exactly 16 KiB is accepted: {}", stderr(&o));
     }
@@ -172,7 +173,7 @@ fn exec_end_to_end_under_landlock() {
     let d = tmp("e2e");
     fs::write(d.join("work/f.txt"), "hello").unwrap();
     let script = format!(
-        r#"echo "p=$SAGEBRUSH_BROKER_PLACEHOLDER c=$SAGEBRUSH_WORKSPACE_CAPABILITY d=${{CREDENTIALS_DIRECTORY-unset}}"
+        r#"echo "p=${{SAGEBRUSH_BROKER_PLACEHOLDER-unset}} c=$SAGEBRUSH_WORKSPACE_CAPABILITY d=${{CREDENTIALS_DIRECTORY-unset}}"
 cat {w}/f.txt; echo; echo ok > {w}/g.txt && echo work-rw
 ls /home >/dev/null 2>&1 && echo home-visible || echo home-denied
 (echo x > /tmp/sbl-escape-{pid}) 2>/dev/null && echo tmp-written || echo tmp-denied
@@ -192,13 +193,14 @@ env | cut -d= -f1 | sort | tr '\n' ' '"#,
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(out.contains("fd42-closed"), "an inherited descriptor 42 is closed before exec: {out}");
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    assert!(out.contains("p=placeholder-123 c=cap-456 d=unset"), "{out}");
+    assert!(out.contains("p=unset c=cap-456 d=unset"), "no Claude placeholder, the capability, no credentials dir: {out}");
     assert!(out.contains("hello") && out.contains("work-rw"), "{out}");
     assert!(out.contains("home-denied"), "{out}");
     assert!(out.contains("tmp-denied"), "{out}");
     assert!(out.contains("fds=0 1 2 3 "), "only stdio (and ls's own listing) survive: {out}");
     assert!(out.contains("NoNewPrivs:\t1"), "{out}");
-    assert!(out.contains("PATH PWD SAGEBRUSH_BROKER_PLACEHOLDER SAGEBRUSH_WORKSPACE_CAPABILITY"), "a fresh environment: {out}");
+    assert!(out.contains("PATH PWD SAGEBRUSH_WORKSPACE_CAPABILITY"), "a fresh environment: {out}");
+    assert!(!out.contains("PLACEHOLDER"), "no Claude placeholder variable at all: {out}");
     assert!(!Path::new(&format!("/tmp/sbl-escape-{}", std::process::id())).exists());
     let _ = fs::remove_dir_all(&d);
 }
@@ -223,14 +225,12 @@ fn a_panic_prints_only_the_fixed_72_line_and_every_secret_is_zeroed() {
     assert_eq!(code(&o), 72);
     assert_eq!(stderr(&o), "sagebrush-agent-launch: internal: internal error\n", "nothing but the fixed line");
     assert!(o.stdout.is_empty());
-    // Exactly the four Secrets, in drop order, each zeroed: the two input buffers (CREDENTIAL_MAX + 1 bytes, dropped
-    // in the loop), then the two env entries ("NAME=value\0", dropped while the panic unwinds).
+    // Exactly the two Secrets, in drop order, each zeroed: the input buffer (CREDENTIAL_MAX + 1 bytes, dropped in the
+    // loop), then the env entry ("NAME=value\0", dropped while the panic unwinds).
     let drops = fs::read_to_string(&log).expect("the Drop log must exist: every Secret drop writes one line");
     let entry = |name: &str, value: &str| name.len() + 1 + value.len() + 1;
     let want: Vec<String> = [
         16 * 1024 + 1,
-        16 * 1024 + 1,
-        entry("SAGEBRUSH_BROKER_PLACEHOLDER", "placeholder-123"),
         entry("SAGEBRUSH_WORKSPACE_CAPABILITY", "cap-456"),
     ]
     .iter()

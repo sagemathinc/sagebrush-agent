@@ -6,12 +6,13 @@ import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { SETUP_TEXT, claudeBinary, claudeSignedIn, cliQuery } from "../lib/claude-cli.mjs";
 import { Turn } from "../lib/turns.mjs";
 
 const BIN = fileURLToPath(new URL("../bin/sagebrush-agent.mjs", import.meta.url));
-const NODE_CHECK = fileURLToPath(new URL("../lib/node-check.mjs", import.meta.url));
+// (imported by its file URL: a bare Windows path like C:\\... isn't a module specifier)
+const NODE_CHECK = pathToFileURL(fileURLToPath(new URL("../lib/node-check.mjs", import.meta.url))).href;
 const CLAUDE = claudeBinary();
 const posix = process.platform === "win32" ? "POSIX stand-ins" : false;
 const stand = (body) => { const d = mkdtempSync(join(tmpdir(), "sb-pre-")); const p = join(d, "claude"); writeFileSync(p, `#!/bin/sh\n${body}\n`); chmodSync(p, 0o700); return p; };

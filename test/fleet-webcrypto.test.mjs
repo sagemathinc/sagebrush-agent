@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { checkFixtures } from "./fleet-fixture-cases.mjs";
+import { checkFixtures, checkHpkeFixtures, checkHpkeVector } from "./fleet-fixture-cases.mjs";
 import * as core from "../lib/fleet/core/index.mjs";
 
 const read = (f) => JSON.parse(readFileSync(new URL(f, import.meta.url), "utf8"));
@@ -14,11 +14,14 @@ const F = read("./fixtures/fleet-fixtures.json");
 const RECOVERY_KNOWN = ["QIgcRL3kWMdpVNtbHP7lkw", "8f8Zi-ibteyHFwp-PnAVfGC6-_75Je6BNI9mNkG6PM0"];
 // (the installed backend is WebCrypto's, watched: the recovery rows see the HKDF output and can refuse the key import)
 const real = core.webCrypto();
-const spy = { hkdf: [], refuseImport: false };
+const spy = { hkdf: [], refuseImport: false, zeroDh: false };
+const zeroable = (pair) => ({ raw: pair.raw, dh: async (peer) => (spy.zeroDh ? new Uint8Array(32) : pair.dh(peer)) });
 const backend = {
   ...real,
   async hkdf(...args) { const out = await real.hkdf(...args); spy.hkdf.push(out); return out; },
   async ed25519FromSeed(seed) { if (spy.refuseImport) throw new Error("import refused"); return real.ed25519FromSeed(seed); },
+  x25519FromPrivate: async (sk) => zeroable(await real.x25519FromPrivate(sk)),
+  x25519Generate: async () => zeroable(await real.x25519Generate()),
 };
 const loader = (name) => read(`../schema/fleet/${name}`);
 
@@ -45,6 +48,28 @@ test("every case, through the core with the WebCrypto backend", async () => {
   const { bad, n } = await checkFixtures(core, F);
   assert.deepEqual(bad, []);
   assert.ok(n > 80, `${n} cases`);
+});
+
+test("HPKE with the WebCrypto backend: the RFC 9180 vector, and every fleet sealed-package and mint case", async () => {
+  const v = await checkHpkeVector(core, read("./fixtures/hpke-x25519-sha256-aes256gcm.json").vector);
+  assert.deepEqual(v.bad, []);
+  assert.equal(v.n, 257);
+  const f = await checkHpkeFixtures(core, read("./fixtures/fleet-hpke-fixtures.json"));
+  assert.deepEqual(f.bad, []);
+  assert.ok(f.n > 25, `${f.n} cases`);
+});
+
+test("a backend whose X25519 gives an all-zero secret is refused by the core itself, sending and receiving", async () => {
+  const R = await core.deriveKeyPair(new Uint8Array(32).fill(1));
+  const { enc: e, ct } = await core.hpkeSeal(R.raw, new Uint8Array(0), new Uint8Array(0), new Uint8Array([1]));
+  spy.zeroDh = true;
+  try {
+    await assert.rejects(core.hpkeSeal(R.raw, new Uint8Array(0), new Uint8Array(0), new Uint8Array([1])), (x) => x.code === "bad_form");
+    await assert.rejects(core.hpkeOpen(R, e, new Uint8Array(0), new Uint8Array(0), ct), (x) => x.code === "bad_form");
+  } finally {
+    spy.zeroDh = false;
+  }
+  assert.deepEqual(await core.hpkeOpen(R, e, new Uint8Array(0), new Uint8Array(0), ct), new Uint8Array([1]));
 });
 
 test("one backend and one schema set per process: the same again is a no-op, any other is refused", () => {

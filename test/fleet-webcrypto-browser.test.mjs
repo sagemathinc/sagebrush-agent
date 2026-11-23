@@ -27,7 +27,7 @@ const chrome = process.platform === "linux" ? findChrome() : null;
 const HARNESS = `<!doctype html><meta charset="utf-8"><pre id="out">PENDING</pre>
 <script type="module">
 import * as core from "/lib/fleet/core/index.mjs";
-import { checkFixtures } from "/test/fleet-fixture-cases.mjs";
+import { checkFixtures, checkHpkeFixtures, checkHpkeVector } from "/test/fleet-fixture-cases.mjs";
 const out = document.getElementById("out");
 try {
   const get = async (p) => (await fetch(p)).json();
@@ -35,6 +35,8 @@ try {
   core.useCrypto(core.webCrypto());
   core.useSchemas((n) => (n === "fleet.schema.json" ? fleet : reasons));
   const r = await checkFixtures(core, F);
+  const hv = await checkHpkeVector(core, (await get("/test/fixtures/hpke-x25519-sha256-aes256gcm.json")).vector);
+  const hf = await checkHpkeFixtures(core, await get("/test/fixtures/fleet-hpke-fixtures.json"));
   const k = await core.recoveryKey(core.idOfBytes(new Uint8Array(16).fill(7)), F.ids.fleet);
   // signing: RFC 8032 test 1 (its seed signs the empty message), and a sealed envelope that opens
   const hex = (h) => Uint8Array.from(h.match(/../g), (x) => parseInt(x, 16));
@@ -44,14 +46,14 @@ try {
   const body = { fleet: F.ids.fleet, aud: F.aud, chain_seq: 0, what: "host", id: F.ids.fleet, host: F.ids.fleet, gen: 1, at_ms: 1 };
   const sealed = await core.seal("sb.revocation.v1", signer, body, rfc);
   const opened = (await core.open(sealed, { aud: F.aud, fleet: F.ids.fleet, resolveKey: () => rfc.raw })).body.gen;
-  out.textContent = "RESULT " + JSON.stringify({ ...r, recovery: [k.key, core.b64(k.raw)], rfcPublic: core.b64(rfc.raw), rfcSig, opened, ua: navigator.userAgent });
+  out.textContent = "RESULT " + JSON.stringify({ ...r, recovery: [k.key, core.b64(k.raw)], rfcPublic: core.b64(rfc.raw), rfcSig, opened, hpke: { vector: hv, fleet: hf }, ua: navigator.userAgent });
 } catch (e) {
   out.textContent = "RESULT " + JSON.stringify({ error: String((e && e.stack) || e) });
 }
 </script>`;
 
 // (only these files are served: the pure core, the shared checker, the vectors and the schemas)
-const SERVED = /^\/(lib\/fleet\/core\/[a-z0-9-]+\.mjs|test\/fleet-fixture-cases\.mjs|test\/fixtures\/fleet-fixtures\.json|schema\/fleet\/(fleet\.schema|reasons)\.json)$/;
+const SERVED = /^\/(lib\/fleet\/core\/[a-z0-9-]+\.mjs|test\/fleet-fixture-cases\.mjs|test\/fixtures\/(fleet-fixtures|fleet-hpke-fixtures|hpke-x25519-sha256-aes256gcm)\.json|schema\/fleet\/(fleet\.schema|reasons)\.json)$/;
 const TYPES = { mjs: "text/javascript", json: "application/json" };
 
 test("headless Chromium: the core with the WebCrypto backend passes every shared vector", { skip: !chrome && "no Chromium or Chrome on PATH (Linux only)" }, async () => {
@@ -86,7 +88,11 @@ test("headless Chromium: the core with the WebCrypto backend passes every shared
     assert.equal(r.rfcPublic, "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo");
     assert.equal(r.rfcSig, "5VZDAMNgrHKQhuLMgG6CioSHfx645dl02HPgZSJJAVVfuIIVkKM7rMYeOXAc-bRr0lv18FlbviRlUUFDjnoQCw");
     assert.equal(r.opened, 1);
-    console.log(`# ${r.n} cases in ${r.ua}`);
+    assert.deepEqual(r.hpke.vector.bad, []);
+    assert.equal(r.hpke.vector.n, 257);
+    assert.deepEqual(r.hpke.fleet.bad, []);
+    assert.ok(r.hpke.fleet.n > 25, `${r.hpke.fleet.n} HPKE cases`);
+    console.log(`# ${r.n} cases, HPKE ${r.hpke.vector.n} + ${r.hpke.fleet.n}, in ${r.ua}`);
   } finally {
     kill();
     process.removeListener("exit", kill);

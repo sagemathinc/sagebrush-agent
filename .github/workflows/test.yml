@@ -46,3 +46,18 @@ jobs:
           node-version: 24.21.0
       - run: npm ci --ignore-scripts
       - run: node scripts/runner-ci.mjs "$RUNNER_TEMP/sagebrush-runner"
+
+  # The fleet protocol's tests on Node 22 too. Node 22's own Ed25519 verify accepts a forged signature under a
+  # small-order public key, while Node 24 and 26 refuse it, so only here would a missing library-side check fail
+  # the shared vectors (test/fixtures/fleet-fixtures.json). No dependencies needed.
+  fleet-node22:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.23.5
+      - run: node --test "test/fleet-*.test.mjs" test/tags.test.mjs test/canon.test.mjs

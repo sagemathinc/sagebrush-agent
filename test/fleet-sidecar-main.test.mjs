@@ -9,7 +9,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { createEncoder, LIMITS } from "../lib/fleet/browser/frames.mjs";
-import { main, OUT_MAX, OUT_RESERVE, FLUSH_MS } from "../lib/fleet/browser/sidecar-cdp-main.mjs";
+import { main, OUT_MAX, OUT_RESERVE, FLUSH_MS, STALL_MS } from "../lib/fleet/browser/sidecar-cdp-main.mjs";
 import { pinnedPermissions } from "../lib/fleet/browser/harden.mjs";
 import { PINS } from "../lib/fleet/browser/pins.mjs";
 
@@ -166,6 +166,81 @@ test("the bounds: the cap holds two of the largest answers the spec allows, and 
   const ended = createEncoder({ from: "cdp" })({ to: "rust", kind: "rust.cdp_state", state: "ended", reason: "r".repeat(LIMITS.reasonBytes) });
   assert.ok(ended.length <= OUT_RESERVE);
   assert.equal(FLUSH_MS, 5000);
+  assert.equal(STALL_MS, 30000);
+});
+
+test("a stalled app that also closes stdin (its end behind unread commands): the stall deadline ends the sidecar, and the flush deadline exits 0", async () => {
+  const clock = manualClock(), out = heldStdout(), t = run({ stdout: out, clock });
+  for (let i = 0; i < 25000; i++) t.stdin.write(command(i + 1, { method: "Target.getTargets" }));
+  t.stdin.end();
+  await settle();
+  assert.equal(t.sidecar.state, "waiting");
+  assert.ok(out.writableLength < 1024, `queued ${out.writableLength}`);
+  clock.advance(STALL_MS - 1);
+  await settle();
+  assert.equal(t.sidecar.state, "waiting");
+  clock.advance(1);
+  await settle();
+  assert.equal(t.sidecar.state, "ended");
+  assert.ok(out.writableLength < 1024 + OUT_RESERVE);
+  assert.deepEqual(t.exits, []);
+  clock.advance(FLUSH_MS);
+  assert.deepEqual(t.exits, [0]);
+  await drainAll(out);
+  const frames = out.frames();
+  assert.deepEqual(frames.at(-1).head, { to: "rust", kind: "rust.cdp_state", state: "ended", reason: "the app isn't reading its channel" });
+  assert.ok(frames.length <= 3);
+});
+
+test("a drain within STALL_MS clears the stall deadline", async () => {
+  const clock = manualClock(), out = heldStdout(), t = run({ stdout: out, clock });
+  t.stdin.write(Buffer.concat([auth(), start()]));
+  await settle();
+  assert.equal(clock.pending(), 1);
+  clock.advance(STALL_MS - 1);
+  await drainAll(out);
+  assert.equal(t.sidecar.state, "ready");
+  assert.equal(clock.pending(), 0);
+  clock.advance(STALL_MS);
+  await settle();
+  assert.equal(t.sidecar.state, "ready");
+});
+
+test("repeated backpressure cycles leave one stall timer at a time, and each drain clears it", async () => {
+  const clock = manualClock(), out = heldStdout(), t = run({ stdout: out, clock });
+  t.stdin.write(Buffer.concat([auth(), start()]));
+  await settle();
+  for (let seq = 1; seq <= 5; seq++) {
+    assert.equal(out.writableNeedDrain, true, `cycle ${seq}`);
+    assert.equal(clock.pending(), 1, `cycle ${seq}: one timer`);
+    await drainAll(out);
+    assert.equal(clock.pending(), 0, `cycle ${seq}: cleared`);
+    t.stdin.write(command(seq, { method: "Target.getTargets" }));
+    await settle();
+  }
+  clock.advance(STALL_MS - 1);
+  await settle();
+  assert.equal(t.sidecar.state, "ready");
+});
+
+test("the stall deadline's end: one terminal frame, nothing after it, exit 0 at the flush deadline; a late drain after the end does nothing", async () => {
+  const clock = manualClock(), out = heldStdout(), t = run({ stdout: out, clock });
+  t.stdin.write(Buffer.concat([auth(), start()]));
+  await settle();
+  clock.advance(STALL_MS);
+  assert.equal(t.sidecar.state, "ended", "stopped synchronously at the bound");
+  t.chrome.event("Page.loadEventFired", { timestamp: 1 }, "SESS-A");
+  t.stdin.write(command(1, { method: "Target.getTargets" }));
+  await settle();
+  clock.advance(FLUSH_MS);
+  assert.deepEqual(t.exits, [0]);
+  await drainAll(out); // (the late drain)
+  assert.equal(t.stdin.isPaused(), true);
+  assert.deepEqual(t.exits, [0]);
+  const frames = out.frames();
+  assert.equal(frames.filter((f) => f.head.kind === "rust.cdp_state" && f.head.state === "ended").length, 1);
+  assert.deepEqual(frames.at(-1).head, { to: "rust", kind: "rust.cdp_state", state: "ended", reason: "the app isn't reading its channel" });
+  assert.ok(!frames.some((f) => f.head.to === "net"), "no answer or event after the stop");
 });
 
 test("backpressure: while stdout wants a drain no input is read, so no command reaches Chrome; the drain resumes it", async () => {

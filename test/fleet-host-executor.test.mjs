@@ -800,7 +800,12 @@ test("after any effect goes unsettled, the running operation does no authority-g
   assert.ok(!fx.log.some((l) => ["unit", "daemon-reload", "unmask", "start"].includes(l[0])), "no unit write, reload or start");
   assert.ok(existsSync(join(fenceDir, A)));
   assert.equal(fx.units[A].active, false);
-  await new Promise((res) => setTimeout(res, 400));
+  // Teardown: a mask that works again, then wait for the late one to settle and its re-containment to finish (it
+  // would otherwise reschedule itself for ever, keeping an unforced test run alive).
+  fx.mask = mask;
+  for (let i = 0; i < 100 && sup.unsettled > 0; i++) await new Promise((res) => setTimeout(res, 20));
+  assert.equal(sup.unsettled, 0);
+  await sup.submit({ kind: "resume-all", authority: "person" }); // a normal input: runs after the queued re-containment
   await close();
 });
 
@@ -832,4 +837,63 @@ test("SEC H3-new: a grant that expires while its own unfinished application is r
   // Verified again after the redo: refused, not "reapplied" with a re-sent acknowledgement.
   await rejects(sup.submit({ kind: "grant", bytes: g1 }), "grant_expired");
   await close();
+});
+
+// ---- third review round: a failed containment stays a pending proof through every retry
+
+for (const count of ["positive", "unreadable"]) {
+  test(`an unproven containment (count ${count}) is never cleared by a retry: same grant, next grant, restart and recovery`, async () => {
+    const root = tmp("state"), fenceDir = tmp("fence"), fx = fakeFx();
+    let stuck = true;
+    fx.start = async (id) => { fx.u(id).active = true; throw new FleetError("unit_failed", "exited"); };
+    const sysStop = fx.sys.stop, sysCount = fx.sys.procCount;
+    fx.sys.stop = (u) => { if (stuck) throw new Error("EIO"); return sysStop(u); };
+    fx.sys.procCount = (u) => { if (stuck) { if (count === "unreadable") throw new Error("EIO"); return 1; } return sysCount(u); };
+    let s = await setup({ fx, root, fenceDir });
+    const g1 = grant(1, [entry(A)]);
+    assert.deepEqual([(await s.sup.submit({ kind: "grant", bytes: g1 })).reason], ["not_empty"]);
+    // The same grant again: the start step is redone and still can't prove the agent down.
+    const r2 = await s.sup.submit({ kind: "grant", bytes: g1 });
+    assert.deepEqual([r2.status, r2.reason], ["refused", "in_progress"]);
+    assert.equal(r2.previous.reason, "not_empty");
+    // The next grant: refused while N can't finish.
+    assert.equal((await s.sup.submit({ kind: "grant", bytes: grant(2, [entry(A)]) })).reason, "in_progress");
+    assert.equal(s.store.grants.pending().phase, "applying");
+    assert.deepEqual(fx.acks, [], "never applied, never acknowledged");
+    await s.close();
+    // A restart: recovery redoes the step and still fails closed.
+    s = await setup({ fx, root, fenceDir });
+    const rec = await s.sup.recover();
+    assert.deepEqual([rec.status, rec.reason], ["failed", "not_empty"]);
+    assert.deepEqual(fx.acks, []);
+    await s.close();
+    // Once the count really reaches 0, recovery proves it and finishes N; the agent stays stopped.
+    stuck = false;
+    s = await setup({ fx, root, fenceDir });
+    assert.equal((await s.sup.recover()).status, "applied");
+    assert.deepEqual(fx.acks.map((a) => a[0]), [1]);
+    assert.deepEqual([fx.units[A].active, s.store.registry.agent(A).state], [false, "stopped"]);
+    await s.close();
+  });
+}
+
+test("recovery from applied(N) proves every agent it doesn't start; an unproven one is reported", async () => {
+  const root = tmp("state"), fenceDir = tmp("fence"), fx = fakeFx();
+  let s = await setup({ fx, root, fenceDir });
+  await s.sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
+  await s.sup.submit({ kind: "stop", authority: "service", agent: B });
+  await s.close();
+  fx.units[B].active = true; // something of B outlived the supervisor
+  const sysStop = fx.sys.stop;
+  fx.sys.stop = (u) => { if (u.includes(B)) throw new Error("EIO"); return sysStop(u); };
+  s = await setup({ fx, root, fenceDir });
+  const r = await s.sup.recover();
+  assert.deepEqual(r.unproven, [B]);
+  fx.sys.stop = sysStop;
+  await s.close();
+  s = await setup({ fx, root, fenceDir });
+  const r2 = await s.sup.recover();
+  assert.equal(r2.unproven, undefined);
+  assert.equal(fx.units[B].active, false);
+  await s.close();
 });

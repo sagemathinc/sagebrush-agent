@@ -100,7 +100,7 @@ const pageVid = (seen, i = 0) => seen.filter((e) => e.method === "Target.targetC
 test("start: the agent's context is created and hardened before anything attaches; a failure retires the session", async () => {
   const { cdp, session, hardened, started } = await setup();
   assert.equal(started, true);
-  assert.deepEqual({ ...DRAIN }, { waitMs: 2000, terminateMs: 3000, tickMs: 1000, attachMs: 30000 }); // (O11 §8.1's ruled 2 s + 3 s; §4.4's 30 s)
+  assert.deepEqual({ ...DRAIN }, { waitMs: 2000, terminateMs: 3000, tickMs: 1000, attachMs: 30000, closeMs: 5000 }); // (O11 §8.1's ruled 2 s + 3 s; §4.4's 30 s; §2's 5 s close)
   const before = cdp.calls.length;
   assert.equal(session.handback(), false); // (no takeover to hand back from: nothing happens)
   assert.equal(cdp.calls.length, before);
@@ -375,4 +375,112 @@ test("retirement: a spent handle budget retires the session and closes the brows
   await settle();
   assert.equal(s2.state, "retired");
   assert.equal(r2.length, 1);
+});
+
+test("takeover: a command the drain abandons settles as unknown then, leaves the in-flight set, and a second takeover doesn't terminate its page again", async () => {
+  const { cdp, seen, session, clock } = await setup();
+  await attach(cdp, { sessionId: "SESS-A", targetId: "REAL-TA" });
+  let outcome = "pending";
+  session.command({ method: "DOM.getDocument", params: {}, sessionId: pageVid(seen) }).then((r) => { outcome = r; }); // (no deadline of its own; CDP never answers)
+  await settle();
+  const t = session.takeover();
+  await clock.advance(DRAIN.waitMs);
+  cdp.last("Runtime.terminateExecution").ok({});
+  await clock.advance(DRAIN.terminateMs);
+  assert.deepEqual(await t, { paused: true });
+  await settle();
+  assert.deepEqual(outcome, { unknown: true }); // (settled when the drain gave it up, not left pending)
+  session.handback();
+  const terminates = cdp.find("Runtime.terminateExecution").length;
+  const t2 = session.takeover();
+  await clock.advance(DRAIN.waitMs + DRAIN.terminateMs);
+  assert.deepEqual(await t2, { paused: true });
+  assert.equal(cdp.find("Runtime.terminateExecution").length, terminates); // (nothing in flight: no terminate)
+  cdp.find("DOM.getDocument")[0].ok({ root: { nodeId: 900001, backendNodeId: 900002, nodeType: 9, nodeName: "#document", localName: "", nodeValue: "" } });
+  await settle();
+  assert.ok(!JSON.stringify(seen).includes("REAL-"));
+});
+
+test("createTarget: one 30 s bound over the answer and the attach: answered at 29 s, never attached, it's 'timed out' at 30 s and frees its place", async () => {
+  const { cdp, seen, session, clock } = await setup();
+  let outcome = "pending";
+  session.command({ method: "Target.createTarget", params: { url: "about:blank" } }).then((r) => { outcome = r; });
+  await clock.advance(29000);
+  cdp.last("Target.createTarget").ok({ targetId: "REAL-TLATE" });
+  await clock.advance(999);
+  assert.equal(outcome, "pending");
+  await clock.advance(1);
+  assert.deepEqual(outcome, { error: { code: -32000, message: "timed out" } });
+  for (let i = 0; i < 16; i++) { // (the timed-out one no longer holds one of the 16 places)
+    const c = session.command({ method: "Target.createTarget", params: { url: "about:blank" } });
+    await settle();
+    cdp.last("Target.createTarget").ok({ targetId: `REAL-TN${i}` });
+    await attach(cdp, { sessionId: `SESS-N${i}`, targetId: `REAL-TN${i}` });
+    assert.ok((await c).result, String(i));
+  }
+  const never = session.command({ method: "Target.createTarget", params: { url: "about:blank" } });
+  assert.equal((await never).error.message, "too many pages");
+  assert.equal(seen.filter((e) => e.method === "Target.targetCreated").length, 16);
+  const silent = await setup();
+  let o2 = "pending";
+  silent.session.command({ method: "Target.createTarget", params: { url: "about:blank" } }).then((r) => { o2 = r; });
+  await silent.clock.advance(DRAIN.attachMs);
+  assert.deepEqual(o2, { error: { code: -32000, message: "timed out" } }); // (CDP never answering at all: the same bound)
+});
+
+test("closing for safety: only { success: true } within 5 s counts; a refused, unsuccessful or silent close retires the session", async () => {
+  for (const mode of ["success-false", "rejected", "silent"]) {
+    const { cdp, seen, session, clock, retired } = await setup({ harden: async (a) => { if (a.sessionId === "SESS-W") throw new Error("no"); } });
+    await attach(cdp, { sessionId: "SESS-A", targetId: "REAL-TA" });
+    const pa = pageVid(seen);
+    if (mode === "success-false") cdp.auto["Target.closeTarget"] = () => ({ success: false });
+    if (mode === "rejected") cdp.auto["Target.closeTarget"] = () => { throw new CdpError(-32000, "no"); };
+    if (mode === "silent") delete cdp.auto["Target.closeTarget"];
+    await attach(cdp, { sessionId: "SESS-W", targetId: "REAL-TW", type: "worker", parent: "SESS-A" });
+    assert.deepEqual(cdp.last("Target.closeTarget").params, { targetId: "REAL-TA" }, mode);
+    if (mode === "silent") { await clock.advance(DRAIN.closeMs - 1); assert.equal(session.state, "running", mode); await clock.advance(1); }
+    assert.equal(session.state, "retired", mode);
+    assert.equal(retired.length, 1, mode);
+    assert.equal(cdp.find("Runtime.runIfWaitingForDebugger", "SESS-W").length, 0, mode);
+    assert.deepEqual(await session.command({ method: "Page.reload", params: {}, sessionId: pa }), { error: { code: -32000, message: "session retired" } }, mode);
+  }
+  for (const mode of ["success-false", "silent"]) { // (a popup that may not be shown, and won't close: the same helper, the same end)
+    const p = await setup();
+    if (mode === "success-false") p.cdp.auto["Target.closeTarget"] = () => ({ success: false });
+    else delete p.cdp.auto["Target.closeTarget"];
+    await attach(p.cdp, { sessionId: "SESS-P", targetId: "REAL-TP", url: "javascript:1" });
+    if (mode === "silent") { assert.equal(p.session.state, "running"); await p.clock.advance(DRAIN.closeMs); }
+    assert.equal(p.session.state, "retired", mode);
+    assert.equal(p.cdp.find("Runtime.runIfWaitingForDebugger", "SESS-P").length, 0, mode);
+    assert.equal(p.seen.length, 0, mode);
+  }
+  const over = await setup(); // (the 17th page, over the limit, and its close refused)
+  for (let i = 0; i < 16; i++) await attach(over.cdp, { sessionId: `SESS-${i}`, targetId: `REAL-T${i}` });
+  over.cdp.auto["Target.closeTarget"] = () => ({ success: false });
+  await attach(over.cdp, { sessionId: "SESS-17", targetId: "REAL-T17" });
+  assert.equal(over.session.state, "retired");
+  const ok = await setup({ harden: async (a) => { if (a.sessionId === "SESS-W") throw new Error("no"); } });
+  await attach(ok.cdp, { sessionId: "SESS-A", targetId: "REAL-TA" });
+  await attach(ok.cdp, { sessionId: "SESS-W", targetId: "REAL-TW", type: "worker", parent: "SESS-A" });
+  assert.equal(ok.session.state, "running"); // (a confirmed close: the session goes on)
+});
+
+test("takeover: a deadline command abandoned by the drain never fires its deadline later (no terminate, no 'timed out' after handback)", async () => {
+  const { cdp, seen, session, clock } = await setup();
+  await attach(cdp, { sessionId: "SESS-A", targetId: "REAL-TA" });
+  let outcome = "pending";
+  session.command({ method: "Runtime.evaluate", params: { expression: "new Promise(()=>{})", awaitPromise: true }, sessionId: pageVid(seen) }).then((r) => { outcome = r; });
+  await clock.advance(10000);
+  const t = session.takeover();
+  await clock.advance(DRAIN.waitMs);
+  cdp.last("Runtime.terminateExecution").ok({});
+  await clock.advance(DRAIN.terminateMs);
+  assert.deepEqual(await t, { paused: true });
+  assert.deepEqual(outcome, { unknown: true });
+  session.handback();
+  const terminates = cdp.find("Runtime.terminateExecution").length, releases = cdp.find("Runtime.releaseObjectGroup").length;
+  await clock.advance(30000); // (past the old command's 30 s)
+  assert.equal(cdp.find("Runtime.terminateExecution").length, terminates);
+  assert.equal(cdp.find("Runtime.releaseObjectGroup").length, releases);
+  assert.deepEqual(outcome, { unknown: true });
 });

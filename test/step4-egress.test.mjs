@@ -203,6 +203,69 @@ test("egress: sagebrush_docs: only the allowlist, only sagebrush.space, never a 
   assert.deepEqual(DOCS_PATHS, ["/llms.txt", "/board-format.md", "/board-host-protocol.md", "/capabilities.md", "/agents/connect.md", "/atlas/llms.txt"]);
 });
 
+test("egress: sagebrush_docs pages (#1552): only a member of the site's index, read once a turn; the page as text; nothing read when the index is bad", async () => {
+  const INDEX = { v: 1, paths: ["/docs/", "/docs/sharing", "/articles/groebner/02-f4", "/blog/"] };
+  const mk = (index, { page = { status: 200, type: "text/html", body: Buffer.from("<h1>Sharing</h1><p>How to share.</p>") } } = {}) => {
+    const calls = [];
+    const get = async (u, o) => {
+      calls.push({ u: u.origin + u.target, o });
+      if (u.pathname === "/docs-index.json") return typeof index === "function" ? index() : { status: 200, type: "application/json", body: Buffer.from(typeof index === "string" ? index : JSON.stringify(index)) };
+      return page;
+    };
+    return { v: netVerbs({ budget: new CardlessBudget(), get }), calls };
+  };
+  {
+    const { v, calls } = mk(INDEX);
+    const r = await v.sagebrush_docs({ path: "/docs/sharing" });
+    assert.equal(r.content[1].text, "Sharing\n\nHow to share.", "the page, HTML turned into text");
+    assert.match(r.content[0].text, /^Untrusted content from https:\/\/sagebrush\.space\./);
+    assert.ok((await v.sagebrush_docs({ path: "/blog/" })).content[1].text);
+    assert.equal(calls.filter((c) => c.u.endsWith("/docs-index.json")).length, 1, "the index is read once a turn");
+    assert.ok(calls.every(({ u, o }) => u.startsWith("https://sagebrush.space/") && JSON.stringify(o.hosts) === '["sagebrush.space"]'), "only sagebrush.space, redirects only there");
+    const listed = await v.sagebrush_docs({ path: "/docs-index.json" });
+    assert.deepEqual(JSON.parse(listed.content[1].text), { paths: INDEX.paths }, "the model can read the list itself");
+    const before = calls.length;
+    for (const p of ["/docs/storage", "/docs/sharing/", "/articles/groebner/", "/blog/x"]) {
+      const n = await v.sagebrush_docs({ path: p });
+      assert.ok(n.isError && /isn't one of Sagebrush's doc pages/.test(n.content[0].text), `not in the index, refused: ${p}`);
+    }
+    for (const p of ["/docs/a?x=1", "/docs/A", "/docs/a%2e", "/docs/../s/x", "/docs/a b", "/examples/x/", "/s/abcdefghijk2", "/docs/" + "a".repeat(81)]) {
+      const n = await v.sagebrush_docs({ path: p });
+      assert.ok(n.isError, `not a page path at all, refused: ${p}`);
+    }
+    assert.equal(calls.length, before, "a refused path makes no request");
+  }
+  for (const [what, index] of [
+    ["not JSON", "<html>"],
+    ["another version", { v: 2, paths: ["/docs/"] }],
+    ["an extra key", { v: 1, paths: ["/docs/"], note: "x" }],
+    ["a member that isn't a slug path", { v: 1, paths: ["/docs/", "/docs/a?leak=1"] }],
+    ["a member outside docs, articles and blog", { v: 1, paths: ["/docs/", "/s/abcdefghijk2"] }],
+    ["over 1000 members", { v: 1, paths: Array.from({ length: 1001 }, (_, i) => `/docs/p${i}`) }],
+    ["the index answered 404", () => ({ status: 404 })],
+    ["the index redirected elsewhere", () => ({ redirect: "https://evil.example" })],
+    ["the index request failed", () => { throw new Error("down"); }],
+  ]) {
+    const { v, calls } = mk(index);
+    const r = await v.sagebrush_docs({ path: "/docs/" });
+    assert.ok(r.isError && /couldn't be read/.test(r.content[0].text), `${what}: no page read`);
+    assert.ok(!calls.some((c) => !c.u.endsWith("/docs-index.json")), `${what}: only the index was asked for`);
+    await v.sagebrush_docs({ path: "/docs/sharing" });
+    assert.equal(calls.length, 1, `${what}: and not asked again this turn`);
+  }
+  {
+    // (a page that answers with a redirect off the host is refused, never followed or passed on)
+    const { v } = mk(INDEX, { page: { redirect: "https://evil.example" } });
+    const r = await v.sagebrush_docs({ path: "/docs/sharing" });
+    assert.ok(r.isError && !JSON.stringify(r).includes("evil.example/"), "a page redirected elsewhere: refused");
+  }
+  {
+    const { v } = mk(INDEX);
+    const fixed = await v.sagebrush_docs({ path: "/llms.txt" });
+    assert.ok(!fixed.isError, "the six fixed files are read as before");
+  }
+});
+
 test("egress: web_fetch through the transport: HTML as text, labeled with its origin; a cross-origin redirect said as its origin alone", TLS, async () => {
   routes.set("/page", text("<h1>Title</h1><p>Body</p>", "text/html"));
   const get = (u, o) => safeGet(u, { ...o, ...T({ maxBytes: o.maxBytes, types: o.types }) });

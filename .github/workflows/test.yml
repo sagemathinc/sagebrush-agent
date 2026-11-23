@@ -64,7 +64,8 @@ jobs:
 
   # The backup binary (backup/): its licenses and sources (cargo-deny, backup/deny.toml), its third-party list, its
   # unit tests in both builds, and its integration tests against a local S3 server (SeaweedFS 4.53, pinned by
-  # SHA-256). The restore rows remove CAP_SYS_RESOURCE with `sudo setpriv`, as the launcher's runner will.
+  # SHA-256). The restore rows remove CAP_SYS_RESOURCE with `sudo setpriv`, as the launcher's runner will, and one
+  # restores with no /proc (`sudo unshare -m`), as the runner's filesystem view has none.
   backup:
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -85,4 +86,5 @@ jobs:
         env:
           SB_TEST_WEED: ${{ runner.temp }}/weed/bin/weed
           SB_TEST_REQUIRE_WEED: "1"
+          SB_TEST_REQUIRE_NOPROC: "1"
       - run: cargo build --locked --release --manifest-path backup/Cargo.toml

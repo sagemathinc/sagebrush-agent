@@ -11,6 +11,7 @@ import { Supervisor } from "../lib/fleet/host/executor.mjs";
 import { raiseFence } from "../lib/fleet/host/fence.mjs";
 import { HostStore } from "../lib/fleet/host/host-store.mjs";
 import { planGrant, parseStep } from "../lib/fleet/host/plan.mjs";
+import { STATES } from "../lib/fleet/host/registry.mjs";
 
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
 const tmp = (n) => join(mkdtempSync(join(tmpdir(), "sb-exec-")), n);
@@ -896,4 +897,81 @@ test("recovery from applied(N) proves every agent it doesn't start; an unproven 
   assert.equal(r2.unproven, undefined);
   assert.equal(fx.units[B].active, false);
   await s.close();
+});
+
+// ---- fourth review round: a start step completes only by a real start or a passed proof, whatever the state
+
+
+/**
+ * Leave applying(1) with A's start step pending and A's cgroup stuck (count positive or unreadable), then put A's
+ * registry record in `state`. provisioned: a crash before the start step; every other state: a failed start whose
+ * containment couldn't be proven, then registry moves.
+ */
+async function stuckAt(state, count) {
+  const root = tmp("state"), fenceDir = tmp("fence"), fx = fakeFx();
+  const stuck = { on: true };
+  fx.start = async (id) => { fx.u(id).active = true; throw new FleetError("unit_failed", "exited"); };
+  const sysStop = fx.sys.stop, sysCount = fx.sys.procCount;
+  fx.sys.stop = (u) => { if (stuck.on) throw new Error("EIO"); return sysStop(u); };
+  fx.sys.procCount = (u) => { if (stuck.on) { if (count === "unreadable") throw new Error("EIO"); return 1; } return sysCount(u); };
+  const g1 = grant(1, [entry(A)]);
+  let s;
+  if (state === "provisioned") {
+    s = await setup({ fx, root, fenceDir, barrier: async (n) => { if (n === "after_daemon_reload") throw new Error("crash"); } });
+    await assert.rejects(s.sup.submit({ kind: "grant", bytes: g1 }), /crash/);
+    fx.u(A).active = true; // something of A runs anyway (a leftover)
+  } else {
+    s = await setup({ fx, root, fenceDir });
+    assert.equal((await s.sup.submit({ kind: "grant", bytes: g1 })).reason, "not_empty");
+    const path = { stopped: [], running: ["running"], paused: ["running", "paused"], revoked: ["revoked"], deleted: ["deleted"] }[state];
+    for (const st of path) s.store.registry.setState(A, st);
+  }
+  assert.equal(s.store.registry.agent(A).state, state);
+  await s.close();
+  return { root, fenceDir, fx, g1, stuck };
+}
+
+for (const state of STATES) {
+  for (const count of ["positive", "unreadable"]) {
+    test(`structural: registry state ${state}, count ${count}: the start step never completes, no applied, no ack`, async () => {
+      const { root, fenceDir, fx, g1, stuck } = await stuckAt(state, count);
+      let s = await setup({ fx, root, fenceDir });
+      const r = await s.sup.submit({ kind: "grant", bytes: g1 }); // the same grant: redo
+      assert.notEqual(r.status, "reapplied");
+      assert.notEqual(r.status, "applied");
+      assert.equal(s.store.grants.pending().phase, "applying");
+      await s.close();
+      s = await setup({ fx, root, fenceDir });
+      const rec = await s.sup.recover();
+      assert.notEqual(rec.status, "applied");
+      assert.equal(s.store.grants.pending().phase, "applying");
+      assert.deepEqual(fx.acks, [], "never acknowledged while the count isn't a proven 0");
+      await s.close();
+      // A proof that really passes completes it (or a real start does, for a state that may start).
+      stuck.on = false;
+      fx.start = async (id) => { if (!fx.u(id).masked && !fx.fenced(id)) fx.u(id).active = true; else if (fx.u(id).masked) throw new Error("masked"); };
+      s = await setup({ fx, root, fenceDir });
+      assert.equal((await s.sup.recover()).status, "applied");
+      assert.equal(fx.acks.length, 1);
+      await s.close();
+    });
+  }
+}
+
+test("SEC r4 (astra4b): a person's delete while the proof is pending doesn't let the same grant finish", async () => {
+  const fx = fakeFx();
+  fx.start = async (id) => { fx.u(id).active = true; throw new FleetError("unit_failed", "exited"); };
+  fx.sys.stop = () => { throw new Error("stop failed"); };
+  const { sup, store, close } = await setup({ fx, deadlines: { stop: 100 } });
+  const g1 = grant(1, [entry(A)]);
+  assert.equal((await sup.submit({ kind: "grant", bytes: g1 })).reason, "not_empty");
+  const del = await sup.submit({ kind: "delete", authority: "person", agent: A });
+  assert.notEqual(del.status, "stopped and fenced");
+  assert.equal(store.registry.agent(A).state, "deleted");
+  const r = await sup.submit({ kind: "grant", bytes: g1 });
+  assert.deepEqual([r.status, r.reason], ["refused", "in_progress"]);
+  assert.equal(store.grants.pending().phase, "applying");
+  assert.deepEqual(fx.acks, []);
+  assert.equal(fx.units[A].active, true, "(the fake's cgroup really is still populated)");
+  await close();
 });

@@ -38,6 +38,9 @@ const listing = () => ({ nftables: [
   { rule: { family: "inet", table: "sagebrush", chain: "in_7", handle: 40, expr: [{ drop: null }] } },
 ] });
 const withItems = (f) => { const l = listing(); f(l.nftables); return l; };
+/** What `ip -n sb-<id> -d -j addr show` lists for a namespace a build made (eth0's ifindex 2). */
+const OUR_NS = [{ ifindex: 1, ifname: "lo", link_type: "loopback", addr_info: [{ local: "127.0.0.1" }] },
+  { ifindex: 2, ifname: "eth0", link_type: "ether", linkinfo: { info_kind: "veth" }, addr_info: [{ local: "10.250.0.30" }] }];
 
 test("each network step is one exact ip argv; an unknown step refuses", () => {
   const p = planNetwork(ga("full"), { uid: UID, hostAddrs: [] });
@@ -92,9 +95,9 @@ function setup(over = {}) {
     assert.ok(ms > 0);
     calls.push(argv);
     for (const [m, fn] of Object.entries(over)) if (argv.join(" ").includes(m)) { const r = fn(argv); if (r) return { stdout: "", stderr: "", ...r }; }
-    if (argv.join(" ") === "ip netns list") return { code: 0, stdout: `${NS} (id: 3)\nsb-other (id: 4)\n`, stderr: "" };
+    if (argv.join(" ") === "ip -j netns list") return { code: 0, stdout: JSON.stringify([{ name: NS, id: 3 }, { name: "sb-other", id: 4 }]), stderr: "" };
     if (argv.join(" ").startsWith("ip -d -j addr show dev")) return { code: 1, stdout: "", stderr: `Device "${argv.at(-1)}" does not exist.\n` };
-    if (argv.join(" ") === `ip -n ${NS} -d -j addr show`) return { code: 0, stdout: JSON.stringify([{ ifname: "lo", addr_info: [{ local: "127.0.0.1" }] }, { ifname: "eth0", linkinfo: { info_kind: "veth" }, addr_info: [{ local: "10.250.0.30" }] }]), stderr: "" };
+    if (argv.join(" ") === `ip -n ${NS} -d -j addr show`) return { code: 0, stdout: JSON.stringify(OUR_NS), stderr: "" };
     if (argv.join(" ") === "nft -a -j list table inet sagebrush") return { code: 0, stdout: JSON.stringify(listing()), stderr: "" };
     return { code: 0, stdout: "", stderr: "" };
   };
@@ -125,7 +128,7 @@ test("applyNetwork: tear down first, build from the plan, then one nft transacti
 });
 
 test("applyNetwork: a missing base table is created first; no namespace to remove is fine; a failing command stops it", async () => {
-  const s = setup({ "nft list table inet sagebrush": () => ({ code: 1 }), "ip netns list": () => ({ code: 0, stdout: "sb-other\n" }) });
+  const s = setup({ "nft list table inet sagebrush": () => ({ code: 1 }), "ip -j netns list": () => ({ code: 0, stdout: JSON.stringify([{ name: "sb-other", id: 4 }]) }) });
   await s.rt.applyNetwork(A, UID, ga("none"), left);
   const seqs = s.calls.map(line);
   assert.ok(!seqs.includes(`ip netns del ${NS}`));
@@ -168,7 +171,7 @@ test("applyNetwork derives its plan from one validated source: a bad uid or anot
     assert.deepEqual(s.calls, [], `${name}: nothing ran`);
   }
   // The names torn down and the plan built always belong together: uid 70008 removes and builds sbv8, writes agent-8.
-  const s = setup({ "ip netns list": () => ({ code: 0, stdout: "" }) });
+  const s = setup({ "ip -j netns list": () => ({ code: 0, stdout: "" }) });
   await s.rt.applyNetwork(A, 70008, ga("full"), left);
   const lines = s.calls.map((c) => c.join(" "));
   assert.ok(lines.includes("ip -d -j addr show dev sbv8"));
@@ -194,9 +197,15 @@ test("a foreign link or namespace with the agent's name is refused and left alon
   await assert.rejects(e.rt.applyNetwork(A, UID, ga("full"), left), host);
   assert.ok(!e.calls.some((c) => /^ip (link (del|add)|netns add)/.test(c.join(" "))));
   // A namespace with this agent's name that holds anything but lo and a veth eth0: refused, not deleted.
-  for (const links of [[{ ifname: "lo" }, { ifname: "eth0", linkinfo: { info_kind: "macvlan" } }], [{ ifname: "lo" }, { ifname: "wg0", linkinfo: { info_kind: "wireguard" } }],
-    [{ ifname: "lo" }, { ifname: "eth0", linkinfo: { info_kind: "veth" }, addr_info: [{ local: "10.250.0.34" }] }], // another agent's address
-    [{ ifname: "lo", addr_info: [{ local: "10.0.0.9" }] }]]) {
+  const LO = OUR_NS[0], ETH0 = OUR_NS[1];
+  for (const links of [[LO, { ...ETH0, linkinfo: { info_kind: "macvlan" } }], [LO, { ifname: "wg0", linkinfo: { info_kind: "wireguard" } }],
+    [LO, { ...ETH0, addr_info: [{ local: "10.250.0.34" }] }], // another agent's address
+    [{ ...LO, addr_info: [{ local: "10.0.0.9" }] }],
+    [], // empty: no loopback at all
+    [ETH0], // eth0 without lo
+    [LO, LO, ETH0], // a duplicate lo
+    [{ ifname: "lo", link_type: "ether", addr_info: [] }, ETH0], // something named lo that isn't a loopback
+    [LO, ETH0, ETH0]]) { // two eth0
     const s = setup({ [`ip -n ${NS} -d -j addr show`]: () => ({ code: 0, stdout: JSON.stringify(links) }) });
     await assert.rejects(s.rt.applyNetwork(A, UID, ga("full"), left), host, JSON.stringify(links));
     assert.ok(!s.calls.some((c) => c.join(" ") === `ip netns del ${NS}`), "the namespace is left alone");
@@ -233,4 +242,51 @@ test("the base table is validated whole: any difference refuses, and nothing is 
   }
   // The valid listing itself passes, and its own agent-70 objects are never touched by agent 7's transaction.
   assert.doesNotMatch(replaceTransaction(listing(), 7, ""), /_70|handle 30/);
+});
+
+test("a host veth peered into our own namespace (a finished build) is accepted; a mixed foreign state deletes nothing", async () => {
+  // The steady state after a build: sbv7's peer is eth0 (ifindex 2) in namespace id 3. The namespace goes, taking it.
+  const steady = [{ ifname: "sbv7", link_netnsid: 3, link_index: 2, linkinfo: { info_kind: "veth" }, addr_info: [{ local: "10.250.0.29" }] }];
+  const s = setup({ "ip -d -j addr show dev": () => ({ code: 0, stdout: JSON.stringify(steady) }) });
+  await s.rt.applyNetwork(A, UID, ga("full"), left);
+  const lines = s.calls.map((c) => c.join(" "));
+  assert.ok(lines.includes(`ip netns del ${NS}`));
+  assert.ok(!lines.includes("ip link del dev sbv7"), "the pair goes with the namespace");
+  // Peered into another namespace id, or another ifindex: refused, and NOTHING deleted (not even our namespace).
+  for (const bad of [{ ...steady[0], link_netnsid: 4 }, { ...steady[0], link_index: 5 }]) {
+    const t = setup({ "ip -d -j addr show dev": () => ({ code: 0, stdout: JSON.stringify([bad]) }) });
+    await assert.rejects(t.rt.applyNetwork(A, UID, ga("full"), left), host);
+    assert.ok(!t.calls.some((c) => /^ip (netns|link) del/.test(c.join(" "))), "zero deletes");
+  }
+  // The mixed case: an owned-looking namespace next to a foreign sbv7 (a bridge): both left untouched.
+  const m = setup({ "ip -d -j addr show dev": () => ({ code: 0, stdout: JSON.stringify([{ ifname: "sbv7", link: "sbp7", linkinfo: { info_kind: "bridge" }, addr_info: [] }]) }) });
+  await assert.rejects(m.rt.applyNetwork(A, UID, ga("full"), left), host);
+  assert.ok(!m.calls.some((c) => /^ip (netns|link) del/.test(c.join(" "))), "zero deletes");
+  // A namespace list that isn't JSON: host-side, nothing deleted.
+  const j = setup({ "ip -j netns list": () => ({ code: 0, stdout: "sb-x (id: 1)" }) });
+  await assert.rejects(j.rt.applyNetwork(A, UID, ga("full"), left), host);
+});
+
+test("only canonical agent indices 0..9999, and only chains and rules: anything else in the table refuses", async () => {
+  const cases = {
+    "a non-canonical chain in_07": (it) => { it.push({ chain: { family: "inet", table: "sagebrush", name: "in_07", handle: 70, comment: "sb-agent-7" } }); },
+    "an out-of-range chain in_10000": (it) => { it.push({ chain: { family: "inet", table: "sagebrush", name: "in_10000", handle: 71, comment: "sb-agent-10000" } }); },
+    "a non-canonical rule comment": (it) => { it.push({ rule: { family: "inet", table: "sagebrush", chain: "input", handle: 72, comment: "sb-agent-07", expr: [meta("iifname", "sbv07"), { accept: null }] } }); },
+    "an out-of-range rule comment": (it) => { it.push({ rule: { family: "inet", table: "sagebrush", chain: "input", handle: 73, comment: "sb-agent-10000", expr: [meta("iifname", "sbv10000"), { accept: null }] } }); },
+    "a named set": (it) => { it.push({ set: { family: "inet", table: "sagebrush", name: "allow", type: "ipv4_addr", handle: 74 } }); },
+    "a map": (it) => { it.push({ map: { family: "inet", table: "sagebrush", name: "m", type: "ipv4_addr", map: "verdict", handle: 75 } }); },
+    "a flowtable": (it) => { it.push({ flowtable: { family: "inet", table: "sagebrush", name: "ft", handle: 76 } }); },
+    "a named counter": (it) => { it.push({ counter: { family: "inet", table: "sagebrush", name: "c", handle: 77 } }); },
+    "an item of two kinds": (it) => { it.push({ chain: { family: "inet", table: "sagebrush", name: "x" }, set: {} }); },
+    "an empty item": (it) => { it.push({}); },
+  };
+  for (const [name, f] of Object.entries(cases)) {
+    assert.throws(() => replaceTransaction(withItems(f), 7, "add x\n"), host, name);
+    const s = setup({ "nft -a -j": () => ({ code: 0, stdout: JSON.stringify(withItems(f)) }) });
+    await assert.rejects(s.rt.applyNetwork(A, UID, ga("full"), left), host, name);
+    assert.ok(!s.calls.some((c) => c[0] === "nft" && c[1] === "-f"), `${name}: nothing applied`);
+  }
+  // The highest canonical index is fine.
+  const hi = withItems((it) => it.push({ chain: { family: "inet", table: "sagebrush", name: "in_9999", handle: 80, comment: "sb-agent-9999" } }));
+  assert.match(replaceTransaction(hi, 9999, ""), /^flush chain inet sagebrush in_9999$/m);
 });

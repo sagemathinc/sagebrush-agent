@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError } from "../lib/fleet/index.mjs";
 import { BINDS, UNIT_DIR, launcherExit, realEffects, runArgv, stagingPlan } from "../lib/fleet/host/effects.mjs";
+import { UNIT_DIRS_ABOVE_MASK } from "../lib/fleet/host/names.mjs";
 import { CONTRACT, launcherContract, renderUnit } from "../lib/fleet/host/unit.mjs";
 
 const A = "abcdefghijklmnopqrstuvwxya", T1 = "tagtagtagtagtagtagtagtagaa";
@@ -42,8 +43,12 @@ function tmpRoot() {
  */
 function scripted(root, over = {}) {
   const calls = [];
+  let masked = false;
   const dflt = (argv) => {
     if (argv[0] === "mountpoint") return { code: 1 };
+    if (argv[0] === "systemctl" && argv[1] === "mask") { masked = true; return { code: 0 }; }
+    if (argv[0] === "systemctl" && argv[1] === "unmask") { masked = false; return { code: 0 }; }
+    if (argv[0] === "systemctl" && argv[1] === "is-enabled") return masked ? { code: 1, stdout: "masked-runtime\n" } : { code: 0, stdout: "static\n" };
     if (argv[1] === "stage-bind") {
       const get = (k) => argv[argv.indexOf(k) + 1];
       const staging = `${BINDS}/${get("--agent")}/${get("--index")}`;
@@ -120,7 +125,11 @@ test("the staging plan numbers the rw paths, then the ro paths, under the agent'
 
 test("the systemd effects are the exact systemctl argv, and a non-zero exit is host-side", async () => {
   const { fx, calls } = setup();
-  for (const [f, args] of [["mask", ["mask", "--runtime", UNIT]], ["unmask", ["unmask", "--runtime", UNIT]], ["stopUnit", ["stop", UNIT]], ["freeze", ["freeze", UNIT]], ["thaw", ["thaw", UNIT]]]) {
+  for (const [f, args] of [["mask", ["mask", "--runtime", UNIT]], ["unmask", ["unmask", "--runtime", UNIT]]]) {
+    await fx[f](A, 1000);
+    assert.deepEqual(calls.slice(-2), [["systemctl", ...args], ["systemctl", "is-enabled", UNIT]]);
+  }
+  for (const [f, args] of [["stopUnit", ["stop", UNIT]], ["freeze", ["freeze", UNIT]], ["thaw", ["thaw", UNIT]]]) {
     await fx[f](A, 1000);
     assert.deepEqual(calls.at(-1), ["systemctl", ...args]);
   }
@@ -128,7 +137,7 @@ test("the systemd effects are the exact systemctl argv, and a non-zero exit is h
   assert.deepEqual(calls.at(-1), ["systemctl", "daemon-reload"]);
   const bad = setup({ over: { "systemctl mask": () => ({ code: 1 }) } });
   await assert.rejects(bad.fx.mask(A, 1000), host);
-  assert.throws(() => setup().fx.mask("not-an-id", 1000), typed("bad_form"));
+  await assert.rejects(setup().fx.mask("not-an-id", 1000), typed("bad_form"));
 });
 
 test("isActive is true only for active; inactive is false; anything else is unknown", async () => {
@@ -299,4 +308,98 @@ test("start uses the lookup's agent only: another agent's entry is host-side", a
   const fx = realEffects({ lookup: () => ({ grantAgent: grantAgent({ agent: T1 }), uid: UID, gid: GID, net: null }), host: HOST, provision: async () => {}, run, root, rootUid: ME });
   await assert.rejects(fx.start(A, 5000), host);
   assert.throws(() => realEffects({ host: HOST, provision: async () => {} }), typed("bad_form"));
+});
+
+/** Poll until `pid` no longer exists (ESRCH), for at most `ms`. */
+async function gone(pid, ms = 2000) {
+  const t = Date.now();
+  for (;;) {
+    try { process.kill(pid, 0); } catch (e) { if (e.code === "ESRCH") return true; throw e; }
+    if (Date.now() - t > ms) return false;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+test("runArgv: a descendant holding stdout can't outlive the command or its time bound", async () => {
+  // The command exits at once; its background child keeps the pipe open. The call settles promptly and the child dies.
+  let t = Date.now();
+  const r = await runArgv(["/bin/sh", "-c", "sleep 30 & echo $!; exit 0"], { ms: 5000 });
+  assert.ok(Date.now() - t < 1500, `settled after ${Date.now() - t} ms`);
+  assert.equal(r.code, 0);
+  assert.ok(await gone(Number(r.stdout.trim())), "the descendant was killed");
+  // The time bound, and an abort, with a descendant holding the pipe and the command still running.
+  for (const how of ["timeout", "abort"]) {
+    const pidFile = join(os.tmpdir(), `sb-runner-${process.pid}-${how}`);
+    fs.rmSync(pidFile, { force: true });
+    const ac = new AbortController();
+    if (how === "abort") setTimeout(() => ac.abort(), 150);
+    t = Date.now();
+    await assert.rejects(runArgv(["/bin/sh", "-c", `sleep 30 & echo $! > ${pidFile}; sleep 30`], { ms: how === "timeout" ? 150 : 10000, signal: ac.signal }), host);
+    assert.ok(Date.now() - t < 1500, `${how}: settled after ${Date.now() - t} ms`);
+    assert.ok(await gone(Number(fs.readFileSync(pidFile, "utf8").trim())), `${how}: the descendant was killed`);
+    fs.rmSync(pidFile, { force: true });
+  }
+});
+
+test("runArgv: a command that exits at once while its descendant holds the pipes settles within its bound (the review's probe)", async () => {
+  // argv ["/bin/sh", "-c", "sleep 2 & exit 0"] with ms 50 used to settle only after the descendant exited (about 2 s).
+  for (const ms of [50, 5000]) {
+    const t = Date.now();
+    const r = await runArgv(["/bin/sh", "-c", "sleep 2 & exit 0"], { ms });
+    assert.ok(Date.now() - t < 500, `ms ${ms}: settled after ${Date.now() - t} ms`);
+    assert.equal(r.code, 0, "the command itself finished in time: its own exit");
+  }
+});
+
+test("runArgv: a descendant that left the group and holds the pipes can't hold the call: bounded by the drain", async () => {
+  // The command exits first; its setsid'd child (out of the group, so it can't be killed with it) keeps stdout open.
+  const t = Date.now();
+  const r = await runArgv(["/bin/sh", "-c", "setsid sleep 30 & echo $!; exit 0"], { ms: 10000 });
+  assert.ok(Date.now() - t < 1000, `settled after ${Date.now() - t} ms`);
+  assert.equal(r.code, 0);
+  // That one survives by construction (stated in runArgv); this test's own cleanup kills it by its exact pid.
+  const pid = Number(r.stdout.trim());
+  assert.ok(Number.isSafeInteger(pid) && pid > 1);
+  try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+});
+
+test("mask counts only if systemd reports the unit masked; unmask only if it loads the generated unit again", async () => {
+  // A mask link shadowed by a higher-ranked unit file: systemctl exits 0, is-enabled still says static.
+  const shadowed = setup({ over: { "is-enabled": () => ({ code: 0, stdout: "static\n" }) } });
+  await assert.rejects(shadowed.fx.mask(A, 1000), host);
+  for (const state of ["masked-runtime", "masked"]) await setup({ over: { "is-enabled": () => ({ code: 1, stdout: `${state}\n` }) } }).fx.mask(A, 1000);
+  for (const out of ["", "not-found\n", "enabled\n", "garbage text\n"]) await assert.rejects(setup({ over: { "is-enabled": () => ({ code: 1, stdout: out }) } }).fx.mask(A, 1000), host, out);
+  // unmask --runtime can't lift a persistent mask, or anything else: only "static" counts.
+  for (const state of ["masked", "masked-runtime", "not-found"]) await assert.rejects(setup({ over: { "is-enabled": () => ({ code: 1, stdout: `${state}\n` }) } }).fx.unmask(A, 1000), host, state);
+  await setup().fx.unmask(A, 1000);
+});
+
+test("writeUnit installs below the runtime mask, and refuses while an agent unit file sits in a load path above it", async () => {
+  assert.equal(UNIT_DIR, "/usr/local/lib/systemd/system");
+  for (const d of UNIT_DIRS_ABOVE_MASK) {
+    const { root, fx, ga } = setup();
+    fs.mkdirSync(join(root, d), { recursive: true });
+    fs.writeFileSync(join(root, d, UNIT), "[Service]\nExecStart=/bin/true\n");
+    await assert.rejects(fx.writeUnit(A, UID, ga, 1000), host, d);
+    assert.equal(fs.existsSync(join(root, UNIT_DIR, UNIT)), false, `${d}: nothing written`);
+  }
+});
+
+const SYSTEMCTL = ["/usr/bin/systemctl", "/bin/systemctl"].find((p) => fs.existsSync(p));
+test("real systemctl (offline, --root): a runtime mask over the generated unit is effective; over /etc it is shadowed", { skip: !SYSTEMCTL && "no systemctl" }, async () => {
+  const { root, fx, ga } = setup();
+  await fx.writeUnit(A, UID, ga, 1000); // the real rendered unit, at UNIT_DIR under root
+  fs.mkdirSync(join(root, "/run/systemd/system"), { recursive: true });
+  const ctl = async (...a) => (await runArgv([SYSTEMCTL, `--root=${root}`, ...a], { ms: 10000 })).stdout.trim();
+  assert.equal(await ctl("is-enabled", UNIT), "static");
+  await ctl("mask", "--runtime", UNIT);
+  assert.equal(await ctl("is-enabled", UNIT), "masked-runtime");
+  await ctl("unmask", "--runtime", UNIT);
+  assert.equal(await ctl("is-enabled", UNIT), "static");
+  // The control: the same unit in /etc/systemd/system shadows the same runtime mask (the placement this replaces).
+  fs.mkdirSync(join(root, "/etc/systemd/system"), { recursive: true });
+  fs.renameSync(join(root, UNIT_DIR, UNIT), join(root, "/etc/systemd/system", UNIT));
+  await ctl("mask", "--runtime", UNIT);
+  assert.equal(fs.readlinkSync(join(root, "/run/systemd/system", UNIT)), "/dev/null");
+  assert.equal(await ctl("is-enabled", UNIT), "static");
 });

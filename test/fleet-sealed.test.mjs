@@ -38,9 +38,9 @@ async function setup() {
   const s = {
     fleet, ctx, N, B, chain, host, hk, encKey, cert, sub, sub2, grant,
     async header(extra = {}) {
-      return { fleet, aud: AUD, package: newId(), host, enc_key: await encKeyId(encKey.raw), fingerprint: cert.body.fingerprint, sub, provider: "claude", purpose: "claude-setup-token", gen: 3, chain_seq: s.chain.seq, at_ms: NOW - 1000, not_after_ms: NOW + 3_600_000, ...extra };
+      return { fleet, aud: AUD, package: newId(), host, enc_key: await encKeyId(encKey.raw), fingerprint: cert.body.fingerprint, sub: sub2, provider: "codex", purpose: "codex-access-token", gen: 3, chain_seq: s.chain.seq, at_ms: NOW - 1000, not_after_ms: NOW + 3_600_000, ...extra };
     },
-    plaintext: (extra = {}) => ({ v: 1, provider: "claude", purpose: "claude-setup-token", secret: "sk-test-mock-not-a-credential", issued_ms: NOW - 2000, ...extra }),
+    plaintext: (extra = {}) => ({ v: 1, provider: "codex", purpose: "codex-access-token", secret: "test-mock-not-a-credential", issued_ms: NOW - 2000, ...extra }),
     vctx: (extra = {}) => ({ ...ctx, chain: s.chain, cert, hostRevoked: () => false, encKey, currentGen: 3, grant, now: NOW, revoked: () => false, opened: () => false, ...extra }),
   };
   return s;
@@ -59,7 +59,7 @@ test("the committed fleet HPKE vectors are exactly what the generator builds, an
   assert.equal(F.freeze, core.FREEZE.sha256);
   const { bad, n } = await checkHpkeFixtures(core, F);
   assert.deepEqual(bad, []);
-  assert.equal(n, 2 + F.packages.length + 3 + F.caps.length + 1, "every case and every plaintext and token");
+  assert.equal(n, 2 + F.packages.length + F.packages.filter((c) => c.plaintext).length + F.caps.length + 1, "every case and every plaintext and token");
 });
 
 test("the X25519 key id: alg \"x25519\" (ruled), pinned, and never the same id as the same bytes under ed25519", async () => {
@@ -116,17 +116,27 @@ test("its own host, key and fingerprint; the subscription, provider and purpose 
   assert.equal(await code(() => verifyPackage(p, s.vctx({ cert: { ...s.cert, encRaw: other.raw }, encKey: other }))), "not_granted", "sealed to another key id");
   assert.equal(await ok({ sub: newId() }), "not_granted", "a subscription not in the grant");
   assert.equal(await ok({}, s.plaintext(), { grant: { ...s.grant, host: newId() } }), "not_granted", "a grant for another host");
-  const codex = (purpose) => [{ sub: s.sub2, provider: "codex", purpose }, s.plaintext({ provider: "codex", purpose })];
+  const codex = (purpose) => [{ purpose }, s.plaintext({ purpose })];
   assert.equal(await ok(...codex("codex-access-token")), "ok");
   assert.equal(await ok(...codex("codex-refresh-home")), "not_granted", "codex-refresh-home needs home: true");
   const homed = { ...s.grant, subscriptions: [s.grant.subscriptions[0], { ...s.grant.subscriptions[1], home: true }] };
   assert.equal(await ok(...codex("codex-refresh-home"), { grant: homed }), "ok");
-  assert.equal(await ok({ sub: s.sub2 }), "not_granted", "a claude package for a codex subscription");
+  assert.equal(await ok({ sub: s.sub }), "not_granted", "a codex package for the grant's claude subscription");
+  // (signed anyway past the app's own refusal, then given to the host)
+  const signedAnyway = async (extra) => {
+    const h = await s.header(extra);
+    const { enc: e, ct } = await hpkeSeal(s.encKey.raw, enc("sagebrush.seal.v1\n" + canonText(h)), new Uint8Array(0), enc(canonText(s.plaintext({ provider: h.provider, purpose: h.purpose }))));
+    return seal("sb.sealed-package.v1", s.N.signer, { ...h, enc: b64(e), ct: b64(ct) }, s.N.k);
+  };
   // a purpose of another provider is refused at sealing; signed anyway, the host refuses it too
-  assert.equal(await code(async () => sealPackage(await s.header({ purpose: "codex-access-token" }), s.plaintext({ purpose: "codex-access-token" }), s.encKey.raw, s.N.signer, s.N.k)), "bad_form");
-  const h = await s.header({ purpose: "codex-access-token" });
-  const { enc: e, ct } = await hpkeSeal(s.encKey.raw, enc("sagebrush.seal.v1\n" + canonText(h)), new Uint8Array(0), enc(canonText(s.plaintext({ purpose: "codex-access-token" }))));
-  assert.equal(await code(() => verifyPackage(seal("sb.sealed-package.v1", s.N.signer, { ...h, enc: b64(e), ct: b64(ct) }, s.N.k), s.vctx())), "bad_form");
+  assert.equal(await code(async () => sealPackage(await s.header({ purpose: "claude-setup-token" }), s.plaintext({ purpose: "claude-setup-token" }), s.encKey.raw, s.N.signer, s.N.k)), "bad_form");
+  assert.equal(await code(async () => verifyPackage(await signedAnyway({ purpose: "claude-setup-token" }), s.vctx())), "bad_form");
+  // no Claude purpose at all: a Claude login is never sealed to a host. A claude-setup-token package for the grant's
+  // claude subscription is refused at sealing, and, signed anyway, by the host
+  const claude = { sub: s.sub, provider: "claude", purpose: "claude-setup-token" };
+  assert.equal(await code(async () => sealPackage(await s.header(claude), s.plaintext({ provider: "claude", purpose: "claude-setup-token" }), s.encKey.raw, s.N.signer, s.N.k)), "bad_form", "sealing a Claude login");
+  assert.equal(await code(async () => verifyPackage(await signedAnyway(claude), s.vctx())), "bad_form", "a Claude login, signed anyway");
+  assert.equal(await code(async () => verifyPackage(await signedAnyway({ ...claude, purpose: "codex-access-token" }), s.vctx())), "bad_form", "a codex purpose under claude");
 });
 
 test("lifetime, plaintext schema and bounds, the encapsulated key, a removed signer", async () => {
@@ -135,7 +145,7 @@ test("lifetime, plaintext schema and bounds, the encapsulated key, a removed sig
   assert.equal(await code(async () => sealPackage(await s.header({ not_after_ms: NOW - 1000 }), s.plaintext(), s.encKey.raw, s.N.signer, s.N.k)), "bad_form", "an empty lifetime");
   assert.equal(await code(async () => sealPackage(await s.header(), s.plaintext({ secret: "" }), s.encKey.raw, s.N.signer, s.N.k)), "bad_form");
   assert.equal(await code(async () => sealPackage(await s.header(), s.plaintext({ secret: "x".repeat(8193) }), s.encKey.raw, s.N.signer, s.N.k)), "bad_form", "a secret over 8 KiB");
-  assert.equal(await code(async () => sealPackage(await s.header(), s.plaintext({ provider: "codex" }), s.encKey.raw, s.N.signer, s.N.k)), "bad_form", "the plaintext's provider isn't the header's");
+  assert.equal(await code(async () => sealPackage(await s.header(), s.plaintext({ provider: "claude" }), s.encKey.raw, s.N.signer, s.N.k)), "bad_form", "the plaintext's provider isn't the header's");
   assert.equal(await code(async () => sealPackage(await s.header({ enc_key: b64(new Uint8Array(16)) }), s.plaintext(), s.encKey.raw, s.N.signer, s.N.k)), "bad_form", "enc_key isn't the key sealed to");
   // forged past the app's checks: a plaintext with an extra field, and one that isn't canonical, are refused when opened
   const h = await s.header();

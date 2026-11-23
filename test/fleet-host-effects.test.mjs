@@ -75,9 +75,15 @@ function setup({ over, settleMs = 30, ga = grantAgent() } = {}) {
   const { run, calls } = scripted(root, over);
   const chowns = [];
   const fsx = { ...fs, chownSync: (p, u, g) => chowns.push([p, u, g]) };
+  // The runtime and requota parts record their calls in the same log as the commands (as pseudo-argv).
+  const runtime = {
+    brokerDirFor: (agent, gid) => { calls.push(["<runtime>", "broker-dir", agent, String(gid)]); },
+    applyNetwork: async (agent, uid, g) => { calls.push(["<runtime>", "network", agent, String(uid), g?.config?.network?.mode ?? ""]); },
+  };
+  const requota = async (agent, uid, g) => { calls.push(["<requota>", agent, String(uid), String(g.config.resources.disk_gb)]); };
   const fx = realEffects({
     lookup: (agent) => ({ grantAgent: ga, uid: UID, gid: GID, net: { mode: "none" } }),
-    host: HOST, provision: async () => {}, run, fsx, root, rootUid: ME, settleMs,
+    host: HOST, provision: async () => {}, runtime, requota, run, fsx, root, rootUid: ME, settleMs,
   });
   return { root, fx, calls, chowns, ga };
 }
@@ -306,9 +312,17 @@ test("start: a unit that never settles is host-side within the start's time; an 
 test("start uses the lookup's agent only: another agent's entry is host-side", async () => {
   const root = tmpRoot();
   const { run } = scripted(root);
-  const fx = realEffects({ lookup: () => ({ grantAgent: grantAgent({ agent: T1 }), uid: UID, gid: GID, net: null }), host: HOST, provision: async () => {}, run, root, rootUid: ME });
+  const parts = { provision: async () => {}, requota: async () => {}, runtime: { brokerDirFor: () => {}, applyNetwork: async () => {} } };
+  const fx = realEffects({ lookup: () => ({ grantAgent: grantAgent({ agent: T1 }), uid: UID, gid: GID, net: null }), host: HOST, ...parts, run, root, rootUid: ME });
   await assert.rejects(fx.start(A, 5000), host);
-  assert.throws(() => realEffects({ host: HOST, provision: async () => {} }), typed("bad_form"));
+  // Every part is required: none is ever silently skipped.
+  const lookup = () => ({});
+  for (const missing of ["lookup", "provision", "requota", "runtime"]) {
+    const opts = { lookup, host: HOST, ...parts };
+    delete opts[missing];
+    assert.throws(() => realEffects(opts), typed("bad_form"), missing);
+  }
+  assert.throws(() => realEffects({ lookup, host: HOST, ...parts, runtime: { brokerDirFor: () => {} } }), typed("bad_form"));
 });
 
 /** Poll until `pid` no longer exists (ESRCH), for at most `ms`. */
@@ -403,4 +417,38 @@ test("real systemctl (offline, --root): a runtime mask over the generated unit i
   await ctl("mask", "--runtime", UNIT);
   assert.equal(fs.readlinkSync(join(root, "/run/systemd/system", UNIT)), "/dev/null");
   assert.equal(await ctl("is-enabled", UNIT), "static");
+});
+
+test("start rebuilds the broker directory and the network BEFORE anything is staged", async () => {
+  const { root, fx, calls } = setup();
+  // A leftover staging mountpoint, so the staging cleanup itself issues commands (mountpoint) that must come after.
+  fs.mkdirSync(join(root, BINDS, A, "5"), { recursive: true });
+  await fx.start(A, 5000);
+  const seq = calls.map((c) => (c[0] === "<runtime>" ? c[1] : c[0] === "mountpoint" ? "mountpoint" : c[1] === "stage-bind" ? "stage-bind" : null)).filter(Boolean);
+  assert.deepEqual(seq.slice(0, 3), ["broker-dir", "network", "mountpoint"]);
+  assert.ok(seq.indexOf("network") < seq.indexOf("stage-bind"));
+  assert.deepEqual(calls.find((c) => c[1] === "broker-dir"), ["<runtime>", "broker-dir", A, String(GID)]);
+  assert.deepEqual(calls.find((c) => c[1] === "network"), ["<runtime>", "network", A, String(UID), "none"]);
+  // A network that can't be built stops the start before any stage-bind.
+  const bad = setup();
+  const failing = realEffects({ lookup: () => ({ grantAgent: grantAgent(), uid: UID, gid: GID, net: { mode: "none" } }), host: HOST, provision: async () => {}, requota: async () => {},
+    runtime: { brokerDirFor: () => {}, applyNetwork: async () => { throw Object.assign(new Error("nft"), { code: "effect_failed" }); } }, run: async (argv) => { bad.calls.push(argv); return { code: 0, stdout: "", stderr: "" }; }, root: bad.root, rootUid: ME });
+  await assert.rejects(failing.start(A, 5000), host);
+  assert.ok(!bad.calls.some((c) => c[1] === "stage-bind"));
+});
+
+test("writeUnit writes the agent's resolver file (root 0644, from its network plan) and resets its quota, before the unit", async () => {
+  const full = { ...config(), network: { mode: "full", allow: [], lan_allow: [] } };
+  const { root, fx, calls } = setup({ ga: grantAgent({ config: full }) });
+  await fx.writeUnit(A, UID, grantAgent({ config: full }), 5000);
+  const resolv = join(root, `/var/lib/sagebrush/resolv/${A}.conf`);
+  assert.equal(fs.readFileSync(resolv, "utf8"), "nameserver 10.250.0.1\noptions edns0\n");
+  assert.equal(fs.statSync(resolv).mode & 0o777, 0o644);
+  assert.deepEqual(calls.find((c) => c[0] === "<requota>"), ["<requota>", A, String(UID), "50"]);
+  // A quota that can't be reset stops the write: no unit is written.
+  const q = setup();
+  const failing = realEffects({ lookup: () => ({}), host: HOST, provision: async () => {}, runtime: { brokerDirFor: () => {}, applyNetwork: async () => {} },
+    requota: async () => { throw Object.assign(new Error("setquota"), { code: "effect_failed" }); }, run: async () => ({ code: 0, stdout: "", stderr: "" }), root: q.root, rootUid: ME });
+  await assert.rejects(failing.writeUnit(A, UID, grantAgent(), 5000), host);
+  assert.equal(fs.existsSync(join(q.root, UNIT_DIR, UNIT)), false);
 });

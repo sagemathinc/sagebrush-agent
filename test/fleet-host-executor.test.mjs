@@ -1070,7 +1070,7 @@ test("pendingProof raised DURING an application (a preempting revoke-caps) block
   const r = await sup.submit({ kind: "grant", bytes: g2 });
   assert.equal(r.status, "refused");
   // Refused at the first widening step for A after the proof became pending (here the map publish), else at finish.
-  assert.ok(["map", `prove:${A}`].includes(r.previous.step), r.previous.step);
+  assert.ok(["daemon-reload", "map", `prove:${A}`].includes(r.previous.step), r.previous.step);
   assert.equal(r.previous.reason, "not_empty");
   assert.equal(s.store.grants.pending().phase, "applying");
   assert.deepEqual(fx.acks.map((x) => x[0]), [1]);
@@ -1235,7 +1235,7 @@ async function pendingA({ via = "stop", fx = fakeFx() } = {}) {
   const snapshot = () => ({
     fences: ["all", A, "expiry"].filter((n) => existsSync(join(fenceDir, n))),
     state: s.store.registry.agent(A).state,
-    widened: fx.log.filter((l) => ["unit", "daemon-reload", "unmask", "start", "thaw", "map", "provision"].includes(l[0])).length,
+    widened: fx.log.filter((l) => ["unit", "daemon-reload", "unmask", "start", "thaw", "map", "provision", "broker-gen"].includes(l[0])).length,
     active: fx.u(A).active, frozen: fx.u(A).frozen, masked: fx.u(A).masked,
   });
   return { ...s, fx, root, fenceDir, stuck, snapshot };
@@ -1386,4 +1386,54 @@ test("SEC r8: an emergency between the proofs and unexpire: the unexpire step's 
   assert.ok(store.grants.pendingProofs().includes(A));
   assert.ok(existsSync(join(s.fenceDir, "expiry")), "expiry not lowered while a proof is pending");
   await s.close();
+});
+
+// ---- ninth review round: the host-wide form of the gate (broker generation and every agentless widening effect)
+
+test("SEC r9: an emergency between the proof and broker-gen: brokerGen isn't called while a proof is pending; it is once proven", async () => {
+  const fx = fakeFx();
+  let sup, store, armed = false, stuck = false;
+  const sysStop = fx.sys.stop, sysCount = fx.sys.procCount;
+  fx.sys.stop = (u) => { if (stuck) throw new Error("EIO"); return sysStop(u); };
+  fx.sys.procCount = (u) => (stuck ? 1 : sysCount(u));
+  const s = await setup({ fx, barrier: async (n) => {
+    if (armed && n === "after_contain") { armed = false; stuck = true; sup.submit({ kind: "stop-all", authority: "local" }); }
+  } });
+  sup = s.sup; store = s.store;
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
+  stuck = true;
+  await sup.submit({ kind: "stop", authority: "service", agent: A }); // A pending
+  stuck = false;
+  armed = true; // during grant 2's prove:A (it passes), a failing stop-all arrives: A and B pending again
+  fx.log.length = 0;
+  await sup.submit({ kind: "grant", bytes: grant(2, [entry(A), entry(B)]) });
+  const g2 = grant(2, [entry(A), entry(B)]);
+  const r = await sup.submit({ kind: "grant", bytes: g2 });
+  assert.notEqual(r.status, "applied");
+  assert.ok(store.grants.pendingProofs().length > 0);
+  assert.ok(!fx.log.some((l) => l[0] === "broker-gen" && l[1] === 2), "no broker generation 2 while a proof is pending");
+  stuck = false;
+  const r2 = await sup.submit({ kind: "grant", bytes: g2 });
+  assert.ok(["applied", "reapplied"].includes(r2.status), r2.status);
+  assert.ok(fx.log.some((l) => l[0] === "broker-gen" && l[1] === 2), "broker generation 2 once proven");
+  await s.close();
+});
+
+test("SEC r9: an agentless widening effect (here a healthy agent's resume, which reloads systemd) is refused while another agent is pending, nothing changed", async () => {
+  const fx = fakeFx();
+  const { sup, store, fenceDir, close } = await setup({ fx });
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
+  await sup.submit({ kind: "stop", authority: "service", agent: B }); // B healthy, stopped, fenced
+  fx.sys.stop = () => { throw new Error("EIO"); };
+  const sysCount = fx.sys.procCount;
+  fx.sys.procCount = (u) => (u.includes(A) ? 1 : sysCount(u));
+  await sup.submit({ kind: "stop", authority: "service", agent: A }); // A pending
+  assert.deepEqual(store.grants.pendingProofs(), [A]);
+  fx.log.length = 0;
+  const r = await sup.submit({ kind: "resume", authority: "person", agent: B });
+  assert.deepEqual([r.status, r.reason], ["refused", "pending_proof"]);
+  assert.ok(existsSync(join(fenceDir, B)), "B's fence stays up");
+  assert.equal(store.registry.agent(B).state, "stopped");
+  assert.ok(!fx.log.some((l) => ["daemon-reload", "unit", "unmask", "start", "broker-gen", "map"].includes(l[0])));
+  await close();
 });

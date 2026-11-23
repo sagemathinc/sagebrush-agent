@@ -101,3 +101,12 @@ test("closed validator: enum, const and uniqueItems compare numbers by value; a 
   assert.equal(bad(() => any([{ a: 1, b: [2] }, { b: [2], a: 1 }])), "bad_form"); // (key order doesn't matter)
   assert.equal(bad(() => any([{ a: 1 }, { a: "1" }, [1], ["1"], null, "null", true, "true"])), "ok");
 });
+
+test("closed validator: uniqueItems stops at canon's depth (32 nested containers) with bad_form, never a stack overflow", () => {
+  const any = compile({ type: "array", uniqueItems: true });
+  assert.equal(bad(() => any(JSON.parse("[" + "[".repeat(100000) + "0" + "]".repeat(100000) + ",1]"))), "bad_form");
+  const nest = (n, x) => { for (let i = 0; i < n; i++) x = i % 2 ? { k: x } : [x]; return x; };
+  assert.equal(bad(() => any([nest(32, 0), 1])), "ok");
+  assert.equal(bad(() => any([nest(33, 0), 1])), "bad_form");
+  assert.equal(bad(() => any([nest(32, 0), nest(32, 0)])), "bad_form"); // (still compared, at the limit)
+});

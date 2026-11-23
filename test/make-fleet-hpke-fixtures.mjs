@@ -50,10 +50,10 @@ export async function build() {
   let eph = 10;
   const ephemeral = () => deriveKeyPair(ikm(eph++));
   const header = async (n, extra = {}) => ({
-    fleet, aud: AUD, package: id(100 + n), host, enc_key: await encKeyId(E.raw), fingerprint: b64(fp), sub, provider: "claude",
-    purpose: "claude-setup-token", gen: 3, chain_seq: 1, at_ms: NOW - 1000, not_after_ms: NOW + 3_600_000, ...extra,
+    fleet, aud: AUD, package: id(100 + n), host, enc_key: await encKeyId(E.raw), fingerprint: b64(fp), sub: sub2, provider: "codex",
+    purpose: "codex-access-token", gen: 3, chain_seq: 1, at_ms: NOW - 1000, not_after_ms: NOW + 3_600_000, ...extra,
   });
-  const plaintext = (extra = {}) => ({ v: 1, provider: "claude", purpose: "claude-setup-token", secret: "sk-mock-not-a-credential", issued_ms: NOW - 2000, ...extra });
+  const plaintext = (extra = {}) => ({ v: 1, provider: "codex", purpose: "codex-access-token", secret: "mock-not-a-credential", issued_ms: NOW - 2000, ...extra });
   const sealed = async (h, pt, by = [sN, N]) => txt(await sealPackage(h, pt, E.raw, by[0], by[1], { ephemeral: await ephemeral() }));
   // (past the app's checks: a body signed honestly over a ciphertext the app would never make)
   const forged = async (h, ptBytes, { encOverride, info } = {}) => {
@@ -66,7 +66,8 @@ export async function build() {
   const packages = [
     { name: "a package for this host, signed by the native device", bytes: p1, ctx, expect: "ok", plaintext: plaintext() },
     { name: "signed by the browser device", bytes: await sealed(await header(2), plaintext(), [sB, B]), ctx, expect: "ok", plaintext: plaintext() },
-    { name: "a codex package for a codex subscription", bytes: await sealed(await header(3, { sub: sub2, provider: "codex", purpose: "codex-access-token" }), plaintext({ provider: "codex", purpose: "codex-access-token" })), ctx, expect: "ok", plaintext: plaintext({ provider: "codex", purpose: "codex-access-token" }) },
+    // (a Claude login is never sealed: an honestly signed claude-setup-token package, for the grant's claude subscription, is refused)
+    { name: "a claude-setup-token package (no Claude purpose)", bytes: await forged(await header(3, { sub, provider: "claude", purpose: "claude-setup-token" }), enc(canonText(plaintext({ provider: "claude", purpose: "claude-setup-token" })))), ctx, expect: "bad_form" },
     { name: "a newer generation than the package's", bytes: p1, ctx: { ...ctx, current_gen: 4 }, expect: "package_stale" },
     { name: "an older generation than the package's", bytes: p1, ctx: { ...ctx, current_gen: 2 }, expect: "package_stale" },
     { name: "now = not_after_ms", bytes: p1, ctx: { ...ctx, now_ms: NOW + 3_600_000 }, expect: "package_stale" },
@@ -77,12 +78,13 @@ export async function build() {
     { name: "an all-zero encapsulated key", bytes: await forged(await header(4), enc(canonText(plaintext())), { encOverride: b64(new Uint8Array(32)) }), ctx, expect: "bad_form" },
     { name: "a plaintext with an extra field", bytes: await forged(await header(5), enc(canonText({ ...plaintext(), extra: 1 }))), ctx, expect: "bad_form" },
     { name: "a plaintext that isn't canonical", bytes: await forged(await header(6), enc(JSON.stringify(plaintext(), null, 1))), ctx, expect: "bad_form" },
-    { name: "a plaintext of another provider than the header's", bytes: await forged(await header(7), enc(canonText(plaintext({ provider: "codex", purpose: "codex-access-token" })))), ctx, expect: "bad_form" },
-    { name: "a purpose of another provider", bytes: await forged(await header(8, { purpose: "codex-access-token" }), enc(canonText(plaintext({ purpose: "codex-access-token" })))), ctx, expect: "bad_form" },
+    { name: "a plaintext of another purpose than the header's", bytes: await forged(await header(7), enc(canonText(plaintext({ purpose: "codex-refresh-home" })))), ctx, expect: "bad_form" },
+    { name: "a purpose of another provider", bytes: await forged(await header(8, { purpose: "claude-setup-token" }), enc(canonText(plaintext({ purpose: "claude-setup-token" })))), ctx, expect: "bad_form" },
+    { name: "a plaintext of another provider than the header's", bytes: await forged(await header(13), enc(canonText(plaintext({ provider: "claude" })))), ctx, expect: "bad_form" },
     { name: "a lifetime past 7 days", bytes: await forged(await header(9, { not_after_ms: NOW - 1000 + 7 * 24 * 3600_000 + 1 }), enc(canonText(plaintext()))), ctx, expect: "bad_form" },
     { name: "a package for another host", bytes: await forged(await header(10, { host: otherHost }), enc(canonText(plaintext()))), ctx, expect: "not_granted" },
     { name: "a subscription not in the grant", bytes: await sealed(await header(11, { sub: id(50) }), plaintext()), ctx, expect: "not_granted" },
-    { name: "codex-refresh-home without home: true", bytes: await sealed(await header(12, { sub: sub2, provider: "codex", purpose: "codex-refresh-home" }), plaintext({ provider: "codex", purpose: "codex-refresh-home" })), ctx, expect: "not_granted" },
+    { name: "codex-refresh-home without home: true", bytes: await sealed(await header(12, { purpose: "codex-refresh-home" }), plaintext({ purpose: "codex-refresh-home" })), ctx, expect: "not_granted" },
   ];
 
   // ---- the capability mint's response (§5.2), sealed to the same host key

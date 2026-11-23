@@ -66,33 +66,34 @@ test("a profile id is never reused; a subscription has at most one live profile;
   assert.equal(next.storage_uid, STORAGE_UID_RANGE[0] + 1, "storage uids are never reused");
   assert.equal(next.project_id, PROJECT_RANGE[0] + 1, "project ids are never reused");
   // Profiles of different subscriptions and kinds coexist.
-  for (const k of [{ harness: "codex", auth: "api_key" }, { harness: "opencode", provider: "openai", auth: "oauth" }, { harness: "pi", provider: "anthropic", auth: "api_key" }]) {
+  for (const k of [{ harness: "codex", auth: "api_key" }, { harness: "opencode", provider: "openai", auth: "api_key" }, { harness: "pi", provider: "openai", auth: "api_key" }]) {
     assert.deepEqual((({ harness, provider, auth }) => ({ harness, provider, auth }))(p.beginCreate(newId(), k, newId())), { provider: null, ...k });
   }
   await p.close();
 });
 
-test("the kind is checked against the harness table: a Claude subscription only in the claude harness", async () => {
+test("the kind is checked against the auth table: a Claude subscription only in claude; no Anthropic route in opencode or pi", async () => {
   const p = await open(fresh());
-  // Anthropic's terms: no Claude subscription sign-in in opencode or pi; API keys and cloud credentials are fine.
+  // Anthropic's terms, and v1's registry: opencode and pi have no Anthropic route at all, whatever the auth kind.
   for (const h of ["opencode", "pi"]) {
-    refused(() => p.beginCreate(newId(), { harness: h, provider: "anthropic", auth: "subscription" }, newId()), "bad_form");
-    refused(() => p.beginCreate(newId(), { harness: h, provider: "anthropic", auth: "oauth" }, newId()), "bad_form");
-    for (const auth of ["api_key", "cloud"]) assert.equal(p.beginCreate(newId(), { harness: h, provider: "anthropic", auth }, newId()).auth, auth);
+    for (const auth of ["subscription", "oauth", "api_key", "cloud", "bedrock"]) refused(() => p.beginCreate(newId(), { harness: h, provider: "anthropic", auth }, newId()), "bad_form");
+    for (const auth of ["oauth", "subscription", "cloud"]) refused(() => p.beginCreate(newId(), { harness: h, provider: "openai", auth }, newId()), "bad_form");
+    assert.equal(p.beginCreate(newId(), { harness: h, provider: "openai", auth: "api_key" }, newId()).auth, "api_key");
     refused(() => p.beginCreate(newId(), { harness: h, auth: "api_key" }, newId()), "bad_form"); // a provider is required
     refused(() => p.beginCreate(newId(), { harness: h, provider: "Open AI", auth: "api_key" }, newId()), "bad_form");
   }
-  for (const auth of ["subscription", "api_key", "cloud"]) assert.equal(p.beginCreate(newId(), { harness: "claude", auth }, newId()).auth, auth);
-  refused(() => p.beginCreate(newId(), { harness: "claude", provider: "anthropic", auth: "api_key" }, newId()), "bad_form"); // no provider on claude
-  refused(() => p.beginCreate(newId(), { harness: "codex", auth: "cloud" }, newId()), "bad_form");
-  refused(() => p.beginCreate(newId(), { harness: "claude", auth: "oauth" }, newId()), "bad_form");
+  // claude: its cloud backend is the auth kind; there is no generic "cloud", and never a provider.
+  for (const auth of ["subscription", "api_key", "bedrock", "vertex", "foundry"]) assert.equal(p.beginCreate(newId(), { harness: "claude", auth }, newId()).auth, auth);
+  for (const auth of ["cloud", "oauth", "Bedrock"]) refused(() => p.beginCreate(newId(), { harness: "claude", auth }, newId()), "bad_form");
+  for (const provider of ["anthropic", "bedrock", "openai"]) refused(() => p.beginCreate(newId(), { harness: "claude", provider, auth: "api_key" }, newId()), "bad_form");
+  for (const auth of ["subscription", "api_key"]) assert.equal(p.beginCreate(newId(), { harness: "codex", auth }, newId()).auth, auth);
+  for (const auth of ["cloud", "bedrock", "oauth"]) refused(() => p.beginCreate(newId(), { harness: "codex", auth }, newId()), "bad_form");
   assert.deepEqual(authKinds("gemini", null), []);
   // A provider the table doesn't list refuses, whatever it is called: an alias of Anthropic, an unknown provider.
   for (const h of ["opencode", "pi"]) {
-    for (const provider of ["claude", "claude-ai", "Anthropic", "mistral", "", null]) {
+    for (const provider of ["claude", "claude-ai", "Anthropic", "OpenAI", "mistral", "", null]) {
       for (const auth of ["subscription", "oauth", "api_key", "cloud"]) refused(() => p.beginCreate(newId(), { harness: h, provider, auth }, newId()), "bad_form");
     }
-    assert.equal(p.beginCreate(newId(), { harness: h, provider: "openai", auth: "oauth" }, newId()).auth, "oauth");
   }
   await p.close();
 });
@@ -114,23 +115,24 @@ test("only primitive strings: arrays, objects and other wrong types never match 
 
 test("the auth table is closed and exactly this (a change is a reviewed change to this row)", () => {
   assert.deepEqual(JSON.parse(JSON.stringify(AUTH_TABLE)), {
-    claude: { "": ["subscription", "api_key", "cloud"] },
+    claude: { "": ["subscription", "api_key", "bedrock", "vertex", "foundry"] },
     codex: { "": ["subscription", "api_key"] },
-    opencode: { anthropic: ["api_key", "cloud"], openai: ["api_key", "oauth"] },
-    pi: { anthropic: ["api_key", "cloud"], openai: ["api_key", "oauth"] },
+    opencode: { openai: ["api_key"] },
+    pi: { openai: ["api_key"] },
   });
   assert.deepEqual(HARNESSES, ["claude", "codex", "opencode", "pi"]);
-  // Only claude lists a subscription; nothing but claude lists any Anthropic sign-in other than an API key or cloud.
+  // Only claude and codex list a subscription, each its own vendor's through its own CLI; no harness has an
+  // anthropic provider; the only provider is openai.
   for (const [h, byProvider] of Object.entries(AUTH_TABLE)) {
     for (const [prov, kinds] of Object.entries(byProvider)) {
-      if (h !== "claude" && prov === "anthropic") assert.deepEqual([...kinds].sort(), ["api_key", "cloud"]);
+      assert.ok(prov === "" || prov === "openai", `${h} ${prov}`);
       if (kinds.includes("subscription")) assert.ok(["claude", "codex"].includes(h) && prov === "");
     }
   }
   assert.ok(Object.isFrozen(AUTH_TABLE) && Object.isFrozen(AUTH_TABLE.pi) && Object.isFrozen(AUTH_TABLE.pi.openai));
   // A copy is returned: mutating it changes nothing.
-  const k = authKinds("pi", "anthropic"); k.push("subscription");
-  assert.deepEqual(authKinds("pi", "anthropic"), ["api_key", "cloud"]);
+  const k = authKinds("pi", "openai"); k.push("subscription");
+  assert.deepEqual(authKinds("pi", "openai"), ["api_key"]);
 });
 
 test("bad input refuses: an unknown harness, bad ids", async () => {

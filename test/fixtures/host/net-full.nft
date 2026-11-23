@@ -1,9 +1,9 @@
 add chain inet sagebrush in_7
 add chain inet sagebrush fwd_7
 add rule inet sagebrush input iifname "sbv7" jump in_7
-add rule inet sagebrush forward iifname "sbv7" jump fwd_7
-add rule inet sagebrush forward oifname "sbv7" ct state established,related accept
-add rule inet sagebrush forward oifname "sbv7" drop
+add rule inet sagebrush agent_ingress iifname "sbv7" jump fwd_7
+add rule inet sagebrush agent_return oifname "sbv7" ct state established,related accept
+add rule inet sagebrush agent_return oifname "sbv7" drop
 add rule inet sagebrush in_7 meta nfproto ipv6 drop
 add rule inet sagebrush fwd_7 meta nfproto ipv6 drop
 add rule inet sagebrush in_7 ip saddr != 10.250.0.30 drop

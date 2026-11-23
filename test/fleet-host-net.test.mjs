@@ -54,10 +54,10 @@ test("every mode drops IPv6 and spoofed sources, and judges every packet from it
   for (const mode of ["allowlist", "full"]) {
     const p = planNetwork(agent({ mode, allow: [], lan_allow: [] }), { uid: 70002 });
     for (const line of [
-      'add rule inet sagebrush input iifname "sbv2" jump in_2', 'add rule inet sagebrush forward iifname "sbv2" jump fwd_2',
+      'add rule inet sagebrush input iifname "sbv2" jump in_2', 'add rule inet sagebrush agent_ingress iifname "sbv2" jump fwd_2',
       "add rule inet sagebrush in_2 meta nfproto ipv6 drop", "add rule inet sagebrush fwd_2 meta nfproto ipv6 drop",
       "add rule inet sagebrush in_2 ip saddr != 10.250.0.10 drop", "add rule inet sagebrush fwd_2 ip saddr != 10.250.0.10 drop",
-      'add rule inet sagebrush forward oifname "sbv2" drop', "add rule inet sagebrush in_2 drop",
+      'add rule inet sagebrush agent_return oifname "sbv2" drop', "add rule inet sagebrush in_2 drop",
     ]) assert.ok(p.nft.split("\n").includes(line), `${mode}: ${line}`);
   }
 });
@@ -81,6 +81,11 @@ test("refused: bad id, unknown mode, cross-mode lists, non-private lan_allow, no
   refused(() => planNetwork(agent({ mode: "allowlist", allow: [], lan_allow: ["10.0.0.0/8"] }), { uid: 70000 }), "bad_form");
   refused(() => planNetwork(agent({ mode: "full", allow: ["github.com"], lan_allow: [] }), { uid: 70000 }), "bad_form");
   refused(() => planNetwork(agent({ mode: "full", allow: [], lan_allow: ["8.8.8.0/24"] }), { uid: 70000 }), "bad_form");
+  // fc00::/7 (the reviewer's row): refused, no plan returned.
+  let plan = null;
+  assert.throws(() => { plan = planNetwork(agent({ mode: "full", allow: [], lan_allow: ["fc00::/7"] }), { uid: 70000 }); }, (e) => e instanceof FleetError && e.code === "bad_form");
+  assert.equal(plan, null);
+  refused(() => planNetwork(agent({ mode: "full", allow: [], lan_allow: ["10.1.0.0/16", "fd12:3456::/32"] }), { uid: 70000 }), "bad_form");
   refused(() => planNetwork(agent({ mode: "full", allow: [], lan_allow: [] }), { uid: 70000, hostAddrs: ["fe80::1"] }), "bad_form");
   refused(() => planNetwork(agent({ mode: "full", allow: [], lan_allow: [] }), { uid: 70000, hostAddrs: ['1.2.3.4" accept'] }), "bad_form");
   refused(() => planNetwork(agent({ mode: "full", allow: [], lan_allow: [] }), { uid: 1000 }), "bad_form");
@@ -89,4 +94,19 @@ test("refused: bad id, unknown mode, cross-mode lists, non-private lan_allow, no
 test("the base table: forwarding defaults to drop; input and postrouting exist for the agent chains", () => {
   golden("net-base.nft", baseTable());
   assert.match(baseTable(), /forward \{ type filter hook forward priority 0 ; policy drop ; \}/);
+});
+
+test("two agents, added in either order: no rule is added to the forward base chain; every agent's ingress dispatch is judged before any return accept", () => {
+  const a = planNetwork({ agent: "aaaaaaaaaaaaaaaaaaaaaaaaaa", config: { network: { mode: "full", allow: [], lan_allow: [] } } }, { uid: 70001 });
+  const b = planNetwork({ agent: "bbbbbbbbbbbbbbbbbbbbbbbbbe", config: { network: { mode: "allowlist", allow: [], lan_allow: [] } } }, { uid: 70002 });
+  for (const order of [[a, b], [b, a]]) {
+  const all = (baseTable() + order[0].nft + order[1].nft).split("\n").filter(Boolean);
+  const forwardRules = all.filter((l) => l.startsWith("add rule inet sagebrush forward "));
+  assert.deepEqual(forwardRules, ["add rule inet sagebrush forward jump agent_ingress", "add rule inet sagebrush forward jump agent_return"]);
+  // Every ingress dispatch lives in agent_ingress, every return accept in agent_return, regardless of add order.
+  assert.ok(all.filter((l) => / iifname "sbv\d+" jump fwd_/.test(l)).every((l) => l.includes(" agent_ingress ")));
+  assert.ok(all.filter((l) => / ct state established,related accept/.test(l)).every((l) => l.includes(" agent_return ")));
+  // Each agent chain ends in a verdict, so a packet from an agent veth never falls through to agent_return.
+  for (const [p, n] of [[a, 1], [b, 2]]) assert.match(p.nft.split("\n").filter((l) => l.startsWith(`add rule inet sagebrush fwd_${n} `)).at(-1), / (accept|drop)$/);
+  }
 });

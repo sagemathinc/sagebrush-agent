@@ -47,7 +47,9 @@ test("config: a full valid config passes, with and without host bounds", () => {
   assert.equal(validateConfig(base()), true);
   assert.equal(validateConfig(base(), { ramMb: 8192, cpus: 4 }), true);
   assert.equal(validateConfig(with_((c) => { c.programs = "no-shell"; c.mcp_allow = [{ name: "math", argv: ["/usr/bin/node", "/data/mcp/math.mjs"] }]; })), true);
-  assert.equal(validateConfig(with_((c) => { c.network = { mode: "full", allow: [], lan_allow: ["10.1.0.0/16", "192.168.1.0/24", "fd12:3456::/32"] }; })), true);
+  assert.equal(validateConfig(with_((c) => { c.network = { mode: "full", allow: [], lan_allow: ["10.1.0.0/16", "192.168.1.0/24"] }; })), true);
+  // v1 has no IPv6 egress (ruled): an IPv6 lan_allow refuses the grant at activation.
+  assert.throws(() => validateConfig(with_((c) => { c.network = { mode: "full", allow: [], lan_allow: ["fc00::/7"] }; })), (e) => e instanceof FleetError && e.code === "bad_form");
   assert.equal(validateConfig(with_((c) => { c.network = { mode: "none", allow: [], lan_allow: [] }; c.files = { rw: [], ro: [] }; c.wakes = []; })), true);
   assert.equal(validateConfig(with_((c) => { c.resources.cpu_quota_pct = 400; })), true);
 });
@@ -99,11 +101,12 @@ test("paths: / is refused exactly; protected subtrees match whole segments; unno
 });
 
 test("lan_allow: canonical CIDRs inside private ranges only; never loopback, link-local or metadata", () => {
-  for (const ok of ["10.0.0.0/8", "10.20.30.0/24", "172.16.0.0/12", "172.31.255.0/24", "192.168.0.0/16", "192.168.4.128/25", "fc00::/7", "fd00::/8", "fd12:3456:789a::/48"]) {
+  for (const ok of ["10.0.0.0/8", "10.20.30.0/24", "172.16.0.0/12", "172.31.255.0/24", "192.168.0.0/16", "192.168.4.128/25"]) {
     assert.equal(checkLanCidr(ok), ok, ok);
   }
   for (const bad of ["127.0.0.0/8", "169.254.169.254/32", "169.254.0.0/16", "8.8.8.0/24", "172.32.0.0/16", "10.0.0.0/7", "0.0.0.0/0",
-    "10.0.0.1/24", "fe80::/10", "::1/128", "::/0", "fc00::/6", "10.0.0.0/33", "10.0.0.0", "10.0.0.0/08", "::ffff:10.0.0.0/104", "x/8"]) {
+    "10.0.0.1/24", "fe80::/10", "::1/128", "::/0", "fc00::/6", "10.0.0.0/33", "10.0.0.0", "10.0.0.0/08", "::ffff:10.0.0.0/104", "x/8",
+    "fc00::/7", "fd00::/8", "fd12:3456:789a::/48"]) { // (v1: no IPv6 exceptions at all)
     refused(() => checkLanCidr(bad), "bad_form");
   }
 });

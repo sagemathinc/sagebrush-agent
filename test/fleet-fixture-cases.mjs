@@ -66,6 +66,22 @@ export async function checkHpkeVector(core, V) {
     if (toHex(await O.open(hex(e.aad), hex(e.ct))) !== e.pt) bad.push(`open ${i}`);
     n++;
   }
+  // overlapping calls on one context (ruled): the first runs, any other started while it is pending is refused
+  // (in_progress) without touching the sequence, so a nonce is never shared; the next call afterwards takes seq + 1
+  const [e0, e1, e2] = V.encryptions;
+  const refusedNow = (r) => r.status === "rejected" && r.reason?.code === "in_progress";
+  const S2 = await core.setupSender(R.raw, hex(V.info), await core.deriveKeyPair(hex(V.ikmE)));
+  const seals = await Promise.allSettled([S2.seal(hex(e0.aad), hex(e0.pt)), S2.seal(hex(e1.aad), hex(e1.pt)), S2.seal(hex(e2.aad), hex(e2.pt))]);
+  if (seals[0].status !== "fulfilled" || toHex(seals[0].value) !== e0.ct || !refusedNow(seals[1]) || !refusedNow(seals[2])) bad.push("overlapping seals");
+  if (toHex(await S2.seal(hex(e1.aad), hex(e1.pt))) !== e1.ct) bad.push("the seal after overlapping ones");
+  const O2 = await core.setupRecipient(R, hex(V.enc), hex(V.info));
+  const opens = await Promise.allSettled([O2.open(hex(e0.aad), hex(e0.ct)), O2.open(hex(e0.aad), hex(e0.ct))]);
+  if (opens[0].status !== "fulfilled" || toHex(opens[0].value) !== e0.pt || !refusedNow(opens[1])) bad.push("the same ciphertext opened twice at once");
+  // a refused open leaves the sequence where it was
+  let refused = "";
+  try { await O2.open(hex(e0.aad), hex(e0.ct)); } catch (x) { refused = x.code; }
+  if (refused !== "bad_form") bad.push("seq-0 ciphertext again, alone");
+  if (toHex(await O2.open(hex(e1.aad), hex(e1.ct))) !== e1.pt) bad.push("the next ciphertext after a refused one");
   return { bad, n };
 }
 
@@ -87,7 +103,7 @@ export async function checkHpkeFixtures(core, F) {
   const encKey = await core.deriveKeyPair(hex(F.host_enc_ikm));
   for (const c of F.packages) {
     let opened = null;
-    const v = { ...ctx, chain, cert, encKey, currentGen: c.ctx.current_gen, grant: F.grant, now: c.ctx.now_ms, revoked: (p) => c.ctx.revoked.includes(p), opened: (p) => c.ctx.opened.includes(p) };
+    const v = { ...ctx, chain, cert, hostRevoked: () => c.ctx.host_revoked, encKey, currentGen: c.ctx.current_gen, grant: F.grant, now: c.ctx.now_ms, revoked: (p) => c.ctx.revoked.includes(p), opened: (p) => c.ctx.opened.includes(p) };
     const got = await result(async () => { opened = await core.verifyPackage(enc(c.bytes), v); });
     check("packages", c.name, got, c.expect);
     if (c.plaintext) check("packages", `${c.name}: its plaintext`, opened && core.canonText(opened.plaintext), core.canonText(c.plaintext));

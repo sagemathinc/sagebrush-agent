@@ -45,7 +45,7 @@ export async function build() {
   const fp = await hostFingerprint(host, H.raw, E.raw);
   const host_cert = txt(seal("sb.host-cert.v1", sN, { fleet, aud: AUD, chain_seq: 1, host, sign_key: b64(H.raw), enc_key: b64(E.raw), fingerprint: b64(fp), name: "lab-box", at_ms: 1 }, N));
   const grant = { host, subscriptions: [{ sub, provider: "claude", use: [agent], home: false }, { sub: sub2, provider: "codex", use: [agent], home: false }] };
-  const ctx = { current_gen: 3, now_ms: NOW, revoked: [], opened: [] };
+  const ctx = { current_gen: 3, now_ms: NOW, revoked: [], opened: [], host_revoked: false };
 
   let eph = 10;
   const ephemeral = () => deriveKeyPair(ikm(eph++));
@@ -72,6 +72,7 @@ export async function build() {
     { name: "now = not_after_ms", bytes: p1, ctx: { ...ctx, now_ms: NOW + 3_600_000 }, expect: "package_stale" },
     { name: "revoked", bytes: p1, ctx: { ...ctx, revoked: [h1.package] }, expect: "package_stale" },
     { name: "already opened", bytes: p1, ctx: { ...ctx, opened: [h1.package] }, expect: "package_stale" },
+    { name: "this host's own certificate is revoked", bytes: p1, ctx: { ...ctx, host_revoked: true }, expect: "host_revoked" },
     { name: "a ciphertext moved under another signed header", bytes: await forged({ ...h1, not_after_ms: h1.not_after_ms - 1 }, enc(canonText(plaintext())), { info: enc("sagebrush.seal.v1\n" + canonText(h1)) }), ctx, expect: "bad_form" },
     { name: "an all-zero encapsulated key", bytes: await forged(await header(4), enc(canonText(plaintext())), { encOverride: b64(new Uint8Array(32)) }), ctx, expect: "bad_form" },
     { name: "a plaintext with an extra field", bytes: await forged(await header(5), enc(canonText({ ...plaintext(), extra: 1 }))), ctx, expect: "bad_form" },

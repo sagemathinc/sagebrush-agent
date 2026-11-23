@@ -10,6 +10,7 @@ import {
 } from "../lib/fleet/index.mjs";
 import * as core from "../lib/fleet/core/index.mjs";
 import { nodeCrypto } from "../lib/fleet/node-crypto.mjs";
+import { atSequence } from "../lib/fleet/core/hpke.mjs";
 import { checkHpkeFixtures, checkHpkeVector } from "./fleet-fixture-cases.mjs";
 import { build } from "./make-fleet-hpke-fixtures.mjs";
 
@@ -40,7 +41,7 @@ async function setup() {
       return { fleet, aud: AUD, package: newId(), host, enc_key: await encKeyId(encKey.raw), fingerprint: cert.body.fingerprint, sub, provider: "claude", purpose: "claude-setup-token", gen: 3, chain_seq: s.chain.seq, at_ms: NOW - 1000, not_after_ms: NOW + 3_600_000, ...extra };
     },
     plaintext: (extra = {}) => ({ v: 1, provider: "claude", purpose: "claude-setup-token", secret: "sk-test-mock-not-a-credential", issued_ms: NOW - 2000, ...extra }),
-    vctx: (extra = {}) => ({ ...ctx, chain: s.chain, cert, encKey, currentGen: 3, grant, now: NOW, revoked: () => false, opened: () => false, ...extra }),
+    vctx: (extra = {}) => ({ ...ctx, chain: s.chain, cert, hostRevoked: () => false, encKey, currentGen: 3, grant, now: NOW, revoked: () => false, opened: () => false, ...extra }),
   };
   return s;
 }
@@ -194,4 +195,55 @@ test("HPKE open: a changed tag, ciphertext, header or key never opens, and is re
   for (const [name, args] of [["tag", [s.encKey, e, info, aad, flipped]], ["info", [s.encKey, e, enc("other"), aad, ct]], ["aad", [s.encKey, e, info, enc("x"), ct]],
     ["key", [await nodeCrypto.x25519FromPrivate(new Uint8Array(32).fill(201)), e, info, aad, ct]], ["short", [s.encKey, e, info, aad, ct.subarray(0, 15)]]])
     assert.equal(await code(() => hpkeOpen(...args)), "bad_form", name);
+});
+
+test("HPKE contexts have one role (RFC 9180 §5.2): a sender only seals, a recipient only opens", async () => {
+  const R = await core.deriveKeyPair(new Uint8Array(32).fill(3));
+  const S = await core.setupSender(R.raw, enc("i"));
+  const O = await core.setupRecipient(R, S.enc, enc("i"));
+  assert.deepEqual(Object.keys(S).sort(), ["enc", "seal"]);
+  assert.deepEqual(Object.keys(O).sort(), ["open"]);
+  assert.ok(Object.isFrozen(S) && Object.isFrozen(O), "and nothing can be added to either");
+  assert.throws(() => { S.open = O.open; }, TypeError);
+  assert.deepEqual(await O.open(new Uint8Array(0), await S.seal(new Uint8Array(0), enc("x"))), enc("x"));
+});
+
+test("the sequence is an exact counter: the last allowed seal and open work, the next is refused (limit), no nonce repeats", async () => {
+  const R = await core.deriveKeyPair(new Uint8Array(32).fill(4)), info = enc("boundary"), aad = new Uint8Array(0), pt = enc("same plaintext");
+  const start = Number.MAX_SAFE_INTEGER - 2;
+  const S = await atSequence.sender(start, R.raw, info);
+  const c1 = await S.seal(aad, pt), c2 = await S.seal(aad, pt); // (seq 2^53 - 3 and 2^53 - 2)
+  assert.notDeepEqual(c1, c2, "two sequence numbers, two nonces: the same plaintext seals differently");
+  assert.equal(await code(() => S.seal(aad, pt)), "limit", "2^53 - 1 is never used");
+  assert.equal(await code(() => S.seal(aad, pt)), "limit", "and stays refused");
+  // the recipient at the same start opens both, in order, then refuses; a refused call doesn't advance it
+  const O = await atSequence.recipient(start, R, S.enc, info);
+  assert.equal(await code(() => O.open(aad, c2)), "bad_form", "c2 isn't seq 2^53 - 3's");
+  assert.deepEqual(await O.open(aad, c1), pt);
+  assert.deepEqual(await O.open(aad, c2), pt);
+  assert.equal(await code(() => O.open(aad, c2)), "limit");
+  // just below 2^32 and 2^48: the nonce's higher bytes are exact (each ciphertext opens only at its own sequence)
+  for (const at of [2 ** 32 - 1, 2 ** 48 - 1]) {
+    const S2 = await atSequence.sender(at, R.raw, info);
+    const a = await S2.seal(aad, pt), b = await S2.seal(aad, pt);
+    const O2 = await atSequence.recipient(at, R, S2.enc, info);
+    assert.deepEqual([await O2.open(aad, a), await O2.open(aad, b)], [pt, pt], String(at));
+    assert.equal(await code(async () => (await atSequence.recipient(at + 1, R, S2.enc, info)).open(aad, a)), "bad_form", `${at}: not at the next`);
+  }
+});
+
+test("a revoked own certificate: host_revoked before anything is opened (the X25519 key is never used)", async () => {
+  const s = await setup();
+  const p = await sealPackage(await s.header(), s.plaintext(), s.encKey.raw, s.N.signer, s.N.k);
+  let used = 0;
+  const watched = { raw: s.encKey.raw, dh: async (peer) => { used++; return s.encKey.dh(peer); } };
+  const seen = [];
+  assert.equal(await code(() => verifyPackage(p, s.vctx({ encKey: watched, hostRevoked: (c) => { seen.push(c); return true; } }))), "host_revoked");
+  assert.equal(used, 0, "no DH, no open");
+  assert.equal(seen[0], s.cert, "asked about its own certificate");
+  // anything but an explicit false is revoked (fail closed)
+  assert.equal(await code(() => verifyPackage(p, s.vctx({ encKey: watched, hostRevoked: () => undefined }))), "host_revoked");
+  assert.equal(used, 0);
+  assert.equal(await code(() => verifyPackage(p, s.vctx({ encKey: watched }))), "ok");
+  assert.equal(used, 1);
 });

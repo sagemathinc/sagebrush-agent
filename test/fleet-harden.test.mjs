@@ -230,3 +230,28 @@ test("the permission generator's mapping covers exactly the pinned protocol's Pe
     assert.equal(doc.descriptors.length + doc.refused.length, all.size, f); // (every descriptor tried, each accepted or refused)
   }
 });
+
+test("Fetch request ids are a session's own: the same id on two sessions is two requests; a challenge never borrows another session's request; no session at all retires", async () => {
+  const two = setup();
+  two.h.privileged(paused("X1.0", "https://example.test/a"));
+  two.h.privileged({ ...paused("X1.0", "https://example.test/b"), sessionId: "SESS-B" });
+  await settle();
+  assert.deepEqual(two.retired, []);
+  assert.deepEqual(two.cdp.calls.map((c) => [c.method, c.sessionId, c.params.requestId]), [["Fetch.continueRequest", "SESS-A", "X1.0"], ["Fetch.continueRequest", "SESS-B", "X1.0"]]);
+  const cross = setup();
+  cross.h.privileged(paused("X2.0", "http://example.test/")); // (continued on SESS-A)
+  cross.h.privileged({ ...auth("X2.0", "Proxy"), sessionId: "SESS-B" }); // (the same id, on another session)
+  assert.deepEqual(cross.retired, ["an auth challenge for an unknown request"]);
+  assert.ok(!cross.cdp.calls.some((c) => c.method === "Fetch.continueWithAuth"));
+  for (const sessionId of [undefined, ""]) {
+    const n = setup();
+    n.h.privileged({ ...paused("X3.0", "https://example.test/"), sessionId });
+    assert.equal(n.retired.length, 1, String(sessionId));
+    assert.equal(n.cdp.calls.length, 0);
+    const m = setup();
+    m.h.privileged(paused("X4.0", "http://example.test/"));
+    m.h.privileged({ ...auth("X4.0", "Proxy"), sessionId });
+    assert.equal(m.retired.length, 1, String(sessionId));
+    assert.ok(!m.cdp.calls.some((c) => c.method === "Fetch.continueWithAuth"));
+  }
+});

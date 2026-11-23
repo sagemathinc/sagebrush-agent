@@ -400,7 +400,7 @@ test("best_effort: false with no root agent unit installed; true whenever one is
   assert.equal(stuck.best_effort, true);
 });
 
-test("best_effort: true when the installed units can't be read, or the budget is spent before they are", async () => {
+test("best_effort: true when the installed units can't be read, the budget is spent before they are, or the read overruns it", async () => {
   const dir = fresh();
   const sys = fakeSystemd(dir);
   sys.rootUnits = () => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); };
@@ -414,6 +414,12 @@ test("best_effort: true when the installed units can't be read, or the budget is
   const r2 = await stop({ all: true }, "all", { sys: sys2, dir, now: () => clock });
   assert.equal(r2.best_effort, true);
   assert.equal(looked, false, "nothing runs once the budget is spent");
+  // A read that overruns the budget proves nothing, even when it says "no root unit".
+  clock = 0;
+  const sys3 = fakeSystemd(dir);
+  sys3.rootUnits = () => { clock += 20000; return []; };
+  const r3 = await stop({ all: true }, "all", { sys: sys3, dir, now: () => clock });
+  assert.equal(r3.best_effort, true);
 });
 
 test("rootUnitsIn: only generated agent units with User=root; other files and non-root units don't count", () => {

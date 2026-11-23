@@ -66,6 +66,9 @@ test("image: refused with a fixed reason: not one of the four (SVG too), a cut o
   assert.equal(reason(gif(1, 1).subarray(0, 8)), "truncated");
   assert.equal(reason(Buffer.from("GIF90a\x01\0\x01\0")), "type");
   assert.equal(reason(jpeg(1, 1).subarray(0, 26)), "truncated"); // (cut inside the frame header)
+  assert.equal(reason(jpeg(1, 1).subarray(0, 31)), "truncated"); // (cut after the dimensions, inside the frame header's declared length)
+  assert.equal(reason(Buffer.from([0xff, 0xd8, 0xff, 0xc0, 0, 17, 8, 0, 1, 0, 1])), "truncated"); // (a frame header declaring 17 bytes, 9 there)
+  assert.equal(reason(Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xc0]), u16be(200), Buffer.from([8, 0, 1, 0, 1, 3]), Buffer.alloc(20)])), "truncated"); // (its length past the end)
   assert.equal(reason(Buffer.from([0xff, 0xd8, 0xff, 0xda, 0, 8])), "header"); // (a scan before any frame header)
   assert.equal(reason(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 1])), "header"); // (a length under 2)
   assert.equal(reason(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0xff, 0xff, 0, 0])), "truncated"); // (a length past the end)
@@ -82,7 +85,7 @@ test("image: refused with a fixed reason: not one of the four (SVG too), a cut o
   for (const r of ["type", "truncated", "header", "size"]) assert.ok(IMAGE_REASONS.includes(r));
 });
 
-test("image: only { base64 }, canonical and padded, its bytes within 3.75 MiB before anything is parsed", () => {
+test("image: only { base64 }, canonical and padded, its bytes within 3.75 MB before anything is parsed", () => {
   const ok = Buffer.concat([png(2, 2), Buffer.from([0])]).toString("base64"); // (34 bytes: padded with "==")
   assert.ok(ok.endsWith("=="));
   assert.equal(checkImage({ base64: ok }).ok, true);
@@ -97,6 +100,9 @@ test("image: only { base64 }, canonical and padded, its bytes within 3.75 MiB be
   assert.equal(checkImage(b64(big)).reason, "too_large");
   assert.equal(checkImage(b64(big.subarray(0, IMAGE_BYTES_MAX))).ok, true);
   assert.equal(checkImage({ base64: "A".repeat(6_000_000) }).reason, "too_large"); // (refused by its length, before decoding)
+  // (the cap is exactly 5,000,000 base64 characters)
+  assert.equal(IMAGE_BYTES_MAX, 3_750_000);
+  assert.equal(b64(big.subarray(0, IMAGE_BYTES_MAX)).base64.length, 5_000_000);
   assert.equal(imageHeader(Buffer.alloc(0)).reason, "type");
 });
 

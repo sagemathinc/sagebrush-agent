@@ -86,6 +86,11 @@ pub struct Plan<'a, H> {
     pub parent: i32,
     /// The attempt directory: the tmpfs is attached onto it inside the private namespace (never visible outside).
     pub attempt: &'a H,
+    /// The attempt's path from the root (no leading '/'): a handle opened before the unshare belongs to the parent's
+    /// mount namespace, so the child re-opens the attempt by this path inside its own and checks its identity.
+    pub attempt_path: String,
+    /// The attempt's identity verified before the fork: (dev, ino).
+    pub attempt_id: ((u32, u32), u64),
     pub binds: Vec<Bind<'a, H>>,
     /// The release binary's identity verified at step 4: (dev, ino).
     pub binary: ((u32, u32), u64),
@@ -256,6 +261,13 @@ fn c(s: &str) -> io::Result<CString> {
 /// The child's syscalls. Built by the parent before the fork, so nothing in the child needs to allocate before it
 /// fails or execs (the launcher is single-threaded either way).
 pub struct RealChild {
+    /// The detached clones of every bind source, made by the parent BEFORE the fork in its own mount namespace (where
+    /// the verified handles live), keyed by the source handle's descriptor: a detached tree can be moved into the
+    /// child's new namespace, a clone taken there from a pre-unshare handle can't (EINVAL).
+    clones: Vec<(i32, OwnedFd)>,
+    /// The attempt's path from the root and its verified identity (the attach target is re-opened in the new namespace).
+    attempt_path: CString,
+    attempt_id: ((u32, u32), u64),
     req_r: OwnedFd,
     req_w: Option<OwnedFd>,
     out_w: OwnedFd,
@@ -281,8 +293,16 @@ impl ChildOps for RealChild {
     fn tmpfs(&mut self) -> io::Result<OwnedFd> {
         sys::tmpfs(c"64k", c"0700")
     }
-    fn attach(&mut self, mnt: &OwnedFd, onto: &OwnedFd) -> io::Result<()> {
-        sys::move_mount(mnt, onto)
+    fn attach(&mut self, mnt: &OwnedFd, _onto: &OwnedFd) -> io::Result<()> {
+        // The pre-unshare handle is in the parent's namespace: re-open the attempt here, by path, and require the same
+        // object before attaching onto it.
+        let root = sys::open_root()?;
+        let here = sys::open_path_dir(&root, &self.attempt_path)?;
+        let i = sys::ident(&here)?;
+        if (i.dev, i.ino) != self.attempt_id {
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+        }
+        sys::move_mount(mnt, &here)
     }
     fn mountpoint(&mut self, dir: &OwnedFd, rel: &str, file: bool) -> io::Result<OwnedFd> {
         let parts: Vec<&str> = rel.split('/').collect();
@@ -304,9 +324,10 @@ impl ChildOps for RealChild {
         Ok(cur)
     }
     fn bind(&mut self, src: &OwnedFd, attrs: u64, target: &OwnedFd) -> io::Result<()> {
-        let clone = sys::open_tree_clone(src)?;
-        sys::mount_set(&clone, attrs)?;
-        sys::move_mount(&clone, target)
+        let fd = src.as_raw_fd();
+        let (_, clone) = self.clones.iter().find(|(s, _)| *s == fd).ok_or(io::Error::from_raw_os_error(libc::EBADF))?;
+        sys::mount_set(clone, attrs)?;
+        sys::move_mount(clone, target)
     }
     fn enter(&mut self, root: &OwnedFd) -> io::Result<()> {
         sys::fchdir(root)?;
@@ -407,15 +428,21 @@ impl RealRunner {
         // argv: the in-namespace paths only (A2 r3.3 Q1); the environment is empty.
         let argv = [BINARY, "--state", "/state", "--secrets", "/secrets", "--cache", "/cache"].iter().map(|a| c(a)).collect::<io::Result<Vec<CString>>>().ok()?;
         plan.parent = sys::getpid();
+        // The bind sources' detached clones, in this (the parent's) namespace, before the fork.
+        let mut clones = Vec::new();
+        for b in &plan.binds {
+            clones.push((b.src.as_raw_fd(), sys::open_tree_clone(b.src).ok()?));
+        }
+        let attempt_path = c(&plan.attempt_path).ok()?;
         let pid = sys::fork().ok()?;
         if pid == 0 {
             // The child: the status pipe's write end is close-on-exec, so EOF in the parent means the exec happened.
-            let mut ch = RealChild { req_r, req_w: Some(req_w), out_w, err_w, request: request.to_vec(), argv };
+            let mut ch = RealChild { clones, attempt_path, attempt_id: plan.attempt_id, req_r, req_w: Some(req_w), out_w, err_w, request: request.to_vec(), argv };
             let (stage, errno) = steps(&mut ch, plan);
             let _ = sys::write(&st_w, &record(stage, errno));
             sys::exit_now(1);
         }
-        drop((st_w, req_r, req_w, out_w, err_w));
+        drop((st_w, req_r, req_w, out_w, err_w, clones, attempt_path));
         let Ok(pidfd) = sys::pidfd_open(pid) else {
             let _ = sys::kill(pid, libc::SIGKILL);
             let _ = sys::waitpid(pid, 0);
@@ -749,6 +776,8 @@ mod tests {
         Plan {
             parent: PARENT,
             attempt: &srcs[0],
+            attempt_path: "srv/sagebrush/.restore/x".into(),
+            attempt_id: ((8, 1), 10),
             binds: vec![
                 b(0, "data", false, true, false, true, 11),
                 b(1, "cache", false, true, false, true, 12),

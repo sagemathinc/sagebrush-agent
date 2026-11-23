@@ -474,7 +474,9 @@ fn stage_inner<O: RestoreOps, R: Runner<O::H>>(o: &mut O, r: &mut R, a: &StageAr
     for (rel, file, h, id) in &system {
         binds.push(Bind { src: h, at: rel, file: *file, write: false, exec: false, recheck: false, id: (id.dev, id.ino) });
     }
-    let mut plan = Plan { parent: 0, attempt: &att, binds, binary: (bin.dev, bin.ino) };
+    let ai = o.ident(&att).map_err(open_err)?;
+    let attempt_path = format!("{}/{}", &RESTORE[1..], n.path());
+    let mut plan = Plan { parent: 0, attempt: &att, attempt_path, attempt_id: (ai.dev, ai.ino), binds, binary: (bin.dev, bin.ino) };
     let ran = r.run(&mut plan, req);
     let stdout = match ran {
         Ran::NotStarted => return Err(err(Fail::Internal, "the restore child can't be started")),

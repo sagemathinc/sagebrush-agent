@@ -886,3 +886,10 @@ pub fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
     // SAFETY: plain integer arguments.
     own(unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) })
 }
+
+/// openat2(root, rel, { O_PATH | O_DIRECTORY | O_CLOEXEC, 0, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+/// RESOLVE_NO_MAGICLINKS }): a directory by its path from the root, crossing mounts (A2: the restore child re-opens
+/// the attempt inside its new mount namespace; the caller checks its identity).
+pub fn open_path_dir(root: &OwnedFd, rel: &CStr) -> io::Result<OwnedFd> {
+    openat2(root, rel, libc::O_PATH | libc::O_DIRECTORY, 0)
+}

@@ -202,7 +202,7 @@ test("filter: evaluate always carries a timeout; agent object groups are prefixe
   const rg = f.command({ method: "Runtime.releaseObjectGroup", params: { objectGroup: "mine" }, sessionId: pa });
   assert.equal(rg.send.params.objectGroup, `${GROUP_PREFIX}mine`);
   assert.equal(f.command({ method: "DOM.getDocument", params: {}, sessionId: pa }).deadlineMs, undefined);
-  assert.deepEqual(f.takeover().releaseGroups.sort(), [`${GROUP_PREFIX}default`, `${GROUP_PREFIX}mine`]);
+  assert.deepEqual(f.takeover().releaseGroups.map((g) => g.objectGroup).sort(), [`${GROUP_PREFIX}default`, `${GROUP_PREFIX}mine`]);
 });
 
 test("filter: navigation and new pages follow the URL policy; at most 16 pages; activate and close name the real target", () => {
@@ -340,7 +340,7 @@ test("filter: takeover pauses everything, revokes every handle, and a late answe
   const inflight = f.command({ method: "Runtime.evaluate", params: { expression: "new Promise(()=>{})", awaitPromise: true }, sessionId: pa });
   const t = f.takeover();
   assert.deepEqual(t.sessions, [A.sessionId, B.sessionId]);
-  assert.ok(t.releaseGroups.includes(`${GROUP_PREFIX}default`));
+  assert.deepEqual(t.releaseGroups, [{ sessionId: A.sessionId, objectGroup: `${GROUP_PREFIX}default` }]);
   assert.ok(f.paused);
   assert.deepEqual(f.command({ method: "Page.reload", params: {}, sessionId: pa }), { error: { code: -32000, message: "paused: takeover" } });
   assert.deepEqual(f.command({ method: "Target.getTargets" }), { error: { code: -32000, message: "paused: takeover" } });
@@ -439,4 +439,29 @@ test("filter: object groups are bounded: releases keep no state, and past 256 li
   assert.ok(h.command({ method: "Runtime.evaluate", params: { expression: "1", objectGroup: "new" }, sessionId: ha }).send); // (a released one frees its place)
   assert.deepEqual(h.command({ method: "Runtime.evaluate", params: { expression: "1", objectGroup: "one-too-many" }, sessionId: ha }), { error: { code: -32000, message: "session retired" } });
   assert.ok(h.retired);
+});
+
+test("filter: object groups belong to their page: the same name in two pages is two groups, released, counted and handed back each on its own", () => {
+  const { f, pa, pb } = setup();
+  const evalIn = (page, objectId) => roundTrip(f, { method: "Runtime.evaluate", params: { expression: "x", objectGroup: "shared" }, sessionId: page }, { result: { type: "object", objectId } }).out.result.result.objectId;
+  const oa = evalIn(pa, "REAL-OA"), ob = evalIn(pb, "REAL-OB");
+  roundTrip(f, { method: "Runtime.releaseObjectGroup", params: { objectGroup: "shared" }, sessionId: pa }, {});
+  assert.equal(f.command({ method: "Runtime.getProperties", params: { objectId: oa }, sessionId: pa }).error.message, "stale handle");
+  assert.ok(f.command({ method: "Runtime.getProperties", params: { objectId: ob }, sessionId: pb }).send);
+  assert.deepEqual(f.takeover().releaseGroups, [{ sessionId: B.sessionId, objectGroup: `${GROUP_PREFIX}shared` }]); // (B still owns its group)
+
+  const { f: g, pa: ga, pb: gb } = setup();
+  for (let i = 0; i < LIMITS.groups / 2; i++) {
+    assert.ok(g.command({ method: "Runtime.evaluate", params: { expression: "1", objectGroup: `g${i}` }, sessionId: ga }).send);
+    assert.ok(g.command({ method: "Runtime.evaluate", params: { expression: "1", objectGroup: `g${i}` }, sessionId: gb }).send); // (the same names, in B: B's own groups)
+  }
+  const rel = g.command({ method: "Runtime.releaseObjectGroup", params: { objectGroup: "g0" }, sessionId: ga });
+  g.result(rel.token, {});
+  assert.ok(g.command({ method: "Runtime.evaluate", params: { expression: "1", objectGroup: "g0" }, sessionId: gb }).send); // (B's g0 still counts: no new place)
+  assert.ok(g.command({ method: "Runtime.evaluate", params: { expression: "1", objectGroup: "new" }, sessionId: gb }).send); // (A's release freed exactly one)
+  assert.deepEqual(g.command({ method: "Runtime.evaluate", params: { expression: "1", objectGroup: "g0" }, sessionId: ga }), { error: { code: -32000, message: "session retired" } }); // (the cap counts every page's groups)
+  const { f: h, pa: ha } = setup();
+  for (let i = 0; i < LIMITS.groups; i++) h.command({ method: "Runtime.evaluate", params: { expression: "1", objectGroup: `g${i}` }, sessionId: ha });
+  h.pageDetached(A.sessionId); // (a closed page's groups go with it)
+  assert.ok(h.command({ method: "Runtime.evaluate", params: { expression: "1", objectGroup: "after" }, sessionId: h.command({ method: "Target.getTargets" }).result.targetInfos[0].targetId }).send);
 });

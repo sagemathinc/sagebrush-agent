@@ -342,3 +342,101 @@ test("cli: the bound counts every unsettled tool call, waiting, being decided or
   await q.return();
   assert.ok([...q.pending.values()].every((e) => e.input === null), "the end settles every entry and drops its input");
 });
+
+// (SEC H3 on the implementation: what a query retains per tool call is bounded in bytes, not only in count)
+test("cli: retained state is bounded in bytes: id and name formats closed at 64 characters, settled entries keep neither name nor input, a measured ceiling for 65,536 ids, the held-input budget", { timeout: 60_000 }, async () => {
+  const { CLI_LIMITS } = await import("../lib/claude-cli.mjs");
+  // (the registered caps)
+  assert.deepEqual({ pendingMax: CLI_LIMITS.pendingMax, seenMax: CLI_LIMITS.seenMax, heldInputBytes: CLI_LIMITS.heldInputBytes, lineMax: CLI_LIMITS.lineMax, bodyMax: CLI_LIMITS.bodyMax }, { pendingMax: 64, seenMax: 65536, heldInputBytes: 64 * 1024 * 1024, lineMax: 16 * 1024 * 1024, bodyMax: 32 * 1024 * 1024 });
+  // (a stand-in that only waits: the run's own state is driven directly)
+  const { writeFileSync, chmodSync } = await import("node:fs");
+  const sleeper = join(mkdtempSync(join(tmpdir(), "sb-sleep-")), "wait");
+  writeFileSync(sleeper, "#!/bin/sh\nexec sleep 600\n");
+  chmodSync(sleeper, 0o700);
+  const run = (limits = {}) => cliQuery({ prompt: "x", options: { abortController: new AbortController(), canUseTool: () => new Promise(() => {}) } }, { bin: sleeper, env: { PATH: process.env.PATH }, limits: { connectMs: 600_000, killGraceMs: 200, ...limits } });
+  const use = (q, id, name = "mcp__s__t", input = {}) => q.line(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id, name, input }] } }));
+  const ended = async (q) => { try { for await (const _ of q) {} return null; } catch (e) { return e.message; } };
+  // (the boundaries: 64 characters pass, 65 end the query; so does anything outside [A-Za-z0-9_-])
+  for (const [id, name, ok] of [["a".repeat(64), "n".repeat(64), true], ["a".repeat(65), "n", false], ["a", "n".repeat(65), false], ["tool é", "n", false], ["a", "mcp__x y", false]]) {
+    const q = run();
+    use(q, id, name);
+    if (ok) { assert.equal(q.done, false); assert.equal(q.pending.get(id).name, name); q.abort.abort(); await q.return(); }
+    else { assert.match(await ended(q), /can't follow/, JSON.stringify([id.length, name.length])); await q.return(); }
+  }
+  // (65,536 ids of 64 characters, each settled at once: a measured ceiling on what stays; then one more ends the query)
+  const q = run({ pendingMax: 1 });
+  global.gc?.();
+  const before = process.memoryUsage().heapUsed;
+  for (let i = 0; i < 65536; i++) {
+    const id = i.toString(36).padStart(64, "_");
+    use(q, id, "n".repeat(64), { v: "y".repeat(1000) });
+    q.queue.length = 0; // (the consumer takes each message, as the agent's turn loop does)
+    const e = q.pending.get(id);
+    if (e) q.settle(e, "denied");
+  }
+  global.gc?.();
+  const grew = process.memoryUsage().heapUsed - before;
+  assert.ok(grew < 24 * 1024 * 1024, `retained ${Math.round(grew / 1048576)} MiB for 65,536 ids`);
+  assert.ok([...q.pending.values()].every((e) => e.name === null && e.input === null), "settled entries keep neither name nor input");
+  use(q, "z".repeat(64));
+  assert.match(await ended(q), /more tool calls/);
+  await q.return();
+  // (the held-input budget: a second input that would pass it isn't held)
+  const h = run({ heldInputBytes: 1500 });
+  use(h, "toolu_a", "mcp__s__t", { v: "y".repeat(1000) });
+  use(h, "toolu_b", "mcp__s__t", { v: "y".repeat(1000) });
+  assert.equal(h.pending.has("toolu_a"), true);
+  assert.equal(h.pending.has("toolu_b"), false);
+  h.abort.abort();
+  await h.return();
+});
+
+// (TESTS T4 on the implementation: a Stop never waits on the prompt's producer)
+test("cli: a Stop returns promptly whatever the prompt's producer does: blocked before or after its first message, then a late yield or a late failure; return() twice", { skip, timeout: 120_000 }, async () => {
+  for (const [label, firstFirst, late] of [["blocked before the first", false, "yield"], ["blocked after the first", true, "yield"], ["blocked after the first, then fails", true, "reject"]]) {
+    const api = await fakeAnthropic(() => [{ type: "text", text: "ok" }]);
+    const { env } = freshEnv(api);
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const input = (async function* () {
+      if (firstFirst) yield { type: "user", message: { role: "user", content: "hi" }, parent_tool_use_id: null, session_id: "", uuid: "44444444-4444-4444-8444-444444444444" };
+      const how = await gate;
+      if (how === "reject") throw new Error("the producer failed late");
+      yield { type: "user", message: { role: "user", content: "late" }, parent_tool_use_id: null, session_id: "", uuid: "55555555-5555-4555-8555-555555555555" };
+    })();
+    const abort = new AbortController();
+    const q = cliQuery({ prompt: input, options: baseOptions({ cwd: env.HOME, abortController: abort, canUseTool: async () => ({ behavior: "deny", message: "no" }) }) }, { bin: BIN, env, limits: { killGraceMs: 200 } });
+    const seen = [];
+    const reader = (async () => { try { for await (const m of q) { seen.push(m.type); if (m.type === "result" || (!firstFirst && m.type === "system")) abort.abort(); } } catch {} })();
+    if (!firstFirst) setTimeout(() => abort.abort(), 3000);
+    await reader;
+    const t0 = Date.now();
+    await q.return();
+    await q.return();
+    assert.ok(Date.now() - t0 < 1500, `${label}: return() took ${Date.now() - t0} ms`);
+    assert.equal(q.done, true);
+    release(late);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(api.requests.filter((r) => JSON.stringify(r.body.messages).includes("late")).length, 0, `${label}: nothing late was sent`);
+    await api.close();
+  }
+});
+
+test("cli: a run that ends while it is still being set up starts no process and leaves no listener", { skip: process.platform === "win32" ? "a shell stand-in" : false, timeout: 30_000 }, async () => {
+  const { writeFileSync, chmodSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "sb-early-"));
+  const mark = join(dir, "started");
+  const bin = join(dir, "wait");
+  writeFileSync(bin, `#!/bin/sh\ntouch ${JSON.stringify(mark)}\nexec sleep 600\n`);
+  chmodSync(bin, 0o700);
+  for (const how of ["a malformed line", "an abort"]) {
+    const abort = new AbortController();
+    const q = cliQuery({ prompt: "x", options: { abortController: abort, canUseTool: async () => ({ behavior: "deny", message: "no" }) } }, { bin, env: { PATH: process.env.PATH }, limits: { killGraceMs: 200 } });
+    if (how === "an abort") abort.abort(); else q.line("{not json");
+    try { for await (const _ of q) {} } catch {}
+    await q.return().catch(() => {});
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(q.child, null, `${how}: nothing was spawned`);
+    assert.equal(existsSync(mark), false, `${how}: the stand-in never ran`);
+  }
+});

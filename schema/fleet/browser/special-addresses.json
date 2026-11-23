@@ -1,0 +1,77 @@
+{
+  "$comment": "O11 §5: the addresses the browser lane's proxy never connects to. ipv4 and ipv6 are every block of the IANA special-purpose registries pinned in sources (compiled by lib/fleet/browser/addresses.mjs registryBlocks; test/fleet-addresses.test.mjs recompiles them). ipv4_also are §5's extra IPv4 blocks. IPv6 must also be in 2000::/3.",
+  "sources": [
+    {
+      "file": "schema/fleet/browser/iana/iana-ipv4-special-registry-1.csv",
+      "url": "https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry-1.csv",
+      "fetched": "2026-11-23",
+      "sha256": "cbc4b7653c8bc640ba1e8e5d4ebbf11e7c7a1d867e7f1593aad001d3f8632aac"
+    },
+    {
+      "file": "schema/fleet/browser/iana/iana-ipv6-special-registry-1.csv",
+      "url": "https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry-1.csv",
+      "fetched": "2026-11-23",
+      "sha256": "bf56772aef97fbf9b4a27c98b8511f2bb1ba96da4b9ccc12ab203a2496faba66"
+    }
+  ],
+  "ipv4": [
+    "0.0.0.0/8",
+    "0.0.0.0/32",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.0.0/29",
+    "192.0.0.8/32",
+    "192.0.0.9/32",
+    "192.0.0.10/32",
+    "192.0.0.170/32",
+    "192.0.0.171/32",
+    "192.0.2.0/24",
+    "192.31.196.0/24",
+    "192.52.193.0/24",
+    "192.88.99.0/24",
+    "192.88.99.2/32",
+    "192.168.0.0/16",
+    "192.175.48.0/24",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "240.0.0.0/4",
+    "255.255.255.255/32"
+  ],
+  "ipv4_also": [
+    "0.0.0.0/8",
+    "224.0.0.0/4",
+    "240.0.0.0/4"
+  ],
+  "ipv6": [
+    "::1/128",
+    "::/128",
+    "::ffff:0:0/96",
+    "64:ff9b::/96",
+    "64:ff9b:1::/48",
+    "100::/64",
+    "100:0:0:1::/64",
+    "2001::/23",
+    "2001::/32",
+    "2001:1::1/128",
+    "2001:1::2/128",
+    "2001:1::3/128",
+    "2001:2::/48",
+    "2001:3::/32",
+    "2001:4:112::/48",
+    "2001:10::/28",
+    "2001:20::/28",
+    "2001:30::/28",
+    "2001:db8::/32",
+    "2002::/16",
+    "2620:4f:8000::/48",
+    "3fff::/20",
+    "5f00::/16",
+    "fc00::/7",
+    "fe80::/10"
+  ]
+}

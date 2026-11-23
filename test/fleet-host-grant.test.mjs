@@ -75,6 +75,10 @@ test("refused: cross-field rules and every agent's config_schema 1", () => {
   refused(() => verifyGrant(grant({ agents: [b.agents[0], b.agents[0]] }), ctx()), "bad_form");
   refused(() => verifyGrant(grant({ tags: [b.tags[0], b.tags[0]] }), ctx()), "bad_form");
   refused(() => verifyGrant(grant({ subscriptions: [{ sub: newId(), provider: "codex", use: [newId()], home: false }] }), ctx()), "bad_form");
+  // (no Claude subscription in a grant: Claude logins are host-local)
+  refused(() => verifyGrant(grant({ subscriptions: [{ ...b.subscriptions[0], provider: "claude" }] }), ctx()), "bad_form");
+  // (nor a claude-subscription right: the host-local pool is the only authority)
+  refused(() => verifyGrant(grant({ agents: [{ ...b.agents[0], broker: ["claude-subscription"] }] }), ctx()), "bad_form");
   refused(() => verifyGrant(grant({ agents: [{ ...b.agents[0], config: { ...config(), extra: 1 } }] }), ctx()), "bad_form");
   refused(() => verifyGrant(grant({ agents: [{ ...b.agents[0], config: { ...config(), files: { rw: ["/etc/x"], ro: [] } } }] }), ctx()), "bad_form");
   refused(() => verifyGrant(grant({ agents: [{ ...b.agents[0], config: {} }] }), ctx()), "bad_form");

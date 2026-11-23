@@ -22,7 +22,7 @@ const samples = {
     fleet, aud: AUD, host, gen: 1, cert: h, chain_seq: 3, at_ms: 1, not_before_ms: 1, not_after_ms: 2, auth_time_ms: 1,
     agents: [{ agent, name: "worker-1", client: "claude", root: false, tags: [tag], workspace: [{ path: "/Algebra", access: "write" }],
       broker: ["messages", "workspace"], spend_cap_cents: 0, config_schema: 1, config: {} }],
-    tags: [{ tag, name: "course-1" }], subscriptions: [{ sub: newId(), provider: "claude", use: [agent], home: false }],
+    tags: [{ tag, name: "course-1" }], subscriptions: [{ sub: newId(), provider: "codex", use: [agent], home: false }],
     offline: { revocation_check_s: 900, horizon_s: 3600 },
   },
   "grant-ack": { fleet, aud: AUD, host, gen: 2, at_ms: 1, narrowed: true, restarted: [agent] },
@@ -31,8 +31,8 @@ const samples = {
   "approval": { fleet, aud: AUD, approval: newId(), kind: "spend", requester: { host, agent }, gen: 1, life: 0, question: newId(),
     subject: { agent, amount_cents: 500, currency: "USD", purpose_code: "cloud-compute", payee: { kind: "provider", id: "gcp" } },
     subject_hash: h, chain_seq: 3, at_ms: 1, not_after_ms: 2, auth_time_ms: 1 },
-  "sealed-package": { fleet, aud: AUD, package: newId(), host, enc_key: "A".repeat(22), fingerprint: h, sub: newId(), provider: "claude",
-    purpose: "claude-setup-token", gen: 1, chain_seq: 3, at_ms: 1, not_after_ms: 2, enc: key32, ct: "AAAA" },
+  "sealed-package": { fleet, aud: AUD, package: newId(), host, enc_key: "A".repeat(22), fingerprint: h, sub: newId(), provider: "codex",
+    purpose: "codex-access-token", gen: 1, chain_seq: 3, at_ms: 1, not_after_ms: 2, enc: key32, ct: "AAAA" },
   "device-chain": { fleet, aud: AUD, seq: 0, prev: "", op: "genesis", at_ms: 1, auth_time_ms: 1,
     device: { id: newId(), alg: "ed25519", key: key32, name: "William's laptop", tier: "browser" }, recovery_key: { alg: "ed25519", key: key32 } },
 };
@@ -84,4 +84,17 @@ test("reasons.json: closed, unique, and every code the fleet library raises is i
 test("purpose codes: the schema's enum and the display list agree", () => {
   const list = read("purpose-codes.json").purpose_codes.map((p) => p.code);
   assert.deepEqual([...doc.$defs.purpose_code.enum].sort(), [...list].sort());
+});
+
+test("no Claude subscription, right, package or purpose: a grant's subscriptions and a sealed package name codex only, no broker right names claude; an agent's client may be claude", () => {
+  const g = body("host-grant"), p = body("sealed-package"), G = samples["host-grant"], P = samples["sealed-package"];
+  assert.ok(refused(g, { ...G, subscriptions: [{ ...G.subscriptions[0], provider: "claude" }] }), "a claude subscription");
+  assert.equal(g({ ...G, agents: [{ ...G.agents[0], client: "claude" }] }), true, "an agent whose client is claude");
+  assert.ok(refused(g, { ...G, agents: [{ ...G.agents[0], broker: ["claude-subscription"] }] }), "a claude-subscription right");
+  assert.ok(refused(g, { ...G, agents: [{ ...G.agents[0], broker: ["messages", "claude-subscription"] }] }), "a claude-subscription right among others");
+  assert.equal(g({ ...G, agents: [{ ...G.agents[0], broker: ["messages", "codex-access-token"] }] }), true, "the other rights, as a control");
+  assert.ok(refused(p, { ...P, provider: "claude", purpose: "claude-setup-token" }), "a claude-setup-token package");
+  assert.ok(refused(p, { ...P, purpose: "claude-setup-token" }), "the claude-setup-token purpose under codex");
+  assert.ok(refused(body("package_plaintext"), { v: 1, provider: "claude", purpose: "claude-setup-token", secret: "x", issued_ms: 1 }), "a claude plaintext");
+  assert.equal(body("package_plaintext")({ v: 1, provider: "codex", purpose: "codex-access-token", secret: "x", issued_ms: 1 }), true, "the codex plaintext, as a control");
 });

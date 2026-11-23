@@ -103,7 +103,9 @@ test("grants: cross-field rules: no_expiry_ack exactly with null, known tags, no
   assert.equal(await code(() => verifyGrant(g({ agents: [{ ...a, workspace: [{ path: "/" + "n".repeat(255), access: "read" }] }] }), ctx)), "ok", "a 255-character name");
   assert.equal(await code(() => verifyGrant(g({ agents: [a, a] }), ctx)), "bad_form");
   const sub = newId();
+  // (no Claude subscription in a grant, home or not: Claude logins are host-local)
   assert.equal(await code(() => verifyGrant(g({ subscriptions: [{ sub, provider: "claude", use: [a.agent], home: true }] }), ctx)), "bad_form");
+  assert.equal(await code(() => verifyGrant(g({ subscriptions: [{ sub, provider: "claude", use: [a.agent], home: false }] }), ctx)), "bad_form");
   assert.equal(await code(() => verifyGrant(g({ subscriptions: [{ sub, provider: "codex", use: [a.agent], home: true }] }), ctx)), "ok");
   assert.equal(await code(() => verifyGrant(g({ subscriptions: [{ sub, provider: "codex", use: [newId()], home: false }] }), ctx)), "bad_form");
   assert.equal(await code(() => verifyGrant(g({}), { ...ctx, checkAuthTime: true, now: NOW + 5 * 60_000 + 1 })), "stale_auth");

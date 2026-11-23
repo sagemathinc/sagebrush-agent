@@ -40,7 +40,7 @@ test("egress: the built-in WebFetch is denied (the backstop to its absence); the
   const r = await Promise.race([n.ask("WebFetch", { url: "https://example.org/", prompt: "x" }, true), new Promise((res) => setTimeout(() => res("a card is pending"), 300))]);
   assert.equal(r?.behavior, "deny", JSON.stringify(r));
   assert.equal(n.cards.length, 0, "no card for it");
-  for (const t of ["repo_read", "repo_list", "sagebrush_docs"]) assert.equal((await s.ask(`mcp__sagebrush_page__${t}`, { path: "/llms.txt" })).behavior, "allow");
+  for (const t of ["repo_read", "repo_list", "sagebrush_docs", "sagebrush_source"]) assert.equal((await s.ask(`mcp__sagebrush_page__${t}`, { path: "/llms.txt" })).behavior, "allow");
   assert.equal(s.cards.length, 0);
 });
 

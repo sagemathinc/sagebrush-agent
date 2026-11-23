@@ -233,3 +233,112 @@ test("cli: options CLI mode can't honor are refused before anything starts: hook
   const q = cliQuery({ prompt: "x", options: { hooks: {}, abortController: (() => { const a = new AbortController(); a.abort(); return a; })() } }, { bin: "/nonexistent" });
   return drain(q);
 });
+
+// (a stand-in executable whose descendant ignores TERM, in the child's process group: after a Stop, and after the
+//  leader has already exited on its own, the whole group is gone once the run's iterator has returned)
+test("cli: a Stop, or a leader that already exited, ends every process of the child's group, a TERM-ignoring descendant included", { skip: process.platform === "win32" ? "POSIX process groups" : false, timeout: 60_000 }, async () => {
+  const { writeFileSync, chmodSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "sb-grp-"));
+  const pidFile = join(dir, "pids");
+  const make = (name, tail) => {
+    const p = join(dir, name);
+    writeFileSync(p, `#!/bin/sh\n(trap "" TERM; echo $$ >> ${JSON.stringify(pidFile)}; exec sh -c 'trap "" TERM; while :; do sleep 1; done') &\n${tail}\n`);
+    chmodSync(p, 0o700);
+    return p;
+  };
+  for (const [label, bin, stop] of [["a Stop", make("held", "exec sleep 600"), true], ["the leader gone first", make("gone", "sleep 0.3; exit 1"), false]]) {
+    const abort = new AbortController();
+    const q = cliQuery({ prompt: "x", options: { abortController: abort, canUseTool: async () => ({ behavior: "deny", message: "no" }) } }, { bin, env: { PATH: process.env.PATH }, limits: { killGraceMs: 300, connectMs: 20_000 } });
+    if (stop) setTimeout(() => abort.abort(), 500);
+    try { for await (const _ of q) {} } catch {}
+    await q.return();
+    const pg = q.child.pid;
+    let alive = true;
+    try { process.kill(-pg, 0); } catch { alive = false; }
+    assert.equal(alive, false, `${label}: the group is empty`);
+  }
+});
+
+// (SEC H2 on the implementation: a tool_use id shown again while its decision is held answers neither call, whatever
+//  the person then says; nothing runs)
+test("cli: an id shown twice while the person decides is answered by neither, Allow or Deny; deterministic, on the run's own state", { timeout: 30_000 }, async () => {
+  const { z: zz } = await import("zod");
+  for (const answer of ["allow", "deny"]) {
+    for (const second of [{ name: "mcp__s__t", input: { a: 1 } }, { name: "mcp__s__other", input: { a: 2 } }]) {
+      let release;
+      const held = new Promise((r) => { release = r; });
+      const ran = [];
+      const server = cliCreateServer({ name: "s", version: "1", tools: [["t", "t", { a: zz.number() }, async (x) => { ran.push(x); return { content: [] }; }]] });
+      const abort = new AbortController();
+      // (a stand-in that never connects: the run's own state is driven directly)
+      const q = cliQuery({ prompt: "x", options: { abortController: abort, mcpServers: { s: server }, canUseTool: async () => { await held; return answer === "allow" ? { behavior: "allow", updatedInput: { a: 1 } } : { behavior: "deny", message: "no" }; } } }, { bin: "/bin/sleep", env: { PATH: process.env.PATH }, limits: { connectMs: 20_000 } });
+      q.line(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_dup", name: "mcp__s__t", input: { a: 1 } }] } }));
+      const decided = q.permission({ tool_name: "mcp__s__t", input: { a: 1 }, tool_use_id: "toolu_dup" });
+      await new Promise((r) => setImmediate(r));
+      q.line(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_dup", ...second }] } }));
+      release();
+      const out = JSON.parse((await decided).content[0].text);
+      assert.equal(out.behavior, "deny", `${answer}, ${second.name}`);
+      assert.equal(q.pending.get("toolu_dup").state, "denied");
+      const t = server.tools[0];
+      const call = await q.callTool("mcp__s__t", t, { a: 1 }, abort.signal);
+      assert.equal(call.isError, true);
+      assert.deepEqual(ran, []);
+      abort.abort();
+      await q.return();
+    }
+  }
+});
+
+test("cli: the real Claude Code shown a duplicated tool_use id (same or different input) while approval is held runs nothing, after Allow or Deny", { skip, timeout: 120_000 }, async () => {
+  for (const answer of ["allow", "deny"]) {
+    for (const second of [{ text: "a" }, { text: "b" }]) {
+      const api = await fakeAnthropic((body) => toolResults(body).length ? [{ type: "text", text: "done" }]
+        : (body.tools ?? []).some((t) => t.name === "mcp__sagebrush__echo") ? [{ type: "tool_use", id: "toolu_dupdupdup", name: "mcp__sagebrush__echo", input: { text: "a" } }, { type: "tool_use", id: "toolu_dupdupdup", name: "mcp__sagebrush__echo", input: second }] : [{ type: "text", text: "ok" }]);
+      const { env } = freshEnv(api);
+      const { server, ran } = echoServer();
+      try {
+        await drain(cliQuery({ prompt: "use echo", options: baseOptions({ cwd: env.HOME, mcpServers: { sagebrush: server }, canUseTool: async (n, i) => { await new Promise((r) => setTimeout(r, 1500)); return answer === "allow" ? { behavior: "allow", updatedInput: i } : { behavior: "deny", message: "no" }; } }) }, { bin: BIN, env }));
+      } catch {}
+      assert.deepEqual(ran, [], `${answer}, second input ${second.text}: nothing ran`);
+      await api.close();
+    }
+  }
+});
+
+test("cli: a whole line over the bound ends the run, even when it ends with its newline (T2)", { skip: process.platform === "win32" ? "a shell stand-in" : false, timeout: 30_000 }, async () => {
+  const { writeFileSync, chmodSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "sb-line-"));
+  const bin = join(dir, "big");
+  writeFileSync(bin, `#!/bin/sh\nprintf '{"type":"result","subtype":"success","pad":"%s"}\\n' "$(head -c 2048 /dev/zero | tr '\\0' a)"\nexec sleep 30\n`);
+  chmodSync(bin, 0o700);
+  const q = cliQuery({ prompt: "x", options: { canUseTool: async () => ({ behavior: "deny", message: "no" }) } }, { bin, env: { PATH: process.env.PATH }, limits: { lineMax: 128, connectMs: 20_000, killGraceMs: 200 } });
+  const got = [];
+  let err = null;
+  try { for await (const m of q) got.push(m); } catch (e) { err = e; }
+  await q.return();
+  assert.match(String(err?.message), /too large/);
+  assert.equal(got.length, 0, "the oversized line was never yielded");
+});
+
+test("cli: the bound counts every unsettled tool call, waiting, being decided or allowed; settled ones keep no input (T3)", { timeout: 30_000 }, async () => {
+  const held = [];
+  const abort = new AbortController();
+  const q = cliQuery({ prompt: "x", options: { abortController: abort, canUseTool: () => new Promise((r) => held.push(r)) } }, { bin: "/bin/sleep", env: { PATH: process.env.PATH }, limits: { pendingMax: 2, connectMs: 20_000 } });
+  const use = (id) => q.line(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id, name: "mcp__s__t", input: { id } }] } }));
+  use("toolu_1"); use("toolu_2");
+  const d1 = q.permission({ tool_name: "mcp__s__t", input: { id: "toolu_1" }, tool_use_id: "toolu_1" });
+  const d2 = q.permission({ tool_name: "mcp__s__t", input: { id: "toolu_2" }, tool_use_id: "toolu_2" });
+  await new Promise((r) => setImmediate(r));
+  use("toolu_3");
+  assert.equal(q.pending.has("toolu_3"), false, "a third, while two are being decided, isn't held");
+  const d3 = await q.permission({ tool_name: "mcp__s__t", input: { id: "toolu_3" }, tool_use_id: "toolu_3" });
+  assert.equal(JSON.parse(d3.content[0].text).behavior, "deny");
+  held[0]({ behavior: "deny", message: "no" });
+  held[1]({ behavior: "allow", updatedInput: { id: "toolu_2" } });
+  await d1; await d2;
+  assert.equal(q.pending.get("toolu_1").input, null, "a denied entry keeps no input");
+  abort.abort();
+  await q.return();
+  assert.ok([...q.pending.values()].every((e) => e.input === null), "the end settles every entry and drops its input");
+});

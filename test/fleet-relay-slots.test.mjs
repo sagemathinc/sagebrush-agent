@@ -211,3 +211,19 @@ test("memory: the verified rate history holds only the last minute's opens, howe
   assert.equal(slots.opens.keys, 0);
   assert.equal(slots.opens.size, 0);
 });
+
+test("the verified opens-a-minute limit, alone: a host's or an account's opens past the minute's limit are refused, and admitted again a minute later", () => {
+  const lim = { ...SLOTS, opensPerMinute: 2 }; // (the socket limits stay high, so only the rate can refuse)
+  { const { slots, clock } = setup(lim), t = ids();
+    slots.reserve(facts("host", { ...ids(), host: t.host }));
+    slots.reserve(facts("host", { ...ids(), host: t.host }));
+    refused(() => slots.reserve(facts("host", { ...ids(), host: t.host })), "limit");
+    clock.advance(60_000);
+    slots.reserve(facts("host", { ...ids(), host: t.host })); }
+  { const { slots, clock } = setup(lim), t = ids();
+    slots.reserve(facts("app", { ...ids(), account: t.account }));
+    slots.reserve(facts("app", { ...ids(), account: t.account }));
+    refused(() => slots.reserve(facts("app", { ...ids(), account: t.account })), "limit");
+    clock.advance(60_000);
+    slots.reserve(facts("app", { ...ids(), account: t.account })); }
+});

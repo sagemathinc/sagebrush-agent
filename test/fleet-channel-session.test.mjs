@@ -650,6 +650,70 @@ test("an answer that isn't a result (undefined, null, an array, a float, over re
   }
 });
 
+test("the smallest accepted bounds: resultBytes = retainBytes = the abandoned outcome's size; a rejection and an abandon each give one unknown within it", async () => {
+  const { appSession, ABANDONED_SIZE } = await import("../lib/fleet/channel/app.mjs");
+  const at = { retainBytes: ABANDONED_SIZE, resultBytes: ABANDONED_SIZE };
+  // a rejected execution, an invalid answer, an explicit abandon: each one unknown, never past the bound
+  const s = sessions({ appOpts: { ...at, execute: async (c) => { if (c.n === 1) throw new Error("rejected"); if (c.n === 2) return undefined; return new Promise(() => {}); } } });
+  const t = connect(s.broker, s.app);
+  const out = [1, 2, 3].map((n) => s.broker.submit({ n }));
+  await t.pump();
+  assert.ok(s.app.held.resultBytes <= ABANDONED_SIZE);
+  assert.equal(s.app.executing, 3, "3 started once rack released 2's outcome");
+  assert.equal(s.app.abandon(3), true);
+  assert.ok(s.app.held.resultBytes <= ABANDONED_SIZE, "the abandoned outcome fits the reservation");
+  await t.pump();
+  assert.deepEqual(await Promise.all(out), Array(3).fill({ outcome: "unknown", reason: "abandoned" }));
+  assert.equal(s.app.ended, null);
+  // one below: refused at construction, for either bound
+  assert.throws(() => appSession({ execute: async () => ({}), retainBytes: ABANDONED_SIZE, resultBytes: ABANDONED_SIZE - 1 }), /abandoned outcome/);
+  assert.throws(() => appSession({ execute: async () => ({}), retainBytes: ABANDONED_SIZE - 1, resultBytes: ABANDONED_SIZE - 1 }), /abandoned outcome/);
+  assert.throws(() => appSession({ execute: async () => ({}), retainBytes: 1, resultBytes: 1 }), /abandoned outcome/, "SEC's example");
+  for (const bad of [1.5, -1, Infinity, NaN]) assert.throws(() => appSession({ execute: async () => ({}), retainCount: bad }), /exact counts/);
+});
+
+test("a replayed outcome is tolerated once per fresh transport: the same refusal twice on the resumed transport ends the session", async () => {
+  const s = sessions();
+  let x = brokerVsRaw(s.broker);
+  const o = s.broker.submit({ n: 1 });
+  x.flush();
+  x.raw.l.send("ctl", 1, { ctl: "refused", seq: 1, reason: "bad" }, { recv: 1, rack: 0 });
+  x.flush();
+  assert.deepEqual(await o, { outcome: "not_run", reason: "bad" });
+  x.bl.lost("cut");
+  x = brokerVsRaw(s.broker);
+  x.flush();
+  x.raw.l.send("ctl", 1, { ctl: "refused", seq: 1, reason: "bad" }, { recv: 1, rack: 0 });
+  x.flush();
+  assert.equal(s.broker.ended, null, "the first replay on the new transport: an exact duplicate, acknowledged");
+  x.raw.l.send("ctl", 2, { ctl: "refused", seq: 1, reason: "bad" }, { recv: 1, rack: 0 });
+  x.flush();
+  assert.equal(s.broker.ended, "bad_form", "a second on that same transport");
+});
+
+test("a retained result is the session's own copy: the executor changing its answer afterwards changes nothing replayed", async () => {
+  const { appSession } = await import("../lib/fleet/channel/app.mjs");
+  const answer = { value: "original" };
+  const app = appSession({ execute: async () => answer, clock: manualClock(), retainBytes: 300, resultBytes: 150 });
+  let w = appVsRaw(app);
+  w.raw.l.send("ctl", 1, { ctl: "ping", t: 0 }, { recv: 0, rack: 0 });
+  w.raw.l.send("cmd", 1, { command: { n: 1 } }, { recv: 0, rack: 0 });
+  await w.flush();
+  const first = w.raw.got.find((m) => m.kind === "res");
+  const held = app.held;
+  w.al.lost("cut");
+  answer.value = "z".repeat(1000);
+  answer.extra = true;
+  w = appVsRaw(app);
+  w.raw.l.send("ctl", 1, { ctl: "ping", t: 0 }, { recv: 0, rack: 0 });
+  await w.flush();
+  const replay = w.raw.got.find((m) => m.kind === "res");
+  assert.deepEqual([...replay.bytes], [...first.bytes], "the same bytes replayed");
+  assert.deepEqual(replay.value, { answer: { value: "original" } });
+  assert.deepEqual(app.held, held, "and the same accounting");
+  assert.equal(app.ended, null);
+});
+
 test("a validator that throws ends the session (bad_form) before anything runs; nothing escapes the transport", async () => {
   const s = sessions({ appOpts: { validate: () => { throw new Error("the validator broke"); } } });
   const t = connect(s.broker, s.app);

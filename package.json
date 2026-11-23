@@ -1,6 +1,6 @@
 {
   "name": "sagebrush-agent",
-  "version": "0.8.14",
+  "version": "0.8.15",
   "description": "Chat with Claude or Codex in Sagebrush: a small daemon on your computer that runs Claude (with your own Claude login), or your own Codex through sagebrush remote, and talks to the Sagebrush page.",
   "type": "module",
   "bin": {

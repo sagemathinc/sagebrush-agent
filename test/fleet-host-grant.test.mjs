@@ -85,6 +85,30 @@ test("refused: cross-field rules and every agent's config_schema 1", () => {
   refused(() => verifyGrant(grant(), ctx({ hostInfo: { ramMb: 512 } })), "bad_form");
 });
 
+test("a grant naming a Claude subscription is refused whole: the pool is host-local policy; Codex entries are unchanged", () => {
+  const b = body();
+  const agent = b.agents[0].agent;
+  for (const use of [[agent], []]) {
+    for (const home of [false, true]) {
+      refused(() => verifyGrant(grant({ subscriptions: [{ sub: newId(), provider: "claude", use, home }] }), ctx()), "bad_form");
+      // A Claude entry among valid Codex ones refuses the whole grant too.
+      refused(() => verifyGrant(grant({ subscriptions: [{ sub: newId(), provider: "codex", use: [agent], home: true }, { sub: newId(), provider: "claude", use, home }] }), ctx()), "bad_form");
+    }
+  }
+  for (const home of [false, true]) assert.equal(verifyGrant(grant({ subscriptions: [{ sub: newId(), provider: "codex", use: [agent], home }] }), ctx()).body.subscriptions[0].provider, "codex");
+  assert.deepEqual(verifyGrant(grant({ subscriptions: [] }), ctx()).body.subscriptions, []);
+});
+
+test("a grant giving any agent the claude-subscription right is refused whole; the other rights verify", () => {
+  const b = body();
+  for (const broker of [["claude-subscription"], ["messages", "claude-subscription"]]) {
+    refused(() => verifyGrant(grant({ agents: [{ ...b.agents[0], broker }] }), ctx()), "bad_form");
+  }
+  for (const broker of [[], ["messages"], ["codex-access-token", "messages", "memory", "workspace"]]) {
+    assert.deepEqual(verifyGrant(grant({ agents: [{ ...b.agents[0], broker }] }), ctx()).body.agents[0].broker, broker);
+  }
+});
+
 const fresh = () => join(mkdtempSync(join(tmpdir(), "sb-grant-")), "state");
 const okIntent = () => { const log = []; const f = async (r) => { log.push(r); }; f.log = log; return f; };
 const stateFile = (root) => join(root, "grant", "state.json");

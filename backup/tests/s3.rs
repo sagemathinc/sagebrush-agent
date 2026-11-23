@@ -536,6 +536,39 @@ fn restore_skips_specials_and_attributes() {
     }
 }
 
+/// The restore's view has no procfs, so the capability check asks the kernel directly. This row runs the restore in its
+/// own mount namespace with an empty read-only tmpfs over `/proc`, then without CAP_SYS_RESOURCE, and needs `sudo` with
+/// CAP_SYS_ADMIN for the `unshare` (CI). Elsewhere it skips, unless SB_TEST_REQUIRE_NOPROC=1.
+#[test]
+fn restore_runs_without_proc() {
+    let Some(bin) = weed() else { return };
+    let can_unshare = Command::new("sudo").args(["-n", "unshare", "-m", "true"]).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+    if !can_unshare {
+        assert!(std::env::var_os("SB_TEST_REQUIRE_NOPROC").is_none(), "sudo unshare -m is required (SB_TEST_REQUIRE_NOPROC is set)");
+        eprintln!("skipping: no sudo unshare -m here");
+        return;
+    }
+    let w = start_weed(&bin);
+    let h = host(&w, "noproc");
+    assert_eq!(run(&h, json!({ "op": "init" }))["ok"], true);
+    let src = tmpdir("noproc-src");
+    fs::write(src.join("f"), b"no proc").unwrap();
+    let b = run(&h, json!({ "op": "backup", "sources": [src], "host": "h1" }));
+    assert_eq!(b["ok"], true, "{b}");
+    let dst = tmpdir("noproc-dst");
+    // SAFETY: getuid and getgid have no preconditions.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let script = format!(
+        "mount -t tmpfs -o ro,nosuid,nodev,noexec,size=4k none /proc && \
+         exec setpriv --reuid={uid} --regid={gid} --clear-groups --bounding-set=-sys_resource --inh-caps=-sys_resource -- \"$0\" \"$@\""
+    );
+    let mut cmd = Command::new("sudo");
+    cmd.args(["-n", "unshare", "-m", "--propagation", "private", "--", "sh", "-c", &script, BIN]);
+    let r = run_cmd(&mut cmd, &h, json!({ "op": "restore", "snapshot": snapshot_id(&b), "dest": dst }), &[]);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(fs::read(walk_find(&dst, "f").expect("restored")).unwrap(), b"no proc");
+}
+
 /// A restore that still holds CAP_SYS_RESOURCE is refused before anything is read or written (host backup design r3.3 §5.7). Where
 /// this environment has already dropped it from the bounding set, the refusal is covered by the unit tests (`caps`)
 /// and by CI, whose runner holds it.

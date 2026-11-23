@@ -4,6 +4,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createServer } from "node:http";
+import { connect as tcpConnect } from "node:net";
 import { parseHead, decide, headEnd, authorized, accountOf, refusalBytes, gateRequest, upstreamHead, LIMITS } from "../lib/fleet/browser/proxy-gate.mjs";
 import { accountOrigins, DEFAULT_ACCOUNT_ORIGINS } from "../lib/fleet/browser/urls.mjs";
 
@@ -21,7 +23,7 @@ function gate(bytes) {
 const why = (bytes) => { const r = gate(bytes); return r.ok ? "ok" : r.why; };
 
 test("proxy gate: an allowed CONNECT and an allowed absolute-form GET give the normalized destination", () => {
-  const tunnel = { kind: "tunnel" }, empty = { kind: "http", bodyBytes: 0 };
+  const tunnel = { kind: "tunnel" }, empty = { kind: "http", bodyBytes: 0, declared: false };
   assert.deepEqual(gate(connect("example.com:443")), { ok: true, connect: true, host: "example.com", port: 443, framing: tunnel, path: null });
   assert.deepEqual(gate(get("http://Example.COM./a?b", "example.com")), { ok: true, connect: false, host: "example.com", port: 80, framing: empty, path: "/a?b" });
   assert.deepEqual(gate(get("http://example.com:443/", "example.com:443")), { ok: true, connect: false, host: "example.com", port: 443, framing: empty, path: "/" });
@@ -161,7 +163,7 @@ test("proxy gate: one request per connection: odd body framing is refused", () =
   assert.equal(why(connect("example.com:443", "Content-Length: 5")), "content-length");
   assert.equal(why(connect("example.com:443", "Transfer-Encoding: chunked")), "transfer-encoding");
   // (the framing is decided once, here)
-  assert.deepEqual(gate(req("POST http://example.com/x HTTP/1.1", "Host: example.com", AUTH, "Content-Length: 3")).framing, { kind: "http", bodyBytes: 3 });
+  assert.deepEqual(gate(req("POST http://example.com/x HTTP/1.1", "Host: example.com", AUTH, "Content-Length: 3")).framing, { kind: "http", bodyBytes: 3, declared: true });
 });
 
 test("proxy gate: gateRequest holds the whole request and refuses anything after it, before forwarding a byte", () => {
@@ -192,13 +194,71 @@ test("proxy gate: gateRequest holds the whole request and refuses anything after
 });
 
 test("proxy gate: upstream gets origin-form, no Proxy-Authorization, no hop-by-hop header, and Connection: close", () => {
-  const h = req("POST http://example.com/a/b?c=d HTTP/1.1", "Host: example.com", AUTH, "Connection: keep-alive, X-Secret-Hop", "Keep-Alive: timeout=5", "Proxy-Connection: keep-alive", "TE: trailers", "Trailer: X", "Upgrade: websocket", "X-Secret-Hop: 1", "Cookie: a=1", "Cookie: b=2", "Content-Length: 2", "Accept: */*");
+  const h = req("POST http://EXAMPLE.com./a/b?c=d HTTP/1.1", "Host: Example.COM", AUTH, "Connection: keep-alive", "Keep-Alive: timeout=5", "Proxy-Connection: keep-alive", "TE: trailers", "Trailer: X", "Upgrade: websocket", "Cookie: a=1", "Cookie: b=2", "Content-Length: 2", "Accept: */*");
   const r = gateRequest(Buffer.concat([h, Buffer.from("hi")]), session);
   assert.equal(r.ok, true);
   const text = r.upstream.toString("latin1");
-  assert.equal(text, "POST /a/b?c=d HTTP/1.1\r\nHost: example.com\r\nCookie: a=1\r\nCookie: b=2\r\nContent-Length: 2\r\nAccept: */*\r\nConnection: close\r\n\r\nhi");
-  for (const gone of ["Proxy-Authorization", "Keep-Alive", "Proxy-Connection", "TE:", "Trailer", "Upgrade", "X-Secret-Hop", "keep-alive"]) assert.ok(!text.includes(gone), gone);
+  assert.equal(text, "POST /a/b?c=d HTTP/1.1\r\nHost: example.com\r\nCookie: a=1\r\nCookie: b=2\r\nAccept: */*\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+  for (const gone of ["Proxy-Authorization", "Keep-Alive", "Proxy-Connection", "TE:", "Trailer", "Upgrade", "keep-alive", "Example.COM"]) assert.ok(!text.includes(gone), gone);
   // (upstreamHead alone, for a body-less GET)
   const g = parseHead(req("GET http://example.com/ HTTP/1.1", "Host: example.com", AUTH));
   assert.equal(upstreamHead(g, decide(g, session)).toString("latin1"), "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n");
+  const p = parseHead(req("GET http://example.com:443/ HTTP/1.1", "Host: example.com:443", AUTH, "Connection: close"));
+  assert.equal(upstreamHead(p, decide(p, session)).toString("latin1"), "GET / HTTP/1.1\r\nHost: example.com:443\r\nConnection: close\r\n\r\n");
+});
+
+test("proxy gate: Connection may only say close or keep-alive: naming a header is refused, so nothing hides in a body", () => {
+  // (the smuggling control: an allowed POST whose declared body is a second request to an account origin)
+  const hidden = Buffer.from("GET http://claude.ai/ HTTP/1.1\r\nHost: claude.ai\r\n\r\n", "latin1");
+  for (const conn of ["Content-Length", "close, Content-Length", "Host", "keep-alive, host", "X-Hop", "close,", ",close", "close,,keep-alive", "", "upgrade"]) {
+    const h = req("POST http://example.com/ HTTP/1.1", "Host: example.com", AUTH, `Connection: ${conn}`, `Content-Length: ${hidden.length}`);
+    const r = gateRequest(Buffer.concat([h, hidden]), session);
+    assert.deepEqual([r.ok, r.status, r.why, "upstream" in r], [false, 400, "connection", false], JSON.stringify(conn));
+  }
+  for (const conn of ["Host", "content-length", "close, x"]) assert.equal(why(req("POST http://example.com/ HTTP/1.1", "Host: example.com", AUTH, `Proxy-Connection: ${conn}`)), "connection", conn);
+  assert.equal(why(connect("example.com:443", "Connection: Host")), "connection");
+  // (close and keep-alive, in any case and spacing, pass; upstream gets Host and Content-Length from the decision)
+  for (const conn of ["close", "keep-alive", "Keep-Alive", " close , keep-alive "]) {
+    const h = req("POST http://example.com/x HTTP/1.1", "Host: example.com", AUTH, `Connection: ${conn}`, "Content-Length: 3");
+    const r = gateRequest(Buffer.concat([h, Buffer.from("abc")]), session);
+    assert.equal(r.ok, true, conn);
+    const lines = r.upstream.toString("latin1").split("\r\n");
+    assert.deepEqual(lines.filter((l) => /^(host|content-length|connection):/i.test(l)), ["Host: example.com", "Content-Length: 3", "Connection: close"], conn);
+  }
+});
+
+test("proxy gate: the forwarded bytes, read by a real HTTP server: exactly one request, its exact body, then the end", async () => {
+  // (Node's own HTTP parser on loopback stands in for the upstream: it must see one request with the whole body, and
+  //  nothing parsed as a second)
+  const seen = [];
+  const server = createServer((rq, rs) => {
+    const chunks = [];
+    rq.on("data", (c) => chunks.push(c));
+    rq.on("end", () => { seen.push({ method: rq.method, url: rq.url, host: rq.headers.host, length: rq.headers["content-length"], connection: rq.headers.connection, body: Buffer.concat(chunks).toString("latin1") }); rs.end("ok"); });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const send = (bytes) => new Promise((resolve) => {
+    const sock = tcpConnect(server.address().port, "127.0.0.1", () => sock.end(bytes));
+    sock.on("data", () => {});
+    sock.on("close", resolve);
+  });
+  try {
+    const body = "GET http://claude.ai/ HTTP/1.1\r\nHost: claude.ai\r\n\r\n"; // (41 bytes that look like a request)
+    // (refused: the same body declared under Connection: Content-Length: nothing to send)
+    const smuggle = req("POST http://example.com/first HTTP/1.1", "Host: example.com", AUTH, "Connection: Content-Length", `Content-Length: ${body.length}`);
+    assert.equal(gateRequest(Buffer.concat([smuggle, Buffer.from(body, "latin1")]), session).why, "connection");
+    // (allowed: Connection: keep-alive, the same body; the server reads it as the body of the one request)
+    const allowed = req("POST http://example.com/first HTTP/1.1", "Host: example.com", AUTH, "Connection: keep-alive", "Proxy-Connection: keep-alive", `Content-Length: ${body.length}`);
+    const r = gateRequest(Buffer.concat([allowed, Buffer.from(body, "latin1")]), session);
+    assert.equal(r.ok, true);
+    await send(r.upstream);
+    assert.deepEqual(seen, [{ method: "POST", url: "/first", host: "example.com", length: String(body.length), connection: "close", body }]);
+    // (a body-less GET: one request, no body)
+    const g = gateRequest(req("GET http://example.com/second?x=1 HTTP/1.1", "Host: example.com", AUTH), session);
+    await send(g.upstream);
+    assert.deepEqual(seen[1], { method: "GET", url: "/second?x=1", host: "example.com", length: undefined, connection: "close", body: "" });
+    assert.equal(seen.length, 2);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
 });

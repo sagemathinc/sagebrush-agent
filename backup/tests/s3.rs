@@ -50,15 +50,19 @@ fn write_private(p: &Path, data: &str) {
     fs::set_permissions(p, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
+/// weed binds each port + 10000 for gRPC. Every such port stays below the kernel's ephemeral floor (32768), where no
+/// outgoing connection can take it before weed binds it.
+const GRPC_SAFE_LIMIT: u16 = 32768 - 10000;
+
 /// Five consecutive loopback ports for one server, each with its +10000 (SeaweedFS's gRPC offset) free too, all below
 /// the ephemeral range. Blocks are handed out from one counter, so servers started in parallel never share a port.
 fn port_block() -> [u16; 5] {
     static NEXT: AtomicU16 = AtomicU16::new(0);
-    let base = 20000 + (std::process::id() % 200) as u16 * 40;
+    let base = 10000 + (std::process::id() % 200) as u16 * 40;
     for _ in 0..400 {
-        let start = base + NEXT.fetch_add(5, Ordering::SeqCst) % 8000;
+        let start = base + NEXT.fetch_add(5, Ordering::SeqCst) % 4000;
         let free = |p: u16| TcpListener::bind(("127.0.0.1", p)).is_ok() && TcpListener::bind(("127.0.0.1", p + 10000)).is_ok();
-        if start + 5 < 30000 && (start..start + 5).all(free) {
+        if start + 5 < GRPC_SAFE_LIMIT && (start..start + 5).all(free) {
             return [start, start + 1, start + 2, start + 3, start + 4];
         }
     }
@@ -81,7 +85,28 @@ impl Drop for Weed {
     }
 }
 
+/// Starts weed on a fresh port block. Another process can still take a port between `port_block`'s check and weed's
+/// bind, and weed then exits at startup; that is retried on a new block. Any other failure to become ready is not.
 fn start_weed(bin: &Path) -> Weed {
+    for attempt in 1..=3 {
+        match try_start_weed(bin) {
+            Ok(w) => return w,
+            Err(why) if attempt < 3 => eprintln!("weed exited at startup (attempt {attempt}), retrying on new ports: {why}"),
+            Err(why) => panic!("weed exited at startup three times; the last: {why}"),
+        }
+    }
+    unreachable!()
+}
+
+/// The weed log's fatal lines (glog's `F` prefix) and its last lines, for a failure message.
+fn weed_log_summary(dir: &Path) -> String {
+    let log = fs::read_to_string(dir.join("weed.log")).unwrap_or_default();
+    let fatal: Vec<&str> = log.lines().filter(|l| l.starts_with('F') || l.contains("address already in use")).take(5).collect();
+    let tail: Vec<&str> = log.lines().rev().take(15).collect();
+    format!("fatal lines:\n{}\nlast lines first:\n{}", fatal.join("\n"), tail.join("\n"))
+}
+
+fn try_start_weed(bin: &Path) -> std::result::Result<Weed, String> {
     let dir = tmpdir("weed");
     let ports = port_block();
     let log = fs::File::create(dir.join("weed.log")).unwrap();
@@ -112,16 +137,18 @@ fn start_weed(bin: &Path) -> Weed {
         .stderr(log)
         .spawn()
         .expect("weed starts");
-    let w = Weed { child, s3: ports[3], filer: ports[2], key, secret, _dir: dir.clone() };
+    let mut w = Weed { child, s3: ports[3], filer: ports[2], key, secret, _dir: dir.clone() };
     let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
-        if http_status(w.filer, "GET", "/buckets/qual/") == Some(200) {
-            return w;
+        if http_status(w.filer, "GET", "/buckets/qual/") == Some(200) && http_status(w.s3, "GET", "/").is_some() {
+            return Ok(w);
+        }
+        if let Ok(Some(status)) = w.child.try_wait() {
+            return Err(format!("ports {ports:?}, {status}; {}", weed_log_summary(&dir)));
         }
         thread::sleep(Duration::from_millis(300));
     }
-    let tail: String = fs::read_to_string(dir.join("weed.log")).unwrap_or_default().lines().rev().take(15).collect::<Vec<_>>().join("\n");
-    panic!("weed didn't become ready on ports {ports:?}; its log, last lines first:\n{tail}");
+    panic!("weed didn't become ready on ports {ports:?}; {}", weed_log_summary(&dir));
 }
 
 /// A minimal HTTP/1.0 request to the filer (1.0, so the body is never chunked) (list, stat, delete objects); returns the status code.

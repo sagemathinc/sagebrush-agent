@@ -26,12 +26,14 @@
 // is how the desktop app starts it (lib/pair-stdin.mjs): the app's own page is the only origin, the app hands the one-time
 // code over stdin, and the agent prints only {"v":1,"listening":<port>} on stdout. The end of stdin stops it.
 
+import "../lib/node-check.mjs"; // (first: an old Node.js is said before anything else loads)
 import { fileURLToPath } from "node:url";
 import { AgentServer, DEFAULT_ORIGINS, TEXT } from "../lib/server.mjs";
 import { stdinChunks } from "../lib/stdio.mjs";
 import { pairOrigin, readPairLine } from "../lib/pair-stdin.mjs";
 import { stdioOutput } from "../lib/stdout-thread.mjs";
-import { baseUrlSet, claudeMode, cliCreateServer, cliDeleteSession, cliQuery, sdkGuard } from "../lib/claude-cli.mjs";
+import { baseUrlSet, claudeBinary, claudeMode, claudeSignedIn, claudeVersionProblem, cliCreateServer, cliDeleteSession, cliQuery, sdkGuard, SETUP_TEXT } from "../lib/claude-cli.mjs";
+
 
 // (r2 §6: Claude is never pointed at another endpoint from here; refused before anything starts)
 const baseUrls = baseUrlSet();
@@ -185,6 +187,20 @@ await listenLoopback();
 }
 
 async function listenLoopback({ appCode = null, onStop = null } = {}) {
+// (#1788, in a terminal: Claude Code that can't start, or isn't signed in, is said now, with the exact next step,
+//  instead of at the first message. The app (--pair-stdin) starts the agent itself: there a turn says it, the same words)
+if (!appCode && claude?.mode === "cli") {
+  const bin = claudeBinary();
+  const why = claudeVersionProblem(bin);
+  if (why) {
+    console.error(why);
+    process.exit(3);
+  }
+  if (claudeSignedIn(bin) === false) {
+    console.error(SETUP_TEXT.notSignedIn);
+    process.exit(3);
+  }
+}
 const server = new AgentServer({ port, origins, query, deleteSession, client });
 server.createServer = createServer;
 server.mcpSource = mcpSource;

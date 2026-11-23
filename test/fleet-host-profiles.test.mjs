@@ -97,6 +97,21 @@ test("the kind is checked against the harness table: a Claude subscription only 
   await p.close();
 });
 
+test("only primitive strings: arrays, objects and other wrong types never match a table key (no property-key coercion)", async () => {
+  const wrong = [["claude"], { toString: () => "claude" }, 1, true, undefined];
+  for (const h of wrong) assert.deepEqual(authKinds(h, null), [], String(h));
+  for (const pr of [["anthropic"], ["openai"], { toString: () => "openai" }, 1, true, undefined]) {
+    for (const h of ["opencode", "pi"]) assert.deepEqual(authKinds(h, pr), [], `${h} ${String(pr)}`);
+  }
+  for (const pr of [[""], "", 0, false, undefined]) assert.deepEqual(authKinds("claude", pr), [], String(pr)); // exactly null
+  const p = await open(fresh());
+  refused(() => p.beginCreate(newId(), { harness: ["claude"], auth: "subscription" }, newId()), "bad_form");
+  refused(() => p.beginCreate(newId(), { harness: "pi", provider: ["anthropic"], auth: "api_key" }, newId()), "bad_form");
+  refused(() => p.beginCreate(newId(), { harness: "claude", auth: ["subscription"] }, newId()), "bad_form");
+  assert.deepEqual(p.all(), []);
+  await p.close();
+});
+
 test("the auth table is closed and exactly this (a change is a reviewed change to this row)", () => {
   assert.deepEqual(JSON.parse(JSON.stringify(AUTH_TABLE)), {
     claude: { "": ["subscription", "api_key", "cloud"] },
@@ -167,6 +182,10 @@ test("anything but the exact closed shape is refused at load", () => {
     "an auth kind the harness lacks": (s) => { s.profiles[P].auth = "oauth"; },
     "a Claude subscription in opencode": (s) => { Object.assign(s.profiles[P], { harness: "opencode", provider: "anthropic", auth: "subscription" }); },
     "an unlisted provider": (s) => { Object.assign(s.profiles[P], { harness: "pi", provider: "claude", auth: "oauth" }); },
+    "an array harness": (s) => { s.profiles[P].harness = ["claude"]; },
+    "an array provider": (s) => { Object.assign(s.profiles[P], { harness: "pi", provider: ["anthropic"], auth: "api_key" }); },
+    "an array auth": (s) => { s.profiles[P].auth = ["subscription"]; },
+    "an omitted provider": (s) => { delete s.profiles[P].provider; },
     "no auth": (s) => { delete s.profiles[P].auth; },
     "a bad sub": (s) => { s.profiles[P].sub = "nope"; },
     "a storage uid at or past next": (s) => { s.profiles[P].storage_uid = s.next_storage_uid; },

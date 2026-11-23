@@ -73,28 +73,41 @@ test("a fresh session: accepted, committed before message 2, message 2 carries t
   assert.equal(await code(() => a.reply()), "bad_form", "message 2 is written once");
 });
 
-test("fresh vs resume (H1): a fresh session needs a higher browser_gen and an unseen session; a resume needs the exact live session", async (t) => {
+test("fresh vs resume (r4.1): a fresh session needs a strictly higher browser_gen; an id may recur only above it; a resume needs the exact live session", async (t) => {
   const s = await setup(t);
   const one = s.session({ browser_gen: 5 });
   await handshake(s, one);
-  // fresh: equal or lower browser_gen, and a reused session id, are refused
+  // fresh: an equal or lower browser_gen is refused, whatever the session id
   assert.equal(await code(() => handshake(s, s.session({ browser_gen: 5 }))), "browser_gen_stale", "equal");
   assert.equal(await code(() => handshake(s, s.session({ browser_gen: 4 }))), "browser_gen_stale", "lower");
-  assert.equal(await code(() => handshake(s, s.session({ browser_gen: 9, session: one.body.session }))), "replay", "the live session's id, as fresh");
+  assert.equal(await code(() => handshake(s, s.session({ browser_gen: 5, session: one.body.session }))), "browser_gen_stale", "the live session's id at its own gen");
+  assert.equal(await code(() => handshake(s, s.session({ browser_gen: 3, session: one.body.session }))), "browser_gen_stale", "an old id at an old gen");
   // resume: exactly resume_n + 1, the same record and key
   assert.equal(await code(() => handshake(s, one, 2)), "replay", "a skipped resume_n");
   assert.equal((await handshake(s, one, 1)).a.accepted.resume_n, 1);
   assert.equal(await code(() => handshake(s, one, 1)), "replay", "the same resume_n again");
   const otherKey = s.session({ browser_gen: 5, session: one.body.session });
   assert.equal(await code(() => handshake(s, otherKey, 2)), "bad_form", "the live session, re-signed with another app key");
-  // a new session retires the old one: the old one never resumes again, and its id is never fresh again
+  // a new session replaces the old one: the old one never resumes again
   const two = s.session({ browser_gen: 6 });
   await handshake(s, two);
-  assert.equal(await code(() => handshake(s, one, 2)), "browser_gen_stale", "a retired session resuming");
-  assert.equal(await code(() => handshake(s, s.session({ browser_gen: 7, session: one.body.session }))), "replay", "a retired session id, as fresh");
-  assert.deepEqual(s.store.get().agents[s.agent].retired, [one.body.session]);
+  assert.equal(await code(() => handshake(s, one, 2)), "browser_gen_stale", "a replaced session resuming");
   assert.equal(await code(() => handshake(s, s.session({ browser_gen: 7 }), 1)), "browser_gen_stale", "a resume of a session never accepted");
   assert.equal(await code(() => handshake(s, s.session({ browser_gen: 6 }), 1)), "browser_gen_stale", "a resume of another session at the live session's browser_gen");
+  // the same id again, at a higher browser_gen: a new tuple, accepted (identity is (host, agent, browser_gen, session))
+  assert.equal((await handshake(s, s.session({ browser_gen: 7, session: one.body.session }))).a.accepted.browser_gen, 7, "an id reused above the high-water mark");
+  assert.deepEqual(Object.keys(s.store.get().agents[s.agent]).sort(), ["high", "live"], "no history of retired ids");
+});
+
+test("r4.1: far past any history size, an id never returns at an old or equal browser_gen", async (t) => {
+  const s = await setup(t);
+  const first = s.session({ browser_gen: 1 });
+  await handshake(s, first);
+  for (let g = 2; g <= 260; g++) await handshake(s, s.session({ browser_gen: g }));
+  assert.equal(s.store.get().agents[s.agent].high, 260);
+  assert.equal(await code(() => handshake(s, s.session({ browser_gen: 1, session: first.body.session }))), "browser_gen_stale", "its own old gen");
+  assert.equal(await code(() => handshake(s, s.session({ browser_gen: 259, session: first.body.session }))), "browser_gen_stale", "a gen below the mark");
+  assert.equal(await code(() => handshake(s, s.session({ browser_gen: 260, session: first.body.session }))), "browser_gen_stale", "the mark itself");
 });
 
 test("before Noise: a stream for another host, fleet or audience, and a held key that isn't the certified one, are refused", async (t) => {
@@ -185,7 +198,7 @@ test("(b) two responders sharing one store: concurrent fresh sessions at one bro
 test("the store refuses a file that isn't its closed shape", async (t) => {
   const s = await setup(t);
   await handshake(s, s.session({ browser_gen: 2 }));
-  for (const bad of [{ v: 2, agents: {} }, { v: 1, agents: { x: { high: 0, live: null, retired: [] } } }, { v: 1, agents: {}, extra: 1 }]) {
+  for (const bad of [{ v: 2, agents: {} }, { v: 1, agents: { x: { high: 0, live: null } } }, { v: 1, agents: {}, extra: 1 }]) {
     assert.throws(() => s.store.commit((st) => { Object.assign(st, bad); if (bad.extra === undefined) delete st.extra; if (bad.v === 2) st.v = 2; if (bad.agents.x) st.agents = bad.agents; }), (e) => e.code === "bad_form", JSON.stringify(bad));
   }
   assert.equal(s.store.get().agents[s.agent].high, 2, "unchanged");

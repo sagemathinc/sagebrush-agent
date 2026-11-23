@@ -82,6 +82,7 @@ async function world(t) {
         exceptions_sha256: b64(new Uint8Array(32).fill(2)), ...extra };
       return { app, body, record: seal("sb.browser-session.v1", sN, body, N) };
     },
+    tuple: (sess) => ({ fleet, host, agent, browser_gen: sess.body.browser_gen, session: sess.body.session }),
     fields: (sess, role, resume_n = 0) => ({ role, fleet, session: sess.body.session, agent, browser_gen: sess.body.browser_gen, host_gen: 3, resume_n }),
     hostOpen(sess, resume_n = 0, extra = {}) {
       const target = openTarget(w.fields(sess, "host", resume_n));
@@ -167,7 +168,7 @@ test("through the fake relay: opens, message 1, the durable compare-and-set, the
   const w = await world(t);
   const sess = w.session({ browser_gen: 4 });
   const c = await connect(w, sess);
-  assert.ok(w.relay.active(w.fleet, sess.body.session), "switched to active once authorized");
+  assert.ok(w.relay.active(w.tuple(sess)), "switched to active once authorized");
   assert.deepEqual(JSON.parse(new TextDecoder().decode(c.i2.payload)), { browser_gen: 4, host_gen: 3, resume_n: 0 });
   // after the switch, transport messages pass both ways
   const got = new Promise((ok) => { c.hostSock.onmessage = ok; });
@@ -192,7 +193,7 @@ test("H4: a candidate that fails Noise or loses the compare-and-set never closes
   h1.close(); // (the host end closes a refused candidate)
   await tick();
   assert.deepEqual(closed, [], "the active pair is untouched");
-  assert.ok(w.relay.active(w.fleet, one.body.session));
+  assert.ok(w.relay.active(w.tuple(one)));
   // a higher-browser_gen candidate that loses the compare-and-set (the store already holds a higher one)
   w.store.commit((st) => { st.agents[w.agent].high = 9; });
   const two = w.session({ browser_gen: 6 });
@@ -204,8 +205,88 @@ test("H4: a candidate that fails Noise or loses the compare-and-set never closes
   await connect(w, three);
   await tick();
   assert.deepEqual(closed, [4000], "replaced, once");
-  assert.equal(w.relay.active(w.fleet, one.body.session), null);
-  assert.ok(w.relay.active(w.fleet, three.body.session));
+  assert.equal(w.relay.active(w.tuple(one)), null);
+  assert.ok(w.relay.active(w.tuple(three)));
+});
+
+test("H1: only the candidate's own host, at its host_gen, can switch it: a genuine authorization from another host or gen changes nothing", async (t) => {
+  const w = await world(t);
+  const one = w.session({ browser_gen: 4 });
+  const live = await connect(w, one);
+  const closed = [];
+  live.appSock.onclose = (x) => closed.push(x);
+  // a candidate for the same agent (a higher browser_gen), up to its compare-and-set but not yet authorized
+  const two = w.session({ browser_gen: 5 });
+  const c = await connect(w, two, 0, { authorize: false });
+  const body = { fleet: w.fleet, session: two.body.session, agent: w.agent, browser_gen: 5, resume_n: 0, host_nonce: c.hv.nonce, app_request: c.av.request };
+  // another host: its own key, genuinely signed, accepted by the relay's signature check, naming this candidate
+  const otherHost = newId(), otherKey = key();
+  const otherSig = { ...w.sig, hostKey: (h) => (h === otherHost ? otherKey.raw : w.H.raw) };
+  const foreign = signCommit(body, { aud: AUD, host: otherHost, key: otherKey, gen: 3, ts: NOW, nonce: nonce() });
+  assert.equal(await code(() => w.relay.commit(verifyCommit(foreign, otherSig))), "not_found", "signed by another host");
+  // the right host, but at another generation (its gen moved on since the candidate opened)
+  const later = signCommit(body, { aud: AUD, host: w.host, key: w.H, gen: 4, ts: NOW, nonce: nonce() });
+  assert.equal(await code(() => w.relay.commit(verifyCommit(later, { ...w.sig, currentGen: () => 4 }))), "not_found", "signed at another host_gen");
+  // a field of the body that isn't the candidate's
+  const wrongResume = signCommit({ ...body, resume_n: 1 }, { aud: AUD, host: w.host, key: w.H, gen: 3, ts: NOW, nonce: nonce() });
+  assert.equal(await code(() => w.relay.commit(verifyCommit(wrongResume, w.sig))), "not_found", "another resume_n");
+  await tick();
+  assert.deepEqual(closed, [], "the active pair is untouched");
+  assert.ok(w.relay.active(w.tuple(one)));
+  // and the candidate's own host, at its gen, switches it
+  w.relay.commit(verifyCommit(signCommit(body, { aud: AUD, host: w.host, key: w.H, gen: 3, ts: NOW, nonce: nonce() }), w.sig));
+  await tick();
+  assert.deepEqual(closed, [4000]);
+  assert.ok(w.relay.active(w.tuple(two)));
+});
+
+test("r4.1: identity is the full tuple: another host's, agent's or host_gen's open never pairs with a candidate, and a commit never reaches it", async (t) => {
+  const w = await world(t);
+  const sess = w.session({ browser_gen: 3 });
+  const av = await verifyAppOpen(w.appOpen(sess), w.app);
+  w.relay.open(av);
+  const hv = verifyHostOpen(w.hostOpen(sess), w.sig);
+  const strays = [{ ...hv, host: newId() }, { ...hv, agent: newId() }];
+  const socks = strays.map((x) => w.relay.open(x)); // (each lands in a slot of its own tuple)
+  assert.equal(await code(() => w.relay.open({ ...hv, host_gen: 4 })), "in_progress", "the same tuple at another host_gen");
+  const host = w.relay.open(hv);
+  // the strays never pair: a message from one has no peer and closes only its own slot
+  const strayClosed = [], candClosed = [];
+  socks[0].onclose = (x) => strayClosed.push(x);
+  host.onclose = (x) => candClosed.push(x);
+  socks[0].send(Uint8Array.of(1));
+  await tick();
+  assert.deepEqual([strayClosed, candClosed], [[1008], []]);
+  // a commit for another agent's tuple, signed by this host, names no candidate
+  const body = { fleet: w.fleet, session: sess.body.session, agent: newId(), browser_gen: 3, resume_n: 0, host_nonce: hv.nonce, app_request: av.request };
+  assert.equal(await code(() => w.relay.commit(verifyCommit(signCommit(body, { aud: AUD, host: w.host, key: w.H, gen: 3, ts: NOW, nonce: nonce() }), w.sig))), "not_found", "another agent");
+  // an authorization naming an earlier candidate's opens, for the same tuple: nothing
+  const earlier = { ...body, agent: w.agent, host_nonce: nonce() };
+  assert.equal(await code(() => w.relay.commit(verifyCommit(signCommit(earlier, { aud: AUD, host: w.host, key: w.H, gen: 3, ts: NOW, nonce: nonce() }), w.sig))), "not_found", "another candidate's open");
+  assert.equal(w.relay.active(w.tuple(sess)), null, "nothing switched");
+});
+
+test("a switch closes only that host's and agent's other sockets: another agent's active pair on the same host is untouched", async (t) => {
+  const w = await world(t);
+  const mine = await connect(w, w.session({ browser_gen: 2 }));
+  // another agent of the same host and fleet, with its own active pair
+  const otherAgent = newId();
+  const w2 = { ...w, agent: otherAgent, sig: { ...w.sig, agentHasBrowser: () => true } };
+  w2.fields = (sess, role, resume_n = 0) => ({ role, fleet: w.fleet, session: sess.body.session, agent: otherAgent, browser_gen: sess.body.browser_gen, host_gen: 3, resume_n });
+  w2.hostOpen = (sess, resume_n = 0) => {
+    const target = openTarget(w2.fields(sess, "host", resume_n));
+    return { target, headers: { "sagebrush-sig": signRequest({ aud: AUD, method: "GET", target, host: w.host, key: w.H, fields: { gen: 3, ts: NOW, nonce: nonce() } }) } };
+  };
+  w2.appOpen = (sess, resume_n = 0) => ({ target: openTarget(w2.fields(sess, "app", resume_n)), headers: { "sagebrush-browser-record": b64(sess.record), "sagebrush-request": nonce() } });
+  const theirs = await connect(w2, w.session({ browser_gen: 2, agent: otherAgent }));
+  const closed = [];
+  theirs.appSock.onclose = (x) => closed.push(x);
+  // this agent replaces its own session: its old pair closes, the other agent's stays
+  const mineClosed = [];
+  mine.appSock.onclose = (x) => mineClosed.push(x);
+  await connect(w, w.session({ browser_gen: 3 }));
+  await tick();
+  assert.deepEqual([mineClosed, closed], [[4000], []]);
 });
 
 test("an authorization that fails after the commit: the lost-reply path, never a rollback", async (t) => {
@@ -216,7 +297,7 @@ test("an authorization that fails after the commit: the lost-reply path, never a
   assert.equal(w.store.get().agents[w.agent].live.session, sess.body.session, "the commit stands");
   w.advance(30_000);
   w.relay.sweep();
-  assert.equal(w.relay.active(w.fleet, sess.body.session), null, "the candidate expired");
+  assert.equal(w.relay.active(w.tuple(sess)), null, "the candidate expired");
   const r = await connect(w, sess, 1);
   assert.deepEqual(JSON.parse(new TextDecoder().decode(r.i2.payload)).resume_n, 1, "the next attempt is the next resume_n");
 });

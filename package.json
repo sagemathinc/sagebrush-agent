@@ -18,6 +18,7 @@
     "lib/brief.mjs",
     "lib/task-notebook-edit.mjs",
     "lib/canon.mjs",
+    "lib/image.mjs",
     "lib/claude-cli.mjs",
     "lib/claude-pin.json",
     "lib/tags.mjs",

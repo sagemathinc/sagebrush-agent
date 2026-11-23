@@ -2,6 +2,9 @@
 //! (`exec`), exactly as in the host launcher contract (sha256 147ec4e3616a42680cc351b20b9259150d61df0f359f86624473eff118510b3b),
 //! under the host supervisor freeze r3.1. It fails closed: every failure is a typed exit code with one fixed stderr
 //! line, and nothing is exec'd after a failure.
+//!
+//! Amendment A1 (deprovision) adds four root-only subcommands run by the supervisor outside any unit: `identify`,
+//! `inspect-home`, `archive-home` and `remove-tree` (tree.rs).
 
 // Unsafe code is refused everywhere except the syscall module and the secret's zeroing Drop (contract §6).
 #![deny(unsafe_code)]
@@ -15,6 +18,7 @@ mod json;
 mod landlock;
 mod secret;
 mod stage;
+mod tree;
 #[allow(unsafe_code)]
 mod sys;
 
@@ -36,6 +40,13 @@ fn run() -> err::Result<()> {
             let v = args::flags(rest, &["agent", "index", "mode", "path", "record"])?;
             stage::run(&stage::parse(&v)?)
         }
+        // Launcher contract amendment A1 (deprovision): root only, outside any unit.
+        "identify" | "inspect-home" | "archive-home" | "remove-tree" => {
+            if !after.is_empty() {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            a1(cmd, rest)
+        }
         "exec" => {
             let v = args::flags(rest, &["agent", "contract", "cli"])?;
             let e = exec::run(&exec::parse(&v)?, &after)?;
@@ -43,6 +54,37 @@ fn run() -> err::Result<()> {
         }
         _ => Err(err(Fail::Usage, "bad arguments")),
     }
+}
+
+fn a1(cmd: &str, rest: &[String]) -> err::Result<()> {
+    let mut o = tree::RealOps;
+    let out = match cmd {
+        "identify" => {
+            let v = args::flags(rest, &["anchor", "name"])?;
+            tree::identify(&mut o, v[0], v[1])?
+        }
+        "inspect-home" => {
+            // `--archive` takes no value: strip it, then the rest are exact flags.
+            let archive = rest.iter().filter(|a| *a == "--archive").count();
+            if archive > 1 {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            let kept: Vec<String> = rest.iter().filter(|a| *a != "--archive").cloned().collect();
+            let v = args::flags(&kept, &["mount", "agent", "tree"])?;
+            tree::inspect_home(&mut o, tree::parse_mount(v[0])?, v[1], tree::parse_tree(v[2])?, archive == 1)?
+        }
+        "archive-home" => {
+            let v = args::flags(rest, &["mount", "agent", "tree", "expect"])?;
+            tree::archive_home(&mut o, tree::parse_mount(v[0])?, v[1], tree::parse_tree(v[2])?, v[3])?;
+            String::new()
+        }
+        _ => {
+            let v = args::flags(rest, &["anchor", "name", "expect"])?;
+            tree::remove_tree(&mut o, v[0], v[1], v[2])?;
+            String::new()
+        }
+    };
+    std::io::stdout().write_all(out.as_bytes()).map_err(|_| err(Fail::Internal, "internal error"))
 }
 
 fn main() {

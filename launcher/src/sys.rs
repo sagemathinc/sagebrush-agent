@@ -233,3 +233,177 @@ pub fn execve(path: &CStr, argv: &[*const libc::c_char], envp: &[*const libc::c_
     unsafe { libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
     last()
 }
+
+// ---- launcher contract amendment A1 (deprovision): identify, inspect-home, archive-home, remove-tree.
+
+/// openat2(dir, name, { flags | O_CLOEXEC, 0, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS |
+/// RESOLVE_NO_XDEV }): one component beneath an opened directory, never crossing a mount (A1 §1).
+pub fn openat2_xdev(dir: &OwnedFd, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    let how = OpenHow {
+        flags: (flags | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_XDEV,
+    };
+    // SAFETY: `dir` is an open descriptor, `name` is NUL-terminated, `how` lives across the call and its size is passed.
+    let fd = unsafe {
+        libc::syscall(libc::SYS_openat2, dir.as_raw_fd(), name.as_ptr(), &how as *const OpenHow, core::mem::size_of::<OpenHow>())
+    };
+    own(fd)
+}
+
+/// The statx fields A1 reads: type and mode, owners, identity and the mount (only fields `stx_mask` reports).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ident {
+    pub attributes: u64,
+    pub dev: (u32, u32),
+    pub ino: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u16,
+    pub mnt_id: u64,
+    pub nlink: u32,
+    pub size: u64,
+}
+
+const IDENT_MASK: u32 = libc::STATX_TYPE
+    | libc::STATX_MODE
+    | libc::STATX_UID
+    | libc::STATX_GID
+    | libc::STATX_INO
+    | libc::STATX_MNT_ID
+    | libc::STATX_NLINK
+    | libc::STATX_SIZE;
+
+fn ident_of(r: libc::c_int, buf: core::mem::MaybeUninit<libc::statx>) -> io::Result<Ident> {
+    if r != 0 {
+        return Err(last());
+    }
+    // SAFETY (§6 conversion 2): statx returned 0, so the kernel initialized the whole struct.
+    let s = unsafe { buf.assume_init() };
+    if s.stx_mask & IDENT_MASK != IDENT_MASK || s.stx_attributes_mask & libc::STATX_ATTR_MOUNT_ROOT as u64 == 0 {
+        return Err(io::Error::from_raw_os_error(libc::ENOTSUP)); // unsupported metadata fails closed (66)
+    }
+    Ok(Ident {
+        attributes: s.stx_attributes,
+        dev: (s.stx_dev_major, s.stx_dev_minor),
+        ino: s.stx_ino,
+        uid: s.stx_uid,
+        gid: s.stx_gid,
+        mode: s.stx_mode,
+        mnt_id: s.stx_mnt_id,
+        nlink: s.stx_nlink,
+        size: s.stx_size,
+    })
+}
+
+/// statx(fd, "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW, IDENT_MASK): an opened object's identity.
+pub fn ident(fd: &OwnedFd) -> io::Result<Ident> {
+    let mut buf = core::mem::MaybeUninit::<libc::statx>::uninit();
+    // SAFETY: `fd` is open, the path is an empty NUL-terminated literal, and `buf` is writable for a whole statx.
+    let r = unsafe { libc::statx(fd.as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW, IDENT_MASK, buf.as_mut_ptr()) };
+    ident_of(r, buf)
+}
+
+/// statx(dir, name, AT_SYMLINK_NOFOLLOW, IDENT_MASK): a symlink leaf by name relative to its opened parent (A1 §5).
+pub fn ident_at_nofollow(dir: &OwnedFd, name: &CStr) -> io::Result<Ident> {
+    let mut buf = core::mem::MaybeUninit::<libc::statx>::uninit();
+    // SAFETY: `dir` is open, `name` is NUL-terminated, and `buf` is writable for a whole statx.
+    let r = unsafe { libc::statx(dir.as_raw_fd(), name.as_ptr(), libc::AT_SYMLINK_NOFOLLOW, IDENT_MASK, buf.as_mut_ptr()) };
+    ident_of(r, buf)
+}
+
+/// struct statfs (x86_64 and aarch64 glibc layout): only `f_fsid` (two ints at offset 56) is read. libc's `fsid_t`
+/// keeps its field private, so this is plain data asserted against libc's size.
+#[repr(C)]
+struct StatFs {
+    head: [u64; 7],
+    fsid: [i32; 2],
+    tail: [u64; 7],
+}
+const _: () = assert!(core::mem::size_of::<StatFs>() == core::mem::size_of::<libc::statfs>());
+const _: () = assert!(core::mem::offset_of!(StatFs, fsid) == 56);
+
+/// fstatfs(fd): the filesystem's `f_fsid` (A1 §1). A zero fsid is unsupported metadata (the caller refuses).
+pub fn fsid(fd: &OwnedFd) -> io::Result<u64> {
+    let mut buf = StatFs { head: [0; 7], fsid: [0; 2], tail: [0; 7] };
+    // SAFETY: `fd` is open; `buf` is writable for a whole struct statfs (asserted above).
+    let r = unsafe { libc::syscall(libc::SYS_fstatfs, fd.as_raw_fd(), &mut buf as *mut StatFs) };
+    if r != 0 {
+        return Err(last());
+    }
+    Ok(((buf.fsid[0] as u32 as u64) << 32) | buf.fsid[1] as u32 as u64)
+}
+
+/// ioctl(fd, FS_IOC_GETVERSION): the inode generation (an O_RDONLY fd; A1 §1).
+pub fn inode_generation(fd: &OwnedFd) -> io::Result<u32> {
+    let mut v: libc::c_long = 0;
+    // SAFETY: `fd` is open; the kernel writes one int into `v`, which is writable for a long.
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), libc::FS_IOC_GETVERSION, &mut v as *mut libc::c_long) };
+    if r != 0 { Err(last()) } else { Ok(v as u32) }
+}
+
+/// struct fsxattr (linux/fs.h), 28 bytes: plain data, zeroed before the call.
+#[repr(C)]
+struct FsXattr {
+    xflags: u32,
+    extsize: u32,
+    nextents: u32,
+    projid: u32,
+    cowextsize: u32,
+    pad: [u8; 8],
+}
+const _: () = assert!(core::mem::size_of::<FsXattr>() == 28);
+/// _IOR('X', 31, struct fsxattr): not in libc 0.2.191.
+const FS_IOC_FSGETXATTR: libc::Ioctl = 0x801c_581f;
+const FS_XFLAG_PROJINHERIT: u32 = 0x0000_0200;
+
+/// ioctl(fd, FS_IOC_FSGETXATTR): (project id, project-inherit flag) (an O_RDONLY fd; A1 §1).
+pub fn project(fd: &OwnedFd) -> io::Result<(u32, bool)> {
+    let mut x = FsXattr { xflags: 0, extsize: 0, nextents: 0, projid: 0, cowextsize: 0, pad: [0; 8] };
+    // SAFETY: `fd` is open; `x` is writable for a whole struct fsxattr.
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), FS_IOC_FSGETXATTR, &mut x as *mut FsXattr) };
+    if r != 0 { Err(last()) } else { Ok((x.projid, x.xflags & FS_XFLAG_PROJINHERIT != 0)) }
+}
+
+/// fchmod(dir, mode): remove-tree's lockdown (A1 §5).
+pub fn fchmod(fd: &OwnedFd, mode: libc::mode_t) -> io::Result<()> {
+    // SAFETY: `fd` is open.
+    let r = unsafe { libc::fchmod(fd.as_raw_fd(), mode) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// Whether a POSIX ACL attribute exists: fgetxattr(fd, name, NULL, 0) (A1 §1's anchor policy).
+pub fn has_xattr(fd: &OwnedFd, name: &CStr) -> io::Result<bool> {
+    // SAFETY: `fd` is open, `name` is NUL-terminated; a NULL buffer with size 0 only asks for the value's size.
+    let r = unsafe { libc::fgetxattr(fd.as_raw_fd(), name.as_ptr(), core::ptr::null_mut(), 0) };
+    if r >= 0 {
+        return Ok(true);
+    }
+    let e = last();
+    if e.raw_os_error() == Some(libc::ENODATA) { Ok(false) } else { Err(e) }
+}
+
+/// fremovexattr(fd, name), with ENODATA (absent) treated as done: remove-tree's lockdown (A1 §5).
+pub fn remove_xattr(fd: &OwnedFd, name: &CStr) -> io::Result<()> {
+    // SAFETY: `fd` is open, `name` is NUL-terminated.
+    let r = unsafe { libc::fremovexattr(fd.as_raw_fd(), name.as_ptr()) };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = last();
+    if e.raw_os_error() == Some(libc::ENODATA) { Ok(()) } else { Err(e) }
+}
+
+/// unlinkat(dir, name, AT_REMOVEDIR): remove-tree's pass 2 for a directory.
+pub fn rmdirat(dir: &OwnedFd, name: &CStr) -> io::Result<()> {
+    // SAFETY: `dir` is open; `name` is NUL-terminated.
+    let r = unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// renameat2(from_dir, name, to_dir, name, RENAME_NOREPLACE): archive-home's move between two opened parents.
+pub fn rename_noreplace_between(from_dir: &OwnedFd, from: &CStr, to_dir: &OwnedFd, to: &CStr) -> io::Result<()> {
+    // SAFETY: both directories are open; both names are NUL-terminated.
+    let r = unsafe { libc::renameat2(from_dir.as_raw_fd(), from.as_ptr(), to_dir.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}

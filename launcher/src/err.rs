@@ -11,6 +11,13 @@ pub enum Fail {
     Record,
     Exec,
     Internal,
+    /// A1: an identity, mount, type, owner, mode, project id or generation differs, a stale epoch, or a foreign,
+    /// too deep or too large tree. No unlink and no rename happened.
+    Identity,
+    /// A1: archive-home's destination exists. Nothing happened.
+    Exists,
+    /// A1: effects happened (an unlink or the rename), then something failed; the caller's retry table decides.
+    Partial,
 }
 
 impl Fail {
@@ -25,6 +32,9 @@ impl Fail {
             Fail::Record => 70,
             Fail::Exec => 71,
             Fail::Internal => 72,
+            Fail::Identity => 73,
+            Fail::Exists => 74,
+            Fail::Partial => 75,
         }
     }
 
@@ -39,6 +49,9 @@ impl Fail {
             Fail::Record => "record",
             Fail::Exec => "exec",
             Fail::Internal => "internal",
+            Fail::Identity => "identity",
+            Fail::Exists => "exists",
+            Fail::Partial => "partial",
         }
     }
 }
@@ -78,6 +91,9 @@ mod tests {
             (Fail::Record, 70, "record"),
             (Fail::Exec, 71, "exec"),
             (Fail::Internal, 72, "internal"),
+            (Fail::Identity, 73, "identity"),
+            (Fail::Exists, 74, "exists"),
+            (Fail::Partial, 75, "partial"),
         ];
         for (f, c, r) in all {
             assert_eq!(f.code(), c);

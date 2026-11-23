@@ -255,6 +255,7 @@ fn a1_subcommands_refuse_bad_arguments_and_a_missing_anchor() {
         vec!["inspect-home", "--mount", "/", "--agent", A, "--tree", "home", "--archive", "--archive"],
         vec!["inspect-home", "--mount", "/", "--agent", "nope", "--tree", "home"],
         vec!["archive-home", "--mount", "/", "--agent", A, "--tree", "home"],
+        vec!["archive-home", "--mount", "/", "--agent", A, "--tree", "home", "--expect", "/x", "--finish", "--finish"],
         vec!["check-parents", "--mount", "/etc"],
         vec!["check-parents", "--mount", "/", "--allow-missing", "--allow-missing"],
         vec!["check-parents"],

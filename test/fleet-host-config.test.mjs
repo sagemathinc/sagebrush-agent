@@ -1,7 +1,7 @@
 // Host supervisor freeze r3.1 §2.1 and §6.1: names derived only from ids, and the config_schema 1 validator: a valid
 // config passes; each shape mistake and each cross-field or path rule is refused with bad_form.
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { HOST_FREEZE, validateConfig, checkGrantPath, checkLanCidr } from "../lib/fleet/host/config.mjs";
 import { agentUser, tagGroup, agentUnit, agentNetns, agentHome, agentVarTmp, tagDir, brokerDir, fenceFiles } from "../lib/fleet/host/names.mjs";

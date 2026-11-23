@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { stop, raiseFence, lowerFence, fenced, countProcs, rootUnitsIn, realSystemd } from "../lib/fleet/host/fence.mjs";
 import { lockDir, realIo } from "../lib/fleet/host/store.mjs";

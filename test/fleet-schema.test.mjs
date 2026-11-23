@@ -85,3 +85,19 @@ test("signed fleet bodies stay integer-only: fleet.schema.json has no number typ
   walk(doc, "#");
   assert.deepEqual(found, []);
 });
+
+test("closed validator: enum, const and uniqueItems compare numbers by value; a non-canonical enum or const member refuses the schema", () => {
+  assert.equal(bad(() => compile({ type: "number", const: 2 })(2.5)), "bad_form");
+  assert.equal(bad(() => compile({ type: "number", enum: [1, 2] })(1.5)), "bad_form");
+  assert.equal(bad(() => compile({ type: "number", enum: [1, 2] })(2)), "ok");
+  for (const s of [{ type: "number", const: 1.5 }, { type: "number", enum: [0.5] }, { enum: [1, 0.5] }, { const: { a: 1.5 } }])
+    assert.throws(() => compile(s), /enum\/const values must be canonical/, JSON.stringify(s));
+  const uniq = compile({ type: "array", items: { type: "number" }, uniqueItems: true });
+  assert.equal(bad(() => uniq([1.5, 2.5])), "ok");
+  assert.equal(bad(() => uniq([1.5, 1.5])), "bad_form");
+  assert.equal(bad(() => uniq([0, -0])), "bad_form"); // (JSON Schema: -0 equals 0)
+  assert.equal(bad(() => uniq([1, 1.5, 2])), "ok");
+  const any = compile({ type: "array", uniqueItems: true });
+  assert.equal(bad(() => any([{ a: 1, b: [2] }, { b: [2], a: 1 }])), "bad_form"); // (key order doesn't matter)
+  assert.equal(bad(() => any([{ a: 1 }, { a: "1" }, [1], ["1"], null, "null", true, "true"])), "ok");
+});

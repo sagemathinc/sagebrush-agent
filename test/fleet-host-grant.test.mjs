@@ -1,7 +1,7 @@
 // Host supervisor freeze r3.1 §3.2–§3.4: verifying a signed host grant for this host, and the durable grant state:
 // intent before highwater, the generation rule with byte-identical re-apply, plan steps, recovery and AU07.
 import assert from "node:assert/strict";
-import { mkdtempSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { realIo } from "../lib/fleet/host/store.mjs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -115,7 +115,7 @@ test("a failed intent changes nothing: no highwater, no grant file, N not accept
   const { bytes, digest } = g(1);
   await rejects(s.begin(1, bytes, digest, ["x"], async () => { throw new FleetError("audit_unavailable"); }), "audit_unavailable");
   assert.equal(s.highwater.gen, 0);
-  assert.equal(existsSync(join(dir, "grant", "grants", "1")), false);
+  assert.deepEqual(readdirSync(join(dir, "grant", "grants")), []);
   assert.equal(s.reconcileIntent(1), "failed_no_effect");
   await s.close();
 });
@@ -183,7 +183,7 @@ const failAt = (step, after = 0) => {
   const boom = () => { throw Object.assign(new Error("ENOSPC"), { code: "ENOSPC" }); };
   return {
     ...realIo,
-    open: (p, f, m) => { if (f === "w" && hit("open")) boom(); dirOpen = f === "r"; return realIo.open(p, f, m); },
+    open: (p, f, m) => { if (f.startsWith("w") && hit("open")) boom(); dirOpen = f === "r"; return realIo.open(p, f, m); },
     write: (fd, b, o, l) => { if (hit("write")) boom(); return realIo.write(fd, b, o, l); },
     fsync: (fd) => { if (!dirOpen && hit("fsync")) boom(); if (dirOpen && hit("dirfsync")) boom(); return realIo.fsync(fd); },
     rename: (a, b) => { if (hit("rename")) boom(); return realIo.rename(a, b); },
@@ -193,8 +193,9 @@ const failAt = (step, after = 0) => {
 for (const step of ["open", "write", "fsync", "rename", "dirfsync"]) {
   test(`a failure at ${step} while committing begin: poisoned; disk holds the old state or the whole new one`, async () => {
     const dir = fresh();
-    // after: 3 skips creating the initial registry and grant state and writing the grant bytes: the failure hits the state commit.
-    const s = await GrantState.open(dir, { io: failAt(step, 3) });
+    // Skip creating the initial registry and grant state and writing the grant bytes (which has no rename, being an
+    // exclusive create): the failure hits the state commit.
+    const s = await GrantState.open(dir, { io: failAt(step, step === "rename" ? 2 : 3) });
     const g1 = g(1);
     await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a", "b"], okIntent()), /ENOSPC/);
     assert.equal(s.poisoned, true);
@@ -208,7 +209,7 @@ for (const step of ["open", "write", "fsync", "rename", "dirfsync"]) {
     await s.close();
   });
 
-  test(`a failure at ${step} while writing the grant bytes: nothing accepted, nothing poisoned`, async () => {
+  if (step !== "rename") test(`a failure at ${step} while writing the grant bytes: nothing accepted, nothing poisoned`, async () => {
     const dir = fresh();
     const s = await GrantState.open(dir, { io: failAt(step, 2) });
     const g1 = g(1);
@@ -216,7 +217,12 @@ for (const step of ["open", "write", "fsync", "rename", "dirfsync"]) {
     assert.equal(s.poisoned, false);
     assert.deepEqual(s.pending(), { phase: "applied", gen: 0, remaining: [] });
     assert.deepEqual(stateOnDisk(dir), { v: 1, gen: 0, digest: null, phase: "applied", plan: [] });
+    assert.deepEqual(readdirSync(join(dir, "grant", "grants")), []); // no partial file left to block a retry
     await s.close();
+    const again = await GrantState.open(dir);
+    await again.begin(1, g1.bytes, g1.digest, ["a"], okIntent());
+    assert.deepEqual([...again.currentBytes()], [...g1.bytes]);
+    await again.close();
   });
 
   test(`a failure at ${step} while marking a step done: poisoned; the step stays pending after reload`, async () => {
@@ -293,4 +299,52 @@ test("anything but the exact closed state is refused at load and left as found",
     await rejects(GrantState.open(dir), "bad_form");
     assert.equal(readFileSync(stateFile(dir), "utf8"), text);
   }
+});
+
+test("astra2's interleaving: a stale begin across lock loss can't touch a replacement's accepted grant bytes", async () => {
+  const dir = fresh();
+  const old = await GrantState.open(dir);
+  let release;
+  const held = new Promise((r) => { release = r; });
+  const A = g(1, { at_ms: 1001 }), B = g(1, { at_ms: 1002 });
+  const p = old.begin(1, A.bytes, A.digest, ["a"], async () => { await held; });
+  const { execFileSync } = await import("node:child_process");
+  for (const pid of String(execFileSync("pgrep", ["-f", join(dir, ".lock")])).trim().split("\n").filter(Boolean)) { try { process.kill(Number(pid), "SIGKILL"); } catch {} }
+  let rep;
+  for (let i = 0; i < 50 && !rep; i++) { try { rep = await GrantState.open(dir); } catch { await new Promise((r) => setTimeout(r, 100)); } }
+  assert.ok(rep, "a replacement opened");
+  await rep.begin(1, B.bytes, B.digest, ["a"], okIntent());
+  rep.done(0); rep.finish();
+  release();
+  await rejects(p, "outcome_unknown");
+  // Fresh-disk oracle: the accepted state and its bytes are B's, and the replacement is healthy.
+  const st = stateOnDisk(dir);
+  assert.equal(st.digest, B.digest);
+  assert.equal(rep.poisoned, false);
+  assert.deepEqual([...rep.currentBytes()], [...B.bytes]);
+  assert.equal(readdirSync(join(dir, "grant", "grants")).some((f) => f.endsWith(A.digest)), false); // the stale begin wrote nothing
+  await rep.close();
+});
+
+test("accepted bytes that don't match their digest are refused, not returned", async () => {
+  const dir = fresh();
+  const s = await GrantState.open(dir);
+  const g1 = g(1);
+  await s.begin(1, g1.bytes, g1.digest, ["a"], okIntent());
+  writeFileSync(join(dir, "grant", "grants", `1-${g1.digest}`), "tampered");
+  refused(() => s.currentBytes(), "outcome_unknown");
+  await s.close();
+});
+
+test("grant bytes are created exclusively: an existing different file under the name refuses; the same bytes are fine", async () => {
+  const dir = fresh();
+  const s = await GrantState.open(dir);
+  const g1 = g(1);
+  writeFileSync(join(dir, "grant", "grants", `1-${g1.digest}`), "something else");
+  await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a"], okIntent()), /different file/);
+  assert.equal(stateOnDisk(dir).gen, 0);
+  writeFileSync(join(dir, "grant", "grants", `1-${g1.digest}`), Buffer.from(g1.bytes));
+  await s.begin(1, g1.bytes, g1.digest, ["a"], okIntent()); // the same bytes already there: accepted
+  assert.deepEqual([...s.currentBytes()], [...g1.bytes]);
+  await s.close();
 });

@@ -101,6 +101,11 @@ test("grants: cross-field rules: no_expiry_ack exactly with null, known tags, no
   assert.equal(code(() => verifyGrant(g({ agents: [{ ...a, tags: [newId()] }] }), ctx)), "bad_form", "an unknown tag");
   for (const path of ["/.agents", "/.agents/x"]) assert.equal(code(() => verifyGrant(g({ agents: [{ ...a, workspace: [{ path, access: "read" }] }] }), ctx)), "not_granted", path);
   assert.equal(code(() => verifyGrant(g({ agents: [{ ...a, workspace: [{ path: "/.agentsx", access: "read" }] }] }), ctx)), "ok", "only the folder itself");
+  // non-canonical paths are refused before any comparison: they would resolve into /.agents, or alias another path
+  for (const path of ["/x/../.agents", "/x/../.agents/y", "//.agents", "/./.agents", "/Algebra/", "/Algebra//b", "/a/./b", "/a\u0001b", "/" + "a/".repeat(32) + "a", "/" + "n".repeat(256)])
+    assert.equal(code(() => verifyGrant(g({ agents: [{ ...a, workspace: [{ path, access: "read" }] }] }), ctx)), "bad_form", JSON.stringify(path));
+  assert.equal(code(() => verifyGrant(g({ agents: [{ ...a, workspace: [{ path: "/", access: "read" }] }] }), ctx)), "ok", "the root is canonical");
+  assert.equal(code(() => verifyGrant(g({ agents: [{ ...a, workspace: [{ path: "/" + "n".repeat(255), access: "read" }] }] }), ctx)), "ok", "a 255-character name");
   assert.equal(code(() => verifyGrant(g({ agents: [a, a] }), ctx)), "bad_form");
   const sub = newId();
   assert.equal(code(() => verifyGrant(g({ subscriptions: [{ sub, provider: "claude", use: [a.agent], home: true }] }), ctx)), "bad_form");
@@ -206,6 +211,18 @@ test("approvals: the subject's hash, the operation, the requester, gen and life,
   assert.equal(code(() => verifyApproval(ap(f.B), { ...ctx, current: { gen: 4, life: 3 } })), "approval_stale", "a revoke-and-resume since");
   assert.equal(code(() => verifyApproval(ap(f.B, { not_after_ms: NOW + 600_001 }), ctx)), "bad_form");
   assert.equal(code(() => verifyApproval(ap(f.B), { ...ctx, now: NOW + 600_000 })), "approval_stale", "expired");
+  // pairing a host needs a fresh sign-in (the service's check): at the 5-minute boundary, past it, and in the future
+  const pairing = newId(), hk = key(), host2 = newId();
+  const pairSubject = { host: host2, sign_key: b64(hk.raw), enc_key: b64(new Uint8Array(32).fill(3)), fingerprint: b64(hostFingerprint(host2, hk.raw, new Uint8Array(32).fill(3))), name: "new-box" };
+  const pair = (auth) => f.sign("sb.approval.v1", f.N, { approval: newId(), kind: "host-pair", requester: { pairing }, subject: pairSubject,
+    subject_hash: sha256b64(enc(canonText(pairSubject))), at_ms: NOW, not_after_ms: NOW + 600_000, auth_time_ms: auth });
+  const pctx = { ...ctx, expect: { kind: "host-pair", subject: pairSubject, requester: { pairing } }, current: null, checkAuthTime: true };
+  assert.equal(code(() => verifyApproval(pair(NOW - 5 * 60_000), pctx)), "ok", "exactly 5 minutes old");
+  assert.equal(code(() => verifyApproval(pair(NOW - 5 * 60_000 - 1), pctx)), "stale_auth");
+  assert.equal(code(() => verifyApproval(pair(NOW + 5 * 60_000 + 1), pctx)), "stale_auth", "a sign-in in the future");
+  assert.equal(code(() => verifyApproval(pair(NOW - 3_600_000), { ...pctx, checkAuthTime: false })), "ok", "hosts can't check it");
+  // other kinds need only a live session: an old auth_time doesn't refuse a spend-style approval
+  assert.equal(code(() => verifyApproval(ap(f.B, { auth_time_ms: NOW - 3_600_000 }), { ...ctx, checkAuthTime: true })), "ok");
   f.chainOp(f.N, "policy", { policy: { require_native_for_widening: true } });
   assert.equal(code(() => verifyApproval(ap(f.B), { ...ctx, chain: f.state })), "device_tier");
   assert.equal(code(() => verifyApproval(ap(f.N), { ...ctx, chain: f.state })), "ok");

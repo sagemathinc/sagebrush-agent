@@ -1,0 +1,34 @@
+# cargo-deny for sagebrush-agent-backup (host backup design r3.3 §1): every dependency's license must be on this list,
+# and every crate must come from crates.io or the one pinned fork. CI runs `cargo deny check licenses sources`.
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSL-1.0",
+    # a public-domain dedication; only tiny-keccak, which runs at build time inside a proc macro and isn't linked
+    "CC0-1.0",
+]
+# The one dependency whose only license is outside the list: option-ext (MPL-2.0, file-level copyleft), linked
+# through rustic_core -> dirs -> dirs-sys. Kept as a named exception pending the host-side licensing decision; the
+# binary ships it unmodified, and its source is public.
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com/sagemathinc/rustic_core.git"]

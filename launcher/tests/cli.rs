@@ -321,3 +321,25 @@ fn a2_subcommands_refuse_bad_arguments_then_the_root_guard() {
     assert_eq!(stderr(&o).lines().count(), 1);
     assert!(o.stdout.is_empty());
 }
+
+#[test]
+fn a3_lease_check_refuses_bad_arguments_then_the_root_guard() {
+    let run = |args: &[&str]| Command::new(BIN).env_clear().args(args).output().unwrap();
+    for bad in [
+        vec!["lease-check"],
+        vec!["lease-check", "--agent"],
+        vec!["lease-check", "--agent", "not-an-id"],
+        vec!["lease-check", "--agent", A, "--agent", A],
+        vec!["lease-check", "--agent", A, "--extra", "x"],
+        vec!["lease-check", "--agent", A, "--", "x"],
+    ] {
+        let o = run(&bad);
+        assert_eq!(code(&o), 64, "{bad:?}: {}", stderr(&o));
+        assert!(o.stdout.is_empty());
+    }
+    // Well-formed as a non-root user: the root guard (66), one fixed line, nothing on stdout.
+    let o = run(&["lease-check", "--agent", A]);
+    assert_eq!(code(&o), 66, "{}", stderr(&o));
+    assert_eq!(stderr(&o), "sagebrush-agent-launch: preflight_missing: root only\n");
+    assert!(o.stdout.is_empty());
+}

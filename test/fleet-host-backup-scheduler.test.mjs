@@ -158,7 +158,7 @@ test("a full run: cache, a left-over run recovered, forbidden roots checked, eac
   const f = fakes();
   const r = await runOnce(f.deps);
   assert.equal(r.status, "ok"); assert.equal(r.manifest, hex(900));
-  assert.deepEqual(f.calls, ["lock", "cache", "recover", "forbidden",
+  assert.deepEqual(f.calls, ["lock", "cache", "recover", "forbidden", "state",
     `backup:agent:${f.a}:none`, `backup:agent:${f.b}:none`, "hoststore-copy", "backup:hoststore:host:none",
     "binary:snapshots", "build", "commit", "retention", "binary:prune", "binary:check-data", "state", "trim"]);
   const w = f.written();
@@ -191,6 +191,47 @@ test("a set that fails: no host store, no manifest; the state records the debt, 
   const w = f.written();
   assert.equal(w.last_success, null);
   assert.equal(w.sets[`agent:${f0.b}`].since, Date.parse("2026-11-24T03:00:00Z"));
+});
+
+test("the debt is written before any backup: a manifest that won't commit, a failed listing, a throw, a partial failure all leave it", async () => {
+  const now = Date.parse("2026-11-24T03:00:00Z");
+  const debtOf = (f, id) => f.written().sets[`agent:${id}`];
+  {
+    const f = fakes({ commit: { ok: false, code: "readback_failed" } });
+    assert.equal((await runOnce(f.deps)).status, "failed");
+    for (const id of [f.a, f.b]) assert.equal(debtOf(f, id).since, now, "no committed manifest covers this change");
+  }
+  {
+    const f = fakes();
+    const old = f.deps.binary;
+    f.deps.binary = async (req) => (req.op === "snapshots" ? { ok: false, code: "destination_unavailable" } : old(req));
+    assert.equal((await runOnce(f.deps)).status, "failed");
+    for (const id of [f.a, f.b]) assert.equal(debtOf(f, id).since, now);
+  }
+  {
+    const f = fakes();
+    f.deps.backupSet = async () => { throw new Error("killed"); };
+    await assert.rejects(runOnce(f.deps), /killed/);
+    for (const id of [f.a, f.b]) assert.equal(debtOf(f, id).since, now, "a throw leaves the debt too");
+  }
+  {
+    // a's change was copied (good) but b failed: a's change is still not in any manifest, so a keeps its debt
+    const f0 = fakes();
+    const f = fakes({ sets: f0.deps.sources(), outcomes: { [`agent:${f0.b}`]: { outcome: "abandoned", code: "cap" } } });
+    f.deps.registry = f0.deps.registry;
+    await runOnce(f.deps);
+    assert.equal(debtOf(f, f0.a).since, now, "a good but unmanifested copy is still debt");
+    assert.equal(debtOf(f, f0.b).since, now);
+  }
+  {
+    // an earlier debt is kept as it was (the oldest unbacked change), and the last good snapshot is preserved
+    const f0 = fakes();
+    const state = { ...emptyState(), sets: { [`agent:${f0.a}`]: { fingerprint: { e: 0 }, snapshot: hex(5), tree: hex(55), since: 42 } } };
+    const f = fakes({ state, sets: f0.deps.sources(), commit: { ok: false, code: "readback_failed" } });
+    f.deps.registry = f0.deps.registry;
+    await runOnce(f.deps);
+    assert.deepEqual(debtOf(f, f0.a), { fingerprint: { e: 0 }, snapshot: hex(5), tree: hex(55), since: 42 });
+  }
 });
 
 test("a manifest that doesn't commit: not a success, and retention never runs", async () => {

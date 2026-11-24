@@ -220,7 +220,8 @@ test("refrozen and stuck, or a worker back, while the supervisor held the lock: 
     const groups = frozenRun(d, [a]);
     const slice = agentSliceCgroup(a);
     const { r } = await recoverAcrossAHeldLock(d, a, groups, () => { groups[slice].frozen = true; groups[slice].thaws = false; });
-    assert.equal(r.backupLowered, false);
+    assert.deepEqual(r, { run: RUN, reaped: true, thawed: false, backupLowered: false, state: "frozen" }, "the proof under the lock is what's reported");
+    assert.equal(groups[slice].frozen, true);
     assert.ok(existsSync(join(d.fenceDir, "backup", a)), "the fence stays while the slice is frozen");
     assert.equal(readJournal({ dir: d.dir }).state, "frozen");
   }
@@ -230,9 +231,29 @@ test("refrozen and stuck, or a worker back, while the supervisor held the lock: 
     const groups = frozenRun(d, [a]);
     const worker = backupScopeCgroup(SCOPE);
     const { r } = await recoverAcrossAHeldLock(d, a, groups, () => { groups[worker].procs = 2; groups[worker].dies = false; });
-    assert.equal(r.backupLowered, false);
+    assert.deepEqual(r, { run: RUN, reaped: false, thawed: true, backupLowered: false, state: "frozen" }, "the proof under the lock is what's reported");
     assert.ok(existsSync(join(d.fenceDir, "backup", a)), "the fence stays while a worker runs");
   }
+});
+
+test("a tag run, ANOTHER member refrozen while the supervisor held the lock: it is thawed again before any fence comes down", async () => {
+  const d = dirs();
+  const [a, b] = [newId(), newId()];
+  const groups = frozenRun(d, [a, b]);
+  const { r } = await recoverAcrossAHeldLock(d, a, groups, () => { groups[agentSliceCgroup(b)].frozen = true; });
+  assert.deepEqual(r, { run: RUN, reaped: true, thawed: true, backupLowered: true, state: "released" });
+  assert.equal(groups[agentSliceCgroup(b)].frozen, false, "b is thawed again under the lock, not only the asking member");
+  for (const x of [a, b]) assert.equal(existsSync(join(d.fenceDir, "backup", x)), false);
+});
+
+test("a tag run, another member refrozen and stuck while the supervisor held the lock: no member's fence comes down", async () => {
+  const d = dirs();
+  const [a, b] = [newId(), newId()];
+  const groups = frozenRun(d, [a, b]);
+  const { r } = await recoverAcrossAHeldLock(d, a, groups, () => { groups[agentSliceCgroup(b)].frozen = true; groups[agentSliceCgroup(b)].thaws = false; });
+  assert.deepEqual(r, { run: RUN, reaped: true, thawed: false, backupLowered: false, state: "frozen" });
+  assert.equal(groups[agentSliceCgroup(b)].frozen, true);
+  for (const x of [a, b]) assert.ok(existsSync(join(d.fenceDir, "backup", x)), `${x === a ? "a" : "b"} keeps its fence`);
 });
 
 test("no run, or a run that doesn't name the agent: a no-op that touches nothing", async () => {

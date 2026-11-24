@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { checkFixtures, checkHpkeFixtures, checkHpkeVector } from "./fleet-fixture-cases.mjs";
+import { CONTEXTS, LENGTHS, checkExportOracle } from "./hpke-export-oracle.mjs";
 import * as core from "../lib/fleet/core/index.mjs";
 
 const read = (f) => JSON.parse(readFileSync(new URL(f, import.meta.url), "utf8"));
@@ -64,6 +65,12 @@ test("HPKE with the WebCrypto backend: the RFC 9180 vector, and every fleet seal
   const f = await checkHpkeFixtures(core, read("./fixtures/fleet-hpke-fixtures.json"));
   assert.deepEqual(f.bad, []);
   assert.ok(f.n > 25, `${f.n} cases`);
+});
+
+test("HPKE export with the WebCrypto backend, every block of long outputs, against an independent HKDF-Expand", async () => {
+  const { bad, n } = await checkExportOracle(core, read("./fixtures/hpke-x25519-sha256-aes256gcm.json").vector);
+  assert.deepEqual(bad, []);
+  assert.equal(n, LENGTHS.length * CONTEXTS.length * 4);
 });
 
 test("one operation in flight per HPKE context: while the backend holds a seal or open, another is refused at once and the nonce is never reused", async () => {

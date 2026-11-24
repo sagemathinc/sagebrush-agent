@@ -13,6 +13,7 @@ import { nodeCrypto } from "../lib/fleet/node-crypto.mjs";
 import { atSequence } from "../lib/fleet/core/hpke.mjs";
 import { checkHpkeFixtures, checkHpkeVector } from "./fleet-fixture-cases.mjs";
 import { build } from "./make-fleet-hpke-fixtures.mjs";
+import { CONTEXTS, LENGTHS, checkExportOracle } from "./hpke-export-oracle.mjs";
 
 const V = JSON.parse(readFileSync(new URL("./fixtures/hpke-x25519-sha256-aes256gcm.json", import.meta.url), "utf8")).vector;
 const FX_TEXT = readFileSync(new URL("./fixtures/fleet-hpke-fixtures.json", import.meta.url), "utf8");
@@ -217,6 +218,12 @@ test("HPKE contexts have one role (RFC 9180 §5.2): a sender only seals, a recip
   assert.ok(Object.isFrozen(S) && Object.isFrozen(O), "and nothing can be added to either");
   assert.throws(() => { S.open = O.open; }, TypeError);
   assert.deepEqual(await O.open(new Uint8Array(0), await S.seal(new Uint8Array(0), enc("x"))), enc("x"));
+});
+
+test("HPKE export, every block of long outputs: an independent HKDF-Expand over Node's HMAC, up to the 8160-byte maximum", async () => {
+  const { bad, n } = await checkExportOracle(core, V);
+  assert.deepEqual(bad, []);
+  assert.equal(n, LENGTHS.length * CONTEXTS.length * 4);
 });
 
 test("HPKE export (RFC 9180 §5.3): both sides agree, bound to the context and the exporter context, with no sequence", async () => {

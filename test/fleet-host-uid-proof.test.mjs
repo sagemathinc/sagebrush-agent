@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { newId } from "../lib/fleet/index.mjs";
-import { statusUids, uidEmpty } from "../lib/fleet/host/uid-proof.mjs";
+import { statusUids, uidEmpty , storageUidEmpty } from "../lib/fleet/host/uid-proof.mjs";
+import { STORAGE_UID_RANGE } from "../lib/fleet/host/profiles.mjs";
 
 const UID = 70001;
 const A = newId();
@@ -84,4 +85,17 @@ test("statusUids parses exactly the four uid fields", () => {
   assert.deepEqual(statusUids(status(1, 2, 3, 4)), [1, 2, 3, 4]);
   assert.equal(statusUids("Uid:\t1\t2\t3\n"), null);
   assert.equal(statusUids("Gid:\t1\t2\t3\t4\n"), null);
+});
+
+test("a storage uid (A4 §2): its processes, user manager and sessions hold it; there is no linger file to check; the range is the storage range", async () => {
+  const SU = STORAGE_UID_RANGE[0] + 5;
+  const sp = (h) => storageUidEmpty(SU, { root: h.root, run: h.run, ms: 1000 });
+  assert.deepEqual(await sp(host()), { empty: true, holders: [] });
+  assert.deepEqual((await sp(host({ procs: { 1: [0, 0, 0, 0], 77: [0, SU, 0, 0] } }))).holders, ["pid 77"]);
+  assert.deepEqual((await sp(host({ mgr: "active" }))).holders, ["user-manager"]);
+  assert.deepEqual((await sp(host({ sessions: `9 ${SU} x seat0 tty3\n` }))).holders, ["session 9"]);
+  for (const bad of [UID, STORAGE_UID_RANGE[0] - 1, STORAGE_UID_RANGE[1] + 1, 0, "90001"]) {
+    await assert.rejects(storageUidEmpty(bad, { root: host().root, run: host().run, ms: 1000 }), /storage range/);
+  }
+  await assert.rejects(uidEmpty(SU, A, { root: host().root, run: host().run, ms: 1000 }), /agent range/, "the agent proof refuses a storage uid");
 });

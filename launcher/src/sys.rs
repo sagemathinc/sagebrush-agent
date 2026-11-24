@@ -458,6 +458,37 @@ pub fn set_project(fd: &OwnedFd, projid: u32, inherit: bool) -> io::Result<()> {
     if r != 0 { Err(last()) } else { Ok(()) }
 }
 
+/// The ext4 immutable flag in `fsx_xflags` (launcher amendment A4 §3).
+pub const FS_XFLAG_IMMUTABLE: u32 = 0x0000_0008;
+
+/// `xflags` with only FS_XFLAG_IMMUTABLE set or cleared; every other bit kept.
+pub const fn with_immutable(xflags: u32, on: bool) -> u32 {
+    if on { xflags | FS_XFLAG_IMMUTABLE } else { xflags & !FS_XFLAG_IMMUTABLE }
+}
+
+/// ioctl(fd, FS_IOC_FSGETXATTR): the extended flags (`fsx_xflags`) (an O_RDONLY fd; A4 §3).
+pub fn xflags(fd: &OwnedFd) -> io::Result<u32> {
+    let mut x = FsXattr { xflags: 0, extsize: 0, nextents: 0, projid: 0, cowextsize: 0, pad: [0; 8] };
+    // SAFETY: `fd` is open; `x` is writable for a whole struct fsxattr.
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), FS_IOC_FSGETXATTR, &mut x as *mut FsXattr) };
+    if r != 0 { Err(last()) } else { Ok(x.xflags) }
+}
+
+/// ioctl(fd, FS_IOC_FSSETXATTR): read the current fsxattr, set or clear ONLY FS_XFLAG_IMMUTABLE, write it back (every
+/// other flag, the project id and the rest unchanged) (A4 §3; needs CAP_LINUX_IMMUTABLE).
+pub fn set_immutable(fd: &OwnedFd, on: bool) -> io::Result<()> {
+    let mut x = FsXattr { xflags: 0, extsize: 0, nextents: 0, projid: 0, cowextsize: 0, pad: [0; 8] };
+    // SAFETY: `fd` is open; `x` is writable for a whole struct fsxattr.
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), FS_IOC_FSGETXATTR, &mut x as *mut FsXattr) };
+    if r != 0 {
+        return Err(last());
+    }
+    x.xflags = with_immutable(x.xflags, on);
+    // SAFETY: `fd` is open; `x` is a whole struct fsxattr, read by the kernel.
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), FS_IOC_FSSETXATTR, &x as *const FsXattr) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
 /// fchown(fd, uid, gid).
 pub fn fchown(fd: &OwnedFd, uid: u32, gid: u32) -> io::Result<()> {
     // SAFETY: `fd` is open.

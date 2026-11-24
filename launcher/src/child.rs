@@ -933,6 +933,8 @@ mod tests {
     struct Probe {
         seen: Seen,
         took: Duration,
+        /// From just before the "SIGTERM" notification was written to the end of the wait (None without one).
+        after_term: Option<Duration>,
     }
 
     /// Run `script` under sh, send the "SIGTERM" notification after `term_at` (if any), and wait as the parent does. A
@@ -955,10 +957,13 @@ mod tests {
         let (sig_r, sig_w) = sys::pipe().unwrap();
         let pid = ch.id() as libc::pid_t;
         let pidfd = sys::pidfd_open(pid).unwrap();
-        // The notifier keeps its write end open until the end, as a signalfd never hangs up.
+        // The notifier keeps its write end open until the end, as a signalfd never hangs up. It reports the instant
+        // just before its write: the wait can't see the notification earlier, so a delay counted from it is a floor.
+        let (term_tx, term_rx) = std::sync::mpsc::channel();
         let notifier = std::thread::spawn(move || {
             if let Some(d) = term_at {
                 std::thread::sleep(d);
+                let _ = term_tx.send(Instant::now());
                 sys::write(&sig_w, b"t").unwrap();
             }
             std::thread::sleep(Duration::from_secs(8));
@@ -966,9 +971,11 @@ mod tests {
         });
         let t0 = Instant::now();
         let seen = wait(pid, &pidfd, &st_r, &out, &err, &sig_r, KILL);
-        let took = t0.elapsed();
+        let end = Instant::now();
+        let took = end - t0;
+        let after_term = term_rx.try_recv().ok().map(|t| end - t);
         drop(notifier); // detached: it only holds the pipe open
-        Probe { seen, took }
+        Probe { seen, took, after_term }
     }
 
     fn signalled(p: &Probe) -> Option<i32> {
@@ -987,7 +994,11 @@ mod tests {
     fn a_child_ignoring_term_gets_sigkill_after_the_delay_even_after_eof() {
         let p = probe("trap '' TERM; exec sleep 5 >&- 2>&-", Some(Duration::from_millis(100)));
         assert_eq!(signalled(&p), Some(libc::SIGKILL), "{:?}", p.seen.exit);
-        assert!(p.took >= Duration::from_millis(100) + KILL && p.took < Duration::from_millis(2500), "{:?}", p.took);
+        // The floor from the notification itself: `took` starts after the notifier's sleep has begun, so on a busy host
+        // it can fall short of 100 ms + KILL (399 ms seen in CI) though the kill waited its whole delay.
+        let after = p.after_term.expect("the notification was written");
+        assert!(after >= KILL, "{after:?}");
+        assert!(p.took < Duration::from_millis(2500), "{:?}", p.took);
     }
 
     #[test]

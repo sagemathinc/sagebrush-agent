@@ -3,7 +3,8 @@
 //! RESOLVE_NO_XDEV, identity from opened handles, the epoch and the unique mount id).
 //!
 //! - `restore-stage` makes one staging attempt of one class (`<run>/<owner>/<class>/<attempt>` under
-//!   /srv/sagebrush/.restore, charged to the class's project), runs the backup binary's restore into its `data/` in a
+//!   /srv/sagebrush/.restore, charged to the class's project), runs the backup binary's restore into its `data/<leaf>`
+//!   (r3.5: the last segment of `--path`; the binary restores the CONTENTS of `path`, so each class is staged alone) in a
 //!   contained child (child.rs), and only after the data is durable writes the completion marker itself.
 //! - `fill-home` consumes an attempt (the marker is unlinked first), drops CAP_SYS_RESOURCE, and moves the staged
 //!   class into its empty, provisioned destination: owners checked, specials never placed, every file stripped
@@ -129,13 +130,20 @@ fn snapshot_ok(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+/// The class's own staging directory beneath `data/` (A2 r3.5): the last segment of `--path`. The binary restores the
+/// CONTENTS of `path` into `dest`, so each class is staged alone, in `data/<leaf>`. `path` must be `rel_ok`.
+pub fn leaf(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 /// The closed request, built here and bounded AS ENCODED (A2 r3.2): a control character escapes to six bytes, so the
-/// raw path length proves nothing.
+/// raw path length proves nothing. `dest` is `/data/<leaf>` (A2 r3.5), counted in the bound.
 pub fn request(snapshot: &str, path: &str) -> Result<Vec<u8>> {
     if !snapshot_ok(snapshot) || !rel_ok(path) {
         return Err(err(Fail::Usage, "bad arguments"));
     }
-    let r = format!("{{\"op\":\"restore\",\"snapshot\":{},\"path\":{},\"dest\":\"/data\"}}", json::quote(snapshot), json::quote(path));
+    let dest = format!("/data/{}", leaf(path));
+    let r = format!("{{\"op\":\"restore\",\"snapshot\":{},\"path\":{},\"dest\":{}}}", json::quote(snapshot), json::quote(path), json::quote(&dest));
     if r.len() > MAX_REQUEST {
         return Err(err(Fail::Usage, "the request is too large"));
     }
@@ -465,11 +473,31 @@ fn stage_inner<O: RestoreOps, R: Runner<O::H>>(o: &mut O, r: &mut R, a: &StageAr
     let data = dh.ok_or(identity("data isn't a directory"))?;
     o.chmod(&data, 0o700).map_err(|_| identity("data's mode can't be set"))?;
     let dx = tchild(o, &att, "data", mnt)?.ok_or(identity("data vanished"))?.0;
-    if dx.uid != 0 || dx.gid != 0 || dx.mode != 0o700 || dx.projid != Some(a.projid) || dx.inherit != Some(true) {
+    let di = o.ident(&data).map_err(open_err)?;
+    // The name re-read must be the very directory opened and chmodded (a replacement with equal attributes refuses).
+    if (dx.dev, dx.ino) != (di.dev, di.ino) || dx.uid != 0 || dx.gid != 0 || dx.mode != 0o700 || dx.projid != Some(a.projid) || dx.inherit != Some(true) {
         return Err(identity("data isn't a root 0700 directory of the class's project"));
     }
-    for h in [&data, &att, &class_h] {
+    // The class's own directory, data/<leaf> (A2 r3.5): the binary's dest, fresh, empty, root 0700, in the project.
+    let lf = leaf(a.path);
+    if let Err(e) = o.mkdir(&data, lf, 0o700) {
+        return Err(if is_space_error(&e) { stage_space(o, &data, a.projid) } else { identity("the class's directory can't be made") });
+    }
+    let (_, lh) = tchild(o, &data, lf, mnt)?.ok_or(identity("the class's directory vanished"))?;
+    let leaf_h = lh.ok_or(identity("the class's directory isn't a directory"))?;
+    o.chmod(&leaf_h, 0o700).map_err(|_| identity("the class's directory's mode can't be set"))?;
+    let lx = tchild(o, &data, lf, mnt)?.ok_or(identity("the class's directory vanished"))?.0;
+    let li = o.ident(&leaf_h).map_err(open_err)?;
+    if (lx.dev, lx.ino) != (li.dev, li.ino) || lx.uid != 0 || lx.gid != 0 || lx.mode != 0o700 || lx.projid != Some(a.projid) || lx.inherit != Some(true) || !o.batch(&leaf_h).map_err(open_err)?.is_empty() {
+        return Err(identity("the class's directory isn't a fresh, empty root 0700 directory of the class's project"));
+    }
+    for h in [&leaf_h, &data, &att, &class_h] {
         o.fsync(h).map_err(|_| err(Fail::Partial, "the attempt can't be synced"))?;
+    }
+    // Still the same directory at the name after the syncs: the child's dest is that path.
+    let again = tchild(o, &data, lf, mnt)?.ok_or(identity("the class's directory vanished"))?.0;
+    if (again.dev, again.ino) != (li.dev, li.ino) {
+        return Err(identity("the class's directory was replaced"));
     }
 
     // 5-10. The child, contained; the parent waits, bounded.
@@ -1006,7 +1034,7 @@ impl RestoreOps for tree::RealOps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::tests::{code, e, expect_file, join, Fake, FH, A, BOOT, MNT, UID};
+    use crate::tree::tests::{code, e, expect_file, join, Fake, Hook, FH, A, BOOT, MNT, UID};
     use crate::tree::{obj_json, S_IFDIR, S_IFLNK, S_IFREG};
 
     const RUN: &str = "abcdefghijklmnop";
@@ -1190,10 +1218,11 @@ mod tests {
 
     #[test]
     fn the_request_is_bounded_as_encoded_exact_and_one_past_and_escape_heavy() {
-        let base = request(SNAP, "x").unwrap().len() - 1;
-        let exact = "a".repeat(MAX_REQUEST - base);
+        // A fixed one-byte leaf, so only the first segment grows (dest repeats the leaf, A2 r3.5).
+        let base = request(SNAP, "a/z").unwrap().len() - 1;
+        let exact = format!("{}/z", "a".repeat(MAX_REQUEST - base));
         assert_eq!(request(SNAP, &exact).unwrap().len(), MAX_REQUEST, "exactly 4096 encoded bytes are accepted");
-        assert_eq!(code(request(SNAP, &format!("{exact}a"))), 64, "4097 is usage");
+        assert_eq!(code(request(SNAP, &format!("a{exact}"))), 64, "4097 is usage");
         // 1003 raw bytes of control characters (four 250-byte components): far over 4096 once encoded.
         let ctl = "\u{1}".repeat(250);
         let heavy = [ctl.as_str(); 4].join("/");
@@ -1202,7 +1231,21 @@ mod tests {
         // A plain 1025-byte path that fits is accepted (the bound is the encoding, not the raw length).
         assert!(request(SNAP, &"b".repeat(1025)).is_ok());
         let r = String::from_utf8(request(SNAP, "srv/x").unwrap()).unwrap();
-        assert_eq!(r, format!("{{\"op\":\"restore\",\"snapshot\":\"{SNAP}\",\"path\":\"srv/x\",\"dest\":\"/data\"}}"));
+        assert_eq!(r, format!("{{\"op\":\"restore\",\"snapshot\":\"{SNAP}\",\"path\":\"srv/x\",\"dest\":\"/data/x\"}}"));
+        // R1: dest is exactly /data/<leaf> for each class's path, and the bound counts it: a path whose request is 4097
+        // bytes only because of the leaf repeated in dest is usage.
+        for (path, want) in [("srv/sagebrush/agents/x/home", "home"), ("srv/sagebrush/agents/x/sessions", "sessions"), ("srv/sagebrush/archive/x", "x"), ("srv/sagebrush/tags/t", "t"), ("solo", "solo")] {
+            assert_eq!(leaf(path), want);
+            let r = String::from_utf8(request(SNAP, path).unwrap()).unwrap();
+            assert!(r.ends_with(&format!(",\"dest\":\"/data/{want}\"}}")), "{r}");
+        }
+        let p = |k: usize| format!("a/{}", "b".repeat(k));
+        let k = (1..MAX_REQUEST).take_while(|k| request(SNAP, &p(*k)).is_ok()).last().unwrap();
+        let len = request(SNAP, &p(k)).unwrap().len();
+        assert!(len >= MAX_REQUEST - 1, "the largest accepted is at the bound: {len}");
+        assert_eq!(code(request(SNAP, &p(k + 1))), 64);
+        // One more `b` adds two bytes (the path and dest's leaf); without dest's leaf the request would still fit.
+        assert!(len + 2 - (k + 1) - 1 < MAX_REQUEST, "over the bound only because dest repeats the leaf");
         for bad in ["", "/srv", "srv/", "srv//x", "srv/./x", "srv/../x", "a\0b"] {
             assert_eq!(code(request(SNAP, bad)), 64, "{bad:?}");
         }
@@ -1401,6 +1444,11 @@ mod tests {
         assert_eq!(f.files[&format!("{att}/.complete")], name("home").path().into_bytes());
         let pos = |s: &str| f.log.iter().position(|l| l == s).unwrap_or_else(|| panic!("{s}: {:?}", f.log));
         assert!(pos(&format!("syncfs {att}")) < pos(&format!("marker {att}/.complete")), "durable data before the marker");
+        // R2: data/<leaf>, the binary's dest, root:root 0700 in the class's project, synced before the child ran.
+        let lf = f.nodes[&format!("{att}/data/home")].clone();
+        assert_eq!((lf.id.uid, lf.id.gid, lf.id.mode & 0o7777, lf.proj, lf.inherit), (0, 0, 0o700, UID, true));
+        assert!(pos(&format!("fsync {att}/data/home")) < pos(&format!("fsync {att}/data")), "the leaf, then data, synced");
+
         assert_eq!(f.log.last().unwrap(), &format!("fsync {att}"), "the marker's directory synced last");
         let (binds, binary, req, attempt) = r.seen.unwrap();
         assert_eq!(attempt, att, "the tmpfs is attached onto the attempt");
@@ -1419,6 +1467,81 @@ mod tests {
         );
         assert_eq!(binary.1, f.nodes[BIN].id.ino);
         assert_eq!(req, request(SNAP, "srv/sagebrush/agents/x/home").unwrap());
+    }
+
+    fn leaf_path() -> String {
+        format!("{}/data/home", attempt_path("home"))
+    }
+
+    #[test]
+    fn the_class_directory_is_fresh_empty_root_0700_in_the_project_else_73_with_nothing_run() {
+        // R2 (A2 r3.5): data/<leaf> is made by the launcher; anything else at the name, or a made one that isn't
+        // exactly that, is 73 and the child never runs. Hooks run before the nth call of an op: the 6th mkdir is the
+        // leaf's, the 6th chmod the leaf's.
+        fn premade(f: &mut Fake) {
+            f.dir(&leaf_path(), 0, 0o700);
+        }
+        fn foreign(f: &mut Fake) {
+            f.node(&leaf_path()).id.uid = 5;
+        }
+        fn group(f: &mut Fake) {
+            f.node(&leaf_path()).id.gid = 5;
+        }
+        fn populated(f: &mut Fake) {
+            f.add(&format!("{}/x", leaf_path()), S_IFREG | 0o600, 0, 0);
+        }
+        fn project(f: &mut Fake) {
+            f.node(&leaf_path()).proj = UID + 1;
+        }
+        fn no_inherit(f: &mut Fake) {
+            f.node(&leaf_path()).inherit = false;
+        }
+        fn file(f: &mut Fake) {
+            f.nodes.remove(&leaf_path());
+            f.add(&leaf_path(), S_IFREG | 0o700, 0, 0);
+        }
+        fn replaced(f: &mut Fake) {
+            f.node(&leaf_path()).id.ino = 99_999; // same owner, mode, project, inherit and emptiness: another inode
+        }
+        fn data_replaced(f: &mut Fake) {
+            f.node(&format!("{}/data", attempt_path("home"))).id.ino = 99_998;
+        }
+        let rows: [(&str, &'static str, Hook); 7] = [
+            ("pre-made", "mkdir", premade),
+            ("another owner", "chmod", foreign),
+            ("another group", "chmod", group),
+            ("not empty", "chmod", populated),
+            ("another project", "chmod", project),
+            ("no inherit", "chmod", no_inherit),
+            ("a file", "chmod", file),
+        ];
+        for (what, op, hook) in rows {
+            let mut f = host();
+            f.hook = Some((op, 6, hook));
+            let mut r = exited(ok_reply());
+            assert_eq!(rcode(&restore_stage(&mut f, &mut r, &stage_args("home"))), 73, "{what}");
+            assert!(r.seen.is_none(), "{what}: nothing ran");
+            assert!(f.hook.is_none(), "{what}: the hook fired");
+        }
+        // An actual inode replacement with every attribute equal, after the open and before the re-read: of the leaf
+        // (the 6th chmod is the leaf's) and of data (the 5th is data's).
+        for (what, n, hook) in [("the leaf replaced", 6usize, replaced as Hook), ("data replaced", 5, data_replaced)] {
+            let mut f = host();
+            f.hook = Some(("chmod", n, hook));
+            let mut r = exited(ok_reply());
+            assert_eq!(rcode(&restore_stage(&mut f, &mut r, &stage_args("home"))), 73, "{what}");
+            assert!(r.seen.is_none() && f.hook.is_none(), "{what}");
+            assert!(!f.log.iter().any(|l| l.starts_with("fsync ")), "{what}: refused at the re-read, before any sync");
+        }
+        // Replaced after its own sync (before data's): the re-read after the syncs refuses.
+        let mut f = host();
+        restore_stage(&mut f, &mut exited(ok_reply()), &stage_args("home"));
+        let k = f.log.iter().filter(|l| l.starts_with("fsync ")).position(|l| *l == format!("fsync {}", leaf_path())).unwrap() + 1;
+        let mut f = host();
+        f.hook = Some(("fsync", k + 1, replaced));
+        let mut r = exited(ok_reply());
+        assert_eq!(rcode(&restore_stage(&mut f, &mut r, &stage_args("home"))), 73, "replaced after the sync");
+        assert!(r.seen.is_none() && f.hook.is_none());
     }
 
     #[test]
@@ -1517,9 +1640,9 @@ mod tests {
     #[test]
     fn restore_stage_own_mkdirs_out_of_space_are_attributed_not_preflight() {
         // Found on a real host: a filesystem out of inodes fails restore-stage's own mkdirs, before the binary runs.
-        // Every one of them (the run, owner and class parents, the attempt, data), with either errno, attributed by
+        // Every one of them (the run, owner and class parents, the attempt, data, data/<leaf>), with either errno, attributed by
         // §3.1: the project at its limit is 76; the project under it on a full filesystem is 77.
-        let names = ["run", "owner", "class", "attempt", "data"];
+        let names = ["run", "owner", "class", "attempt", "data", "data/<leaf>"];
         for (n, name) in names.iter().enumerate() {
             for errno in [libc::ENOSPC, libc::EDQUOT] {
                 for (quota, space, want) in [(q(0, 0, 100, 100), (100u64, 100u64), 76), (q(2 << 20, GIB_BLOCKS, 5, 100), (100, 0), 77)] {
@@ -1600,13 +1723,10 @@ mod tests {
         let mut f = host();
         restore_stage(&mut f, &mut exited(ok_reply()), &stage_args(class));
         let att = attempt_path(class);
-        let src = format!("{att}/data/srv/sagebrush/agents/{A}/{class}");
-        let mut p = format!("{att}/data");
-        for d in ["srv", "sagebrush", "agents", A] {
-            p = join(&p, d);
-            f.dir(&p, 0, 0o755);
-        }
-        f.dir(&src, UID, 0o700);
+        // R3 (A2 r3.5): the class's contents land in data/<leaf>, the launcher's own root 0700 directory; nothing else
+        // (no sibling class) is staged.
+        let src = format!("{att}/data/{}", leaf(stage_args(class).path));
+        assert_eq!(f.nodes.keys().filter(|k| k.starts_with(&format!("{att}/data/"))).collect::<Vec<_>>(), vec![&src]);
         let put = |f: &mut Fake, rel: &str, mode: u16, uid: u32| {
             let path = format!("{src}/{rel}");
             f.add(&path, mode, uid, uid);
@@ -1636,7 +1756,7 @@ mod tests {
     }
 
     fn fill_args(class: &str, expect: String) -> FillArgs<'static> {
-        let source: &'static str = Box::leak(format!("data/srv/sagebrush/agents/{A}/{class}").into_boxed_str());
+        let source: &'static str = Box::leak(format!("data/{}", leaf(stage_args(class).path)).into_boxed_str());
         FillArgs { mount: "/srv/sagebrush", name: name(class), source, expect: Box::leak(expect.into_boxed_str()) }
     }
 
@@ -1747,10 +1867,29 @@ mod tests {
         // A failure before the first effect (the dry pass can't list): 73, nothing moved or stripped.
         let (mut f, src) = staged("home");
         let x = fill_expect(&mut f, "home");
-        let n = f.count("list") + 3;
+        let n = f.count("list") + 2; // in the dry pass, before any effect (the first listing is a precondition's: 66)
         f.errno_at = Some(("list", n, libc::EIO));
+        f.log.clear(); // restore-stage's own chmod of data/<leaf> isn't the fill's
         assert_eq!(code(fill_home(&mut f, &fill_args("home", x))), 73);
         assert!(!f.log.iter().any(|l| l.starts_with("rename") || l.starts_with(&format!("chmod {src}"))), "{:?}", f.log);
+    }
+
+    #[test]
+    fn a_restored_complete_lands_inside_the_class_and_the_fill_consumes_only_the_real_marker() {
+        // R4 (A2 r3.5): the marker sits beside data, never inside it; a restored top-level `.complete` is an ordinary
+        // entry of data/<leaf>, placed like any other file of the class.
+        let (mut f, src) = staged("home");
+        let att = attempt_path("home");
+        let fake = format!("{src}/.complete");
+        f.add(&fake, S_IFREG | 0o600, UID, UID);
+        f.node(&fake).proj = UID;
+        f.node(&fake).inherit = true;
+        assert!(f.nodes.contains_key(&format!("{att}/.complete")), "the real marker, beside data");
+        let x = fill_expect(&mut f, "home");
+        let out = fill_home(&mut f, &fill_args("home", x)).unwrap();
+        assert!(out.contains("\"files\":3"), "{out}");
+        assert!(!f.nodes.contains_key(&format!("{att}/.complete")), "the real marker consumed");
+        assert!(f.nodes.contains_key(&format!("srv/sagebrush/agents/{A}/home/.complete")), "the restored one placed");
     }
 
     #[test]
@@ -1797,8 +1936,7 @@ mod tests {
         let args = StageArgs { mount: "/srv/sagebrush", name: tn.clone(), projid: 80001, snapshot: SNAP, path: "srv/sagebrush/tags/x" };
         assert_eq!(rcode(&restore_stage(&mut f, &mut exited(ok_reply()), &args)), 0);
         let att = format!("srv/sagebrush/.restore/{RUN}/{t}/tag/1");
-        let src = format!("{att}/data/t");
-        f.dir(&src, 0, 0o755);
+        let src = format!("{att}/data/x"); // the launcher's data/<leaf> for srv/sagebrush/tags/x
         for (n, uid, gid) in [("m1", 70001u32, 80001u32), ("m2", 70002, 80001), ("stranger", 70003, 80001), ("own-group", 70001, 70001)] {
             let p = format!("{src}/{n}");
             f.add(&p, S_IFREG | 0o640, uid, gid);
@@ -1814,7 +1952,7 @@ mod tests {
         let tags = f.dir_from_root(&root, "srv/sagebrush/tags").unwrap();
         let (dx, _) = crate::tree::child(&mut f, &tags, TAG, MNT).unwrap().unwrap();
         let x = expect_file(&mut f, "tag.json", format!("{{\"epoch\":{{\"boot_id\":\"{BOOT}\",\"mnt_id\":{MNT}}},\"fsid\":\"0000abcd00001234\",\"dest\":{},\"uids\":[70001,70002],\"gid\":80001,\"projid\":80001}}", obj_json(&dx)));
-        let out = fill_home(&mut f, &FillArgs { mount: "/srv/sagebrush", name: tn, source: "data/t", expect: Box::leak(x.into_boxed_str()) }).unwrap();
+        let out = fill_home(&mut f, &FillArgs { mount: "/srv/sagebrush", name: tn, source: "data/x", expect: Box::leak(x.into_boxed_str()) }).unwrap();
         assert!(out.contains("\"files\":2") && out.contains("\"path\":\"stranger\"") && out.contains("\"path\":\"own-group\""), "{out}");
         assert!(f.nodes.contains_key(&format!("{dest}/m1")) && f.nodes.contains_key(&format!("{dest}/m2")));
         assert!(!f.nodes.contains_key(&format!("{dest}/stranger")));
@@ -1836,7 +1974,7 @@ mod tests {
         assert_eq!(owners.len(), 65);
         let ex = expect_file(&mut f, "rm.json", format!("{{\"epoch\":{{\"boot_id\":\"{BOOT}\",\"mnt_id\":{MNT}}},\"fsid\":\"0000abcd00001234\",\"root\":{},\"owners\":[{}]}}", obj_json(&x), owners.join(",")));
         // remove-tree refuses a FIFO (A1 §5): drop it from this staging.
-        f.nodes.remove(&format!("{att}/data/srv/sagebrush/agents/{A}/home/fifo"));
+        f.nodes.remove(&format!("{att}/data/home/fifo"));
         assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 0);
         assert!(!f.nodes.contains_key(&att) && f.nodes.contains_key(&format!("srv/sagebrush/.restore/{RUN}/{}/home", owner())));
         // Already gone, and a missing staging parent: success after syncing the deepest existing parent.
@@ -1846,7 +1984,7 @@ mod tests {
         // A staging parent that isn't root:root 0700 refuses, with everything else removable (owners, no FIFO).
         for (uid, mode) in [(0u32, 0o755u16), (5, 0o700)] {
             let (mut f, _) = staged("home");
-            f.nodes.remove(&format!("{att}/data/srv/sagebrush/agents/{A}/home/fifo"));
+            f.nodes.remove(&format!("{att}/data/home/fifo"));
             let run = format!("srv/sagebrush/.restore/{RUN}");
             f.node(&run).id.mode = S_IFDIR | mode;
             f.node(&run).id.uid = uid;

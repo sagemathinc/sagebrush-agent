@@ -87,6 +87,14 @@ function launcher(m, args) {
       const p = `${flag("anchor")}/${flag("name")}`;
       const x = JSON.parse(fs.readFileSync(join(m.root, flag("expect")), "utf8"));
       if (JSON.stringify(x.epoch) !== JSON.stringify(m.epoch)) return { code: 73, stdout: "", stderr: "stale epoch" };
+      // An archived tree (purge): only the exact recorded directory; absent: the anchor synced again.
+      const archived = { "/srv/sagebrush/archive": "home", "/srv/sagebrush/archive-config": "config" }[flag("anchor")];
+      if (archived) {
+        const t = m.trees[archived];
+        if (t.archive && JSON.stringify(t.archive.dir) !== JSON.stringify(x.root)) return { code: 73, stdout: "", stderr: "differs" };
+        t.archive = null;
+        return sync("remove-tree", [flag("anchor")]);
+      }
       if (m.objects.has(p) && JSON.stringify(m.objects.get(p)) !== JSON.stringify(x.root)) return { code: 73, stdout: "", stderr: "differs" };
       m.objects.delete(p); // (absent already: nothing removed, the anchor still synced)
       return sync("remove-tree", [flag("anchor")]);
@@ -94,7 +102,8 @@ function launcher(m, args) {
     case "inspect-home": {
       const t = m.trees[flag("tree")];
       const v = args.includes("--archive") ? t.archive : t.live;
-      return v ? ok(v) : { code: 73, stdout: "", stderr: "sagebrush-agent-launch: identity: the tree is absent" };
+      // The live fields are reported in the CURRENT epoch (a reboot moves m.epoch; the durable objects stay).
+      return v ? ok({ ...v, epoch: m.epoch }) : { code: 73, stdout: "", stderr: "sagebrush-agent-launch: identity: the tree is absent" };
     }
     case "archive-home": {
       if (m.refuse["archive-home"]) return { code: m.refuse["archive-home"], stdout: "", stderr: "x" };
@@ -104,11 +113,11 @@ function launcher(m, args) {
       if (JSON.stringify(x.epoch) !== JSON.stringify(m.epoch)) return { code: 73, stdout: "", stderr: "stale epoch" };
       if (args.includes("--finish")) {
         // No rename: the archive exactly the expected tree, the source absent; then both parents synced again.
-        if (t.live || JSON.stringify(t.archive) !== JSON.stringify(x)) return { code: 73, stdout: "", stderr: "differs" };
+        if (t.live || JSON.stringify({ ...t.archive, epoch: m.epoch }) !== JSON.stringify(x)) return { code: 73, stdout: "", stderr: "differs" };
         return sync("archive-home", parents);
       }
       if (t.archive) return { code: 74, stdout: "", stderr: "exists" };
-      if (JSON.stringify(t.live) !== JSON.stringify(x)) return { code: 73, stdout: "", stderr: "differs" };
+      if (JSON.stringify({ ...t.live, epoch: m.epoch }) !== JSON.stringify(x)) return { code: 73, stdout: "", stderr: "differs" };
       t.archive = t.live; t.live = null;
       return sync("archive-home", parents);
     }
@@ -524,5 +533,150 @@ test("only a deleted agent; a record bound to another life is refused", async ()
   const B = newId();
   s.h.registry.addAgent(B, 1);
   await assert.rejects(s.dp.pass(B, 1000), /only a deleted agent/);
+  await s.close();
+});
+
+// ---- part 3: the local root host commands (deprovision r3.2 §3.6)
+
+// A reboot: a new boot id (the fake keeps the objects' live mnt_id equal to the epoch's, as on a real host).
+const REBOOT = { boot_id: "11111111-2222-3333-4444-555555555555", mnt_id: 30 };
+const purge = (s) => { s.m.root = s.root; return s.dp.purge(s.A, 10000); };
+const requalify = (s) => { s.m.root = s.root; return s.dp.requalify(s.A, 10000); };
+const launches = (s, sub) => s.m.calls.filter((c) => c[0] === LAUNCH && c[1] === sub);
+
+test("purge: only a done record, after both fresh proofs; it removes exactly the recorded archives; again, it confirms them gone", async () => {
+  const s = await setup();
+  assert.deepEqual(await purge(s), { status: "pending", step: null, reason: "no deprovision record" });
+  s.m.refuse["remove-tree"] = 73; // the pass parks at runtime: not done
+  await go(s);
+  delete s.m.refuse["remove-tree"];
+  const n = launches(s, "remove-tree").length;
+  assert.match((await purge(s)).reason, /isn't done/);
+  assert.equal(launches(s, "remove-tree").length, n, "nothing removed before done");
+  assert.equal((await go(s)).status, "done");
+  // The proofs first: a process in the cgroup, or the uid held: nothing runs.
+  for (const o of [{ procs: 1 }, { uidEmpty: false }]) {
+    Object.assign(s.m, o);
+    const k = s.m.calls.length;
+    assert.equal((await purge(s)).status, "pending", JSON.stringify(o));
+    assert.equal(s.m.calls.length, k, "the launcher isn't called");
+    delete s.m.procs; delete s.m.uidEmpty;
+  }
+  assert.deepEqual(await purge(s), { status: "purged" });
+  assert.ok(!s.m.trees.home.archive && !s.m.trees.config.archive, "both archives removed");
+  const rec = s.h.deprovision.record(s.A);
+  const rm = launches(s, "remove-tree").slice(-2);
+  assert.deepEqual(rm.map((c) => c[c.indexOf("--anchor") + 1]), ["/srv/sagebrush/archive", "/srv/sagebrush/archive-config"]);
+  for (const [i, tree] of [[0, "home"], [1, "config"]]) {
+    const x = JSON.parse(fs.readFileSync(join(s.root, rm[i][rm[i].indexOf("--expect") + 1]), "utf8"));
+    assert.deepEqual(x, { epoch: rec.identities[tree].epoch, fsid: rec.identities[tree].fsid, root: rec.identities[tree].dir, owners: [0, s.uid] }, tree);
+  }
+  // Again, same epoch: already gone, and the launcher syncs each anchor again before that is success.
+  const syncs = s.m.syncs.length;
+  assert.deepEqual(await purge(s), { status: "purged" });
+  assert.deepEqual(s.m.syncs.slice(syncs), ["remove-tree /srv/sagebrush/archive", "remove-tree /srv/sagebrush/archive-config"]);
+  // After a reboot: absent is durably absent; no requalify needed, nothing removed or synced.
+  s.m.epoch = REBOOT;
+  const before = launches(s, "remove-tree").length;
+  assert.deepEqual(await purge(s), { status: "purged" });
+  assert.equal(launches(s, "remove-tree").length, before);
+  await s.close();
+});
+
+test("purge refuses, untouched: a stale epoch until requalify, a substitute in the archive, a source back, a launcher refusal", async () => {
+  const done = async () => { const s = await setup(); assert.equal((await go(s)).status, "done"); return s; };
+  // A reboot: parked for requalify; requalify rebinds the archives (and the absent objects); then purge proceeds.
+  let s = await done();
+  s.m.epoch = REBOOT;
+  assert.match((await purge(s)).reason, /home: a stale epoch \(requalify\)/);
+  assert.ok(s.m.trees.home.archive && s.m.trees.config.archive, "untouched");
+  const q = await requalify(s);
+  assert.equal(q.status, "requalified");
+  assert.deepEqual(q.rebound.sort(), ["binds", "broker", "config", "contract", "creds", "home", "managed", "resolv"]);
+  assert.deepEqual(await purge(s), { status: "purged" });
+  await s.close();
+  // A same-shaped substitute in the archive (another ino): refused, untouched; requalify refuses it too.
+  s = await done();
+  s.m.trees.home.archive = structuredClone(s.m.trees.home.archive);
+  s.m.trees.home.archive.dir.ino = 999;
+  assert.match((await purge(s)).reason, /home: the archive differs/);
+  s.m.epoch = REBOOT;
+  assert.match((await requalify(s)).reason, /home: another durable tree; not requalified/);
+  assert.equal(s.h.deprovision.record(s.A).identities.home.epoch.boot_id, BOOT, "nothing rebound");
+  assert.ok(s.m.trees.home.archive);
+  await s.close();
+  // A source tree back at the live path: refused.
+  s = await done();
+  s.m.trees.config.live = structuredClone(s.m.trees.config.archive);
+  assert.match((await purge(s)).reason, /config: a source tree exists again/);
+  await s.close();
+  // remove-tree refusing or partial: pending with its reason.
+  for (const [code, re] of [[73, /remove-tree refused \(73\)/], [75, /partly removed; purge again/]]) {
+    s = await done();
+    s.m.refuse["remove-tree"] = code;
+    assert.match((await purge(s)).reason, re);
+    await s.close();
+  }
+});
+
+test("requalify: after a reboot a parked pass is rebound by exact durable match, then resumes; a substitute or a failed proof rebinds nothing", async () => {
+  // Parked at runtime after its binds identity was recorded, then a reboot.
+  let s = await setup();
+  s.m.refuse["remove-tree"] = 73;
+  await go(s);
+  delete s.m.refuse["remove-tree"];
+  s.m.epoch = REBOOT;
+  assert.match((await go(s)).reason, /stale epoch/);
+  // A failed proof: nothing rebound, no launcher call.
+  s.m.procs = 1;
+  const k = s.m.calls.length;
+  assert.equal((await requalify(s)).status, "pending");
+  assert.equal(s.m.calls.length, k);
+  delete s.m.procs;
+  const before = s.h.deprovision.record(s.A).identities.binds;
+  const q = await requalify(s);
+  assert.equal(q.status, "requalified");
+  assert.ok(q.rebound.includes("binds") && q.rebound.includes("provisioned"), JSON.stringify(q));
+  const after = s.h.deprovision.record(s.A).identities.binds;
+  assert.deepEqual(after.epoch, REBOOT);
+  assert.deepEqual(after.object, before.object, "the same durable object");
+  // Requalify again: nothing stale, nothing rebound.
+  assert.deepEqual((await requalify(s)).rebound, []);
+  assert.equal((await go(s)).status, "done");
+  await s.close();
+  // A substitute after a reboot (another ino): refused, nothing rebound, the pass stays parked.
+  s = await setup();
+  s.m.refuse["remove-tree"] = 73;
+  await go(s);
+  delete s.m.refuse["remove-tree"];
+  s.m.epoch = REBOOT;
+  s.m.objects.set(`/run/sagebrush/binds/${s.A}`, obj({ ino: 77 }));
+  assert.match((await requalify(s)).reason, /binds: another durable object; not requalified/);
+  assert.equal(s.h.deprovision.record(s.A).identities.binds.epoch.boot_id, BOOT);
+  await s.close();
+});
+
+test("requalify: the provisioned trees too, while their identities aren't recorded; a substitute provisioned tree is refused", async () => {
+  // A reboot before the home step: the pass parks on the provisioned identity's stale epoch.
+  let s = await setup();
+  s.m.epoch = REBOOT;
+  for (const k of [...s.m.objects.keys()]) s.m.objects.delete(k); // the runtime and files were never made: nothing recorded
+  const r = await go(s);
+  assert.deepEqual([r.status, r.step], ["pending", "home"]);
+  assert.match(r.reason, /stale epoch \(requalify\)/);
+  const q = await requalify(s);
+  assert.deepEqual(q.rebound, ["provisioned"]);
+  assert.deepEqual(s.h.provisioned.record(s.A).home.epoch, REBOOT);
+  assert.equal((await go(s)).status, "done");
+  await s.close();
+  // The provisioned home replaced by a same-shaped tree after the reboot: refused, the provisioned record unchanged.
+  s = await setup();
+  s.m.epoch = REBOOT;
+  for (const k of [...s.m.objects.keys()]) s.m.objects.delete(k);
+  s.m.trees.home.live = structuredClone(s.m.trees.home.live);
+  s.m.trees.home.live.entries.home.ino = 555;
+  assert.match((await go(s)).reason, /stale epoch \(requalify\)/, "the pass parks first");
+  assert.match((await requalify(s)).reason, /provisioned trees: another durable identity/);
+  assert.equal(s.h.provisioned.record(s.A).home.epoch.boot_id, BOOT);
   await s.close();
 });

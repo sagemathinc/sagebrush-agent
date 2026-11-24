@@ -199,6 +199,32 @@ test("no run, or a run that doesn't name the agent: a no-op that touches nothing
   assert.equal(readJournal({ dir: d.dir }).state, "frozen", "another agent's run is untouched");
 });
 
+test("the run is replaced between the thaw and the lock: the new run's journal and fences are untouched", async () => {
+  const d = dirs();
+  const [a, b] = [newId(), newId()];
+  const groups = frozenRun(d, [a]);
+  const RUN_B = "20261124T020000Z-bcdefghi";
+  let swapped = false, journalB;
+  const cg = fakeCgroup(groups);
+  const frozen = cg.frozen;
+  // Right after A's slice reads back frozen 0 (the last step before the lock), run A ends and run B starts.
+  cg.frozen = (p) => {
+    const v = frozen(p);
+    if (!swapped && p === agentSliceCgroup(a) && v === false) {
+      swapped = true;
+      journalB = advance(advance(newJournal(RUN_B, [b]), "fenced"), "idle");
+      writeJournal(journalB, { dir: d.dir });
+      raiseFence("backup", b, { dir: d.fenceDir });
+    }
+    return v;
+  };
+  const r = await recoverBackup(a, { dir: d.dir, fenceDir: d.fenceDir, cg, ...clock() });
+  assert.ok(swapped);
+  assert.deepEqual(readJournal({ dir: d.dir }), journalB, "B's journal is exactly as B wrote it");
+  assert.ok(existsSync(join(d.fenceDir, "backup", b)), "B's member keeps its backup fence");
+  assert.deepEqual(r, { run: RUN, reaped: true, thawed: true, backupLowered: false, state: "idle" });
+});
+
 test("a tag-folder run: recovering one member reaps the worker and thaws and unfences every member", async () => {
   const d = dirs();
   const [a, b, c] = [newId(), newId(), newId()];

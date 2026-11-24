@@ -1012,12 +1012,18 @@ test("an applying(N) whose grant no longer verifies is held too, and a newer gra
 
 test("recovery from an applying(N) held by expiry stays held: nothing continues or starts after a restart", async () => {
   const root = tmp("state"), fenceDir = tmp("fence"), fx = fakeFx();
-  let sup, armed = true;
+  let sup, armed = true, expiry = null;
   const [first] = [A, B].sort();
-  let s = await setup({ fx, root, fenceDir, barrier: async (n, d) => { if (armed && n === "after_unit_write" && d.agent === first) { armed = false; sup.submit({ kind: "expiry", authority: "host" }); } } });
+  let s = await setup({ fx, root, fenceDir, barrier: async (n, d) => { if (armed && n === "after_unit_write" && d.agent === first) { armed = false; expiry = sup.submit({ kind: "expiry", authority: "host" }); } } });
   sup = s.sup;
+  // The expiry's masks are slow, so it is still running when the held grant resolves: the store is closed only after
+  // the expiry it preempted with has finished (closing earlier would refuse its later writes).
+  const mask = fx.mask;
+  fx.mask = async (...a) => { await new Promise((r) => setTimeout(r, 100)); return mask(...a); };
   await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
-  await new Promise((r) => setTimeout(r, 50));
+  assert.ok(expiry, "the expiry was submitted during the application");
+  assert.equal((await expiry).status, "stopped and fenced");
+  fx.mask = mask;
   await s.close();
   s = await setup({ fx, root, fenceDir });
   assert.deepEqual(await s.sup.recover(), { status: "held", reason: "expired" });

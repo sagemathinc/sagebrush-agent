@@ -1,5 +1,17 @@
 # sagebrush-agent changes
 
+## 0.8.18
+
+**Claude can see images, and what's missing is said before anything starts.**
+
+- **Images:** when Claude reads a PNG, JPEG, GIF or WebP file in the workspace, it gets the picture itself, with one line giving its type and size. That includes its own plots. The type and size come from the file's own bytes. A file over 3.75 MB, over 8000 pixels on a side or over 25 million pixels in all is refused with a short reason, as is one that isn't really an image. The picture's bytes are never logged or shown in a tool card. SVG is read as text, as before. The hello offers `workspace.image` so the page knows. If the API refuses an image anyway, Claude Code drops it and goes on. A turn that ends over it says, in our words, to try a smaller image.
+- **An old Node.js:** on Node.js older than 20, the agent stops at once and says where to get a current one.
+- **Claude Code not signed in:** with a Claude subscription, the agent checks before it starts that Claude Code is signed in. If not, it says how: install Claude Code, run `claude auth login` once in a terminal, then start the agent again. The agent never starts a sign-in itself.
+- **A sign-in that expires during a chat:** the turn ends with one plain reason, "Your Claude sign-in expired. In your terminal, run `claude auth login`, then send your message again.", instead of Claude Code's own text. Only Claude Code's own sign-in messages count; any other error (a key or credential you set, another service's login) is shown as before.
+- **One end per run:** a Claude Code run that ends with an error now ends once, not twice.
+- **License:** sagebrush-agent is now licensed under Apache-2.0 or MIT, at your option, like Sagebrush. The package carries both license texts.
+- **Autonomous agents groundwork:** more of `lib/fleet/` (the browser channel's sessions, host deprovisioning). As before, nothing in the `sagebrush-agent` command uses it yet.
+
 ## 0.8.17
 
 **A Claude subscription is used only by Claude Code itself.** Each Claude turn (a Pair chat, a Delegate task, a chat brief) runs the Claude Code release this sagebrush-agent pins (2.1.330), unmodified, as `claude -p`, with your own Claude login. sagebrush-agent never reads, keeps or passes that login.

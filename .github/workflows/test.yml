@@ -92,6 +92,22 @@ jobs:
       - run: cargo build --locked --release --manifest-path backup/Cargo.toml --target x86_64-unknown-linux-musl
       - run: scripts/backup-static-check-test.sh backup/target/x86_64-unknown-linux-musl/release/sagebrush-agent-backup
 
+  # The launcher (launcher/, sagebrush-agent-launch, root-run and security-critical): its unit and CLI tests, then
+  # the shipped release build. Its Landlock rows need the kernel's ABI 4; SB_TEST_REQUIRE_LANDLOCK makes a runner
+  # kernel without it fail the job rather than skip them.
+  launcher:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0
+      - run: cargo test --locked --manifest-path launcher/Cargo.toml
+        env:
+          SB_TEST_REQUIRE_LANDLOCK: "1"
+      - run: cargo build --locked --release --manifest-path launcher/Cargo.toml
+
   # The Python reference verifier (python/): every case of both shared fleet fixture files, each with the JavaScript
   # checker's result, the RFC 9180 vector, and its own rule rows. Its one dependency, cryptography (with cffi and
   # pycparser), is installed by hash.

@@ -23,6 +23,9 @@ pub enum Fail {
     Quota,
     /// A2: the filesystem itself is out of blocks or inodes. Transient for the agent.
     NoSpace,
+    /// A3: no current execution lease (no record, a spent lg, past the effective end, or the lock busy). Nothing
+    /// changed and nothing of the unit or turn executed.
+    Lease,
 }
 
 impl Fail {
@@ -42,6 +45,7 @@ impl Fail {
             Fail::Partial => 75,
             Fail::Quota => 76,
             Fail::NoSpace => 77,
+            Fail::Lease => 78,
         }
     }
 
@@ -61,6 +65,7 @@ impl Fail {
             Fail::Partial => "partial",
             Fail::Quota => "quota",
             Fail::NoSpace => "no_space",
+            Fail::Lease => "lease",
         }
     }
 }
@@ -105,6 +110,7 @@ mod tests {
             (Fail::Partial, 75, "partial"),
             (Fail::Quota, 76, "quota"),
             (Fail::NoSpace, 77, "no_space"),
+            (Fail::Lease, 78, "lease"),
         ];
         for (f, c, r) in all {
             assert_eq!(f.code(), c);

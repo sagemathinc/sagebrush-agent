@@ -46,7 +46,7 @@ test("every required §4.2 directive is present, and the dangerous ones are abse
     "RestrictRealtime=yes", "RestrictNamespaces=yes", "SystemCallArchitectures=native", "SystemCallFilter=@system-service",
     "SystemCallFilter=~@mount @swap @reboot @raw-io @module @obsolete @cpu-emulation @privileged", "PrivateDevices=yes",
     `NetworkNamespacePath=/run/netns/sb-${A}`, "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK", "LimitCORE=0",
-    "Slice=sagebrush-agents.slice", "Delegate=no", "KillMode=control-group", "Restart=on-failure", "MemorySwapMax=0",
+    `Slice=sagebrush-agents-${A}.slice`, "Delegate=no", "KillMode=control-group", "Restart=on-failure", "MemorySwapMax=0",
     "MemoryMax=6144M", "TasksMax=4096", "CPUQuota=200%", "LimitNOFILE=65536",
   ]) has(line);
   for (const bad of [/^Environment/m, /^MemoryDenyWriteExecute/m, /^PAMName/m, /^PrivateTmp/m, /^User=root/m, /^AmbientCapabilities=.+/m, /^CapabilityBoundingSet=.+/m]) {
@@ -54,7 +54,7 @@ test("every required §4.2 directive is present, and the dangerous ones are abse
   }
 });
 
-test("the stop fences (§3.3) and the backup fence are start conditions, one per cause", () => {
+test("the stop fences (§3.3), the backup fence, the lease fence (execution lease §2) and the restore fence are start conditions, one per cause", () => {
   const { text } = renderUnit(agent(), ctx());
   const conds = text.split("\n").filter((l) => l.startsWith("ConditionPathExists="));
   assert.deepEqual(conds, [
@@ -62,6 +62,8 @@ test("the stop fences (§3.3) and the backup fence are start conditions, one per
     `ConditionPathExists=!/var/lib/sagebrush/fence/${A}`,
     "ConditionPathExists=!/var/lib/sagebrush/fence/expiry",
     `ConditionPathExists=!/var/lib/sagebrush/fence/backup/${A}`,
+    `ConditionPathExists=!/var/lib/sagebrush/fence/lease/${A}`,
+    `ConditionPathExists=!/var/lib/sagebrush/fence/restore/${A}`,
   ]);
 });
 
@@ -252,4 +254,13 @@ test("launcherContract: the launcher's closed JSON (rules = the Landlock column,
   assert.deepEqual(withProxy.env.slice(-3).map((e) => e[0]), ["HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]);
   refused(() => launcherContract(agent(), ctx(), [{ index: 0, path: "/elsewhere", mode: "rw", dev: [8, 1], ino: 1 }], null), "bad_form");
   refused(() => launcherContract(agent(), ctx(), [{ index: 64, path: "/data/project", mode: "rw", dev: [8, 1], ino: 1 }], null), "bad_form");
+});
+
+test("the execution lease's guard runs first: ExecStartPre=+ lease-check, root and non-root agents alike (launcher A3)", () => {
+  for (const root of [false, true]) {
+    const lines = renderUnit(agent({ root }), ctx()).text.split("\n");
+    const pre = lines.filter((l) => l.startsWith("ExecStartPre="));
+    assert.deepEqual(pre, [`ExecStartPre=+/opt/sagebrush/1.2.3/bin/sagebrush-agent-launch lease-check --agent ${A}`], `root=${root}`);
+    assert.ok(lines.indexOf(pre[0]) < lines.findIndex((l) => l.startsWith("ExecStart=")), `root=${root}: before ExecStart`);
+  }
 });

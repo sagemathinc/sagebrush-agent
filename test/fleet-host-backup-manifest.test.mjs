@@ -65,6 +65,7 @@ test("the config hashes are exactly the live agents': a missing one, an extra on
   refused(() => buildManifest({ ...args, config: { [a]: hex(21) } }), "not_granted");
   refused(() => buildManifest({ ...args, config: { ...args.config, [newId()]: hex(23) } }), "not_granted");
   refused(() => buildManifest({ ...args, config: { ...args.config, [c]: hex(23) } }), "not_granted");
+  refused(() => buildManifest({ ...args, config: { [newId()]: hex(21), [b]: hex(22) } }), "not_granted"); // same size, a live agent swapped out
   const m = buildManifest(args);
   assert.deepEqual(Object.keys(m.config).sort(), [a, b].sort());
   for (const config of [{}, { [a]: hex(21) }, { ...m.config, [c]: hex(23) }, { ...m.config, [newId()]: hex(23) }]) {
@@ -106,7 +107,7 @@ test("commit: backed up as sb-kind=manifest, read back, dumped and compared byte
     const r = await commitManifest(m, staging, { binary });
     assert.deepEqual(r, { ok: true, snapshot: hex(77), sha256: sha256(canonical(m) + "\n") });
     assert.deepEqual(binary.calls.map((c) => c.op), ["backup", "readback", "dump"]);
-    assert.deepEqual(binary.calls[0].tags, [`sb-run=${RUN}`, "sb-state=good", "sb-kind=manifest"]);
+    assert.deepEqual(binary.calls[0].tags, [`sb-run=${RUN}`, "sb-state=good", "sb-kind=manifest", `sb-manifest=${sha256(canonical(m) + "\n")}`]);
     assert.equal(binary.calls[2].path, `${staging.slice(1)}/manifest.json`);
   }
   for (const [name, opts] of [["a dump that differs", { text: "{}\n" }], ["read-back findings", { readback: { ok: true, value: { findings: 1 } } }], ["a read-back failure", { readback: { ok: false, code: "readback_failed" } }]]) {
@@ -166,34 +167,59 @@ test("the data check's part at fixed UTC days: day 0 is part 1, day 29 part 30, 
   assert.equal(checkDataPart(Date.parse("2026-11-24T23:59:59Z")).part, 22, "the same UTC day, the same part");
 });
 
-const snap = (id, time, tags) => ({ id, time, tags });
-const T = (kind, state, run = RUN) => [`sb-kind=${kind}`, `sb-state=${state}`, `sb-run=${run}`];
+const HOST = "h1";
+const snap = (id, time, tags, host = HOST, tree = hex(0)) => ({ id, time, tags, host, tree });
+/** Our tags for a snapshot: kind, state, run, and the id tag its kind needs (or the manifest hash). */
+const T = (kind, state, run = RUN, extra = null) => {
+  const t = [`sb-kind=${kind}`, `sb-state=${state}`, `sb-run=${run}`];
+  if (["agent", "archive", "tag"].includes(kind)) t.push(`${kind}=${extra ?? newId()}`);
+  if (kind === "manifest") t.push(`sb-manifest=${extra ?? hex(999)}`);
+  return t;
+};
+
+test("classify is strict: exactly one of each tag, the run grammar, the id or hash its kind needs, this host", () => {
+  const id = newId();
+  assert.deepEqual(classify(snap(hex(1), 0, T("agent", "good", RUN, id)), HOST), { kind: "agent", state: "good", run: RUN, id, manifest: null });
+  for (const [name, s] of [
+    ["another host", snap(hex(1), 0, T("agent", "good"), "other")],
+    ["two kinds", snap(hex(1), 0, [...T("agent", "good"), "sb-kind=tag"])],
+    ["two states", snap(hex(1), 0, [...T("agent", "warm"), "sb-state=good"])],
+    ["a bad run", snap(hex(1), 0, T("agent", "good", "run-1"))],
+    ["no id tag", snap(hex(1), 0, ["sb-kind=agent", "sb-state=good", `sb-run=${RUN}`])],
+    ["two id tags", snap(hex(1), 0, [...T("agent", "good"), `agent=${newId()}`])],
+    ["a manifest without its hash", snap(hex(1), 0, ["sb-kind=manifest", "sb-state=good", `sb-run=${RUN}`])],
+    ["a warm manifest", snap(hex(1), 0, T("manifest", "warm"))],
+    ["no tags", snap(hex(1), 0, ["user=1"])],
+  ]) assert.equal(classify(s, HOST), null, name);
+});
 
 test("roots: kept manifests and all they reference (an unchanged agent's old snapshot included), and good snapshots newer than the last manifest", () => {
   const mOld = hex(100), mNew = hex(101), oldAgent = hex(1), fresh = hex(2), orphan = hex(3);
   const snaps = [snap(mOld, T0 - 60 * DAY, T("manifest", "good")), snap(mNew, T0 - DAY, T("manifest", "good")),
     snap(oldAgent, T0 - 90 * DAY, T("agent", "good")), snap(orphan, T0 - 30 * DAY, T("agent", "good")), snap(fresh, T0, T("agent", "good"))];
   const contents = new Map([[mOld, [oldAgent]], [mNew, [oldAgent]]]);
-  const roots = rootsOf(new Set([mOld, mNew]), contents, snaps, T0 - DAY);
+  const roots = rootsOf(new Set([mOld, mNew]), contents, snaps, T0 - DAY, HOST);
   assert.deepEqual([...roots].sort(), [oldAgent, fresh, mOld, mNew].sort());
-  refused(() => rootsOf(new Set([mOld]), new Map(), snaps, T0), "not_found");
+  refused(() => rootsOf(new Set([mOld]), new Map(), snaps, T0, HOST), "not_found");
 });
 
-test("forget: never a root, never a snapshot that isn't ours; warm ones by age or by an ended run, never the active run's", () => {
+test("forget: never a root, nothing not unambiguously ours, nothing of the active run (good or warm, however old)", () => {
   const roots = new Set([hex(1)]);
   const snaps = [
     snap(hex(1), T0 - 100 * DAY, T("agent", "good")), // root
-    snap(hex(2), T0 - 10 * DAY, T("agent", "good")), // unreferenced, old
+    snap(hex(2), T0 - 10 * DAY, T("agent", "good", "20261101T030000Z-dddddddd")), // unreferenced, old
     snap(hex(3), T0 - 10 * DAY, ["user=1"]), // not ours
     snap(hex(4), T0 - 2 * DAY, T("agent", "warm", "20261122T030000Z-aaaaaaaa")), // stale warm
     snap(hex(5), T0 - 3600000, T("agent", "warm", "20261124T020000Z-bbbbbbbb")), // young warm of an ended run
-    snap(hex(6), T0 - 3 * DAY, T("agent", "warm", RUN)), // the active run's (however old)
+    snap(hex(6), T0 - 3 * DAY, T("agent", "warm", RUN)), // the active run's warm
     snap(hex(7), T0 - 3600000, T("agent", "warm", "20261124T010000Z-cccccccc")), // young warm, run unknown: kept for now
-    snap(hex(8), T0 - 20 * DAY, T("manifest", "good")), // a manifest not kept
+    snap(hex(8), T0 - 20 * DAY, T("manifest", "good", "20261101T030000Z-dddddddd")), // a manifest not kept
+    snap(hex(9), T0 - 30 * DAY, T("agent", "good", RUN)), // the active run's GOOD, older than anything
+    snap(hex(10), T0 - 30 * DAY, T("agent", "good", "20261101T030000Z-dddddddd"), "other-host"), // another host's
+    snap(hex(11), T0 - 30 * DAY, [...T("agent", "good", "20261101T030000Z-dddddddd"), "sb-state=warm"]), // ambiguous
   ];
-  const plan = forgetPlan(snaps, roots, { now: T0, activeRun: RUN, endedRuns: new Set(["20261124T020000Z-bbbbbbbb"]) });
+  const plan = forgetPlan(snaps, roots, { now: T0, host: HOST, activeRun: RUN, endedRuns: new Set(["20261124T020000Z-bbbbbbbb"]) });
   assert.deepEqual(plan, [hex(2), hex(4), hex(5), hex(8)]);
-  assert.equal(classify(snap(hex(9), 0, ["sb-kind=manifest", "sb-state=warm", `sb-run=${RUN}`])), null);
   refused(() => forgetPlan(snaps, roots, {}), "bad_form");
 });
 
@@ -211,32 +237,59 @@ function store(snapshots, manifests, { failDump = null, failReadback = null } = 
   fn.calls = calls;
   return fn;
 }
-const listed = (id, time, tags) => ({ id, time: new Date(time).toISOString(), tree: hex(0), host: "h1", paths: ["/var/lib/sagebrush/backup/staging-x"], tags, summary: null });
+const listed = (id, time, tags, { host = HOST, tree = hex(0) } = {}) => ({ id, time: new Date(time).toISOString(), tree, host, paths: ["/var/lib/sagebrush/backup/staging-x"], tags, summary: null });
 
-test("a retention pass: roots from the manifests as dumped from the store; forget only outside them, in batches", async () => {
+/** A store holding one committed manifest and exactly the snapshots it references, plus `extra` listings. */
+function committedStore(extra = [], { text = null, tag = null, edit = (x) => x } = {}) {
   const f = fixture();
   const m = buildManifest(f.args);
+  const mtext = canonical(m) + "\n";
   const mid = hex(500);
-  const snapshots = [listed(mid, T0 - DAY, T("manifest", "good")), ...[1, 2, 3, 4, 5].map((n) => listed(hex(n), T0 - 2 * DAY, T("agent", "good"))),
-    listed(hex(6), T0 - 2 * DAY, T("agent", "good")), listed(hex(7), T0 - 2 * DAY, T("agent", "warm", "20261122T030000Z-aaaaaaaa"))];
-  const binary = store(snapshots, new Map([[mid, canonical(m) + "\n"]]));
-  const r = await retentionPass({ binary }, { now: T0, parse: parseManifest, referenced, batch: 1 });
+  const refs = m.sets.map((set) => listed(set.snapshot, T0 - 2 * DAY, T(set.kind, "good", RUN, set.id), { tree: set.tree }));
+  const snapshots = edit.call(m, [listed(mid, T0 - DAY, T("manifest", "good", RUN, tag ?? sha256(mtext))), ...refs, listed(m.hoststore, T0 - 2 * DAY, T("hoststore", "good")), ...extra]);
+  return { binary: store(snapshots, new Map([[mid, text ?? mtext]])), mid, m };
+}
+const pass = (binary) => retentionPass({ binary }, { now: T0, host: HOST, parse: parseManifest, sha256, batch: 1 });
+
+test("a retention pass: the manifest checked against its bound hash, its references against the listing; forget only outside, in batches", async () => {
+  const extra = [listed(hex(6), T0 - 2 * DAY, T("agent", "good", "20261101T030000Z-dddddddd")), listed(hex(7), T0 - 2 * DAY, T("agent", "warm", "20261122T030000Z-aaaaaaaa"))];
+  const { binary, mid } = committedStore(extra);
+  const r = await pass(binary);
   assert.deepEqual(r.kept, [mid]);
   assert.deepEqual(r.forgotten, [hex(6), hex(7)]);
   assert.deepEqual(binary.calls.filter((c) => c.op === "forget"), [{ op: "forget", snapshots: [hex(6)] }, { op: "forget", snapshots: [hex(7)] }]);
 });
 
-test("a retention pass with any doubt about a manifest forgets nothing: a dump or read-back that fails, a text that doesn't parse", async () => {
-  const m = buildManifest(fixture().args);
-  const mid = hex(500);
-  const snapshots = [listed(mid, T0 - DAY, T("manifest", "good")), listed(hex(6), T0 - 2 * DAY, T("agent", "good"))];
-  for (const [name, b] of [
-    ["a dump failure", store(snapshots, new Map([[mid, canonical(m) + "\n"]]), { failDump: mid })],
-    ["a read-back failure", store(snapshots, new Map([[mid, canonical(m) + "\n"]]), { failReadback: mid })],
-    ["an unparsable manifest", store(snapshots, new Map([[mid, "{}\n"]]))],
-  ]) {
-    const r = await retentionPass({ binary: b }, { now: T0, parse: parseManifest, referenced });
-    assert.ok(r.error, name);
-    assert.ok(!b.calls.some((c) => c.op === "forget"), `${name}: nothing forgotten`);
+test("a retention pass with any doubt forgets nothing", async () => {
+  const stale = listed(hex(6), T0 - 2 * DAY, T("agent", "good", "20261101T030000Z-dddddddd"));
+  const variants = [
+    ["a dump failure", committedStore([stale]), { failDump: true }],
+    ["a read-back failure", committedStore([stale]), { failReadback: true }],
+    ["an unparsable manifest", committedStore([stale], { text: "{}\n", tag: sha256("{}\n") })],
+    ["text that isn't the bound hash", committedStore([stale], { tag: hex(4242) })],
+    ["a referenced snapshot missing", committedStore([stale], { edit: (l) => l.filter((x) => x.id !== hex(2)) })],
+    ["a referenced snapshot with another tree", committedStore([stale], { edit: (l) => l.map((x) => (x.id === hex(1) ? { ...x, tree: hex(99) } : x)) })],
+    // the archive's own id, listed under another kind: only the kind is wrong
+    ["a referenced snapshot of another kind", committedStore([stale], { edit: function (l) { const c = this.sets.find((x) => x.kind === "archive"); return l.map((x) => (x.id === c.snapshot ? { ...x, tags: T("agent", "good", RUN, c.id) } : x)); } })],
+    ["the host store missing", committedStore([stale], { edit: (l) => l.filter((x) => x.id !== hex(5)) })],
+    ["a duplicate snapshot id", committedStore([stale, { ...stale }])],
+  ];
+  for (const [name, s, fail] of variants) {
+    let binary = s.binary;
+    if (fail?.failDump || fail?.failReadback) {
+      const inner = s.binary;
+      binary = async (req, o) => {
+        if (fail.failDump && req.op === "dump" && req.snapshot === s.mid) return { ok: false, code: "destination_unavailable" };
+        if (fail.failReadback && req.op === "readback" && req.snapshot === s.mid) return { ok: false, code: "readback_failed" };
+        return inner(req, o);
+      };
+      binary.calls = inner.calls;
+    }
+    const r = await pass(binary);
+    assert.ok(r.error, `${name}: an error`);
+    assert.ok(!(binary.calls ?? []).some((c) => c.op === "forget"), `${name}: nothing forgotten`);
   }
+  // the same store without any doubt does forget the stale snapshot (so the rows above test the doubt, not the store)
+  const ok = await pass(committedStore([stale]).binary);
+  assert.deepEqual(ok.forgotten, [hex(6)]);
 });

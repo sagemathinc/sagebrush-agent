@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
-import { EXIT, classPaths, fillExpect, outcomeOf, ownersOf, restoreFiller, writeExpectFile } from "../lib/fleet/host/restore-fill.mjs";
+import { EXIT, classPaths, destOf, fillExpect, outcomeOf, ownersOf, restoreFiller, writeExpectFile } from "../lib/fleet/host/restore-fill.mjs";
 import { realIo } from "../lib/fleet/host/store.mjs";
 import { MAX_ATTEMPTS, newRestoreRun, readRecord, retryRecord, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 
@@ -272,6 +272,10 @@ test("fillExpect: the launcher's identity of the destination plus the class's ow
   assert.throws(() => fillExpect({ ...identity, object: { ...object, dev: 2049 } }, owners), (e) => e.code === "bad_form");
   assert.throws(() => fillExpect({ ...identity, object: { ...object, type: "file" } }, owners), (e) => e.code === "not_granted");
   assert.throws(() => fillExpect({ ...identity, object: { ...object, projid: 70006 } }, owners), (e) => e.code === "not_granted");
+  assert.throws(() => fillExpect({ ...identity, object: { ...object, inherit: false } }, owners), (e) => e.code === "not_granted", "no inherit flag");
+  // destOf pins the device encoding: [major, minor] as major * 2^20 + minor.
+  assert.deepEqual(destOf({ ...object, dev: [8, 1], ino: 42 }), { dev: "8388609", ino: "42" });
+  assert.deepEqual(destOf({ ...object, dev: [259, 3], ino: 7 }), { dev: String(259 * 1048576 + 3), ino: "7" });
   // The test seam: this process's uid and gid stand for root's (the real caller passes 0 and 0).
   const me = { rootUid: typeof process.getuid === "function" ? process.getuid() : -1, rootGid: typeof process.getgid === "function" ? process.getgid() : -1 };
   const dir = join(mkdtempSync(join(tmpdir(), "sb-expect-")), "expect");

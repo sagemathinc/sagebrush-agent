@@ -19,7 +19,8 @@ import {
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
 const hex = (n) => n.toString(16).padStart(64, "0");
-const me = process.getuid();
+// Read at import, so guarded: process.getuid exists only on POSIX; elsewhere every row here is skipped (host-linux-only).
+const me = typeof process.getuid === "function" ? process.getuid() : -1;
 
 function setupDir() {
   const dir = join(mkdtempSync(join(tmpdir(), "sb-sched-")), "backup");

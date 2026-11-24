@@ -31,6 +31,9 @@ pub const MAX_SUBPATHS: usize = 16;
 
 /// The four handle operations A4 adds to A1's. `RealOps` maps each to one syscall wrapper in `sys`.
 pub trait ProfileOps: Ops {
+    /// umask(0), so a new mountpoint's mode is exactly the requested 0555 whatever the caller's umask (an inherited
+    /// 0077 would make it 0500), and a crash right after the mkdir leaves exactly the bounded residue.
+    fn clear_umask(&mut self);
     fn mkdir(&mut self, dir: &Self::H, name: &str, mode: u16) -> io::Result<()>;
     fn chown(&mut self, h: &Self::H, uid: u32, gid: u32) -> io::Result<()>;
     fn immutable(&mut self, h: &Self::H) -> io::Result<bool>;
@@ -38,6 +41,9 @@ pub trait ProfileOps: Ops {
 }
 
 impl ProfileOps for RealOps {
+    fn clear_umask(&mut self) {
+        sys::umask0();
+    }
     fn mkdir(&mut self, dir: &OwnedFd, name: &str, mode: u16) -> io::Result<()> {
         sys::mkdirat(dir, &c(name)?, mode as libc::mode_t)
     }
@@ -140,6 +146,7 @@ pub fn create<O: ProfileOps>(o: &mut O, pid: &str, subpaths: &[String], expect_d
     let root = o.root().map_err(|_| pre("the root can't be opened"))?;
     let want = dir_expect(&read_expect(o, &root, expect_dir)?)?;
     let (p, mnt) = open_profile(o, pid, &want)?;
+    o.clear_umask();
     let mut changed = false;
     let mut out = Vec::with_capacity(subpaths.len());
     for name in subpaths {
@@ -161,9 +168,11 @@ pub fn create<O: ProfileOps>(o: &mut O, pid: &str, subpaths: &[String], expect_d
             Some((x, Some(h))) => (x, h),
             Some(_) => return Err(fail(changed, "a mountpoint name holds a symlink")),
         };
-        // Exactly what this step makes (immutable already, or the one bounded residue without the flag).
+        // Exactly what this step makes (immutable already, or the one bounded residue without the flag): a directory,
+        // root:root, 0555, empty, with exactly two links (no subdirectory, and nothing hard-linked in).
         let empty = is_empty(o, &h).map_err(|e| if changed { err(Fail::Partial, "a mountpoint can't be listed") } else { e })?;
-        if x.kind != Kind::Dir || x.uid != 0 || x.gid != 0 || x.mode != 0o555 || !empty {
+        let nlink = o.ident(&h).map_err(|_| fail(changed, "a mountpoint can't be examined"))?.nlink;
+        if x.kind != Kind::Dir || x.uid != 0 || x.gid != 0 || x.mode != 0o555 || !empty || nlink != 2 {
             return Err(fail(changed, "a mountpoint name holds something else"));
         }
         let flagged = o.immutable(&h).map_err(|_| fail(changed, "a mountpoint's flags can't be read"))?;
@@ -248,13 +257,19 @@ mod tests {
     const PDIR: &str = "srv/sagebrush/claude-profiles/abcdefghijklmnopqrstuvwxya";
 
     impl ProfileOps for Fake {
+        /// A test knob, "<umask>" holding the octal umask the launcher inherited; clear_umask removes it.
+        fn clear_umask(&mut self) {
+            self.xattrs.remove("<umask>");
+        }
         fn mkdir(&mut self, dir: &FH, name: &str, mode: u16) -> io::Result<()> {
             self.tick("mkdir")?;
             let p = join(&dir.p, name);
             if self.nodes.contains_key(&p) {
                 return Err(e(libc::EEXIST));
             }
-            self.add(&p, S_IFDIR | mode, 0, 0);
+            let umask = self.xattrs.get("<umask>").and_then(|v| v.first()).map_or(0, |s| u16::from_str_radix(s, 8).unwrap());
+            self.add(&p, S_IFDIR | (mode & !umask), 0, 0);
+            self.node(&p).id.nlink = 2; // a new, empty directory
             self.log.push(format!("mkdir {p}"));
             Ok(())
         }
@@ -293,6 +308,14 @@ mod tests {
     fn dir_file(f: &mut Fake) -> String {
         let id = identify(f, PROFILES, A).unwrap();
         expect_file(f, "dir.json", id.trim_end().to_string())
+    }
+
+    /// An existing entry at `p`: a directory gets nlink 2 (empty), as on the kernel.
+    fn entry(f: &mut Fake, p: &str, mode: u16, uid: u32, gid: u32) {
+        f.add(p, mode, uid, gid);
+        if mode & 0o170000 == S_IFDIR {
+            f.node(p).id.nlink = 2;
+        }
     }
 
     fn subs(names: &[&str]) -> Vec<String> {
@@ -352,10 +375,20 @@ mod tests {
     }
 
     #[test]
+    fn an_inherited_umask_doesnt_change_the_mountpoint_mode() {
+        // Under an inherited 0077, mkdirat(0555) alone would make 0500, and create would refuse its own entry.
+        let mut f = fixture();
+        f.xattrs.insert("<umask>".into(), vec!["077".into()]);
+        let d = dir_file(&mut f);
+        create(&mut f, A, &subs(&["projects"]), &d).unwrap();
+        assert_eq!(f.nodes[&format!("{PDIR}/projects")].id.mode & 0o7777, 0o555);
+    }
+
+    #[test]
     fn create_accepts_the_one_bounded_residue_and_flags_it() {
         // A crash between the mkdir and the flag: an empty root:root 0555 directory without the flag.
         let mut f = fixture();
-        f.add(&format!("{PDIR}/projects"), S_IFDIR | 0o555, 0, 0);
+        entry(&mut f, &format!("{PDIR}/projects"), S_IFDIR | 0o555, 0, 0);
         let d = dir_file(&mut f);
         create(&mut f, A, &subs(&["projects"]), &d).unwrap();
         assert!(f.nodes[&format!("{PDIR}/projects")].immutable);
@@ -365,13 +398,14 @@ mod tests {
     #[test]
     fn create_refuses_an_existing_entry_that_differs_with_nothing_changed_or_75_after_a_change() {
         type Spoil = fn(&mut Fake, &str);
-        let cases: [(&str, Spoil); 6] = [
-            ("owner", |f, p| f.add(p, S_IFDIR | 0o555, SUID, SUID)),
-            ("mode", |f, p| f.add(p, S_IFDIR | 0o755, 0, 0)),
-            ("non-empty", |f, p| { f.add(p, S_IFDIR | 0o555, 0, 0); f.file(&format!("{p}/x"), SUID, 0o600); }),
+        let cases: [(&str, Spoil); 7] = [
+            ("owner", |f, p| entry(f, p, S_IFDIR | 0o555, SUID, SUID)),
+            ("mode", |f, p| entry(f, p, S_IFDIR | 0o755, 0, 0)),
+            ("non-empty", |f, p| { entry(f, p, S_IFDIR | 0o555, 0, 0); f.file(&format!("{p}/x"), SUID, 0o600); }),
             ("a file", |f, p| f.file(p, 0, 0o555)),
             ("a symlink", |f, p| f.add(p, libc::S_IFLNK as u16 | 0o777, 0, 0)),
-            ("unflagged but group 1", |f, p| f.add(p, S_IFDIR | 0o555, 0, 1)),
+            ("unflagged but group 1", |f, p| entry(f, p, S_IFDIR | 0o555, 0, 1)),
+            ("nlink 3", |f, p| { entry(f, p, S_IFDIR | 0o555, 0, 0); f.node(p).id.nlink = 3; }),
         ];
         for (label, spoil) in cases {
             let mut f = fixture();
@@ -433,7 +467,7 @@ mod tests {
             ("another generation", |f, p| { f.node(p).gen += 1; }),
             ("non-empty", |f, p| { f.node(p).immutable = false; f.file(&format!("{p}/x"), SUID, 0o600); }),
             ("foreign owner", |f, p| { f.node(p).id.uid = SUID; }),
-            ("replaced", |f, p| { f.nodes.remove(p); f.add(p, S_IFDIR | 0o555, 0, 0); }),
+            ("replaced", |f, p| { f.nodes.remove(p); entry(f, p, S_IFDIR | 0o555, 0, 0); }),
         ];
         for (label, spoil) in cases {
             for (first, code_want) in [(true, 73), (false, 75)] {
@@ -456,7 +490,7 @@ mod tests {
     fn a_failed_flag_change_is_66_before_any_change_and_75_after() {
         let mut f = fixture();
         let d = dir_file(&mut f);
-        f.add(&format!("{PDIR}/projects"), S_IFDIR | 0o555, 0, 0); // the residue: needs only the flag
+        entry(&mut f, &format!("{PDIR}/projects"), S_IFDIR | 0o555, 0, 0); // the residue: needs only the flag
         f.errno_at = Some(("set_immutable", 1, libc::EPERM));
         assert_eq!(code(create(&mut f, A, &subs(&["projects"]), &d)), 73);
         let mut f = fixture();

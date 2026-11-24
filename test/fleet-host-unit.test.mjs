@@ -46,7 +46,7 @@ test("every required §4.2 directive is present, and the dangerous ones are abse
     "RestrictRealtime=yes", "RestrictNamespaces=yes", "SystemCallArchitectures=native", "SystemCallFilter=@system-service",
     "SystemCallFilter=~@mount @swap @reboot @raw-io @module @obsolete @cpu-emulation @privileged", "PrivateDevices=yes",
     `NetworkNamespacePath=/run/netns/sb-${A}`, "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK", "LimitCORE=0",
-    "Slice=sagebrush-agents.slice", "Delegate=no", "KillMode=control-group", "Restart=on-failure", "MemorySwapMax=0",
+    `Slice=sagebrush-agents-${A}.slice`, "Delegate=no", "KillMode=control-group", "Restart=on-failure", "MemorySwapMax=0",
     "MemoryMax=6144M", "TasksMax=4096", "CPUQuota=200%", "LimitNOFILE=65536",
   ]) has(line);
   for (const bad of [/^Environment/m, /^MemoryDenyWriteExecute/m, /^PAMName/m, /^PrivateTmp/m, /^User=root/m, /^AmbientCapabilities=.+/m, /^CapabilityBoundingSet=.+/m]) {
@@ -54,7 +54,7 @@ test("every required §4.2 directive is present, and the dangerous ones are abse
   }
 });
 
-test("the stop fences (§3.3) and the backup fence are start conditions, one per cause", () => {
+test("the stop fences (§3.3), the backup fence and the lease fence (execution lease §2) are start conditions, one per cause", () => {
   const { text } = renderUnit(agent(), ctx());
   const conds = text.split("\n").filter((l) => l.startsWith("ConditionPathExists="));
   assert.deepEqual(conds, [
@@ -62,6 +62,7 @@ test("the stop fences (§3.3) and the backup fence are start conditions, one per
     `ConditionPathExists=!/var/lib/sagebrush/fence/${A}`,
     "ConditionPathExists=!/var/lib/sagebrush/fence/expiry",
     `ConditionPathExists=!/var/lib/sagebrush/fence/backup/${A}`,
+    `ConditionPathExists=!/var/lib/sagebrush/fence/lease/${A}`,
   ]);
 });
 

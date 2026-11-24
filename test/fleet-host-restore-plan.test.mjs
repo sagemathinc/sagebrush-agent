@@ -11,13 +11,18 @@ import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { buildManifest, canonical, sha256 } from "../lib/fleet/host/backup-manifest.mjs";
 import { PLAN, checkPlan, chooseManifest, createPlan, expectedOf, listManifests, newPlan, readPlan, replanSet, updatePlan, withRestoreLock } from "../lib/fleet/host/restore-plan.mjs";
-import { newRecord, restoreReady, retryRecord, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
+import { newRecord, newRestoreRun, restoreReady, retryRecord, runTime, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
 let n = 0;
 const hex = () => (++n).toString(16).padStart(64, "0");
-const RUN = "20261124T030000Z-abcdefgh", RUN2 = "20261125T030000Z-bcdefghi", RRUN = "20261126T010000Z-cdefghij", RRUN2 = "20261126T020000Z-defghijk";
+const RUN = "20261124T030000Z-abcdefgh", RUN2 = "20261125T030000Z-bcdefghi"; // backup runs
+const T0 = 1795500000000;
+const zeros = () => Buffer.alloc(6);
+/** A restore run at T0 + `ms`. */
+const rrun = (ms, rand = zeros) => newRestoreRun(T0 + ms, rand);
+const RRUN = rrun(0), RRUN2 = rrun(3600000);
 const fresh = () => join(mkdtempSync(join(tmpdir(), "sb-plan-")), "restore");
 
 /**
@@ -152,6 +157,8 @@ test("the plan: every set of the chosen manifest bound to the restore's run, its
   assert.deepEqual(p.sets, Object.fromEntries(b.m.sets.map((s) => [`${s.kind}-${s.id}`, { run: RRUN, snapshot: s.snapshot, tree: s.tree }])));
   assert.deepEqual(expectedOf(p), Object.fromEntries(b.m.sets.map((s) => [`${s.kind}-${s.id}`, { run: RRUN, snapshot: s.snapshot }])));
   refused(() => newPlan(chosen, "x"), "bad_form");
+  refused(() => newPlan(chosen, RUN), "bad_form"); // a backup's run format isn't a restore's
+  refused(() => checkPlan({ ...p, sets: Object.fromEntries(Object.entries(p.sets).map(([k, v]) => [k, { ...v, run: RUN }])) }), "bad_form");
   // A manifest with no sets still needs a valid run.
   const empty = { ...chosen, manifest: { ...chosen.manifest, sets: [] } };
   assert.deepEqual(newPlan(empty, RRUN).sets, {});
@@ -189,7 +196,7 @@ test("the plan is restoreReady's authority: records of the plan's run and snapsh
   assert.equal(retryRecord(stopped, { run: replanSet(p, "agent", agent, RRUN2).sets[`agent-${agent}`].run, snapshot: p.sets[`agent-${agent}`].snapshot }).run, RRUN2);
 });
 
-test("re-planning a set: only a set of this restore, only to a newer run, nothing else changes", async () => {
+test("re-planning a set: only a set of this restore, only to a run newer by decoded time, nothing else changes", async () => {
   const b = backup("old-host", RUN, "2026-11-24T03:10:00.000Z");
   const p = newPlan(await chooseManifest(store([b]), b.mid), RRUN);
   const k = `agent-${b.ids[1]}`;
@@ -198,7 +205,16 @@ test("re-planning a set: only a set of this restore, only to a newer run, nothin
   refused(() => replanSet(p, "agent", newId(), RRUN2), "not_found");
   refused(() => replanSet(p, "tag", b.ids[1], RRUN2), "not_found");
   refused(() => replanSet(p, "agent", b.ids[1], RRUN), "bad_form"); // the same run
-  refused(() => replanSet(p2, "agent", b.ids[1], RRUN), "bad_form"); // an older one
+  refused(() => replanSet(p2, "agent", b.ids[1], RRUN), "bad_form"); // an older one: its old records would count again
+  refused(() => replanSet(p2, "agent", b.ids[1], rrun(3600000, () => Buffer.alloc(6, 7))), "bad_form"); // the same ms
+  refused(() => replanSet(p, "agent", b.ids[1], "20261126T020000Z-aaaaaaaa"), "bad_form"); // a backup's run format
+  // Order is by decoded time, not by the strings: a later run whose string sorts lower is newer, and the reverse not.
+  const t = 3600000 - ((T0 + 3600000) % 32) + 25 + 32;
+  const older = rrun(t), later = rrun(t + 1);
+  assert.ok(later < older && runTime(later) > runTime(older), "the later run's string sorts lower");
+  const q = replanSet(p, "agent", b.ids[1], older);
+  assert.equal(replanSet(q, "agent", b.ids[1], later).sets[k].run, later);
+  refused(() => replanSet(replanSet(q, "agent", b.ids[1], later), "agent", b.ids[1], older), "bad_form");
   refused(() => replanSet(p, "agent", b.ids[1], "x"), "bad_form");
   refused(() => replanSet({ ...p, v: 0 }, "agent", b.ids[1], RRUN2), "bad_form");
 });
@@ -225,13 +241,39 @@ test("the plan on disk: created once (0600, exclusive; the same plan again is fi
   const p2 = replanSet(p, kind, id, RRUN2);
   updatePlan(p2, { dir });
   assert.deepEqual(readPlan({ dir }), p2);
+  updatePlan(p2, { dir }); // the same update again: a retry, no-op
+  assert.deepEqual(readPlan({ dir }), p2);
+  // Exactly one set's new request: two sets moved at once refuse, and so does one set's request with anything else
+  // of the plan changed too.
+  const [k2] = Object.keys(p2.sets).filter((x) => x !== k);
+  const [kind2, id2] = [k2.split("-")[0], k2.slice(k2.indexOf("-") + 1)];
+  const two = replanSet(replanSet(p2, kind, id, rrun(7200000)), kind2, id2, rrun(7200000));
+  const step3 = replanSet(p2, kind, id, rrun(7200000));
+  const alsoChanged = [
+    { ...step3, manifest: hex() }, { ...step3, sha256: hex() }, { ...step3, hoststore: hex() }, { ...step3, host: "elsewhere" },
+    { ...step3, sets: { ...step3.sets, [k]: { ...step3.sets[k], snapshot: hex() } } },
+    { ...step3, sets: { ...step3.sets, [k]: { ...step3.sets[k], tree: hex() } } },
+    { ...step3, sets: { ...step3.sets, [k2]: { ...step3.sets[k2], tree: hex() } } },
+  ];
+  // The same millisecond, or a run whose string sorts higher but whose time is older, is not newer.
+  const sameMs = { ...p2, sets: { ...p2.sets, [k]: { ...p2.sets[k], run: rrun(3600000, () => Buffer.alloc(6, 5)) } } };
   for (const bad of [
+    two, ...alsoChanged, sameMs,
     p, // backwards
     { ...p2, manifest: hex() }, { ...p2, sha256: hex() }, { ...p2, hoststore: hex() }, { ...p2, host: "elsewhere" },
     { ...p2, sets: { ...p2.sets, [k]: { ...p2.sets[k], snapshot: hex() } } }, { ...p2, sets: { ...p2.sets, [k]: { ...p2.sets[k], tree: hex() } } },
     { ...p2, sets: Object.fromEntries(Object.entries(p2.sets).slice(1)) }, { ...p2, sets: { ...p2.sets, [`agent-${newId()}`]: p2.sets[k] } },
   ]) refused(() => updatePlan(bad, { dir }), "not_granted");
   assert.deepEqual(readPlan({ dir }), p2);
+  // The next single request is fine, including a later one whose string sorts lower.
+  const base = 3600000 + 32 - ((T0 + 3600000) % 32) + 25;
+  const a1 = replanSet(p2, kind, id, rrun(base));
+  updatePlan(a1, { dir });
+  const a2 = replanSet(a1, kind, id, rrun(base + 1));
+  assert.ok(a2.sets[k].run < a1.sets[k].run, "its string sorts lower");
+  updatePlan(a2, { dir });
+  assert.deepEqual(readPlan({ dir }), a2);
+  refused(() => updatePlan(a1, { dir }), "not_granted"); // and back is refused
   for (const text of ["", "{", "null", JSON.stringify({ ...p2, v: 2 })]) {
     writeFileSync(join(dir, PLAN), text);
     refused(() => readPlan({ dir }), "bad_form");

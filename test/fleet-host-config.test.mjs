@@ -41,7 +41,7 @@ test("names: derived from the id, within Linux's 32-character user and group lim
   assert.equal(agentConfigArchive(a), `/srv/sagebrush/archive-config/${a}`);
   assert.equal(tagDir(t), `/srv/sagebrush/tags/${t}`);
   assert.equal(brokerDir(a), `/run/sagebrush/broker/${a}`);
-  assert.deepEqual(fenceFiles(a), { all: "/var/lib/sagebrush/fence/all", agent: `/var/lib/sagebrush/fence/${a}`, expiry: "/var/lib/sagebrush/fence/expiry", backup: `/var/lib/sagebrush/fence/backup/${a}`, restore: `/var/lib/sagebrush/fence/restore/${a}` });
+  assert.deepEqual(fenceFiles(a), { all: "/var/lib/sagebrush/fence/all", agent: `/var/lib/sagebrush/fence/${a}`, expiry: "/var/lib/sagebrush/fence/expiry", backup: `/var/lib/sagebrush/fence/backup/${a}`, lease: `/var/lib/sagebrush/fence/lease/${a}`, restore: `/var/lib/sagebrush/fence/restore/${a}` });
   for (const bad of ["worker-1", a.toUpperCase(), `${a}x`, "../etc", `${a.slice(0, 25)}b`, "", null, 5]) {
     for (const f of [agentUser, tagGroup, agentUnit, agentNetns, agentHome, agentSessions, agentConfigDir, agentArchive, agentConfigArchive, tagDir, brokerDir, fenceFiles]) refused(() => f(bad));
   }

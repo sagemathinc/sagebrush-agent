@@ -13,13 +13,14 @@ import { CAUSES, fenced, lowerFence, raiseFence, stop } from "../lib/fleet/host/
 import { RESTORE_DIR, RESTORE_STAGING, fenceFiles } from "../lib/fleet/host/names.mjs";
 import { realIo } from "../lib/fleet/host/store.mjs";
 import {
-  CLASSES, FAILED_REASONS, KINDS, MAX_ATTEMPTS, STATES, checkRecord, invalidateMarker, markerIo, markerPath, newRecord, readMarker,
-  readRecord, recordName, recoveryStep, restoreReady, retryRecord, stagingDir, stagingSetDir, step, writeMarker, writeRecord,
+  CLASSES, FAILED_REASONS, KINDS, MAX_ATTEMPTS, RESTORE_RUN, STATES, checkRecord, markerPath, newRecord, newRestoreRun, ownerOf,
+  readMarker, readRecord, recordName, recoveryStep, restoreReady, retryRecord, runTime, stagingDir, stagingName, step, writeRecord,
 } from "../lib/fleet/host/restore-record.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
-const RUN = "20261124T013000Z-abcdefgh", RUN2 = "20261125T013000Z-bcdefghi";
+const T1 = 1795400000000;
+const RUN = newRestoreRun(T1, () => Buffer.alloc(6)), RUN2 = newRestoreRun(T1 + 86400000, () => Buffer.alloc(6, 1));
 const SNAP = "a".repeat(64), SNAP2 = "b".repeat(64);
 const DEST = { home: { dev: "2049", ino: "131" }, sessions: { dev: "2049", ino: "132" } };
 const fresh = () => mkdtempSync(join(tmpdir(), "sb-restore-"));
@@ -66,19 +67,50 @@ test("the restore fence: per agent at fence/restore/<id>, lowered only by a resu
   await rejects(stop({ agent: a }, "restore", { dir }), "bad_form");
 });
 
-test("names: records under RESTORE_DIR by set, staging under RESTORE_STAGING by run, set and attempt", () => {
+test("names: records under RESTORE_DIR by set; staging is the launcher's, one directory per class, under RESTORE_STAGING", () => {
   const id = newId();
   assert.equal(RESTORE_DIR, "/var/lib/sagebrush/restore");
   assert.equal(RESTORE_STAGING, "/srv/sagebrush/.restore");
   assert.equal(recordName("tag", id), `tag-${id}.json`);
-  const r = step(newRecord({ kind: "archive", id, run: RUN, snapshot: SNAP }), "retry");
-  assert.equal(stagingSetDir(RUN, "archive", id), `/srv/sagebrush/.restore/${RUN}/archive-${id}`);
-  assert.equal(stagingDir(r), `/srv/sagebrush/.restore/${RUN}/archive-${id}/2`);
-  assert.equal(markerPath(r), `/srv/sagebrush/.restore/${RUN}/archive-${id}/2.complete`);
+  assert.deepEqual([ownerOf("agent", id), ownerOf("archive", id), ownerOf("tag", id)], [`a-${id}`, `a-${id}`, `t-${id}`]);
+  for (const [kind, i] of [["agents", id], ["host", id], ["agent", "nope"], ["tag", `${id}/..`]]) refused(() => ownerOf(kind, i), "bad_form");
+  const ar = step(newRecord({ kind: "archive", id, run: RUN, snapshot: SNAP }), "retry");
+  assert.equal(stagingName(ar, "archive"), `${RUN}/a-${id}/archive/2`);
+  assert.equal(stagingDir(ar, "archive"), `/srv/sagebrush/.restore/${RUN}/a-${id}/archive/2`);
+  assert.equal(markerPath(ar, "archive"), `/srv/sagebrush/.restore/${RUN}/a-${id}/archive/2/.complete`);
+  const ag = newRecord({ kind: "agent", id, run: RUN, snapshot: SNAP });
+  assert.deepEqual(CLASSES.agent.map((c) => stagingName(ag, c)), [`${RUN}/a-${id}/home/1`, `${RUN}/a-${id}/sessions/1`]);
+  assert.equal(stagingName(newRecord({ kind: "tag", id, run: RUN, snapshot: SNAP }), "tag"), `${RUN}/t-${id}/tag/1`);
+  for (const [r, c] of [[ag, "archive"], [ag, "tag"], [ar, "home"], [ar, "x"]]) refused(() => stagingName(r, c), "bad_form");
   for (const [kind, i] of [["agents", id], ["host", id], ["agent", "nope"], ["agent", "../x"]]) refused(() => recordName(kind, i), "bad_form");
-  for (const run of ["", "x", `${RUN}/..`, "20261124T013000Z-ABCDEFGH"]) refused(() => stagingSetDir(run, "agent", id), "bad_form");
   assert.deepEqual(KINDS, ["agent", "archive", "tag"]);
   assert.deepEqual(CLASSES, { agent: ["home", "sessions"], archive: ["archive"], tag: ["tag"] });
+});
+
+test("restore runs: the launcher's 16 characters of [a-z2-7], ordered by their decoded time, never as strings", () => {
+  assert.ok(RESTORE_RUN.test(RUN) && RESTORE_RUN.test(RUN2));
+  assert.equal(runTime(RUN), T1);
+  assert.equal(RUN.length, 16);
+  assert.equal(newRestoreRun(0, () => Buffer.alloc(6)), "aaaaaaaaaaaaaaaa");
+  assert.equal(runTime(newRestoreRun(2 ** 50 - 1, () => Buffer.alloc(6))), 2 ** 50 - 1);
+  for (const t of [-1, 1.5, 2 ** 50, NaN, "1"]) refused(() => newRestoreRun(t), "bad_form");
+  for (const run of ["", "x", "a".repeat(15), "a".repeat(17), "A".repeat(16), "1".repeat(16), "aaaaaaaaaaaaaaa8"]) refused(() => runTime(run), "bad_form");
+  // Random runs of one millisecond differ.
+  const many = new Set(Array.from({ length: 200 }, () => newRestoreRun(T1)));
+  assert.equal(many.size, 200);
+  for (const r of many) assert.equal(runTime(r), T1);
+  // A pair where the string order and the time order disagree: the digit '2' (26) sorts before the letter 'z' (25).
+  const t = T1 - (T1 % 32) + 25;
+  const older = newRestoreRun(t, () => Buffer.alloc(6)), newer = newRestoreRun(t + 1, () => Buffer.alloc(6));
+  assert.deepEqual([older[9], newer[9]], ["z", "2"]);
+  assert.ok(newer < older && runTime(newer) > runTime(older), "string order isn't time order");
+  // retryRecord orders by time: the later run (the lower string) is accepted, the earlier refused.
+  let stop = step(newRecord({ kind: "agent", id: newId(), run: older, snapshot: SNAP }), "not_fitting");
+  assert.equal(retryRecord(stop, { run: newer, snapshot: SNAP }).run, newer);
+  stop = step(newRecord({ kind: "agent", id: newId(), run: newer, snapshot: SNAP }), "not_fitting");
+  refused(() => retryRecord(stop, { run: older, snapshot: SNAP }), "bad_form");
+  // The same millisecond is not newer, whatever its random part.
+  refused(() => retryRecord(stop, { run: newRestoreRun(t + 1, () => Buffer.alloc(6, 9)), snapshot: SNAP }), "bad_form");
 });
 
 test("the record's closed shape: a new record, and every invariant refused", () => {
@@ -184,6 +216,7 @@ test("a stop is restarted only by the person's new request: a new run, attempt 1
   const nf = step(at("filling", { attempt: 3 }), "not_fitting");
   refused(() => retryRecord(nf, { run: RUN, snapshot: SNAP }), "bad_form");
   refused(() => retryRecord(nf, { run: "x", snapshot: SNAP }), "bad_form");
+  refused(() => retryRecord(nf, { run: "20261125T013000Z-bcdefghi", snapshot: SNAP }), "bad_form"); // the backup's run format isn't a restore's
   const r = retryRecord(nf, { run: RUN2, snapshot: SNAP2 });
   assert.deepEqual([r.run, r.snapshot, r.attempt, r.state, r.dirty, r.dest, r.reason], [RUN2, SNAP2, 1, "staging", true, DEST, null]);
   const clean = retryRecord(at("not_fitting"), { run: RUN2, snapshot: SNAP });
@@ -191,36 +224,42 @@ test("a stop is restarted only by the person's new request: a new run, attempt 1
   assert.equal(retryRecord(at("failed"), { run: RUN2, snapshot: SNAP }).reason, null);
 });
 
-test("recovery's first step: from every record state and every disk state", () => {
-  const whole = (r) => ({ v: 1, run: r.run, kind: r.kind, id: r.id, snapshot: r.snapshot, attempt: r.attempt });
-  assert.equal(recoveryStep(null, { marker: null, attemptExists: false }), "start");
+test("recovery's first step: from every record state and every disk state, every class's marker exactly its name", () => {
+  const whole = (r) => Object.fromEntries(CLASSES[r.kind].map((c) => [c, stagingName(r, c)]));
+  assert.equal(recoveryStep(null, { markers: {}, begun: false }), "start");
   const s = at("staging");
-  assert.equal(recoveryStep(s, { marker: null, attemptExists: false }), "stage");
-  assert.equal(recoveryStep(s, { marker: null, attemptExists: true }), "retry");
-  assert.equal(recoveryStep(s, { marker: whole(s), attemptExists: true }), "promote");
-  // A marker for anything else than this exact binding is not this attempt's.
-  for (const k of ["v", "run", "kind", "id", "snapshot", "attempt"]) {
-    const m = { ...whole(s), [k]: k === "attempt" || k === "v" ? 2 : k === "run" ? RUN2 : k === "kind" ? "tag" : k === "id" ? newId() : SNAP2 };
-    assert.equal(recoveryStep(s, { marker: m, attemptExists: true }), "retry", k);
-  }
-  assert.equal(recoveryStep(s, { marker: { ...whole(s), extra: 1 }, attemptExists: true }), "retry");
+  assert.equal(recoveryStep(s, { markers: {}, begun: false }), "stage");
+  assert.equal(recoveryStep(s, { markers: {}, begun: true }), "retry");
+  assert.equal(recoveryStep(s, { markers: whole(s), begun: true }), "promote");
+  // One class whole is not the set whole; a marker of any other name (another class, attempt, run or owner), a torn
+  // one, or one with a trailing newline is not this class's.
+  const other = step(s, "retry");
+  for (const markers of [
+    { home: whole(s).home }, { sessions: whole(s).sessions }, { home: whole(s).home, sessions: null },
+    { home: whole(s).sessions, sessions: whole(s).home }, { ...whole(s), home: whole(other).home },
+    { ...whole(s), home: whole(s).home.replace(RUN, RUN2) }, { ...whole(s), home: whole(s).home.replace("a-", "t-") },
+    { ...whole(s), home: whole(s).home.slice(0, -1) }, { ...whole(s), home: whole(s).home + "\n" },
+    Object.assign(Object.create(whole(s)), {}), null, undefined,
+  ]) assert.equal(recoveryStep(s, { markers, begun: true }), "retry", JSON.stringify(markers));
+  // Extra classes' markers don't matter; only the set's classes do.
+  assert.equal(recoveryStep(s, { markers: { ...whole(s), tag: "x" }, begun: true }), "promote");
   const st = at("staged");
-  assert.equal(recoveryStep(st, { marker: whole(st), attemptExists: true }), "fill");
-  assert.equal(recoveryStep(st, { marker: null, attemptExists: true }), "retry");
-  // A filling record is never filled again, even with its marker still there (a crash before the invalidation).
+  assert.equal(recoveryStep(st, { markers: whole(st), begun: true }), "fill");
+  assert.equal(recoveryStep(st, { markers: { home: whole(st).home }, begun: true }), "retry");
+  // A filling record is never filled again, even with every marker still there (a crash before fill-home began).
   const f = at("filling");
-  for (const marker of [null, whole(f)]) for (const attemptExists of [true, false]) assert.equal(recoveryStep(f, { marker, attemptExists }), "retry");
+  for (const markers of [{}, whole(f)]) for (const begun of [true, false]) assert.equal(recoveryStep(f, { markers, begun }), "retry");
   // Dirty records are cleaned first, whatever is on disk.
   const d = step(f, "retry");
-  for (const marker of [null, whole(d)]) assert.equal(recoveryStep(d, { marker, attemptExists: true }), "clean");
+  for (const markers of [{}, whole(d)]) assert.equal(recoveryStep(d, { markers, begun: true }), "clean");
   for (const to of ["not_fitting", "failed"]) {
     const x = step(f, to, { reason: "bad_form" });
-    assert.equal(recoveryStep(x, { marker: null, attemptExists: false }), "clean", to);
-    assert.equal(recoveryStep(step(x, "clean"), { marker: null, attemptExists: false }), "none", `${to}, cleaned: only the person restarts it`);
+    assert.equal(recoveryStep(x, { markers: {}, begun: false }), "clean", to);
+    assert.equal(recoveryStep(step(x, "clean"), { markers: {}, begun: false }), "none", `${to}, cleaned: only the person restarts it`);
   }
-  assert.equal(recoveryStep(at("published"), { marker: null, attemptExists: false }), "validate");
-  assert.equal(recoveryStep(at("validated"), { marker: null, attemptExists: false }), "none");
-  refused(() => recoveryStep({ ...s, state: "x" }, { marker: null, attemptExists: false }), "bad_form");
+  assert.equal(recoveryStep(at("published"), { markers: {}, begun: false }), "validate");
+  assert.equal(recoveryStep(at("validated"), { markers: {}, begun: false }), "none");
+  refused(() => recoveryStep({ ...s, state: "x" }, { markers: {}, begun: false }), "bad_form");
 });
 
 test("records on disk: durable, 0600 in a 0700 directory, absent is null, anything invalid or another set's throws", () => {
@@ -253,97 +292,22 @@ test("records on disk: durable, 0600 in a 0700 directory, absent is null, anythi
   assert.throws(() => readRecord("agent", r.id, { dir }), (e) => e.code === "EISDIR");
 });
 
-test("markers: written once, only while staging and clean; torn is not complete; invalidated only by a fill", () => {
+test("markers are the launcher's: read per class, exactly as written; this side never writes or removes one", async () => {
+  const mod = await import("../lib/fleet/host/restore-record.mjs");
+  for (const name of ["writeMarker", "invalidateMarker", "markerIo"]) assert.equal(Object.hasOwn(mod, name), false, name);
   const root = fresh();
   const r = at("staging");
-  mkdirSync(stagingDir(r, root), { recursive: true });
-  assert.equal(readMarker(r, { root }), null);
-  for (const s of ["staged", "filling", "published", "not_fitting"]) refused(() => writeMarker({ ...at(s), id: r.id }, { root }), "not_granted");
-  refused(() => writeMarker(step(at("filling"), "retry"), { root }), "not_granted"); // dirty
-  writeMarker(r, { root });
-  assert.deepEqual(readMarker(r, { root }), { v: 1, run: RUN, kind: "agent", id: r.id, snapshot: SNAP, attempt: 1 });
-  assert.equal(statSync(markerPath(r, root)).mode & 0o777, 0o600);
-  assert.equal(recoveryStep(r, { marker: readMarker(r, { root }), attemptExists: true }), "promote");
-  assert.throws(() => writeMarker(r, { root }), (e) => e.code === "EEXIST", "a marker is never rewritten");
-  // A torn marker reads as none.
-  writeFileSync(markerPath(r, root), "{\"v\":1,\"run\"");
-  assert.equal(readMarker(r, { root }), null);
-  assert.equal(recoveryStep(r, { marker: readMarker(r, { root }), attemptExists: true }), "retry");
-  // Invalidation: only a filling record, durable, idempotent.
-  const st = step(r, "staged");
-  refused(() => invalidateMarker(st, { root }), "not_granted");
-  const f = step(st, "filling", { dest: DEST });
-  invalidateMarker(f, { root });
-  assert.equal(existsSync(markerPath(f, root)), false);
-  invalidateMarker(f, { root });
-  // Another attempt's marker is a different file.
-  const r2 = step(f, "retry");
-  assert.notEqual(markerPath(r2, root), markerPath(f, root));
-});
-
-/** A markerIo that records each step as [op, path] (fds mapped back to their paths) and fails `fail` = [op, path]. */
-function spyIo(fail = null) {
-  const ops = [], fds = new Map();
-  const check = (op, p) => { ops.push([op, p]); if (fail && fail[0] === op && fail[1] === p) throw Object.assign(new Error(`injected ${op}`), { code: "EIO" }); };
-  return {
-    ops,
-    io: {
-      ...markerIo,
-      open: (p, f, m) => { const fd = markerIo.open(p, f, m); fds.set(fd, p); ops.push(["open", p]); return fd; },
-      write: (fd, b, o, l) => { check("write", fds.get(fd)); return markerIo.write(fd, b, o, l); },
-      fsync: (fd) => { check("fsync", fds.get(fd)); return markerIo.fsync(fd); },
-      close: (fd) => { ops.push(["close", fds.get(fd)]); return markerIo.close(fd); },
-      unlink: (p) => { check("unlink", p); return markerIo.unlink(p); },
-    },
-  };
-}
-
-test("markers are durable in order: the whole write, then the file's fsync, then its directory's; each failure throws", () => {
-  const root = fresh();
-  const r = at("staging");
-  mkdirSync(stagingDir(r, root), { recursive: true });
-  const file = markerPath(r, root), set = stagingSetDir(r.run, r.kind, r.id, root);
-  const { ops, io } = spyIo();
-  writeMarker(r, { root, io });
-  assert.deepEqual(ops, [["open", file], ["write", file], ["fsync", file], ["close", file], ["open", set], ["fsync", set], ["close", set]]);
-  assert.deepEqual(readMarker(r, { root }), { v: 1, run: RUN, kind: "agent", id: r.id, snapshot: SNAP, attempt: 1 });
-  // A short write is completed before the flush; a zero-byte write is an error, never a whole marker.
-  const r2 = step(r, "retry");
-  mkdirSync(stagingDir(r2, root), { recursive: true });
-  const f2 = markerPath(r2, root);
-  const short = spyIo();
-  writeMarker(r2, { root, io: { ...short.io, write: (fd, b, o, l) => short.io.write(fd, b, o, Math.min(l, 5)) } });
-  const writes = short.ops.filter(([op]) => op === "write").length;
-  assert.ok(writes > 1, `${writes} writes`);
-  assert.ok(short.ops.findIndex(([op]) => op === "fsync") > short.ops.findLastIndex(([op]) => op === "write"), "the flush follows the last write");
-  assert.deepEqual(readMarker(r2, { root }).attempt, 2);
-  rmSync(f2);
-  assert.throws(() => writeMarker(r2, { root, io: { ...markerIo, write: () => 0 } }), (e) => e.code === "EIO");
-  for (const fail of [["fsync", f2], ["fsync", set], ["write", f2]]) {
-    rmSync(f2, { force: true });
-    assert.throws(() => writeMarker(r2, { root, io: spyIo(fail).io }), (e) => e.code === "EIO", fail.join(" "));
-  }
-});
-
-test("invalidating a marker is durable in order: the unlink, then its directory's fsync; each failure throws", () => {
-  const root = fresh();
-  const r = at("staging");
-  mkdirSync(stagingDir(r, root), { recursive: true });
-  writeMarker(r, { root });
-  const f = step(step(r, "staged"), "filling", { dest: DEST });
-  const file = markerPath(f, root), set = stagingSetDir(f.run, f.kind, f.id, root);
-  assert.throws(() => invalidateMarker(f, { root, io: spyIo(["fsync", set]).io }), (e) => e.code === "EIO", "the directory's flush");
-  writeFileSync(file, "x");
-  assert.throws(() => invalidateMarker(f, { root, io: spyIo(["unlink", file]).io }), (e) => e.code === "EIO", "the unlink");
-  assert.ok(existsSync(file));
-  const { ops, io } = spyIo();
-  invalidateMarker(f, { root, io });
-  assert.deepEqual(ops, [["unlink", file], ["open", set], ["fsync", set], ["close", set]]);
-  assert.equal(existsSync(file), false);
-  // Already gone (a crash after the unlink): the directory is still flushed.
-  const again = spyIo();
-  invalidateMarker(f, { root, io: again.io });
-  assert.deepEqual(again.ops, [["unlink", file], ["open", set], ["fsync", set], ["close", set]]);
+  assert.equal(readMarker(r, "home", { root }), null);
+  mkdirSync(stagingDir(r, "home", root), { recursive: true });
+  assert.equal(readMarker(r, "home", { root }), null);
+  // As the launcher writes it: the name, no newline.
+  writeFileSync(markerPath(r, "home", root), stagingName(r, "home"));
+  assert.equal(readMarker(r, "home", { root }), stagingName(r, "home"));
+  assert.equal(readMarker(r, "sessions", { root }), null);
+  refused(() => readMarker(r, "tag", { root }), "bad_form");
+  // A marker path that isn't a file is an error, never "absent".
+  mkdirSync(markerPath(r, "sessions", root), { recursive: true });
+  assert.throws(() => readMarker(r, "sessions", { root }), (e) => e.code === "EISDIR");
 });
 
 test("restoreReady: validated only when the agent's record and each of its tags' records are", () => {
@@ -400,62 +364,73 @@ test("restoreReady: every record is bound to the current restore's run and snaps
 const tag = (id, path) => { let r = newRecord({ kind: "tag", id, run: RUN, snapshot: SNAP }); for (const s of path) r = step(r, s, { dest: { tag: DEST.home } }); return r; };
 
 /**
- * A model fill on a real directory tree, with a crash injected at the `crashAt`-th effect: staging writes files then
- * the marker; a fill writes `filling`, invalidates the marker, then MOVES each file into the destination (consuming
- * staging). A quota hit (`quotaAt`: the quotaAt-th move of every fill fails) is not_fitting; `crashOnMove` crashes
- * every fill at that move. Recovery follows
- * recoveryStep only. `fills` records every attempt a durable `filling` was written for; `effects` counts the effects done.
+ * A model restore on a real directory tree, with a crash injected at the `crashAt`-th effect, the launcher's part
+ * played as the launcher does it: staging each class writes its files into <attempt>/data, then its marker (the
+ * class's name); a fill writes `filling`, then per class unlinks the marker and MOVES each file into the class's
+ * destination (consuming staging). A quota hit (`quotaAt`: the quotaAt-th move of every fill fails) is not_fitting;
+ * `crashOnMove` crashes every fill at that move. Recovery follows recoveryStep only. `fills` records every attempt a
+ * durable `filling` was written for; `effects` counts the effects done.
  */
 function model(root, id, { crashAt = Infinity, quotaAt = null, crashOnMove = null } = {}) {
   const dir = join(root, "restore"), stage = join(root, "staging"), home = join(root, "home"), sessions = join(root, "sessions");
   for (const d of [dir, stage, home, sessions]) mkdirSync(d, { recursive: true });
   const ident = (p) => { const s = statSync(p, { bigint: true }); return { dev: String(s.dev), ino: String(s.ino) }; };
   const dest = { home: ident(home), sessions: ident(sessions) };
-  const m = { fills: [], effects: 0, home, stage, dir };
+  const into = { home, sessions };
+  const m = { fills: [], effects: 0, home, sessions, stage, dir };
   const effect = () => { if (++m.effects === crashAt) throw Object.assign(new Error("crash"), { crash: true }); };
   const save = (r) => { effect(); writeRecord(r, { dir }); return r; };
-  const others = (r) => { // every other staging of the set: other runs' and other attempts', with their markers
-    for (const run of readdirSync(stage)) {
-      const set = stagingSetDir(run, r.kind, r.id, stage);
-      if (!existsSync(set)) continue;
-      for (const e of readdirSync(set)) if (run !== r.run || (e !== String(r.attempt) && e !== `${r.attempt}.complete`)) { effect(); rmSync(join(set, e), { recursive: true }); }
+  const others = (r) => { // every other staging of the set, any run: <run>/<owner>/<class>/<attempt>
+    for (const run of readdirSync(stage)) for (const c of CLASSES.agent) {
+      const cd = join(stage, run, ownerOf("agent", id), c);
+      if (!existsSync(cd)) continue;
+      for (const n of readdirSync(cd)) if (run !== r.run || n !== String(r.attempt)) { effect(); rmSync(join(cd, n), { recursive: true }); }
     }
   };
   const ops = {
     stage(r) {
       others(r);
-      const d = stagingDir(r, stage);
-      effect(); mkdirSync(d, { recursive: true });
-      for (const [k, v] of Object.entries(SNAPSHOT)) { effect(); writeFileSync(join(d, k), v); }
-      effect(); writeMarker(r, { root: stage });
+      for (const c of CLASSES.agent) {
+        const d = stagingDir(r, c, stage);
+        effect(); mkdirSync(join(d, "data"), { recursive: true });
+        for (const [k, v] of Object.entries(SNAPSHOT[c])) { effect(); writeFileSync(join(d, "data", k), v); }
+        effect(); writeFileSync(markerPath(r, c, stage), stagingName(r, c), { flag: "wx" }); // the launcher's marker
+      }
       return save(step(r, "staged"));
     },
     fill(r) {
       r = save(step(r, "filling", { dest }));
       m.fills.push(`${r.run}/${r.attempt}`); // only once filling is durable: before it, nothing is consumed
-      effect(); invalidateMarker(r, { root: stage });
       let i = 0;
-      for (const k of readdirSync(stagingDir(r, stage)).sort()) {
-        if (++i === quotaAt) return save(step(r, "not_fitting"));
-        if (i === crashOnMove) throw Object.assign(new Error("crash"), { crash: true });
-        effect(); fs.renameSync(join(stagingDir(r, stage), k), join(home, k));
+      for (const c of CLASSES.agent) {
+        effect(); rmSync(markerPath(r, c, stage)); // fill-home's first act
+        for (const k of readdirSync(join(stagingDir(r, c, stage), "data")).sort()) {
+          if (++i === quotaAt) return save(step(r, "not_fitting"));
+          if (i === crashOnMove) throw Object.assign(new Error("crash"), { crash: true });
+          effect(); fs.renameSync(join(stagingDir(r, c, stage), "data", k), join(into[c], k));
+        }
       }
       return save(step(r, "published"));
     },
     clean(r) {
-      for (const e of readdirSync(home)) { effect(); rmSync(join(home, e)); }
+      for (const c of CLASSES.agent) for (const e of readdirSync(into[c])) { effect(); rmSync(join(into[c], e)); }
       others(r);
-      if (r.state === "staging") { const d = stagingDir(r, stage); if (existsSync(d)) { effect(); rmSync(d, { recursive: true }); } }
+      if (r.state === "staging") for (const c of CLASSES.agent) { const d = stagingDir(r, c, stage); if (existsSync(d)) { effect(); rmSync(d, { recursive: true }); } }
       return save(step(r, "clean"));
     },
     validate(r) {
-      return save(JSON.stringify(tree(home)) === JSON.stringify(SNAPSHOT) ? step(r, "validated") : step(r, "failed", { reason: "bad_form" }));
+      const ok = CLASSES.agent.every((c) => JSON.stringify(tree(into[c])) === JSON.stringify(SNAPSHOT[c]));
+      return save(ok ? step(r, "validated") : step(r, "failed", { reason: "bad_form" }));
     },
   };
   m.recover = ({ run = RUN } = {}) => {
     for (let guard = 0; guard < 50; guard++) {
       const r = readRecord("agent", id, { dir });
-      const s = recoveryStep(r, r === null ? { marker: null, attemptExists: false } : { marker: readMarker(r, { root: stage }), attemptExists: existsSync(stagingDir(r, stage)) });
+      const disk = r === null ? { markers: {}, begun: false } : {
+        markers: Object.fromEntries(CLASSES.agent.map((c) => [c, readMarker(r, c, { root: stage })])),
+        begun: CLASSES.agent.some((c) => existsSync(stagingDir(r, c, stage))),
+      };
+      const s = recoveryStep(r, disk);
       if (s === "none") return r;
       if (s === "start") ops.stage(save(newRecord({ kind: "agent", id, run, snapshot: SNAP })));
       else if (s === "stage") ops.stage(r);
@@ -469,13 +444,20 @@ function model(root, id, { crashAt = Infinity, quotaAt = null, crashOnMove = nul
   };
   return m;
 }
-const SNAPSHOT = { a: "1", b: "22", c: "333", d: "4444" };
+const SNAPSHOT = { home: { a: "1", b: "22", c: "333" }, sessions: { d: "4444", e: "55555" } };
 const tree = (d) => Object.fromEntries(readdirSync(d).sort().map((k) => [k, readFileSync(join(d, k), "utf8")]));
+const filled = (m) => ({ home: tree(m.home), sessions: tree(m.sessions) });
+const EMPTY = { home: {}, sessions: {} };
+/** What is left of a run's staging for the set: class -> its attempts. */
+const left = (m, run, id) => Object.fromEntries(CLASSES.agent.map((c) => {
+  const cd = join(m.stage, run, `a-${id}`, c);
+  return [c, existsSync(cd) ? readdirSync(cd).sort() : []];
+}));
 
 test("T5: a crash at any effect of a restore recovers to exactly the snapshot, never filling a consumed attempt", () => {
   const whole = model(fresh(), newId());
   assert.equal(whole.recover().state, "validated");
-  assert.deepEqual(tree(whole.home), SNAPSHOT);
+  assert.deepEqual(filled(whole), SNAPSHOT);
   assert.ok(whole.effects > 15, `${whole.effects} effects`);
   for (let crashAt = 1; crashAt <= whole.effects; crashAt++) {
     const root = fresh(), id = newId();
@@ -484,14 +466,16 @@ test("T5: a crash at any effect of a restore recovers to exactly the snapshot, n
     const after = model(root, id); // the restart: no crash this time
     const r = after.recover();
     assert.equal(r.state, "validated", `crash at ${crashAt}`);
-    assert.deepEqual(tree(after.home), SNAPSHOT, `crash at ${crashAt}`);
+    assert.deepEqual(filled(after), SNAPSHOT, `crash at ${crashAt}`);
     const fills = [...m.fills, ...after.fills];
     assert.equal(new Set(fills).size, fills.length, `crash at ${crashAt}: an attempt filled twice: ${fills}`);
     assert.ok(r.attempt <= 2, `crash at ${crashAt}: one crash costs at most one attempt (${r.attempt})`);
-    // Only the validated attempt's staging (consumed, empty) is left; its marker is gone.
-    const set = stagingSetDir(RUN, "agent", id, after.stage);
-    assert.deepEqual(readdirSync(set), [String(r.attempt)], `crash at ${crashAt}`);
-    assert.deepEqual(readdirSync(join(set, String(r.attempt))), []);
+    // Only the validated attempt's staging (consumed: an empty data, no marker) is left, per class.
+    assert.deepEqual(left(after, RUN, id), { home: [String(r.attempt)], sessions: [String(r.attempt)] }, `crash at ${crashAt}`);
+    for (const c of CLASSES.agent) {
+      assert.deepEqual(readdirSync(stagingDir(r, c, after.stage)), ["data"], `crash at ${crashAt}`);
+      assert.deepEqual(readdirSync(join(stagingDir(r, c, after.stage), "data")), []);
+    }
   }
 });
 
@@ -499,7 +483,7 @@ test("H2: a quota hit in the fill is cleaned once and stops, through any crash; 
   const whole = model(fresh(), newId(), { quotaAt: 3 });
   const r0 = whole.recover();
   assert.deepEqual([r0.state, r0.reason, r0.dirty, r0.attempt], ["not_fitting", "limit", false, 1]);
-  assert.deepEqual(tree(whole.home), {}, "the partial fill is removed");
+  assert.deepEqual(filled(whole), EMPTY, "the partial fill is removed");
   for (let crashAt = 1; crashAt <= whole.effects; crashAt++) {
     const root = fresh(), id = newId();
     const m = model(root, id, { crashAt, quotaAt: 3 });
@@ -507,7 +491,7 @@ test("H2: a quota hit in the fill is cleaned once and stops, through any crash; 
     const after = model(root, id, { quotaAt: 3 });
     const r = after.recover();
     assert.deepEqual([r.state, r.dirty], ["not_fitting", false], `crash at ${crashAt}`);
-    assert.deepEqual(tree(after.home), {}, `crash at ${crashAt}`);
+    assert.deepEqual(filled(after), EMPTY, `crash at ${crashAt}`);
     // Once not_fitting is written, nothing fills again: a restart after it does nothing.
     const again = model(root, id, { quotaAt: 3 });
     assert.equal(again.recover().state, "not_fitting");
@@ -521,9 +505,9 @@ test("H2: a quota hit in the fill is cleaned once and stops, through any crash; 
   const later = model(root, id);
   const r = later.recover();
   assert.deepEqual([r.state, r.run, r.attempt], ["validated", RUN2, 1]);
-  assert.deepEqual(tree(later.home), SNAPSHOT);
-  assert.deepEqual(readdirSync(later.stage), [RUN, RUN2].sort());
-  assert.deepEqual(readdirSync(stagingSetDir(RUN, "agent", id, later.stage)), [], "the old run's staging is discarded");
+  assert.deepEqual(filled(later), SNAPSHOT);
+  assert.deepEqual(left(later, RUN, id), { home: [], sessions: [] }, "the old run's staging is discarded");
+  assert.deepEqual(left(later, RUN2, id), { home: ["1"], sessions: ["1"] });
 });
 
 test("automatic retries stop at MAX_ATTEMPTS: a set that crashes in every fill fails (outcome_unknown), cleaned", () => {
@@ -536,6 +520,6 @@ test("automatic retries stop at MAX_ATTEMPTS: a set that crashes in every fill f
   const after = model(root, id);
   const r = after.recover();
   assert.deepEqual([r.state, r.reason, r.attempt, r.dirty], ["failed", "outcome_unknown", MAX_ATTEMPTS, false]);
-  assert.deepEqual([after.fills, tree(after.home)], [[], {}], "never filled again; the partial fill removed");
+  assert.deepEqual([after.fills, filled(after)], [[], EMPTY], "never filled again; the partial fill removed");
   assert.equal(model(root, id).recover().state, "failed", "and it stays failed: only the person restarts it");
 });

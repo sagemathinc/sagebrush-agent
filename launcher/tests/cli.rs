@@ -61,6 +61,8 @@ fn kernel_abi() -> i64 {
 /// Where the kernel supports ABI 4, the launcher's positive control MUST succeed: a skip there is a failure.
 fn landlock_abi4() -> bool {
     if kernel_abi() < 4 {
+        // CI sets SB_TEST_REQUIRE_LANDLOCK: there a kernel without ABI 4 fails the job instead of skipping these rows.
+        assert!(std::env::var_os("SB_TEST_REQUIRE_LANDLOCK").is_none(), "SB_TEST_REQUIRE_LANDLOCK is set, but this kernel has no Landlock ABI 4");
         eprintln!("this kernel has no Landlock ABI 4 (independent query): the Landlock rows run on the VM");
         return false;
     }

@@ -6,6 +6,7 @@ ConditionPathExists=!/var/lib/sagebrush/fence/all
 ConditionPathExists=!/var/lib/sagebrush/fence/abcdefghijklmnopqrstuvwxya
 ConditionPathExists=!/var/lib/sagebrush/fence/expiry
 ConditionPathExists=!/var/lib/sagebrush/fence/backup/abcdefghijklmnopqrstuvwxya
+ConditionPathExists=!/var/lib/sagebrush/fence/restore/abcdefghijklmnopqrstuvwxya
 StartLimitIntervalSec=300
 StartLimitBurst=5
 

@@ -87,7 +87,10 @@ jobs:
           SB_TEST_WEED: ${{ runner.temp }}/weed/bin/weed
           SB_TEST_REQUIRE_WEED: "1"
           SB_TEST_REQUIRE_NOPROC: "1"
-      - run: cargo build --locked --release --manifest-path backup/Cargo.toml
+      # The shipped build: static musl, checked to name no dynamic loader (the launcher refuses one that does).
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools && rustup target add x86_64-unknown-linux-musl
+      - run: cargo build --locked --release --manifest-path backup/Cargo.toml --target x86_64-unknown-linux-musl
+      - run: scripts/backup-static-check-test.sh backup/target/x86_64-unknown-linux-musl/release/sagebrush-agent-backup
 
   # The Python reference verifier (python/): every case of both shared fleet fixture files, each with the JavaScript
   # checker's result, the RFC 9180 vector, and its own rule rows. Its one dependency, cryptography (with cffi and

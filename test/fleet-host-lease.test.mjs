@@ -441,3 +441,30 @@ test("realSystem.empty: every cgroup.procs in the tree, recursively, and the sli
   writeFileSync(join(e.slice, "cgroup.events"), "populated 1\nfrozen 0\n");
   assert.equal(sys.empty(e.slice), false, "populated 1 (a thread-only or zombie-held cgroup)");
 });
+
+test("realSystem.mask: the runtime mask counts only when is-enabled then says masked or masked-runtime", async () => {
+  for (const [state, ok] of [["masked-runtime", true], ["masked", true], ["static", false], ["enabled", false], ["linked-runtime", false], ["", false]]) {
+    const calls = [];
+    const run = async (argv) => { calls.push(argv); return argv[1] === "is-enabled" ? { code: state.startsWith("masked") ? 1 : 0, stdout: `${state}\n`, stderr: "" } : { code: 0, stdout: "", stderr: "" }; };
+    const p = realSystem({ run }).mask(`sagebrush-agent-${A}.service`);
+    if (ok) await p; else await assert.rejects(p, /the mask isn't effective/, state || "(empty)");
+    assert.deepEqual(calls.map((c) => c.slice(0, 3)), [["systemctl", "mask", "--runtime"], ["systemctl", "is-enabled", `sagebrush-agent-${A}.service`]]);
+  }
+  // a failing mask command refuses before any is-enabled
+  await assert.rejects(realSystem({ run: async () => ({ code: 1, stdout: "", stderr: "" }) }).mask("u.service"));
+});
+
+test("realSystem.cgroup: only a real directory on cgroup2: a symlink, a file or another fs type is refused, even when statfs says cgroup2", () => {
+  const CG2 = 0x63677270;
+  const mk = (kind, type) => realSystem({ fsx: {
+    lstatSync: () => ({ isDirectory: () => kind === "dir", isSymbolicLink: () => kind === "symlink", isFile: () => kind === "file" }),
+    statfsSync: () => ({ type }),
+  } });
+  assert.equal(mk("dir", CG2).cgroup("/sys/fs/cgroup/x.slice"), "/sys/fs/cgroup/x.slice");
+  for (const kind of ["symlink", "file"]) assert.throws(() => mk(kind, CG2).cgroup("/sys/fs/cgroup/x.slice"), /isn't a cgroup/, kind);
+  assert.throws(() => mk("dir", 0xef53).cgroup("/sys/fs/cgroup/x.slice"), /isn't a cgroup/, "ext4");
+  const gone = realSystem({ fsx: { lstatSync: () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); } } });
+  assert.equal(gone.cgroup("/sys/fs/cgroup/x.slice"), null);
+  const eacces = realSystem({ fsx: { lstatSync: () => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); } } });
+  assert.throws(() => eacces.cgroup("/sys/fs/cgroup/x.slice"), /EACCES/);
+});

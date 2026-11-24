@@ -468,3 +468,18 @@ test("realSystem.cgroup: only a real directory on cgroup2: a symlink, a file or 
   const eacces = realSystem({ fsx: { lstatSync: () => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); } } });
   assert.throws(() => eacces.cgroup("/sys/fs/cgroup/x.slice"), /EACCES/);
 });
+
+test("cross-language fixture: lease.mjs reads the runtime files exactly as the fixture's js column (the launcher pins rust)", () => {
+  const fx = JSON.parse(readFileSync(new URL("./fixtures/host/lease-files.json", import.meta.url), "utf8"));
+  const e = env(); mkdirSync(e.dir, { recursive: true });
+  for (const t of fx.tombstones) {
+    writeFileSync(join(e.dir, `${A}.spent`), t.text);
+    assert.equal(readTombstone(A, { dir: e.dir }), t.js, JSON.stringify(t.text));
+    if (t.rust !== null && t.js !== null) assert.equal(t.rust, t.js);
+  }
+  for (const r of fx.records) {
+    writeFileSync(join(e.dir, A), r.text);
+    assert.equal(readRecord(A, { dir: e.dir }).state === "ok", r.js, r.text);
+    assert.ok(!r.rust || r.js, `rust is never more lenient: ${r.text}`);
+  }
+});

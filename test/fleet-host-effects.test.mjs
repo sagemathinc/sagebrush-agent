@@ -115,7 +115,7 @@ test("runArgv kills a command past its time or on abort, and refuses a bad argv"
 });
 
 test("the launcher's exit codes map exactly as the contract's table", () => {
-  const want = { 64: null, 65: "preflight_missing", 66: "preflight_missing", 67: "landlock_abi", 68: "preflight_missing", 69: "preflight_missing", 70: "unit_failed", 71: "unit_failed", 72: null, 1: "unit_failed", 203: "unit_failed" };
+  const want = { 64: null, 65: "preflight_missing", 66: "preflight_missing", 67: "landlock_abi", 68: "preflight_missing", 69: "preflight_missing", 70: "unit_failed", 71: "unit_failed", 72: null, 78: null, 1: "unit_failed", 203: "unit_failed" };
   for (const [code, reason] of Object.entries(want)) assert.equal(launcherExit(Number(code)), reason, code);
 });
 

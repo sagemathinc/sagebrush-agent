@@ -255,3 +255,12 @@ test("launcherContract: the launcher's closed JSON (rules = the Landlock column,
   refused(() => launcherContract(agent(), ctx(), [{ index: 0, path: "/elsewhere", mode: "rw", dev: [8, 1], ino: 1 }], null), "bad_form");
   refused(() => launcherContract(agent(), ctx(), [{ index: 64, path: "/data/project", mode: "rw", dev: [8, 1], ino: 1 }], null), "bad_form");
 });
+
+test("the execution lease's guard runs first: ExecStartPre=+ lease-check, root and non-root agents alike (launcher A3)", () => {
+  for (const root of [false, true]) {
+    const lines = renderUnit(agent({ root }), ctx()).text.split("\n");
+    const pre = lines.filter((l) => l.startsWith("ExecStartPre="));
+    assert.deepEqual(pre, [`ExecStartPre=+/opt/sagebrush/1.2.3/bin/sagebrush-agent-launch lease-check --agent ${A}`], `root=${root}`);
+    assert.ok(lines.indexOf(pre[0]) < lines.findIndex((l) => l.startsWith("ExecStart=")), `root=${root}: before ExecStart`);
+  }
+});

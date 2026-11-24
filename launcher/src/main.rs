@@ -8,6 +8,8 @@
 //!
 //! Amendment A2 (backup restore) adds two more, also root-only and outside any unit: `restore-stage` and `fill-home`
 //! (restore.rs, child.rs).
+//!
+//! Amendment A3 (execution lease) adds `lease-check`, root-only, run as the unit's `ExecStartPre=+` (lease.rs).
 
 // Unsafe code is refused everywhere except the syscall module and the secret's zeroing Drop (contract §6).
 #![deny(unsafe_code)]
@@ -21,6 +23,7 @@ mod err;
 mod exec;
 mod json;
 mod landlock;
+mod lease;
 mod secret;
 mod stage;
 mod tree;
@@ -58,6 +61,20 @@ fn run() -> err::Result<()> {
                 return Err(err(Fail::Usage, "bad arguments"));
             }
             a2(cmd, rest)
+        }
+        // Launcher contract amendment A3 (execution lease): root only, the unit's ExecStartPre.
+        "lease-check" => {
+            if !after.is_empty() {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            let v = args::flags(rest, &["agent"])?;
+            if !args::is_id(v[0]) {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            if !sys::is_root() {
+                return Err(err(Fail::Preflight, "root only"));
+            }
+            lease::hold(v[0]).map(drop) // the fd closes here: the shared lock is released before ExecStart
         }
         "exec" => {
             let v = args::flags(rest, &["agent", "contract", "cli"])?;

@@ -1,0 +1,112 @@
+{
+ "about": "The execution lease's runtime files, read by both lease.mjs (js) and the launcher's lease-check (rust). A tombstone's value, or null when refused; a record accepted or not. Rust is never more lenient than JS: where they differ (16-digit tombstones are never written by lease.mjs; 5.0 and duplicate keys are never written by its JSON.stringify), Rust refuses, which fails closed.",
+ "tombstones": [
+  {
+   "text": "0\n",
+   "js": 0,
+   "rust": 0
+  },
+  {
+   "text": "4\n",
+   "js": 4,
+   "rust": 4
+  },
+  {
+   "text": "999999999999999\n",
+   "js": 999999999999999,
+   "rust": 999999999999999
+  },
+  {
+   "text": "9007199254740991\n",
+   "js": null,
+   "rust": 9007199254740991
+  },
+  {
+   "text": "9007199254740992\n",
+   "js": null,
+   "rust": null
+  },
+  {
+   "text": "10000000000000000\n",
+   "js": null,
+   "rust": null
+  },
+  {
+   "text": "01\n",
+   "js": null,
+   "rust": null
+  },
+  {
+   "text": "1",
+   "js": null,
+   "rust": null
+  },
+  {
+   "text": "\n",
+   "js": null,
+   "rust": null
+  },
+  {
+   "text": "a\n",
+   "js": null,
+   "rust": null
+  },
+  {
+   "text": "1\n\n",
+   "js": null,
+   "rust": null
+  }
+ ],
+ "records": [
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000}",
+   "js": true,
+   "rust": true
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":9007199254740991,\"expiry_tick\":9007199254740991}",
+   "js": true,
+   "rust": true
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":9007199254740992,\"expiry_tick\":1}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":0,\"expiry_tick\":1}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":-1}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":1,\"x\":1}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"lg\":5,\"expiry_tick\":1}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"a b\",\"lg\":5,\"expiry_tick\":1}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":5.0,\"expiry_tick\":1}",
+   "js": true,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":1,\"lg\":2,\"expiry_tick\":1}",
+   "js": true,
+   "rust": false
+  }
+ ]
+}

@@ -71,7 +71,7 @@ test("the hash rule: canonical JSON (keys in order), sha256 of its UTF-8, the sa
 test("E17 (helper): the hello says notebook.edit; the edit tool only for a page that offers it, and write_notebook as today without it", async () => {
   const off = await paired({ features: false });
   try {
-  assert.deepEqual(off.hello.result.features, ["notebook.edit", "permission.digest", "run.context", "chat.resume", "edit.turn", "chat.steer", "egress.turn", "chat.resume.tag"]);
+  assert.deepEqual(off.hello.result.features, ["notebook.edit", "permission.digest", "run.context", "chat.resume", "edit.turn", "chat.steer", "egress.turn", "chat.resume.tag", "workspace.image"]);
   assert.equal("workspace_edit_notebook" in off.tools().handlers, false);
   // (an old page: write_notebook on an existing path still asks for a base, as before)
   const w = await off.tools().handlers.workspace_write_notebook({ path: "/n.ipynb", mode: "python", cells: [] });

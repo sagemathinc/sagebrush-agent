@@ -159,8 +159,8 @@ test("out of space (77), a partial step (75) and an existing attempt (74) retry 
       const fills = w.calls.filter((a) => a[0] === "fill-home").map((a) => `${a[6]}:${a[10]}`);
       assert.equal(new Set(fills).size, fills.length, "no class filled twice from one attempt");
       if (where === "fill-home") assert.deepEqual(w.cleaned, [2], "the partial fill removed before the next attempt");
-      // Only the attempt that was published is left: the first one is discarded whichever way it failed.
-      assert.deepEqual(["home", "sessions"].map((c) => readdirSync(join(w.stage, RUN, `a-${id}`, c))), [["2"], ["2"]], `${code} in ${where}`);
+      // Nothing is left: the first attempt is discarded whichever way it failed, the published one once it settled.
+      assert.deepEqual(["home", "sessions"].map((c) => readdirSync(join(w.stage, RUN, `a-${id}`, c))), [[], []], `${code} in ${where}`);
     }
   }
 });
@@ -223,8 +223,8 @@ test("a crash after filling is written: the next call never refills that attempt
   const fills = w.calls.filter((a) => a[0] === "fill-home").map((a) => `${a[6]}:${a[10]}`);
   assert.deepEqual(fills, ["home:1", "sessions:1", "home:2", "sessions:2"]);
   assert.deepEqual([tree(w.dests.home), tree(w.dests.sessions)], [DATA.home, DATA.sessions]);
-  // The consumed attempt 1 is discarded.
-  assert.deepEqual(readdirSync(join(w.stage, RUN, `a-${id}`, "home")), ["2"]);
+  // The consumed attempt 1 is discarded, and so is attempt 2 once the set is published.
+  assert.deepEqual(readdirSync(join(w.stage, RUN, `a-${id}`, "home")), []);
 });
 
 test("refusals: a set not in the plan, a record of another restore, missing adapters, an aborted call", async () => {
@@ -340,4 +340,39 @@ test("a stopped set's next call only discards what a crash left; it never restag
   // And again: idempotent, still nothing staged.
   assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "not_fitting");
   assert.equal(w.calls.length, before);
+});
+
+test("a published set's consumed staging is discarded before it is reported, on every call, a crash repaired", async () => {
+  const id = newId();
+  const w = world("agent");
+  const r = await w.fill("agent", id, planOf("agent", id));
+  assert.equal(r.state, "published");
+  // The staged copies (directories, symlinks, the emptied data) don't stay charged: nothing of the set is left.
+  for (const cls of ["home", "sessions"]) assert.deepEqual(readdirSync(join(w.stage, RUN, `a-${id}`, cls)), [], cls);
+  // A crash in that discard: the next call repairs it, with no launcher call.
+  const id2 = newId();
+  const w2 = world("agent", { failDiscards: 1 });
+  await assert.rejects(w2.fill("agent", id2, planOf("agent", id2)), /crash in discard/);
+  assert.equal(readRecord("agent", id2, { dir: w2.dir }).state, "published");
+  assert.ok(existsSync(join(w2.stage, RUN, `a-${id2}`, "home", "1")), "left by the crash");
+  const n = w2.calls.length;
+  assert.equal((await w2.fill("agent", id2, planOf("agent", id2))).state, "published");
+  assert.equal(w2.calls.length, n, "no launcher call");
+  assert.equal(existsSync(join(w2.stage, RUN, `a-${id2}`, "home", "1")), false, "discarded now");
+});
+
+test("a new attempt is staged only after every earlier one is discarded: two attempts are never charged at once", async () => {
+  const id = newId();
+  const seen = [];
+  const w = world("agent", {
+    script: (op, cls, attempt) => (op === "restore-stage" && cls === "home" && attempt === 1 ? EXIT.partial : 0),
+    onCall: (args) => {
+      if (args[0] === "restore-stage" && args[10] === "2") {
+        seen.push(["home", "sessions"].map((c) => existsSync(join(w.stage, RUN, `a-${id}`, c, "1"))));
+      }
+    },
+  });
+  const r = await w.fill("agent", id, planOf("agent", id));
+  assert.deepEqual([r.state, r.attempt], ["published", 2]);
+  assert.deepEqual(seen, [[false, false], [false, false]], "attempt 1's partial staging is gone before attempt 2 stages either class");
 });

@@ -17,7 +17,7 @@ from sagebrush_fleet import (  # noqa: E402
     parse_canonical, replay, service_key_at, unb64, verify_approval, verify_grant, verify_grant_ack, verify_host_cert, verify_host_op,
     verify_package, verify_strict,
 )
-from sagebrush_fleet.hpke import Recipient, Sender  # noqa: E402
+from sagebrush_fleet.hpke import Recipient, Sender, receive_export, send_export  # noqa: E402
 
 FIXTURES = ROOT / "test" / "fixtures"
 # (the JavaScript checker's case counts: a fixture file that loses cases fails here, not silently)
@@ -156,6 +156,18 @@ class HpkeVector(unittest.TestCase):
         self.assertEqual(O2.open(h(e0["aad"]), h(e0["ct"])).hex(), e0["pt"])
         self.assertEqual(result(lambda: O2.open(h(e0["aad"]), h(e0["ct"]))), "bad_form")
         self.assertEqual(O2.open(h(e1["aad"]), h(e1["ct"])).hex(), e1["pt"])
+        # every exported secret, from both sides and single-shot
+        self.assertEqual(len(V["exports"]), 3)
+        for i, x in enumerate(V["exports"]):
+            with self.subTest(export=i):
+                c = h(x["exporter_context"])
+                self.assertEqual(S.export(c, x["L"]).hex(), x["exported_value"])
+                self.assertEqual(O.export(c, x["L"]).hex(), x["exported_value"])
+                self.assertEqual(send_export(R.raw, h(V["info"]), c, x["L"], E), (h(V["enc"]), h(x["exported_value"])))
+                self.assertEqual(receive_export(R, h(V["enc"]), h(V["info"]), c, x["L"]).hex(), x["exported_value"])
+        for bad in (0, -1, 8161, 1.5, True, "32", None):
+            self.assertEqual(result(lambda: S.export(b"", bad)), "bad_form", bad)
+        self.assertEqual(result(lambda: O.export("pop", 32)), "bad_form")
 
 
 class HpkeFixtures(Cases):

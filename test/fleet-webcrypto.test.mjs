@@ -60,7 +60,7 @@ test("every case, through the core with the WebCrypto backend", async () => {
 test("HPKE with the WebCrypto backend: the RFC 9180 vector, and every fleet sealed-package and mint case", async () => {
   const v = await checkHpkeVector(core, read("./fixtures/hpke-x25519-sha256-aes256gcm.json").vector);
   assert.deepEqual(v.bad, []);
-  assert.equal(v.n, 257);
+  assert.equal(v.n, 260);
   const f = await checkHpkeFixtures(core, read("./fixtures/fleet-hpke-fixtures.json"));
   assert.deepEqual(f.bad, []);
   assert.ok(f.n > 25, `${f.n} cases`);

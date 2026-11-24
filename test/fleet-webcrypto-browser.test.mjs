@@ -127,7 +127,7 @@ test("headless Chromium: the core with the WebCrypto backend passes every shared
     assert.equal(r.rfcSig, "5VZDAMNgrHKQhuLMgG6CioSHfx645dl02HPgZSJJAVVfuIIVkKM7rMYeOXAc-bRr0lv18FlbviRlUUFDjnoQCw");
     assert.equal(r.opened, 1);
     assert.deepEqual(r.hpke.vector.bad, []);
-    assert.equal(r.hpke.vector.n, 257);
+    assert.equal(r.hpke.vector.n, 260);
     assert.deepEqual(r.hpke.fleet.bad, []);
     assert.ok(r.hpke.fleet.n > 25, `${r.hpke.fleet.n} HPKE cases`);
     console.log(`# ${r.n} cases, HPKE ${r.hpke.vector.n} + ${r.hpke.fleet.n}, in ${r.ua}; ${chrome} asked for the page after ${pageMs} ms`);

@@ -1,9 +1,10 @@
-//! The operations: init, add-key, backup, readback, check-data, snapshots, dump, restore, forget and
-//! prune. The host supervisor decides when; this binary only does each one exactly, and refuses what the design
+//! The operations: init, add-key, backup, readback, check-data, snapshots, dump, restore, forget, prune and
+//! usage. The host supervisor decides when; this binary only does each one exactly, and refuses what the design
 //! forbids: it never initializes a repository except on `init`, never skips the ctime or inode comparison, and never
 //! restores with CAP_SYS_RESOURCE.
 
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -70,6 +71,11 @@ pub enum Request {
         snapshots: Vec<String>,
     },
     Prune {},
+    Usage {
+        snapshot: String,
+        #[serde(default)]
+        path: Option<String>,
+    },
 }
 
 pub struct Ctx {
@@ -137,6 +143,7 @@ pub fn run(ctx: &Ctx, req: Request) -> Result<Value> {
         Request::Restore { snapshot, path, dest } => restore(ctx, &snapshot, path.as_deref(), &dest),
         Request::Forget { snapshots } => forget(ctx, &snapshots),
         Request::Prune {} => prune(ctx),
+        Request::Usage { snapshot, path } => usage(ctx, &snapshot, path.as_deref()),
     }
 }
 
@@ -382,6 +389,149 @@ fn prune(ctx: &Ctx) -> Result<Value> {
     Ok(json!({ "stats": stats }))
 }
 
+/// The space a restore of `path` from a snapshot can need, from the tree's metadata only (no data is read): an UPPER
+/// bound on the ext4 blocks it charges, and the exact number of inodes (host backup design r3.3 §5.7; the proof is
+/// on `Tally`). The restore's own filter applies: device nodes, FIFOs and sockets are never created, so not counted.
+fn usage(ctx: &Ctx, snapshot: &str, path: Option<&str>) -> Result<Value> {
+    let repo = ctx.open(false)?;
+    let snap = one_snapshot(&repo, snapshot)?;
+    let repo = repo.to_indexed_ids().map_err(lib("index_failed"))?;
+    let node = repo.node_from_snapshot_and_path(&snap, path.unwrap_or("")).map_err(lib("usage_failed"))?;
+    let mut t = Tally::default();
+    for r in repo.ls(&node, &LsOptions::default()).map_err(lib("usage_failed"))? {
+        let (p, n) = r.map_err(lib("usage_failed"))?;
+        t.add(&p, &n);
+    }
+    let u = t.finish();
+    Ok(json!({
+        "snapshot": full(*snap.id), "entries": u.entries, "inodes": u.inodes, "blocks_upper": u.blocks,
+        "peak_inodes": u.peak_inodes, "peak_blocks_upper": u.peak_blocks, "block_size": BLOCK,
+    }))
+}
+
+/// ext4's block size here (the quota filesystem is made with 4 KiB blocks).
+const BLOCK: u64 = 4096;
+/// The longest initialized ext4 extent, in blocks (128 MiB of 4 KiB blocks).
+const EXTENT_MAX: u64 = 32768;
+/// Extents an inode holds itself; a file with more needs extent tree blocks.
+const INLINE_EXTENTS: u64 = 4;
+/// Extents per extent tree block ((4096 - 12) / 12).
+const EXTENTS_PER_BLOCK: u64 = 340;
+/// The longest symlink target an inode holds itself ("fast" symlink); a longer one takes a block.
+const FAST_SYMLINK: usize = 59;
+/// Index entries per htree index block (a conservative floor of (4096 - 8) / 8).
+const DX_PER_BLOCK: u64 = 500;
+
+/// The bound, per restored object (each is created fresh, into an empty destination):
+/// - a regular file of `s` bytes, written dense, takes B = ceil(s / 4096) data blocks in E0 = ceil(s / 128 MiB)
+///   extents. The restore is sparse (zero runs of at least 4096 bytes are punched): a punch frees at least one whole
+///   block whenever it splits an extent, so it adds at most one extent per block it frees, and the extents can never
+///   outnumber E0 + B. The design's measured rule charges one extra block per extent (an extent may end a block later).
+///   So the file needs at most B + E0 blocks for its data and extents (a punch that adds an extent has freed the block
+///   paying for it), plus its extent tree: none while E0 + B fits in the inode (4 extents), else at most
+///   ceil((E0 + B) / 340) leaf blocks and one more for the index. Extended attributes are never restored.
+/// - a hard link: the inode and its blocks once, exactly when the restorer links it (`hardlink_key`: a regular file,
+///   links > 1, nonzero device and inode); every name is a directory entry.
+/// - a directory: its entries take 8 + the name's length rounded up to 4 bytes each, plus 24 for "." and "..". Its
+///   leaves can be as little as half full after htree splits, so at most 2 * ceil(bytes / 4096) leaf blocks, plus the
+///   index root and one index block per 500 leaves. The destination directory itself exists; its entries are counted.
+/// - a symlink: a block when its target is longer than 59 bytes, else none (held in the inode).
+/// - every entry but the specials: one inode (hard links once). This count is exact, not a bound.
+///
+/// The PEAK, while a class is filled from its staging (launcher amendment A2 §4): fill-home renames files and symlinks
+/// (their inodes move) but makes every directory anew in the destination, while the staged directories stay until the
+/// staging is discarded. So at its end every directory exists twice: the peak adds their inodes (exact) and their blocks
+/// (the directory bound, the destination's own entries included, since data/<leaf> held them too) once more. The launcher's own staging objects (the attempt, data, data/<leaf>, the marker, the parents) are the
+/// space check's to add (restore-space.mjs), not the tree's.
+#[derive(Default)]
+struct Tally {
+    entries: u64,
+    inodes: u64,
+    blocks: u64,
+    /// Directories (made anew by the fill, so twice at the peak).
+    twice_inodes: u64,
+    /// Directory entry bytes per directory (by its path; "" is the destination itself).
+    dirs: HashMap<PathBuf, u64>,
+    links: HashSet<(u64, u64)>,
+}
+
+impl Tally {
+    fn add(&mut self, path: &Path, node: &Node) {
+        if matches!(node.node_type, NodeType::Dev { .. } | NodeType::Chardev { .. } | NodeType::Fifo | NodeType::Socket) {
+            return; // never restored
+        }
+        self.entries += 1;
+        let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let name = path.file_name().map_or(0, |n| n.len() as u64);
+        *self.dirs.entry(parent).or_insert(0) += 8 + name.div_ceil(4) * 4;
+        if let Some(key) = hardlink_key(node) {
+            if !self.links.insert(key) {
+                return; // another name of an inode already counted
+            }
+        }
+        self.inodes += 1;
+        match &node.node_type {
+            NodeType::Dir => {
+                self.twice_inodes += 1;
+                self.dirs.entry(path.to_path_buf()).or_insert(0);
+            }
+            NodeType::Symlink { .. } => {
+                if node.node_type.to_link().as_os_str().len() > FAST_SYMLINK {
+                    self.blocks += 1;
+                }
+            }
+            _ => self.blocks += file_blocks(node.meta.size),
+        }
+    }
+
+    fn finish(&self) -> Usage {
+        // The destination's own directory (data/<leaf> while staged) is always counted, even with no entry.
+        let root = if self.dirs.contains_key(Path::new("")) { 0 } else { dir_blocks(24) };
+        let dirs: u64 = root + self.dirs.values().map(|bytes| dir_blocks(bytes + 24)).sum::<u64>();
+        Usage {
+            entries: self.entries,
+            inodes: self.inodes,
+            blocks: self.blocks + dirs,
+            peak_inodes: self.inodes + self.twice_inodes,
+            peak_blocks: self.blocks + dirs + dirs,
+        }
+    }
+}
+
+/// What a restore of a path needs: after the fill (`inodes`, `blocks`) and at its peak, before the staging is
+/// discarded (`peak_*`). Inodes are exact; blocks are upper bounds.
+#[derive(Debug, PartialEq)]
+struct Usage {
+    entries: u64,
+    inodes: u64,
+    blocks: u64,
+    peak_inodes: u64,
+    peak_blocks: u64,
+}
+
+/// The restorer's own rule for which names are one inode (rustic_core 51115c47, commands/restore.rs `hardlink_key`):
+/// a regular file with more than one link and a nonzero device and inode. Anything else (a symlink, a zero id) is
+/// restored as its own inode, so counted as one.
+fn hardlink_key(node: &Node) -> Option<(u64, u64)> {
+    (matches!(node.node_type, NodeType::File) && node.meta.links > 1 && node.meta.device_id != 0 && node.meta.inode != 0)
+        .then_some((node.meta.device_id, node.meta.inode))
+}
+
+/// A regular file's bound (see `Tally`).
+fn file_blocks(size: u64) -> u64 {
+    let data = size.div_ceil(BLOCK);
+    let extents = size.div_ceil(BLOCK * EXTENT_MAX);
+    let worst = extents + data;
+    let tree = if worst <= INLINE_EXTENTS { 0 } else { worst.div_ceil(EXTENTS_PER_BLOCK) + 1 };
+    data + extents + tree
+}
+
+/// A directory's bound (see `Tally`).
+fn dir_blocks(bytes: u64) -> u64 {
+    let leaves = 2 * bytes.div_ceil(BLOCK);
+    1 + leaves + leaves.div_ceil(DX_PER_BLOCK)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,5 +562,148 @@ mod tests {
         assert!(serde_json::from_str::<Request>(r#"{"op":"init","force":true}"#).is_err());
         assert!(serde_json::from_str::<Request>(r#"{"op":"snapshots"}"#).is_ok());
         assert!(serde_json::from_str::<Request>(r#"{"op":"restore","snapshot":"x","dest":"/d","no_cap_check":true}"#).is_err());
+        assert!(serde_json::from_str::<Request>(r#"{"op":"usage","snapshot":"x"}"#).is_ok());
+        assert!(serde_json::from_str::<Request>(r#"{"op":"usage","snapshot":"x","path":"srv/a"}"#).is_ok());
+        assert!(serde_json::from_str::<Request>(r#"{"op":"usage","snapshot":"x","exact":true}"#).is_err());
+    }
+
+    use rustic_core::repofile::Metadata;
+    use std::ffi::OsStr;
+
+    fn file(size: u64) -> Node {
+        Node::new_node(OsStr::new("f"), NodeType::File, Metadata { size, links: 1, ..Default::default() })
+    }
+
+    #[test]
+    fn a_file_bound() {
+        // Empty: no data, no extent, no tree.
+        assert_eq!(file_blocks(0), 0);
+        // One byte: one block in one extent, plus that extent's block.
+        assert_eq!(file_blocks(1), 2);
+        assert_eq!(file_blocks(4096), 2);
+        assert_eq!(file_blocks(4097), 3);
+        // Three blocks: 3 data + 1 extent, the worst case 4 extents fits in the inode: no tree.
+        assert_eq!(file_blocks(3 * 4096), 4);
+        // Four blocks: the worst case is 5 extents (every block its own, plus one): a tree leaf and its index.
+        assert_eq!(file_blocks(4 * 4096), 4 + 1 + 2);
+    }
+
+    #[test]
+    fn a_sparse_file_is_bounded_by_its_dense_size() {
+        // 1 GiB, mostly holes or not: the bound never depends on the content, only the size, and covers the dense
+        // write (every block) with its 8 extents, plus a tree for the worst split into one extent per block.
+        let s = 1u64 << 30;
+        let data = s / 4096; // 262144
+        let extents = 8; // 1 GiB / 128 MiB
+        let tree = (data + extents).div_ceil(340) + 1;
+        assert_eq!(file_blocks(s), data + extents + tree);
+        // Every punched hole frees a block and adds at most one extent: the worst split (each block its own extent)
+        // still fits under the bound, data + extents of the split never above data + extents dense.
+        for punched in [0, 1, 1000, data / 2, data - 1] {
+            let left = data - punched;
+            let split = extents + punched; // at most one more extent per freed block
+            assert!(left + split + (left + split).div_ceil(340) + 1 <= file_blocks(s), "{punched}");
+        }
+    }
+
+    #[test]
+    fn extents_split_at_the_ext4_maximum() {
+        let m = EXTENT_MAX * BLOCK; // 128 MiB
+        assert_eq!(file_blocks(m) - file_blocks(m - 4096), 1, "the same extent count");
+        assert_eq!(file_blocks(m + 1), m / 4096 + 1 + 2 + (m / 4096 + 1 + 2).div_ceil(340) + 1, "a second extent");
+    }
+
+    #[test]
+    fn a_tally() {
+        let mut t = Tally::default();
+        t.add(Path::new("a"), &file(10_000)); // 3 blocks + 1 extent
+        let dir = Node::new_node(OsStr::new("d"), NodeType::Dir, Metadata { links: 2, ..Default::default() });
+        t.add(Path::new("d"), &dir);
+        // Hard links: the inode and its blocks once, every name an entry.
+        let linked = |name: &str| Node::new_node(OsStr::new(name), NodeType::File, Metadata { size: 8192, links: 2, inode: 77, device_id: 3, ..Default::default() });
+        t.add(Path::new("d/x"), &linked("x"));
+        t.add(Path::new("d/y"), &linked("y"));
+        // A link of another inode with the same number on another device is another inode.
+        t.add(Path::new("d/z"), &Node::new_node(OsStr::new("z"), NodeType::File, Metadata { size: 8192, links: 2, inode: 77, device_id: 4, ..Default::default() }));
+        // Symlinks: 59 bytes in the inode, 60 take a block.
+        t.add(Path::new("s59"), &Node::new_node(OsStr::new("s59"), NodeType::from_link(Path::new(&"t".repeat(59))), Metadata::default()));
+        t.add(Path::new("s60"), &Node::new_node(OsStr::new("s60"), NodeType::from_link(Path::new(&"t".repeat(60))), Metadata::default()));
+        // Specials are never restored: not counted at all.
+        t.add(Path::new("fifo"), &Node::new_node(OsStr::new("fifo"), NodeType::Fifo, Metadata::default()));
+        let u = t.finish();
+        let (entries, inodes, blocks) = (u.entries, u.inodes, u.blocks);
+        assert_eq!(entries, 7, "a, d, x, y, z, s59, s60");
+        assert_eq!(inodes, 6, "x and y are one inode");
+        // Files: a 3+1, x 2+1 (once), z 2+1; s60 1; dirs: the destination (a, d, s59, s60) and d (x, y, z).
+        let root = dir_blocks(24 + (8 + 4) + (8 + 4) + (8 + 4) + (8 + 4));
+        let d = dir_blocks(24 + 3 * (8 + 4));
+        assert_eq!(blocks, 4 + 3 + 3 + 1 + root + d);
+        // The peak: only d exists twice (made anew by the fill), and every directory's blocks (the destination's entries
+        // included) once more. Files and symlinks are renamed: once.
+        assert_eq!(u.peak_inodes, 6 + 1);
+        assert_eq!(u.peak_blocks, blocks + root + d);
+    }
+
+    #[test]
+    fn hard_links_exactly_as_the_restorer_makes_them() {
+        let node = |t: NodeType, links, device_id, inode| Node::new_node(OsStr::new("n"), t, Metadata { size: 100, links, device_id, inode, ..Default::default() });
+        let count = |nodes: &[Node]| {
+            let mut t = Tally::default();
+            for (i, n) in nodes.iter().enumerate() {
+                t.add(&PathBuf::from(format!("n{i}")), n);
+            }
+            t.finish().inodes
+        };
+        // Regular files with links > 1 and nonzero ids: one inode.
+        assert_eq!(count(&[node(NodeType::File, 2, 3, 77), node(NodeType::File, 2, 3, 77)]), 1);
+        // A hard-linked symlink pair: the restorer makes two symlinks.
+        let link = || node(NodeType::from_link(Path::new("target")), 2, 3, 78);
+        assert_eq!(count(&[link(), link()]), 2);
+        // Zero device or zero inode: never linked by the restorer, so two inodes.
+        assert_eq!(count(&[node(NodeType::File, 2, 0, 79), node(NodeType::File, 2, 0, 79)]), 2);
+        assert_eq!(count(&[node(NodeType::File, 2, 3, 0), node(NodeType::File, 2, 3, 0)]), 2);
+        // links == 1 with equal ids: two.
+        assert_eq!(count(&[node(NodeType::File, 1, 3, 80), node(NodeType::File, 1, 3, 80)]), 2);
+        assert_eq!(hardlink_key(&node(NodeType::File, 2, 3, 77)), Some((3, 77)));
+        assert_eq!(hardlink_key(&link()), None);
+    }
+
+    #[test]
+    fn symlinks_are_moved_not_made_anew() {
+        // One long symlink: a block and an inode, once, at the end and at the peak (the fill renames it).
+        let mut t = Tally::default();
+        t.add(Path::new("l"), &Node::new_node(OsStr::new("l"), NodeType::from_link(Path::new(&"t".repeat(200))), Metadata::default()));
+        let u = t.finish();
+        let root = dir_blocks(24 + 8 + 4);
+        assert_eq!((u.inodes, u.blocks), (1, 1 + root));
+        assert_eq!((u.peak_inodes, u.peak_blocks), (1, 1 + 2 * root), "only the destination directory's blocks twice");
+    }
+
+    #[test]
+    fn an_empty_class() {
+        let u = Tally::default().finish();
+        // Nothing restored, but the destination's (empty) directory bound still counts once, and twice at the peak.
+        assert_eq!(u, Usage { entries: 0, inodes: 0, blocks: dir_blocks(24), peak_inodes: 0, peak_blocks: 2 * dir_blocks(24) });
+    }
+
+    #[test]
+    fn a_directory_bound() {
+        assert_eq!(dir_blocks(24), 1 + 2 + 1);
+        // 100,000 entries of 20-byte names (28 bytes each): ~684 blocks full, at most twice that in leaves.
+        let bytes: u64 = 24 + 100_000 * 28;
+        let leaves = 2 * bytes.div_ceil(4096);
+        assert_eq!(dir_blocks(bytes), 1 + leaves + leaves.div_ceil(500));
+        // Name lengths round up to 4.
+        let mut t = Tally::default();
+        t.add(Path::new("abcde"), &file(0));
+        assert_eq!(t.dirs[Path::new("")], 8 + 8);
+        // "." and ".." (24 bytes) count: 255 entries of 8-byte names are 4080 bytes, 4104 with them, so two blocks of
+        // entries, four leaves at worst.
+        let mut t = Tally::default();
+        for i in 0..255 {
+            t.add(&PathBuf::from(format!("n{i:07}")), &file(0));
+        }
+        assert_eq!(t.dirs[Path::new("")], 4080);
+        assert_eq!(t.finish().blocks, 1 + 4 + 1, "the dot entries push the directory into a second block");
     }
 }

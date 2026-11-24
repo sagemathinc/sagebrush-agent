@@ -565,6 +565,77 @@ fn restore_skips_specials_and_attributes() {
     }
 }
 
+/// usage: the exact entry and inode counts and an upper bound on blocks, from the tree's metadata alone; a restore of
+/// the same path, measured on this filesystem, never needs more blocks than the bound or more inodes than counted.
+#[test]
+fn usage_bounds_a_restore() {
+    use std::os::unix::fs::MetadataExt;
+    let Some(bin) = weed() else { return };
+    let w = start_weed(&bin);
+    let h = host(&w, "usage");
+    assert_eq!(run(&h, json!({ "op": "init" }))["ok"], true);
+    let src = tmpdir("usage-src");
+    // A 1 GiB sparse file with a few data runs; a hard-linked pair; symlinks of 59 and 60 bytes; a FIFO (never
+    // restored); a directory of 300 entries.
+    let sparse = fs::File::create(src.join("sparse.bin")).unwrap();
+    sparse.set_len(1 << 30).unwrap();
+    for (off, len) in [(0u64, 10_000usize), (300_000_001, 70_000), (1_073_000_000, 4_097)] {
+        sparse.write_all_at(&vec![0x5a; len], off).unwrap();
+    }
+    fs::write(src.join("a"), vec![1u8; 9_000]).unwrap();
+    fs::hard_link(src.join("a"), src.join("a-link")).unwrap();
+    std::os::unix::fs::symlink("t".repeat(59), src.join("s59")).unwrap();
+    std::os::unix::fs::symlink("t".repeat(60), src.join("s60")).unwrap();
+    let fifo = std::ffi::CString::new(src.join("pipe").to_str().unwrap()).unwrap();
+    // SAFETY: mkfifo with a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0, "mkfifo");
+    fs::create_dir(src.join("many")).unwrap();
+    for i in 0..300 {
+        fs::write(src.join("many").join(format!("entry-number-{i:05}")), b"x").unwrap();
+    }
+    let b = run(&h, json!({ "op": "backup", "sources": [src], "host": "h1" }));
+    assert_eq!(b["ok"], true, "{b}");
+    let path = src.to_str().unwrap()[1..].to_string();
+    let u = run(&h, json!({ "op": "usage", "snapshot": snapshot_id(&b), "path": path }));
+    assert_eq!(u["ok"], true, "{u}");
+    assert_eq!(u["snapshot"], b["snapshot"]["id"], "{u}");
+    assert_eq!(u["block_size"], 4096);
+    // sparse.bin, a, a-link, s59, s60, many, 300 entries; the FIFO isn't restored.
+    assert_eq!(u["entries"], 306, "{u}");
+    assert_eq!(u["inodes"], 305, "a and a-link are one inode: {u}");
+    let bound = u["blocks_upper"].as_u64().unwrap();
+    // At the peak of a fill the directory exists twice (made anew; the staged copy stays); files and symlinks are moved.
+    assert_eq!(u["peak_inodes"], 305 + 1, "{u}");
+    assert!(u["peak_blocks_upper"].as_u64().unwrap() > bound, "{u}");
+    // Without reading data it can't know the holes: the bound covers the whole 1 GiB.
+    assert!(bound >= (1 << 30) / 4096, "{u}");
+    // The restore of the same path, measured.
+    let dst = tmpdir("usage-dst");
+    let r = run(&h, json!({ "op": "restore", "snapshot": snapshot_id(&b), "path": path, "dest": dst }));
+    assert_eq!(r["ok"], true, "{r}");
+    let (mut blocks, mut inodes, mut seen) = (0u64, 0u64, std::collections::HashSet::new());
+    let mut stack = vec![dst.clone()];
+    blocks += fs::symlink_metadata(&dst).unwrap().blocks() * 512 / 4096; // the destination directory itself
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap().flatten() {
+            let m = fs::symlink_metadata(e.path()).unwrap();
+            if m.nlink() > 1 && !m.is_dir() && !seen.insert(m.ino()) {
+                continue;
+            }
+            inodes += 1;
+            blocks += (m.blocks() * 512).div_ceil(4096);
+            if m.is_dir() {
+                stack.push(e.path());
+            }
+        }
+    }
+    assert_eq!(inodes, 305, "the inode count is exact");
+    assert!(blocks <= bound, "the restore used {blocks} blocks, the bound is {bound}");
+    // A missing path is an error, never zero.
+    let bad = run(&h, json!({ "op": "usage", "snapshot": snapshot_id(&b), "path": "no/such/path" }));
+    assert_eq!(code(&bad), "usage_failed", "{bad}");
+}
+
 /// Whether this environment can run the rows that need their own mount namespace (`sudo unshare -m`, which needs sudo
 /// with CAP_SYS_ADMIN: CI). Where it can't, those rows skip, unless SB_TEST_REQUIRE_NOPROC=1 (set by CI), which makes
 /// every such row required.

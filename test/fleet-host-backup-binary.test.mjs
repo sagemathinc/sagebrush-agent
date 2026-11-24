@@ -211,3 +211,18 @@ test("the real binary (when SB_TEST_BACKUP_BIN is set): a closed error through t
   const r = await runBackupOp({ op: "snapshots" }, ctx, { ms: 30000 });
   assert.equal(r.ok, false); assert.ok(CODES.includes(r.code), r.code);
 });
+
+test("usage: the request's and the result's closed shapes", () => {
+  const S = "a".repeat(64);
+  checkRequest({ op: "usage", snapshot: S });
+  checkRequest({ op: "usage", snapshot: S, path: "srv/sagebrush/agents/x/home" });
+  for (const r of [{ op: "usage" }, { op: "usage", snapshot: "latest" }, { op: "usage", snapshot: S, path: "/abs" }, { op: "usage", snapshot: S, path: "a/../b" },
+    { op: "usage", snapshot: S, path: "" }, { op: "usage", snapshot: S, exact: true }]) refused(() => checkRequest(r), "bad_form");
+  const ok = (v) => parseResult(JSON.stringify({ ok: true, ...v }) + "\n", 0, null, "", "usage");
+  const good = { snapshot: S, entries: 306, inodes: 305, blocks_upper: 262_903, peak_inodes: 308, peak_blocks_upper: 262_920, block_size: 4096 };
+  assert.deepEqual(ok(good), { ok: true, value: good, stderr: "" });
+  for (const bad of [{ ...good, inodes: 307 }, { ...good, peak_inodes: 304 }, { ...good, peak_blocks_upper: 262_902 }, { ...good, block_size: 1024 }, { ...good, entries: -1 }, { ...good, blocks_upper: 1.5 }, { ...good, extra: 1 }, { ...good, snapshot: "x" }]) {
+    assert.equal(ok(bad).code, "bad_result", JSON.stringify(bad));
+  }
+  assert.ok(CODES.includes("usage_failed"));
+});

@@ -84,6 +84,26 @@ setTimeout(() => {}, 60000);`);
   assert.throws(() => process.kill(gpid, 0), (e) => e.code === "ESRCH", "the grandchild is gone");
 });
 
+test("a normal settlement kills the group too: a descendant left behind by a binary that succeeded or failed cleanly is gone", async () => {
+  for (const [name, result, exit] of [["success", '{"ok":true,"forgotten":1}', 0], ["closed error", '{"ok":false,"error":{"code":"forget_failed","message":"m"}}', 1]]) {
+    const { dir, ctx } = fake(`const { spawn } = require("node:child_process");
+const g = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+fs.writeFileSync(dir + "/gpid", String(g.pid));
+process.stdout.write(${JSON.stringify(result + "\n")});
+process.exitCode = ${exit};
+setImmediate(() => process.exit(${exit}));`);
+    const r = await runBackupOp({ op: "forget", snapshots: [SNAP] }, ctx, { ms: 10000 });
+    assert.equal(r.ok, exit === 0, name);
+    if (exit !== 0) assert.equal(r.code, "forget_failed", name);
+    await new Promise((res) => setTimeout(res, 300));
+    const gpid = Number(readFileSync(join(dir, "gpid"), "utf8"));
+    let alive = true;
+    try { process.kill(gpid, 0); } catch (e) { alive = e.code !== "ESRCH"; }
+    if (alive) { try { process.kill(gpid, "SIGKILL"); } catch {} }
+    assert.equal(alive, false, `${name}: the descendant is killed when the call settles`);
+  }
+});
+
 test("an abort kills it; an abort before the start never spawns", async () => {
   const { dir, ctx } = fake(`fs.writeFileSync(dir + "/ran", "1"); setTimeout(() => {}, 60000);`);
   const ac = new AbortController();

@@ -54,13 +54,14 @@ test("every required §4.2 directive is present, and the dangerous ones are abse
   }
 });
 
-test("the four stop fences are start conditions (§3.3; execution lease §2), one per cause", () => {
+test("the stop fences (§3.3), the backup fence and the lease fence (execution lease §2) are start conditions, one per cause", () => {
   const { text } = renderUnit(agent(), ctx());
   const conds = text.split("\n").filter((l) => l.startsWith("ConditionPathExists="));
   assert.deepEqual(conds, [
     "ConditionPathExists=!/var/lib/sagebrush/fence/all",
     `ConditionPathExists=!/var/lib/sagebrush/fence/${A}`,
     "ConditionPathExists=!/var/lib/sagebrush/fence/expiry",
+    `ConditionPathExists=!/var/lib/sagebrush/fence/backup/${A}`,
     `ConditionPathExists=!/var/lib/sagebrush/fence/lease/${A}`,
   ]);
 });

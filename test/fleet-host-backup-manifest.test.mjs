@@ -131,6 +131,26 @@ test("kept manifests: always the last, the newest of each of 7 days, 4 weeks and
   assert.deepEqual([...keepManifests(ms, { daily: 0, weekly: 0, monthly: 0 })], [hex(1000)], "the last is kept whatever the policy");
 });
 
+test("kept manifests, exactly, on a sparse calendar: 7 days, the newest of 4 ISO weeks, 6 months; an 8th day and a 7th month go", () => {
+  const dates = ["2026-11-24", "2026-11-23", "2026-11-22", "2026-11-21", "2026-11-20", "2026-11-19", "2026-11-18", "2026-11-17",
+    "2026-11-12", "2026-11-05", "2026-10-29", "2026-09-15", "2026-08-15", "2026-07-15", "2026-06-15", "2026-05-15"];
+  const ms = dates.map((d) => ({ snapshot: d, time: Date.parse(`${d}T03:00:00Z`) }));
+  // daily: 11-24 .. 11-18 (7); weekly: W48 11-24, W47 11-22, W46 11-12, W45 11-05 (4); monthly: Nov 11-24, Oct 10-29,
+  // Sep, Aug, Jul, Jun (6). Not kept: 11-17 (an 8th day, not its week's newest) and 05-15 (a 7th month).
+  assert.deepEqual([...keepManifests(ms)].sort(), [
+    "2026-06-15", "2026-07-15", "2026-08-15", "2026-09-15", "2026-10-29", "2026-11-05", "2026-11-12",
+    "2026-11-18", "2026-11-19", "2026-11-20", "2026-11-21", "2026-11-22", "2026-11-23", "2026-11-24",
+  ]);
+  assert.equal(isoWeek(Date.parse("2026-11-05T03:00:00Z")), "2026-W45", "11-05 is kept only as the 4th week's newest");
+});
+
+test("the data check's part at fixed UTC days: day 0 is part 1, day 29 part 30, day 30 part 1 again", () => {
+  const D = 86400000;
+  assert.deepEqual([0, 1, 2, 29, 30, 31, 59, 60].map((d) => checkDataPart(d * D + 3 * 3600000).part), [1, 2, 3, 30, 1, 2, 30, 1]);
+  assert.equal(checkDataPart(Date.parse("2026-11-24T03:00:00Z")).part, 22, "day 20781: 20781 mod 30 = 21, so part 22");
+  assert.equal(checkDataPart(Date.parse("2026-11-24T23:59:59Z")).part, 22, "the same UTC day, the same part");
+});
+
 const snap = (id, time, tags) => ({ id, time, tags });
 const T = (kind, state, run = RUN) => [`sb-kind=${kind}`, `sb-state=${state}`, `sb-run=${run}`];
 

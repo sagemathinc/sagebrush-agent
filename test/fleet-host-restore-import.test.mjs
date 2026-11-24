@@ -17,13 +17,14 @@ import { chmodSync } from "node:fs";
 import { dirname } from "node:path";
 import { buildManifest, canonical, sha256 } from "../lib/fleet/host/backup-manifest.mjs";
 import { newPlan } from "../lib/fleet/host/restore-plan.mjs";
+import { newRestoreRun } from "../lib/fleet/host/restore-record.mjs";
 import { BY_RULE, DISPOSITION, NOT_RESTORED, PER_HOST, copyReadOnly, importHostStore } from "../lib/fleet/host/restore-import.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
 let n = 0;
 const hex = () => (++n).toString(16).padStart(64, "0");
-const RUN = "20261124T030000Z-abcdefgh", RRUN = "20261126T010000Z-cdefghij";
+const RUN = "20261124T030000Z-abcdefgh", RRUN = newRestoreRun(1795500000000, () => Buffer.alloc(6)); // a backup run; a restore run
 const tmp = () => mkdtempSync(join(tmpdir(), "sb-import-"));
 
 /** An old host's registry: two live agents (one with a start failure), a tombstone, a tag; and its manifest and plan. */

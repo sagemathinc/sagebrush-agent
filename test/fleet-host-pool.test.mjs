@@ -92,12 +92,13 @@ test("eligible: only bound profiles of exactly the entry's harness and provider,
   const p = await open(fresh());
   const O = entry([A], { harness: "opencode", provider: "openai" }), P = entry([A, B]), Q = entry([B]);
   p.set(doc(1, [O, P, Q]), isAgent);
-  const prof = (sub, o = {}) => ({ pid: newId(), harness: "claude", provider: null, auth: "subscription", sub, storage_uid: 90000, project_id: 100000, gen: 1, state: "bound", ...o });
+  const prof = (sub, o = {}) => ({ pid: newId(), harness: "claude", provider: null, auth: "subscription", sub, storage_uid: 90000, project_id: 100000, gen: 1, state: "bound", mountpoints: [], removal: null, ...o });
   const good = prof(P.sub), openai = prof(O.sub, { harness: "opencode", provider: "openai", auth: "api_key" });
   const profiles = [
     good, openai,
     prof(Q.sub), // another agent's subscription
     prof(P.sub, { state: "creating" }), prof(P.sub, { state: "retiring" }), prof(P.sub, { state: "retired" }),
+    prof(P.sub, { mountpoints: null }), // a piece-1 bound record: its mountpoints were never made
     // A profile whose own recorded kind differs from its sub's entry is never selectable (e.g. an old credential).
     prof(O.sub, { harness: "opencode", provider: "anthropic", auth: "api_key" }),
     prof(O.sub, { harness: "pi", provider: "openai", auth: "api_key" }),

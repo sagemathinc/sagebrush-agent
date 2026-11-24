@@ -66,7 +66,7 @@ test("stdout past its limit is bad_result and the binary is killed; stderr keeps
     assert.equal(r.code, "bad_result"); assert.ok(Date.now() - t0 < 10000, "killed, not waited out");
   }
   {
-    const { ctx } = fake(`process.stderr.write("e".repeat(200000)); process.stdout.write('{"ok":true}\\n');`);
+    const { ctx } = fake(`process.stderr.write("e".repeat(200000)); process.stdout.write('{"ok":true,"snapshots":[]}\\n');`);
     const r = await runBackupOp({ op: "snapshots" }, ctx, { ms: 10000 });
     assert.equal(r.ok, true); assert.equal(r.stderr.length, 64 * 1024);
   }
@@ -150,9 +150,45 @@ test("closed requests: each op's exact fields; restore is never one; refused bef
 });
 
 test("parseResult on its own: closed errors only, and the codes list matches the binary's", () => {
-  assert.deepEqual(parseResult('{"ok":true,"forgotten":2}\n', 0, null), { ok: true, value: { forgotten: 2 }, stderr: "" });
-  assert.equal(parseResult('{"ok":false,"error":{"code":"usage","message":"m"},"extra":1}\n', 1, null).code, "bad_result");
+  assert.deepEqual(parseResult('{"ok":true,"forgotten":2}\n', 0, null, "", "forget"), { ok: true, value: { forgotten: 2 }, stderr: "" });
+  assert.equal(parseResult('{"ok":false,"error":{"code":"usage","message":"m"},"extra":1}\n', 1, null, "", "forget").code, "bad_result");
   assert.ok(CODES.includes("quota_exceeded") && CODES.includes("no_space") && CODES.includes("capability_refused"));
+});
+
+test("success is each op's exact shape, bound to the op asked: extra fields, an error beside ok, another op's shape are bad_result", () => {
+  const snap = { id: SNAP, time: "2026-11-24T03:00:00Z", tree: "b".repeat(64), host: "h1", paths: ["/a"], tags: ["sb-state=good"], summary: null };
+  const ok = (op, v) => parseResult(JSON.stringify({ ok: true, ...v }) + "\n", 0, null, "", op);
+  assert.equal(ok("backup", { snapshot: snap, cache_full: false }).ok, true);
+  assert.equal(ok("readback", { snapshot: snap, findings: 0 }).ok, true);
+  assert.equal(ok("snapshots", { snapshots: [snap, { ...snap, summary: { files_new: 1, files_changed: 0, files_unmodified: 2, total_files_processed: 3, total_bytes_processed: 10, data_added_packed: 5 } }] }).ok, true);
+  for (const [op, v] of [
+    ["forget", { forgotten: 1, error: { code: "usage", message: "m" } }],
+    ["forget", { forgotten: 1, unexpected: true }],
+    ["snapshots", { forgotten: 1 }],
+    ["forget", { snapshots: [] }],
+    ["backup", { snapshot: { ...snap, id: "short" }, cache_full: false }],
+    ["backup", { snapshot: { ...snap, extra: 1 }, cache_full: false }],
+    ["backup", { snapshot: snap }],
+    ["readback", { snapshot: snap, findings: -1 }],
+    ["snapshots", { snapshots: [{ ...snap, summary: { files_new: 1 } }] }],
+    ["init", { initialized: false }],
+    ["prune", { stats: 5 }],
+    ["restore", { snapshot: SNAP, skipped_special: 0 }],
+  ]) assert.equal(ok(op, v).code, "bad_result", `${op} ${JSON.stringify(v).slice(0, 60)}`);
+});
+
+test("requests match the binary's own rules: host 1-64 of [A-Za-z0-9-], tags 1-128 with '=', at most 64 KiB serialized", () => {
+  const b = (x) => ({ op: "backup", sources: ["/a"], host: "h1", ...x });
+  for (const host of [" ".repeat(200), "", "a".repeat(65), "h_1", "h.1", "h 1"]) refused(() => checkRequest(b({ host })), "bad_form");
+  checkRequest(b({ host: "a".repeat(64) })); checkRequest(b({ host: "Host-1" }));
+  for (const tag of ["noequals", "a=b,c", "a b=c", "=" + "x".repeat(128), "a=b/c"]) refused(() => checkRequest(b({ tags: [tag] })), "bad_form");
+  checkRequest(b({ tags: ["a=b=c", "sb-run=20261124T030000Z-abcdefgh", "x".repeat(126) + "=y"] }));
+  refused(() => checkRequest({ op: "check-data", part: 1, of: 2 ** 33 }), "bad_form");
+  const big = b({ excludes: Array.from({ length: 300 }, (_, i) => "x".repeat(250) + i) });
+  refused(() => checkRequest(big), "bad_form"); // 300 globs is over 256 anyway; and the serialized size:
+  const near = { op: "forget", snapshots: Array.from({ length: 1100 }, (_, i) => i.toString(16).padStart(64, "0")) };
+  assert.ok(JSON.stringify(near).length > 64 * 1024);
+  refused(() => checkRequest(near), "bad_form");
 });
 
 /** With SB_TEST_BACKUP_BIN set to a built binary, the real one answers through this client with a closed error. */

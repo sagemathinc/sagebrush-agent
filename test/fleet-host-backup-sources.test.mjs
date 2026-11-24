@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
-import { FIXED_FORBIDDEN, backupSources, checkExcludes, checkForbidden, unchanged, walkSources, within } from "../lib/fleet/host/backup-sources.mjs";
+import { FIXED_FORBIDDEN, backupSources, checkExcludes, checkForbidden, realOrSelf, unchanged, walkSources, within } from "../lib/fleet/host/backup-sources.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const SRV = "/srv/sagebrush";
@@ -63,6 +63,24 @@ test("forbidden roots are checked as resolved too: a symlink can't bring one int
   // either; but a source that IS the link resolves into the forbidden root.
   refused(() => checkForbidden([join(root, "home", "linked")], [join(root, "profiles")]), "not_granted");
   checkForbidden([join(root, "home")], [join(root, "profiles")]);
+});
+
+test("a missing tail behind a symlink is resolved through the link, in both directions and for several missing parts", () => {
+  const root = mkdtempSync(join(tmpdir(), "sb-btail-"));
+  const forbidden = join(root, "forbidden"), safe = join(root, "safe"), home = join(root, "home");
+  for (const d of [forbidden, safe, home]) mkdirSync(d);
+  symlinkSync(forbidden, join(safe, "link"));
+  symlinkSync(home, join(safe, "tohome"));
+  // a source through the link, with one and with several parts that don't exist yet
+  refused(() => checkForbidden([join(safe, "link", "missing")], [forbidden]), "not_granted");
+  refused(() => checkForbidden([join(safe, "link", "a", "b", "c")], [forbidden]), "not_granted");
+  // a forbidden root through a link into the source, with missing parts
+  refused(() => checkForbidden([home], [join(safe, "tohome", "profiles", "p1")]), "not_granted");
+  // and nothing is refused when the link leads elsewhere
+  checkForbidden([join(safe, "tohome", "x")], [forbidden]);
+  assert.equal(realOrSelf(join(safe, "link", "a", "b")), join(forbidden, "a", "b"));
+  assert.equal(realOrSelf("/nonexistent-root-xyz/a"), "/nonexistent-root-xyz/a");
+  assert.throws(() => realOrSelf("/x/y", { realpath: () => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); } }), (e) => e.code === "EACCES");
 });
 
 test("the walk: owners not allowed are counted and listed, links aren't followed, a missing source is reported", () => {

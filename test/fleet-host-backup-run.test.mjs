@@ -246,6 +246,21 @@ test("another run's journal written meanwhile is never overwritten or cleared: d
   assert.ok(!ctx.binary.calls.some((c) => c.state === "good"));
 });
 
+test("the SAME agent's journal replaced by run B, then A throws (in the warm pass or the read-back): B stays exact, A is never good", async () => {
+  for (const when of ["warm", "readback"]) {
+    const ctx = {};
+    Object.assign(ctx, setup("agent", 1, { [when]: () => {
+      ctx.b = newJournal("20261124T050000Z-cccccccc", [ctx.members[0]]);
+      writeJournal(ctx.b, { dir: ctx.d.dir });
+      throw new Error("killed");
+    } }));
+    const r = await backupSet(ctx.set, RUN, ctx.deps);
+    assert.notEqual(r.outcome, "good", when); assert.equal(r.code, "error", when);
+    assert.deepEqual(readJournal({ dir: ctx.d.dir }), ctx.b, `${when}: B's journal is exactly as B wrote it`);
+    assert.equal(r.recovered.run, null, `${when}: the recovery didn't act on B`);
+  }
+});
+
 test("an archive (never live): one good backup and its read-back, no fence and no freeze", async () => {
   const { d, binary, set, deps } = setup("archive", 1);
   const r = await backupSet(set, RUN, deps);

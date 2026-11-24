@@ -344,6 +344,32 @@ test("recovery is idempotent: a second call after a released run lowers nothing 
   refused(() => advance(readJournal({ dir: d.dir }), "released"), "not_granted");
 });
 
+test("expectedRun: another run's journal is never touched, byte for byte; an unreadable one costs only that run's scope", async () => {
+  {
+    const d = dirs();
+    const a = newId();
+    const groups = frozenRun(d, [a]);
+    const before = readFileSync(join(d.dir, "run.json"));
+    const cg = fakeCgroup(groups);
+    const r = await recoverBackup(a, { expectedRun: "20261124T090000Z-zzzzzzzz", dir: d.dir, fenceDir: d.fenceDir, cg, ...clock() });
+    assert.equal(r.run, null); assert.equal(r.backupLowered, false);
+    assert.deepEqual(cg.ops, [], "no kill, no thaw of another run");
+    assert.ok(readFileSync(join(d.dir, "run.json")).equals(before));
+    assert.ok(existsSync(join(d.fenceDir, "backup", a)));
+    // the same run: recovered as usual
+    assert.equal((await recoverBackup(a, { expectedRun: RUN, dir: d.dir, fenceDir: d.fenceDir, cg, ...clock() })).state, "released");
+  }
+  {
+    const d = dirs();
+    const a = newId();
+    writeFileSync(join(d.dir, "run.json"), "not json");
+    const cg = fakeCgroup({ [agentSliceCgroup(a)]: { procs: 1, frozen: true } });
+    await recoverBackup(a, { expectedRun: RUN, dir: d.dir, fenceDir: d.fenceDir, cg, ...clock() });
+    assert.deepEqual(cg.ops, [["kill", backupScopeCgroup(SCOPE)], ["thaw", agentSliceCgroup(a)]], "only this run's scope, never the whole slice");
+  }
+  await rejects(recoverBackup(newId(), { expectedRun: "bad" }), "bad_form");
+});
+
 test("a bad agent id is refused before any effect", async () => {
   const d = dirs();
   const cg = fakeCgroup({});

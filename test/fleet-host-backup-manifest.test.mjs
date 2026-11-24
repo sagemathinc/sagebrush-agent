@@ -260,6 +260,16 @@ test("a retention pass: the manifest checked against its bound hash, its referen
   assert.deepEqual(binary.calls.filter((c) => c.op === "forget"), [{ op: "forget", snapshots: [hex(6)] }, { op: "forget", snapshots: [hex(7)] }]);
 });
 
+test("a manifest whose content names another host (its hash tag and listing local and valid): the pass stops, nothing forgotten", async () => {
+  const s0 = committedStore([listed(hex(6), T0 - 2 * DAY, T("agent", "good", "20261101T030000Z-dddddddd"))]);
+  const text = canonical({ ...s0.m, host: "other" }) + "\n";
+  const list = (await s0.binary({ op: "snapshots" })).value.snapshots.map((x) => (x.id === s0.mid ? { ...x, tags: T("manifest", "good", RUN, sha256(text)) } : x));
+  const b = store(list, new Map([[s0.mid, text]]));
+  const r = await pass(b);
+  assert.equal(r.error, "bad_manifest");
+  assert.ok(!b.calls.some((c) => c.op === "forget"));
+});
+
 test("a retention pass with any doubt forgets nothing", async () => {
   const stale = listed(hex(6), T0 - 2 * DAY, T("agent", "good", "20261101T030000Z-dddddddd"));
   const variants = [
@@ -272,6 +282,9 @@ test("a retention pass with any doubt forgets nothing", async () => {
     // the archive's own id, listed under another kind: only the kind is wrong
     ["a referenced snapshot of another kind", committedStore([stale], { edit: function (l) { const c = this.sets.find((x) => x.kind === "archive"); return l.map((x) => (x.id === c.snapshot ? { ...x, tags: T("agent", "good", RUN, c.id) } : x)); } })],
     ["the host store missing", committedStore([stale], { edit: (l) => l.filter((x) => x.id !== hex(5)) })],
+    // only the id tag is wrong (same kind and tree), or only the state (the same snapshot listed as warm)
+    ["a referenced snapshot with another id", committedStore([stale], { edit: function (l) { const a = this.sets.find((x) => x.kind === "agent"); return l.map((x) => (x.id === a.snapshot ? { ...x, tags: T("agent", "good", RUN, newId()) } : x)); } })],
+    ["a referenced snapshot that is warm", committedStore([stale], { edit: function (l) { const a = this.sets.find((x) => x.kind === "agent"); return l.map((x) => (x.id === a.snapshot ? { ...x, tags: T("agent", "warm", RUN, a.id) } : x)); } })],
     ["a duplicate snapshot id", committedStore([stale, { ...stale }])],
   ];
   for (const [name, s, fail] of variants) {

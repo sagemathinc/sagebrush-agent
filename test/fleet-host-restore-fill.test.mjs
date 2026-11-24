@@ -27,7 +27,7 @@ const planOf = (kind, id, run = RUN) => ({ v: 1, host: "old-host", manifest: hex
  * leaves a partial attempt (some data, no marker), a non-zero fill-home moves the first file only. `calls` records every
  * argv; `onCall(args)` runs first (the test sees the record as it is at that moment).
  */
-function world(kind, { script = () => 0, onCall = () => {} } = {}) {
+function world(kind, { script = () => 0, onCall = () => {}, failDiscards = 0 } = {}) {
   const base = mkdtempSync(join(tmpdir(), "sb-fill-"));
   const stage = join(base, "staging"), dir = join(base, "restore");
   const dests = {};
@@ -65,7 +65,9 @@ function world(kind, { script = () => 0, onCall = () => {} } = {}) {
   const identifyDest = async (k, id, cls) => ({ epoch: { boot_id: "00000000-0000-4000-8000-000000000000", mnt_id: 7 }, fsid: "0123456789abcdef", object: { type: "dir", mode: 0o700, uid: 70000, gid: 70000, dev: [8, 1], ino: statSync(dests[cls]).ino, gen: 1, mnt_id: 7, projid: 70000, inherit: true } });
   const expectOf = async (k, id, cls) => join(base, "expect", `${cls}.json`);
   const cleanDest = async (r) => { cleaned.push(r.attempt); for (const d of Object.values(dests)) for (const e of readdirSync(d)) rmSync(join(d, e)); };
+  let discardFailures = failDiscards;
   const discardStaging = async (r) => {
+    if (discardFailures > 0 && r.state !== "staging") { discardFailures -= 1; throw new Error("crash in discard"); }
     discarded.push(r.attempt);
     if (!existsSync(stage)) return;
     for (const run of readdirSync(stage)) for (const owner of readdirSync(join(stage, run))) for (const cls of readdirSync(join(stage, run, owner))) {
@@ -308,4 +310,34 @@ test("fillExpect: the launcher's identity of the destination plus the class's ow
   const io = { ...realIo, fsync: () => { throw Object.assign(new Error("EIO"), { code: "EIO" }); } };
   assert.throws(() => writeExpectFile(dir, `agent-${id}-tag.json`, {}, { ...me, io }), (e) => e.code === "EIO");
   assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith(".tmp")), []);
+});
+
+test("a stop discards the set's staging before it is reported: nothing stays charged (a quota hit in staging, a failure)", async () => {
+  for (const [code, state] of [[EXIT.quota, "not_fitting"], [73, "failed"]]) {
+    const id = newId();
+    const w = world("agent", { script: (op, cls) => (op === "restore-stage" && cls === "sessions" ? code : 0) });
+    const r = await w.fill("agent", id, planOf("agent", id));
+    assert.equal(r.state, state);
+    for (const cls of ["home", "sessions"]) {
+      assert.equal(existsSync(join(w.stage, RUN, `a-${id}`, cls, "1")), false, `${state}: ${cls}'s attempt (complete or partial) discarded`);
+    }
+    assert.equal(w.calls.filter((a) => a[0] === "fill-home").length, 0);
+  }
+});
+
+test("a stopped set's next call only discards what a crash left; it never restages or refills", async () => {
+  // Every stage of attempt 1 hits the quota; the first discard after the stop dies (a crash right after the stop's write).
+  const id = newId();
+  const w = world("agent", { script: () => EXIT.quota, failDiscards: 1 });
+  await assert.rejects(w.fill("agent", id, planOf("agent", id)), /crash in discard/);
+  assert.equal(readRecord("agent", id, { dir: w.dir }).state, "not_fitting", "the stop was written first");
+  assert.ok(existsSync(join(w.stage, RUN, `a-${id}`, "home", "1")), "its staging survived the crash");
+  const before = w.calls.length;
+  const r = await w.fill("agent", id, planOf("agent", id));
+  assert.equal(r.state, "not_fitting");
+  assert.equal(w.calls.length, before, "no restore-stage, no fill-home");
+  assert.equal(existsSync(join(w.stage, RUN, `a-${id}`, "home", "1")), false, "the leftover is discarded now");
+  // And again: idempotent, still nothing staged.
+  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "not_fitting");
+  assert.equal(w.calls.length, before);
 });

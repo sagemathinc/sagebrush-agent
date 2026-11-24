@@ -59,6 +59,21 @@ test("a manifest inconsistent with the registry copy is refused: a missing set, 
   refused(() => buildManifest({ ...args, sets: [...args.sets, args.sets[0]] }), "not_granted");
 });
 
+test("the config hashes are exactly the live agents': a missing one, an extra one, a deleted agent's are refused, built or parsed", () => {
+  const { a, b, c, args } = fixture();
+  refused(() => buildManifest({ ...args, config: {} }), "not_granted");
+  refused(() => buildManifest({ ...args, config: { [a]: hex(21) } }), "not_granted");
+  refused(() => buildManifest({ ...args, config: { ...args.config, [newId()]: hex(23) } }), "not_granted");
+  refused(() => buildManifest({ ...args, config: { ...args.config, [c]: hex(23) } }), "not_granted");
+  const m = buildManifest(args);
+  assert.deepEqual(Object.keys(m.config).sort(), [a, b].sort());
+  for (const config of [{}, { [a]: hex(21) }, { ...m.config, [c]: hex(23) }, { ...m.config, [newId()]: hex(23) }]) {
+    refused(() => parseManifest(canonical({ ...m, config }) + "\n"), "bad_form");
+  }
+  // and a parsed manifest's sets must match its registry copy too
+  refused(() => parseManifest(canonical({ ...m, sets: m.sets.slice(1) }) + "\n"), "bad_form");
+});
+
 test("the manifest's shape is closed, and only its canonical text parses", () => {
   const m = buildManifest(fixture().args);
   for (const bad of [{ ...m, v: 2 }, { ...m, extra: 1 }, { ...m, hoststore: "x" }, { ...m, run: "r" }, { ...m, sets: [{ ...m.sets[0], snapshot: "short" }] },

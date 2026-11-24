@@ -604,8 +604,8 @@ fn usage_bounds_a_restore() {
     assert_eq!(u["entries"], 306, "{u}");
     assert_eq!(u["inodes"], 305, "a and a-link are one inode: {u}");
     let bound = u["blocks_upper"].as_u64().unwrap();
-    // At the peak of a fill the directory and the two symlinks exist twice (made anew; the staged copies stay).
-    assert_eq!(u["peak_inodes"], 305 + 3, "{u}");
+    // At the peak of a fill the directory exists twice (made anew; the staged copy stays); files and symlinks are moved.
+    assert_eq!(u["peak_inodes"], 305 + 1, "{u}");
     assert!(u["peak_blocks_upper"].as_u64().unwrap() > bound, "{u}");
     // Without reading data it can't know the holes: the bound covers the whole 1 GiB.
     assert!(bound >= (1 << 30) / 4096, "{u}");

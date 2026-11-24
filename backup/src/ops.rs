@@ -438,20 +438,18 @@ const DX_PER_BLOCK: u64 = 500;
 /// - a symlink: a block when its target is longer than 59 bytes, else none (held in the inode).
 /// - every entry but the specials: one inode (hard links once). This count is exact, not a bound.
 ///
-/// The PEAK, while a class is filled from its staging (launcher amendment A2 §4): fill-home renames files but makes
-/// every directory and symlink anew in the destination, while the staged copies stay until the staging is discarded.
-/// So at its end every directory and symlink exists twice: the peak adds their inodes (exact) and their blocks (the
-/// directory bound, the destination's own entries included, since data/<leaf> held them too; a block per long symlink)
-/// once more. The launcher's own staging objects (the attempt, data, data/<leaf>, the marker, the parents) are the
+/// The PEAK, while a class is filled from its staging (launcher amendment A2 §4): fill-home renames files and symlinks
+/// (their inodes move) but makes every directory anew in the destination, while the staged directories stay until the
+/// staging is discarded. So at its end every directory exists twice: the peak adds their inodes (exact) and their blocks
+/// (the directory bound, the destination's own entries included, since data/<leaf> held them too) once more. The launcher's own staging objects (the attempt, data, data/<leaf>, the marker, the parents) are the
 /// space check's to add (restore-space.mjs), not the tree's.
 #[derive(Default)]
 struct Tally {
     entries: u64,
     inodes: u64,
     blocks: u64,
-    /// Directories and symlinks (made anew by the fill, so twice at the peak), and the symlinks' blocks.
+    /// Directories (made anew by the fill, so twice at the peak).
     twice_inodes: u64,
-    link_blocks: u64,
     /// Directory entry bytes per directory (by its path; "" is the destination itself).
     dirs: HashMap<PathBuf, u64>,
     links: HashSet<(u64, u64)>,
@@ -478,10 +476,8 @@ impl Tally {
                 self.dirs.entry(path.to_path_buf()).or_insert(0);
             }
             NodeType::Symlink { .. } => {
-                self.twice_inodes += 1;
                 if node.node_type.to_link().as_os_str().len() > FAST_SYMLINK {
                     self.blocks += 1;
-                    self.link_blocks += 1;
                 }
             }
             _ => self.blocks += file_blocks(node.meta.size),
@@ -497,7 +493,7 @@ impl Tally {
             inodes: self.inodes,
             blocks: self.blocks + dirs,
             peak_inodes: self.inodes + self.twice_inodes,
-            peak_blocks: self.blocks + dirs + dirs + self.link_blocks,
+            peak_blocks: self.blocks + dirs + dirs,
         }
     }
 }
@@ -642,10 +638,10 @@ mod tests {
         let root = dir_blocks(24 + (8 + 4) + (8 + 4) + (8 + 4) + (8 + 4));
         let d = dir_blocks(24 + 3 * (8 + 4));
         assert_eq!(blocks, 4 + 3 + 3 + 1 + root + d);
-        // The peak: d, s59 and s60 exist twice (made anew by the fill); every directory's blocks (the destination's
-        // entries included) and the long symlink's block once more. Files are renamed: once.
-        assert_eq!(u.peak_inodes, 6 + 3);
-        assert_eq!(u.peak_blocks, blocks + root + d + 1);
+        // The peak: only d exists twice (made anew by the fill), and every directory's blocks (the destination's entries
+        // included) once more. Files and symlinks are renamed: once.
+        assert_eq!(u.peak_inodes, 6 + 1);
+        assert_eq!(u.peak_blocks, blocks + root + d);
     }
 
     #[test]
@@ -670,6 +666,17 @@ mod tests {
         assert_eq!(count(&[node(NodeType::File, 1, 3, 80), node(NodeType::File, 1, 3, 80)]), 2);
         assert_eq!(hardlink_key(&node(NodeType::File, 2, 3, 77)), Some((3, 77)));
         assert_eq!(hardlink_key(&link()), None);
+    }
+
+    #[test]
+    fn symlinks_are_moved_not_made_anew() {
+        // One long symlink: a block and an inode, once, at the end and at the peak (the fill renames it).
+        let mut t = Tally::default();
+        t.add(Path::new("l"), &Node::new_node(OsStr::new("l"), NodeType::from_link(Path::new(&"t".repeat(200))), Metadata::default()));
+        let u = t.finish();
+        let root = dir_blocks(24 + 8 + 4);
+        assert_eq!((u.inodes, u.blocks), (1, 1 + root));
+        assert_eq!((u.peak_inodes, u.peak_blocks), (1, 1 + 2 * root), "only the destination directory's blocks twice");
     }
 
     #[test]

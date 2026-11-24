@@ -190,6 +190,12 @@ test("classify is strict: exactly one of each tag, the run grammar, the id or ha
     ["a manifest without its hash", snap(hex(1), 0, ["sb-kind=manifest", "sb-state=good", `sb-run=${RUN}`])],
     ["a warm manifest", snap(hex(1), 0, T("manifest", "warm"))],
     ["no tags", snap(hex(1), 0, ["user=1"])],
+    ["an agent with another kind's identity too", snap(hex(1), 0, [...T("agent", "good"), `archive=${newId()}`])],
+    ["an agent whose only identity is another kind's", snap(hex(1), 0, ["sb-kind=agent", "sb-state=good", `sb-run=${RUN}`, `tag=${newId()}`])],
+    ["a host store with an identity tag", snap(hex(1), 0, [...T("hoststore", "good"), `agent=${newId()}`])],
+    ["a manifest with an identity tag", snap(hex(1), 0, [...T("manifest", "good"), `tag=${newId()}`])],
+    ["an agent with a manifest hash", snap(hex(1), 0, [...T("agent", "good"), `sb-manifest=${hex(5)}`])],
+    ["a host store with a manifest hash", snap(hex(1), 0, [...T("hoststore", "good"), `sb-manifest=${hex(5)}`])],
   ]) assert.equal(classify(s, HOST), null, name);
 });
 
@@ -264,6 +270,16 @@ test("a manifest whose content names another host (its hash tag and listing loca
   const s0 = committedStore([listed(hex(6), T0 - 2 * DAY, T("agent", "good", "20261101T030000Z-dddddddd"))]);
   const text = canonical({ ...s0.m, host: "other" }) + "\n";
   const list = (await s0.binary({ op: "snapshots" })).value.snapshots.map((x) => (x.id === s0.mid ? { ...x, tags: T("manifest", "good", RUN, sha256(text)) } : x));
+  const b = store(list, new Map([[s0.mid, text]]));
+  const r = await pass(b);
+  assert.equal(r.error, "bad_manifest");
+  assert.ok(!b.calls.some((c) => c.op === "forget"));
+});
+
+test("a manifest whose content is another run's than its sb-run tag (its hash valid): the pass stops, nothing forgotten", async () => {
+  const s0 = committedStore([listed(hex(6), T0 - 2 * DAY, T("agent", "good", "20261101T030000Z-dddddddd"))]);
+  const text = canonical(s0.m) + "\n"; // run RUN
+  const list = (await s0.binary({ op: "snapshots" })).value.snapshots.map((x) => (x.id === s0.mid ? { ...x, tags: T("manifest", "good", "20261123T030000Z-eeeeeeee", sha256(text)) } : x));
   const b = store(list, new Map([[s0.mid, text]]));
   const r = await pass(b);
   assert.equal(r.error, "bad_manifest");

@@ -14,14 +14,14 @@ sys.path.insert(0, str(ROOT / "python"))
 
 from sagebrush_fleet import (  # noqa: E402
     FleetError, apply_chain_entry, canon_text, derive_key_pair, device_key, is_id, key_id, open_cap, open_envelope,
-    parse_canonical, replay, service_key_at, unb64, verify_approval, verify_grant, verify_host_cert, verify_host_op,
+    parse_canonical, replay, service_key_at, unb64, verify_approval, verify_grant, verify_grant_ack, verify_host_cert, verify_host_op,
     verify_package, verify_strict,
 )
 from sagebrush_fleet.hpke import Recipient, Sender  # noqa: E402
 
 FIXTURES = ROOT / "test" / "fixtures"
 # (the JavaScript checker's case counts: a fixture file that loses cases fails here, not silently)
-COUNTS = {"fleet": 84, "hpke": 34}
+COUNTS = {"fleet": 91, "hpke": 34}
 
 
 def load(name):
@@ -109,6 +109,10 @@ class FleetFixtures(Cases):
 
         self.each("grants", ((c["name"], run(c), c["expect"]) for c in O["grants"]))
 
+    def test_grant_acks(self):
+        O, _, cert = self.objects()
+        self.each("grant_acks", ((c["name"], result(lambda: verify_grant_ack(enc(c["bytes"]), {**self.ctx, "cert": cert, "current_gen": c["current_gen"]})), c["expect"]) for c in O["grant_acks"]))
+
     def test_host_ops(self):
         O, st, _ = self.objects()
         self.each("host_ops", ((c["name"], result(lambda: verify_host_op(enc(c["bytes"]), {
@@ -123,7 +127,7 @@ class FleetFixtures(Cases):
 
     def test_zz_every_case_ran(self):
         """(named to run last in the class) the JavaScript checker's count of cases, all of them run here"""
-        groups = ["canonical", "base64url", "ids", "ed25519", "chain", "service_keys", "envelopes", "grants", "host_ops", "approvals"]
+        groups = ["canonical", "base64url", "ids", "ed25519", "chain", "service_keys", "envelopes", "grants", "grant_acks", "host_ops", "approvals"]
         missing = [g for g in groups if g not in Cases.ran]
         if missing:
             self.skipTest(f"run alone: {missing} not run")

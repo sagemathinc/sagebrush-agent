@@ -181,6 +181,20 @@ export async function build() {
     { name: "a subject_hash of another subject", bytes: approval(N, nId, { subject_hash: sha256b64(enc(canonText({ ...subject, count: 3 }))) }), expect_op: { ...expectA, subject: { ...subject, count: 3 } }, current: { gen: 4, life: 2 }, used: [], expect: "approval_mismatch" },
     { name: "a browser device under the native policy", bytes: approval(B, bId), expect_op: expectA, current: { gen: 4, life: 2 }, used: [], expect: "device_tier" },
   ];
+  // a host's acknowledgement of its grant (§3.3), against the certificate above, at current_gen 3
+  const hostSigner = { kind: "host", id: host, alg: "ed25519", key: H.key };
+  const ackBody = (extra = {}) => ({ fleet, aud: AUD, host, gen: 3, at_ms: NOW, narrowed: false, restarted: [], ...extra });
+  const ack = (type, sg, body, k) => txt(seal(type, sg, body, k));
+  const ack0 = ack("sb.grant-ack.v1", hostSigner, ackBody(), H);
+  const grant_acks = [
+    { name: "an ack of the current generation", bytes: ack0, current_gen: 3, expect: "ok" },
+    { name: "an ack of an older generation", bytes: ack("sb.grant-ack.v1", hostSigner, ackBody({ gen: 2 }), H), current_gen: 3, expect: "ok" },
+    { name: "an ack ahead of the grant", bytes: ack("sb.grant-ack.v1", hostSigner, ackBody({ gen: 4 }), H), current_gen: 3, expect: "stale_generation" },
+    { name: "signed by a key other than the certified host's", bytes: ack("sb.grant-ack.v1", hostSigner, ackBody(), N2), current_gen: 3, expect: "bad_signature" },
+    { name: "another host", bytes: ack("sb.grant-ack.v1", { ...hostSigner, id: agent }, ackBody({ host: agent }), H), current_gen: 3, expect: "bad_signature" },
+    { name: "a device as an ack's signer (still well-formed; acks are signed by hosts)", bytes: txt(enc(canonText({ ...JSON.parse(ack0), signer: signer(N, nId) }))), current_gen: 3, expect: "bad_signature" },
+    { name: "an ack's body under another type", bytes: ack("sb.audit-event.v1", hostSigner, ackBody(), H), current_gen: 3, expect: "bad_form" },
+  ];
   const envelopes = [
     { name: "a host op, as signed", bytes: host_ops[0].bytes, expect: "ok" },
     { name: "another audience", bytes: host_ops[0].bytes, ctx: { aud: "https://sagebrush.space", fleet }, expect: "bad_audience" },
@@ -196,7 +210,7 @@ export async function build() {
     canonical, base64url, ids_cases: idCases, ed25519,
     chain: { entries_note: "envelope texts, in order", cases: chain },
     service_keys: { chain: honest, cases: service_keys },
-    objects: { chain: honest, host_cert: cert, grants, host_ops, approvals, envelopes },
+    objects: { chain: honest, host_cert: cert, grants, grant_acks, host_ops, approvals, envelopes },
   };
 }
 

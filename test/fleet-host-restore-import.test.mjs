@@ -172,6 +172,91 @@ test("a crash after the fences and records, before the registry: the retry compl
   } finally { await store.close(); }
 });
 
+/**
+ * An io that records [op, path]. `failAfter`: [dir, n] fails that directory's fsync once, right after the n-th rename
+ * into it (a write visible but not known durable; the first rename into a component's directory is its attach
+ * creating the empty file). `failDir`: fails every fsync of that directory.
+ */
+function faultIo({ failAfter = null, failDir = null } = {}) {
+  const ops = [], fds = new Map();
+  let renames = 0, failed = false;
+  return {
+    ops,
+    io: {
+      ...realIo,
+      open: (p, f, m) => { const fd = realIo.open(p, f, m); fds.set(fd, p); return fd; },
+      fsync: (fd) => {
+        const p = fds.get(fd);
+        ops.push(["fsync", p]);
+        if (p === failDir) throw Object.assign(new Error("injected EIO"), { code: "EIO" });
+        if (failAfter && p === failAfter[0] && renames === failAfter[1] && !failed) { failed = true; throw Object.assign(new Error("injected EIO"), { code: "EIO" }); }
+        return realIo.fsync(fd);
+      },
+      rename: (a, b) => { ops.push(["rename", b]); if (failAfter && dirname(b) === failAfter[0]) renames += 1; return realIo.rename(a, b); },
+    },
+  };
+}
+const at = (ops, op, p) => ops.findIndex(([o, q]) => o === op && q === p);
+const isEIO = (e) => e.code === "EIO";
+
+test("a deleted agent's done record visible but not durable: the retry makes it durable before the registry, or stops", async () => {
+  const { dead, registry, manifest, plan } = fixture();
+  const root = join(tmp(), "store"), restoreDir = join(tmp(), "restore"), fenceDir = join(tmp(), "fence");
+  const depDir = join(root, "deprovision"), depFile = join(depDir, "deprovision.json"), regFile = join(root, "registry", "registry.json");
+  const run = async (io) => {
+    const store = await HostStore.open(root, io ? { io } : {});
+    try { return await importHostStore({ copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir }); } finally { await store.close(); }
+  };
+  const look = async () => {
+    const store = await HostStore.open(root);
+    try { return { done: store.deprovision.record(dead)?.done ?? null, ids: store.registry.ids() }; } finally { await store.close(); }
+  };
+  // The record's rename lands, then its directory's fsync fails: the import stops before the registry.
+  const first = faultIo({ failAfter: [depDir, 2] });
+  await assert.rejects(run(first.io), isEIO);
+  assert.ok(at(first.ops, "rename", depFile) >= 0, "the record was renamed into place");
+  assert.deepEqual(await look(), { done: true, ids: [] }, "visible after a reload; the registry not written");
+  // A retry whose re-flush fails again stops again, before the registry.
+  const again = faultIo({ failDir: depDir });
+  await assert.rejects(run(again.io), isEIO);
+  assert.ok(at(again.ops, "fsync", depDir) >= 0, "the retry re-flushed the record's directory");
+  assert.equal(at(again.ops, "rename", depFile), -1, "without rewriting the record");
+  assert.equal(at(again.ops, "rename", regFile), -1, "and stopped before the registry");
+  assert.deepEqual((await look()).ids, []);
+  // The good retry: the record's file, then its directory, fsynced BEFORE the registry's rename.
+  const good = faultIo();
+  await run(good.io);
+  assert.ok(at(good.ops, "fsync", depFile) >= 0 && at(good.ops, "fsync", depDir) > at(good.ops, "fsync", depFile), "file, then directory");
+  assert.ok(at(good.ops, "rename", regFile) > at(good.ops, "fsync", depDir), "both before the registry is published");
+  assert.deepEqual((await look()).ids, Object.keys(registry.agents).sort());
+});
+
+test("the registry visible but not durable: the identical retry makes it durable before anything after it", async () => {
+  const { registry, manifest, plan } = fixture();
+  const root = join(tmp(), "store"), fenceDir = join(tmp(), "fence");
+  const regDir = join(root, "registry"), regFile = join(regDir, "registry.json");
+  const run = async (io, restoreDir) => {
+    const store = await HostStore.open(root, io ? { io } : {});
+    try { return await importHostStore({ copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir }); } finally { await store.close(); }
+  };
+  const r1 = join(tmp(), "restore");
+  const first = faultIo({ failAfter: [regDir, 2] });
+  await assert.rejects(run(first.io, r1), isEIO);
+  assert.equal(existsSync(join(r1, "provenance")), false, "nothing after the registry ran");
+  // A repeated failure of the re-flush stops before the rest.
+  const r2 = join(tmp(), "restore");
+  const again = faultIo({ failDir: regDir });
+  await assert.rejects(run(again.io, r2), isEIO);
+  assert.equal(at(again.ops, "rename", regFile), -1, "not rewritten");
+  assert.equal(existsSync(join(r2, "provenance")), false, "nothing after the registry ran");
+  // The good retry: the registry's file, then its directory, fsynced, and only then the rest.
+  const good = faultIo();
+  await run(good.io, r1);
+  assert.ok(at(good.ops, "fsync", regFile) >= 0 && at(good.ops, "fsync", regDir) > at(good.ops, "fsync", regFile), "file, then directory");
+  assert.equal(at(good.ops, "rename", regFile), -1, "not rewritten");
+  assert.ok(existsSync(join(r1, "provenance", "grant")), "then the rest");
+});
+
 test("the report's words for what isn't restored: exactly these three lines", async () => {
   assert.equal(BY_RULE, "not restored (by rule: a restored host waits for a fresh grant)");
   assert.equal(PER_HOST, "not restored (per host)");
@@ -215,28 +300,69 @@ test("only the manifest's registry is imported, registry first: a refusal leaves
   }
 });
 
-test("the registry importer: only onto a registry that never recorded anything; the same import again is a no-op", async () => {
+/** What a refused import must leave untouched: the restore fences present and the deprovision records' bytes. */
+const effects = (root, fenceDir) => ({
+  fences: existsSync(join(fenceDir, "restore")) ? readdirSync(join(fenceDir, "restore")).sort() : [],
+  deprovision: existsSync(join(root, "deprovision", "deprovision.json")) ? readFileSync(join(root, "deprovision", "deprovision.json"), "utf8") : null,
+});
+
+test("the registry importer: only onto a registry that never recorded anything, checked read-only before any fence or record", async () => {
   const { registry, manifest, plan } = fixture();
   for (const [why, prep] of [
     ["an agent recorded", (s) => s.registry.addAgent(newId(), 1)],
     ["a tag recorded", (s) => s.registry.addTag(newId())],
+    ["an agent recorded and deleted, with its own deprovision record", (s) => {
+      const id = newId();
+      s.registry.addAgent(id, 1);
+      s.registry.setState(id, "deleted", "delete");
+      s.deprovision.ensure(id, s.registry.agent(id));
+    }],
   ]) {
     const { root, store, restoreDir, fenceDir } = await host();
     try {
       prep(store);
-      const before = store.registry.ids();
+      const before = { ids: store.registry.ids(), ...effects(root, fenceDir) };
       await rejects(importHostStore({ copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir }), "not_granted");
-      assert.deepEqual(store.registry.ids(), before, why);
+      assert.deepEqual({ ids: store.registry.ids(), ...effects(root, fenceDir) }, before, `${why}: no fence, no record, no registry change`);
+      assert.equal(existsSync(join(restoreDir, "provenance")), false, why);
     } finally { await store.close(); }
   }
-  // Another restore's registry onto a restored one refuses; the same one is fine.
+  // Another restore's registry onto a restored host: refused before any of ITS fences or records exist.
   const { root, store, restoreDir, fenceDir } = await host();
   try {
     await importHostStore({ copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir });
     const other = fixture();
+    const before = { ids: store.registry.ids(), ...effects(root, fenceDir) };
+    await rejects(importHostStore({ copy: copyOf(other.registry), store, root, plan: other.plan, manifest: other.manifest, restoreDir, fenceDir }), "not_granted");
+    assert.deepEqual({ ids: store.registry.ids(), ...effects(root, fenceDir) }, before, "the other restore's agents aren't fenced, its deleted agent has no record");
+    for (const id of [other.a, other.b]) assert.equal(fenced(id, { dir: fenceDir }), false, id);
+    assert.equal(store.deprovision.record(other.dead), null);
     refused(() => store.registry.importRestored(other.registry), "not_granted");
     store.registry.importRestored(registry);
     refused(() => store.registry.importRestored({ ...registry, next_uid: 1 }), "bad_form");
+  } finally { await store.close(); }
+});
+
+test("the registry preflight: fresh, or exactly this import, and nothing else; it changes nothing", async () => {
+  const { registry } = fixture();
+  const { root, store } = await host();
+  try {
+    const file = join(root, "registry", "registry.json");
+    const text = readFileSync(file, "utf8"), ino = statSync(file).ino;
+    assert.equal(store.registry.importPreflight(registry), "fresh");
+    assert.deepEqual([readFileSync(file, "utf8"), statSync(file).ino], [text, ino], "read only: not even rewritten");
+    refused(() => store.registry.importPreflight({ ...registry, extra: 1 }), "bad_form");
+    store.registry.importRestored(registry);
+    assert.equal(store.registry.importPreflight(registry), "same");
+    // The same copy with a start failure is the same import (start failures are cleared either way).
+    const a = Object.keys(registry.agents)[0];
+    assert.equal(store.registry.importPreflight({ ...registry, agents: { ...registry.agents, [a]: { ...registry.agents[a], start_failed: "unit_failed" } } }), "same");
+    refused(() => store.registry.importPreflight(fixture().registry), "not_granted");
+    refused(() => store.registry.importPreflight({ ...registry, next_uid: registry.next_uid + 1 }), "not_granted");
+    const text2 = readFileSync(file, "utf8"), ino2 = statSync(file).ino;
+    assert.equal(store.registry.importPreflight(registry), "same");
+    refused(() => store.registry.importPreflight(fixture().registry), "not_granted");
+    assert.deepEqual([readFileSync(file, "utf8"), statSync(file).ino], [text2, ino2], "a preflight never writes");
   } finally { await store.close(); }
 });
 

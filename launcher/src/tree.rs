@@ -29,7 +29,7 @@ pub(crate) const S_IFREG: u16 = 0o100000;
 pub(crate) const S_IFLNK: u16 = 0o120000;
 
 /// The compiled anchor table (A1 §1): an anchor path and the form of the one name beneath it.
-pub const ANCHORS: [(&str, &str); 9] = [
+pub const ANCHORS: [(&str, &str); 10] = [
     ("/run/sagebrush/binds", ""),
     ("/run/sagebrush/broker", ""),
     ("/var/lib/sagebrush/creds", ""),
@@ -39,6 +39,8 @@ pub const ANCHORS: [(&str, &str); 9] = [
     ("/srv/sagebrush/archive", ""),
     ("/srv/sagebrush/archive-config", ""),
     ("/var/lib/sagebrush/secrets", ""),
+    // Launcher amendment A4: the host's harness profile directories (profiles piece 2), `<pid>`.
+    ("/srv/sagebrush/claude-profiles", ""),
 ];
 
 /// Whether `name` is `<id><suffix>` for the anchor's suffix; beneath A2's `.restore`, `<run>/<owner>/<class>/<attempt>`.
@@ -613,7 +615,7 @@ pub fn inspect_home<O: Ops>(o: &mut O, mount: &str, agent: &str, tree: Tree, arc
 // ---- check-parents (A1 r2.2 §3a): the fixed parents provisioning writes beneath
 
 /// The fixed directories under /srv/sagebrush that provisioning creates or adopts and then writes beneath.
-pub const FIXED_PARENTS: [&str; 5] = ["agents", "agent-config", "archive", "archive-config", "tags"];
+pub const FIXED_PARENTS: [&str; 6] = ["agents", "agent-config", "archive", "archive-config", "tags", "claude-profiles"];
 
 /// Check the quota mount (its root, its ancestors) and every fixed parent: each root:root, without group or other
 /// write, without an ACL, on the mount. With `allow_missing`, a fixed component that doesn't exist yet ends the walk
@@ -964,6 +966,9 @@ pub(crate) mod tests {
         pub(crate) proj: u32,
         pub(crate) inherit: bool,
         pub(crate) acl: bool,
+        /// A4: the ext4 immutable flag. An immutable node can't be unlinked, renamed, chmod'ed or have its ACLs or
+        /// flags changed except through set_immutable (root with CAP_LINUX_IMMUTABLE), as on the real kernel.
+        pub(crate) immutable: bool,
     }
 
     pub(crate) type Hook = fn(&mut Fake);
@@ -1015,7 +1020,7 @@ pub(crate) mod tests {
             for d in ["run", "run/sagebrush", "run/sagebrush/binds", "var", "var/lib", "var/lib/sagebrush", "var/lib/sagebrush/contract", "srv", "srv/sagebrush", "srv/sagebrush/agents", "srv/sagebrush/agent-config"] {
                 f.add(d, S_IFDIR | 0o755, 0, 0);
             }
-            for d in ["srv/sagebrush/archive", "srv/sagebrush/archive-config"] {
+            for d in ["srv/sagebrush/archive", "srv/sagebrush/archive-config", "srv/sagebrush/claude-profiles"] {
                 f.add(d, S_IFDIR | 0o700, 0, 0);
             }
             f.files.insert("proc/sys/kernel/random/boot_id".into(), format!("{BOOT}\n").into_bytes());
@@ -1024,7 +1029,7 @@ pub(crate) mod tests {
         pub(crate) fn add(&mut self, p: &str, mode: u16, uid: u32, gid: u32) {
             self.next_ino += 1;
             let id = Ident { attributes: 0, dev: (8, 1), ino: self.next_ino, uid, gid, mode, mnt_id: MNT, nlink: 1, size: 0 };
-            self.nodes.insert(p.to_string(), Node { id, gen: 7, proj: 0, inherit: false, acl: false });
+            self.nodes.insert(p.to_string(), Node { id, gen: 7, proj: 0, inherit: false, acl: false, immutable: false });
         }
         pub(crate) fn dir(&mut self, p: &str, uid: u32, mode: u16) {
             self.add(p, S_IFDIR | mode, uid, uid);
@@ -1145,6 +1150,9 @@ pub(crate) mod tests {
         }
         fn chmod(&mut self, h: &FH, mode: u16) -> io::Result<()> {
             self.tick("chmod")?;
+            if self.nodes[&h.p].immutable {
+                return Err(e(libc::EPERM));
+            }
             self.log.push(format!("chmod {} {mode:o}", h.p));
             let n = self.node(&h.p);
             n.id.mode = (n.id.mode & S_IFMT) | mode;
@@ -1153,6 +1161,9 @@ pub(crate) mod tests {
         fn drop_acls(&mut self, h: &FH) -> io::Result<()> {
             // Two removals, like the real one: the access ACL goes first, then the default ACL (each can fail).
             self.tick("drop_access")?;
+            if self.nodes[&h.p].immutable {
+                return Err(e(libc::EPERM));
+            }
             self.node(&h.p).acl = false;
             self.tick("drop_default")?;
             Ok(())
@@ -1167,6 +1178,9 @@ pub(crate) mod tests {
             if is_dir && !self.children(&p).is_empty() {
                 return Err(e(libc::ENOTEMPTY));
             }
+            if n.immutable {
+                return Err(e(libc::EPERM));
+            }
             self.nodes.remove(&p);
             self.log.push(format!("unlink {p}"));
             Ok(())
@@ -1176,6 +1190,9 @@ pub(crate) mod tests {
             let (src, dst) = (join(&from.p, name), join(&to.p, name));
             if self.nodes.contains_key(&dst) {
                 return Err(e(libc::EEXIST));
+            }
+            if self.nodes.get(&src).is_some_and(|n| n.immutable) {
+                return Err(e(libc::EPERM));
             }
             let keys: Vec<String> = self.nodes.keys().filter(|k| **k == src || k.starts_with(&format!("{src}/"))).cloned().collect();
             for k in keys {

@@ -9,6 +9,9 @@
 //! Amendment A2 (backup restore) adds two more, also root-only and outside any unit: `restore-stage` and `fill-home`
 //! (restore.rs, child.rs).
 //!
+//! Amendment A4 (profiles) adds `profile-mounts`, root-only, outside any unit (profile.rs), and the profiles root to A1's
+//! anchor table and check-parents.
+//!
 //! Amendment A3 (execution lease) adds `lease-check`, root-only, run as the unit's `ExecStartPre=+` (lease.rs).
 
 // Unsafe code is refused everywhere except the syscall module and the secret's zeroing Drop (contract §6).
@@ -24,6 +27,7 @@ mod exec;
 mod json;
 mod landlock;
 mod lease;
+mod profile;
 mod secret;
 mod stage;
 mod tree;
@@ -61,6 +65,14 @@ fn run() -> err::Result<()> {
                 return Err(err(Fail::Usage, "bad arguments"));
             }
             a2(cmd, rest)
+        }
+        // Launcher contract amendment A4 (profiles): root only, outside any unit.
+        "profile-mounts" => {
+            if !after.is_empty() {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            let out = profile::run(rest)?;
+            std::io::stdout().write_all(out.as_bytes()).map_err(|_| err(Fail::Internal, "internal error"))
         }
         // Launcher contract amendment A3 (execution lease): root only, the unit's ExecStartPre.
         "lease-check" => {

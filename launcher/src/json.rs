@@ -17,8 +17,14 @@ pub const MAX_ITEMS: usize = 256;
 pub const MAX_STR: usize = 4096;
 
 pub fn parse(src: &[u8]) -> Option<Value> {
+    parse_with(src, MAX_STR)
+}
+
+/// `parse` with another string bound (A2: the backup binary's result, whose error message may be longer than a
+/// contract string; the whole result is already bounded at 64 KiB by the caller).
+pub fn parse_with(src: &[u8], max_str: usize) -> Option<Value> {
     let text = core::str::from_utf8(src).ok()?;
-    let mut p = Parser { s: text.as_bytes(), i: 0 };
+    let mut p = Parser { s: text.as_bytes(), i: 0, max_str };
     let v = p.value(0)?;
     p.ws();
     if p.i != p.s.len() {
@@ -30,6 +36,7 @@ pub fn parse(src: &[u8]) -> Option<Value> {
 struct Parser<'a> {
     s: &'a [u8],
     i: usize,
+    max_str: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -124,7 +131,7 @@ impl<'a> Parser<'a> {
                     self.i = start + len;
                 }
             }
-            if out.len() > MAX_STR {
+            if out.len() > self.max_str {
                 return None;
             }
         }

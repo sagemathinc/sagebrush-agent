@@ -18,6 +18,11 @@ pub enum Fail {
     Exists,
     /// A1: effects happened (an unlink or the rename), then something failed; the caller's retry table decides.
     Partial,
+    /// A2: the class's project is at its own block or inode limit, or that can't be attributed (`quota_unknown`).
+    /// Permanent: no automatic retry.
+    Quota,
+    /// A2: the filesystem itself is out of blocks or inodes. Transient for the agent.
+    NoSpace,
 }
 
 impl Fail {
@@ -35,6 +40,8 @@ impl Fail {
             Fail::Identity => 73,
             Fail::Exists => 74,
             Fail::Partial => 75,
+            Fail::Quota => 76,
+            Fail::NoSpace => 77,
         }
     }
 
@@ -52,6 +59,8 @@ impl Fail {
             Fail::Identity => "identity",
             Fail::Exists => "exists",
             Fail::Partial => "partial",
+            Fail::Quota => "quota",
+            Fail::NoSpace => "no_space",
         }
     }
 }
@@ -94,6 +103,8 @@ mod tests {
             (Fail::Identity, 73, "identity"),
             (Fail::Exists, 74, "exists"),
             (Fail::Partial, 75, "partial"),
+            (Fail::Quota, 76, "quota"),
+            (Fail::NoSpace, 77, "no_space"),
         ];
         for (f, c, r) in all {
             assert_eq!(f.code(), c);

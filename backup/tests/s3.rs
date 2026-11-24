@@ -50,15 +50,19 @@ fn write_private(p: &Path, data: &str) {
     fs::set_permissions(p, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
+/// weed binds each port + 10000 for gRPC. Every such port stays below the kernel's ephemeral floor (32768), where no
+/// outgoing connection can take it before weed binds it.
+const GRPC_SAFE_LIMIT: u16 = 32768 - 10000;
+
 /// Five consecutive loopback ports for one server, each with its +10000 (SeaweedFS's gRPC offset) free too, all below
 /// the ephemeral range. Blocks are handed out from one counter, so servers started in parallel never share a port.
 fn port_block() -> [u16; 5] {
     static NEXT: AtomicU16 = AtomicU16::new(0);
-    let base = 20000 + (std::process::id() % 200) as u16 * 40;
+    let base = 10000 + (std::process::id() % 200) as u16 * 40;
     for _ in 0..400 {
-        let start = base + NEXT.fetch_add(5, Ordering::SeqCst) % 8000;
+        let start = base + NEXT.fetch_add(5, Ordering::SeqCst) % 4000;
         let free = |p: u16| TcpListener::bind(("127.0.0.1", p)).is_ok() && TcpListener::bind(("127.0.0.1", p + 10000)).is_ok();
-        if start + 5 < 30000 && (start..start + 5).all(free) {
+        if start + 5 < GRPC_SAFE_LIMIT && (start..start + 5).all(free) {
             return [start, start + 1, start + 2, start + 3, start + 4];
         }
     }
@@ -81,7 +85,28 @@ impl Drop for Weed {
     }
 }
 
+/// Starts weed on a fresh port block. Another process can still take a port between `port_block`'s check and weed's
+/// bind, and weed then exits at startup; that is retried on a new block. Any other failure to become ready is not.
 fn start_weed(bin: &Path) -> Weed {
+    for attempt in 1..=3 {
+        match try_start_weed(bin) {
+            Ok(w) => return w,
+            Err(why) if attempt < 3 => eprintln!("weed exited at startup (attempt {attempt}), retrying on new ports: {why}"),
+            Err(why) => panic!("weed exited at startup three times; the last: {why}"),
+        }
+    }
+    unreachable!()
+}
+
+/// The weed log's fatal lines (glog's `F` prefix) and its last lines, for a failure message.
+fn weed_log_summary(dir: &Path) -> String {
+    let log = fs::read_to_string(dir.join("weed.log")).unwrap_or_default();
+    let fatal: Vec<&str> = log.lines().filter(|l| l.starts_with('F') || l.contains("address already in use")).take(5).collect();
+    let tail: Vec<&str> = log.lines().rev().take(15).collect();
+    format!("fatal lines:\n{}\nlast lines first:\n{}", fatal.join("\n"), tail.join("\n"))
+}
+
+fn try_start_weed(bin: &Path) -> std::result::Result<Weed, String> {
     let dir = tmpdir("weed");
     let ports = port_block();
     let log = fs::File::create(dir.join("weed.log")).unwrap();
@@ -112,16 +137,18 @@ fn start_weed(bin: &Path) -> Weed {
         .stderr(log)
         .spawn()
         .expect("weed starts");
-    let w = Weed { child, s3: ports[3], filer: ports[2], key, secret, _dir: dir.clone() };
+    let mut w = Weed { child, s3: ports[3], filer: ports[2], key, secret, _dir: dir.clone() };
     let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
-        if http_status(w.filer, "GET", "/buckets/qual/") == Some(200) {
-            return w;
+        if http_status(w.filer, "GET", "/buckets/qual/") == Some(200) && http_status(w.s3, "GET", "/").is_some() {
+            return Ok(w);
+        }
+        if let Ok(Some(status)) = w.child.try_wait() {
+            return Err(format!("ports {ports:?}, {status}; {}", weed_log_summary(&dir)));
         }
         thread::sleep(Duration::from_millis(300));
     }
-    let tail: String = fs::read_to_string(dir.join("weed.log")).unwrap_or_default().lines().rev().take(15).collect::<Vec<_>>().join("\n");
-    panic!("weed didn't become ready on ports {ports:?}; its log, last lines first:\n{tail}");
+    panic!("weed didn't become ready on ports {ports:?}; {}", weed_log_summary(&dir));
 }
 
 /// A minimal HTTP/1.0 request to the filer (1.0, so the body is never chunked) (list, stat, delete objects); returns the status code.
@@ -534,6 +561,39 @@ fn restore_skips_specials_and_attributes() {
         let n = unsafe { libc::listxattr(p.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
         assert_eq!(n, 0, "no extended attribute restored: {:?}", String::from_utf8_lossy(&buf[..n.max(0) as usize]));
     }
+}
+
+/// The restore's view has no procfs, so the capability check asks the kernel directly. This row runs the restore in its
+/// own mount namespace with an empty read-only tmpfs over `/proc`, then without CAP_SYS_RESOURCE, and needs `sudo` with
+/// CAP_SYS_ADMIN for the `unshare` (CI). Elsewhere it skips, unless SB_TEST_REQUIRE_NOPROC=1.
+#[test]
+fn restore_runs_without_proc() {
+    let Some(bin) = weed() else { return };
+    let can_unshare = Command::new("sudo").args(["-n", "unshare", "-m", "true"]).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+    if !can_unshare {
+        assert!(std::env::var_os("SB_TEST_REQUIRE_NOPROC").is_none(), "sudo unshare -m is required (SB_TEST_REQUIRE_NOPROC is set)");
+        eprintln!("skipping: no sudo unshare -m here");
+        return;
+    }
+    let w = start_weed(&bin);
+    let h = host(&w, "noproc");
+    assert_eq!(run(&h, json!({ "op": "init" }))["ok"], true);
+    let src = tmpdir("noproc-src");
+    fs::write(src.join("f"), b"no proc").unwrap();
+    let b = run(&h, json!({ "op": "backup", "sources": [src], "host": "h1" }));
+    assert_eq!(b["ok"], true, "{b}");
+    let dst = tmpdir("noproc-dst");
+    // SAFETY: getuid and getgid have no preconditions.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let script = format!(
+        "mount -t tmpfs -o ro,nosuid,nodev,noexec,size=4k none /proc && \
+         exec setpriv --reuid={uid} --regid={gid} --clear-groups --bounding-set=-sys_resource --inh-caps=-sys_resource -- \"$0\" \"$@\""
+    );
+    let mut cmd = Command::new("sudo");
+    cmd.args(["-n", "unshare", "-m", "--propagation", "private", "--", "sh", "-c", &script, BIN]);
+    let r = run_cmd(&mut cmd, &h, json!({ "op": "restore", "snapshot": snapshot_id(&b), "dest": dst }), &[]);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(fs::read(walk_find(&dst, "f").expect("restored")).unwrap(), b"no proc");
 }
 
 /// A restore that still holds CAP_SYS_RESOURCE is refused before anything is read or written (host backup design r3.3 §5.7). Where

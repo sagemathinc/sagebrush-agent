@@ -64,6 +64,9 @@ function fakeFx(over = {}) {
       }
       return d;
     },
+    // The local host commands (deprovision part 3): `hostResult` picks the outcome.
+    purge: async (id, ms) => { log.push(["purge", id, ms]); const d = fx.hostResult?.("purge", id) ?? { status: "purged" }; if (d instanceof Error) throw d; return d; },
+    requalify: async (id, ms) => { log.push(["requalify", id, ms]); const d = fx.hostResult?.("requalify", id) ?? { status: "requalified", rebound: ["home"] }; if (d instanceof Error) throw d; return d; },
     thaw: async (id) => { if (!u(id).frozen || !u(id).active) throw new Error("not frozen"); log.push(["thaw", id]); u(id).frozen = false; },
     sys: {
       stop: (unit) => { log.push(["sys-stop", unit]); for (const [id, s] of Object.entries(units)) if (unit === "sagebrush-agents.slice" || idOf(unit) === id) s.active = false; },
@@ -444,6 +447,54 @@ test("delete: a proven stop runs one deprovision pass, audited; a pending or fai
   assert.deepEqual(dpAudit(B), [["pending", "accounts", "uid still in use"]]);
   assert.deepEqual(dpAudit(C), [["unknown_effect", undefined, undefined]]);
   assert.deepEqual([B, C].map((id) => store.registry.agent(id).state), ["deleted", "deleted"]);
+  await close();
+});
+
+test("purge and requalify: the local authority only, for a deleted agent only; owned under the deprovision deadline; audited", async () => {
+  const { sup, fx, close } = await setup();
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
+  const host = () => fx.log.filter((l) => l[0] === "purge" || l[0] === "requalify");
+  // Never a remote op: the person, the service and the host refuse; only the local CLI may submit them.
+  for (const kind of ["purge", "requalify"]) {
+    for (const authority of ["person", "service", "host"]) await rejects(sup.submit({ kind, authority, agent: A }), "not_granted");
+  }
+  // Only a deleted agent: a live one is refused, with no effect.
+  assert.deepEqual(await sup.submit({ kind: "purge", authority: "local", agent: A }), { status: "refused", reason: "not_deleted" });
+  assert.deepEqual(host(), []);
+  await sup.submit({ kind: "delete", authority: "person", agent: A });
+  assert.deepEqual(await sup.submit({ kind: "requalify", authority: "local", agent: A }), { status: "requalified", rebound: ["home"] });
+  assert.deepEqual(await sup.submit({ kind: "purge", authority: "local", agent: A }), { status: "purged" });
+  assert.deepEqual(host(), [["requalify", A, 120000], ["purge", A, 120000]]);
+  const aud = (kind) => fx.audits.filter((r) => r.kind === kind && r.agent === A).map(({ phase, reason, rebound }) => [phase, reason, rebound]);
+  assert.deepEqual(aud("agent.requalify"), [["succeeded", undefined, ["home"]]]);
+  assert.deepEqual(aud("agent.purge"), [["succeeded", undefined, undefined]]);
+  // Pending and failing: audited, no error for the caller.
+  fx.hostResult = (cmd) => (cmd === "purge" ? { status: "pending", step: null, reason: "home: a stale epoch (requalify)" } : new Error("EIO"));
+  assert.equal((await sup.submit({ kind: "purge", authority: "local", agent: A })).status, "pending");
+  assert.equal((await sup.submit({ kind: "requalify", authority: "local", agent: A })).reason, "host-side failure");
+  assert.deepEqual(aud("agent.purge").at(-1), ["pending", "home: a stale epoch (requalify)", undefined]);
+  assert.deepEqual(aud("agent.requalify").at(-1), ["unknown_effect", undefined, undefined]);
+  await close();
+});
+
+test("a hung purge is owned: aborted at its deadline, abandoned after the grace, ordinary input refused meanwhile", async () => {
+  const fx = fakeFx();
+  const { sup, close } = await setup({ fx, deadlines: { deprovision: 40, grace: 20 } });
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
+  await sup.submit({ kind: "delete", authority: "person", agent: A });
+  let settle, seen;
+  fx.purge = (id, ms, signal) => { seen = { ms, signal }; return new Promise((r) => { settle = r; }); };
+  const r = await sup.submit({ kind: "purge", authority: "local", agent: A });
+  assert.deepEqual([r.status, r.reason], ["pending", "step_deadline"]);
+  assert.deepEqual([seen.ms, seen.signal.aborted], [40, true]);
+  assert.equal(sup.unsettled, 1);
+  assert.deepEqual(fx.audits.filter((a) => a.kind === "agent.purge").map((a) => a.phase), ["unknown_effect"]);
+  // Meanwhile: ordinary input, and another host command, refused; an emergency still runs.
+  assert.equal((await sup.submit({ kind: "requalify", authority: "local", agent: A })).reason, "in_progress");
+  await sup.submit({ kind: "stop-all", authority: "local" });
+  settle({ status: "purged" });
+  for (let i = 0; i < 250 && sup.unsettled > 0; i++) await new Promise((res) => setTimeout(res, 20));
+  assert.equal(sup.unsettled, 0);
   await close();
 });
 
@@ -1027,7 +1078,11 @@ test("after any effect goes unsettled, the running operation does no authority-g
   const { sup, fenceDir, close } = await setup({ fx, deadlines: { mask: 20, grace: 20 } });
   await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
   const mask = fx.mask;
-  fx.mask = async (id, ...rest) => { await lateBy(150); return mask(id, ...rest); }; // ignores its abort
+  // The mask ignores its abort and settles only when the test releases it, after the assertions: never by a clock,
+  // so a stalled runner can't let it settle within the grace.
+  let release;
+  const held = new Promise((res) => { release = res; });
+  fx.mask = async (id, ...rest) => { await held; return mask(id, ...rest); };
   fx.log.length = 0;
   const r = await sup.submit({ kind: "revoke-caps", authority: "service", agent: A });
   assert.equal(r.status, "failed");
@@ -1037,7 +1092,8 @@ test("after any effect goes unsettled, the running operation does no authority-g
   // Teardown: a mask that works again, then wait for the late one to settle and its re-containment to finish (it
   // would otherwise reschedule itself for ever, keeping an unforced test run alive).
   fx.mask = mask;
-  for (let i = 0; i < 100 && sup.unsettled > 0; i++) await new Promise((res) => setTimeout(res, 20));
+  release();
+  for (let i = 0; i < 250 && sup.unsettled > 0; i++) await new Promise((res) => setTimeout(res, 20));
   assert.equal(sup.unsettled, 0);
   await sup.submit({ kind: "resume-all", authority: "person" }); // a normal input: runs after the queued re-containment
   await close();

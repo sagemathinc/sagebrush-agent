@@ -13,7 +13,7 @@ import { CAUSES, fenced, lowerFence, raiseFence, stop } from "../lib/fleet/host/
 import { RESTORE_DIR, RESTORE_STAGING, fenceFiles } from "../lib/fleet/host/names.mjs";
 import { realIo } from "../lib/fleet/host/store.mjs";
 import {
-  CLASSES, FAILED_REASONS, KINDS, MAX_ATTEMPTS, STATES, checkRecord, invalidateMarker, markerPath, newRecord, readMarker,
+  CLASSES, FAILED_REASONS, KINDS, MAX_ATTEMPTS, STATES, checkRecord, invalidateMarker, markerIo, markerPath, newRecord, readMarker,
   readRecord, recordName, recoveryStep, restoreReady, retryRecord, stagingDir, stagingSetDir, step, writeMarker, writeRecord,
 } from "../lib/fleet/host/restore-record.mjs";
 
@@ -281,25 +281,123 @@ test("markers: written once, only while staging and clean; torn is not complete;
   assert.notEqual(markerPath(r2, root), markerPath(f, root));
 });
 
+/** A markerIo that records each step as [op, path] (fds mapped back to their paths) and fails `fail` = [op, path]. */
+function spyIo(fail = null) {
+  const ops = [], fds = new Map();
+  const check = (op, p) => { ops.push([op, p]); if (fail && fail[0] === op && fail[1] === p) throw Object.assign(new Error(`injected ${op}`), { code: "EIO" }); };
+  return {
+    ops,
+    io: {
+      ...markerIo,
+      open: (p, f, m) => { const fd = markerIo.open(p, f, m); fds.set(fd, p); ops.push(["open", p]); return fd; },
+      write: (fd, b, o, l) => { check("write", fds.get(fd)); return markerIo.write(fd, b, o, l); },
+      fsync: (fd) => { check("fsync", fds.get(fd)); return markerIo.fsync(fd); },
+      close: (fd) => { ops.push(["close", fds.get(fd)]); return markerIo.close(fd); },
+      unlink: (p) => { check("unlink", p); return markerIo.unlink(p); },
+    },
+  };
+}
+
+test("markers are durable in order: the whole write, then the file's fsync, then its directory's; each failure throws", () => {
+  const root = fresh();
+  const r = at("staging");
+  mkdirSync(stagingDir(r, root), { recursive: true });
+  const file = markerPath(r, root), set = stagingSetDir(r.run, r.kind, r.id, root);
+  const { ops, io } = spyIo();
+  writeMarker(r, { root, io });
+  assert.deepEqual(ops, [["open", file], ["write", file], ["fsync", file], ["close", file], ["open", set], ["fsync", set], ["close", set]]);
+  assert.deepEqual(readMarker(r, { root }), { v: 1, run: RUN, kind: "agent", id: r.id, snapshot: SNAP, attempt: 1 });
+  // A short write is completed before the flush; a zero-byte write is an error, never a whole marker.
+  const r2 = step(r, "retry");
+  mkdirSync(stagingDir(r2, root), { recursive: true });
+  const f2 = markerPath(r2, root);
+  const short = spyIo();
+  writeMarker(r2, { root, io: { ...short.io, write: (fd, b, o, l) => short.io.write(fd, b, o, Math.min(l, 5)) } });
+  const writes = short.ops.filter(([op]) => op === "write").length;
+  assert.ok(writes > 1, `${writes} writes`);
+  assert.ok(short.ops.findIndex(([op]) => op === "fsync") > short.ops.findLastIndex(([op]) => op === "write"), "the flush follows the last write");
+  assert.deepEqual(readMarker(r2, { root }).attempt, 2);
+  rmSync(f2);
+  assert.throws(() => writeMarker(r2, { root, io: { ...markerIo, write: () => 0 } }), (e) => e.code === "EIO");
+  for (const fail of [["fsync", f2], ["fsync", set], ["write", f2]]) {
+    rmSync(f2, { force: true });
+    assert.throws(() => writeMarker(r2, { root, io: spyIo(fail).io }), (e) => e.code === "EIO", fail.join(" "));
+  }
+});
+
+test("invalidating a marker is durable in order: the unlink, then its directory's fsync; each failure throws", () => {
+  const root = fresh();
+  const r = at("staging");
+  mkdirSync(stagingDir(r, root), { recursive: true });
+  writeMarker(r, { root });
+  const f = step(step(r, "staged"), "filling", { dest: DEST });
+  const file = markerPath(f, root), set = stagingSetDir(f.run, f.kind, f.id, root);
+  assert.throws(() => invalidateMarker(f, { root, io: spyIo(["fsync", set]).io }), (e) => e.code === "EIO", "the directory's flush");
+  writeFileSync(file, "x");
+  assert.throws(() => invalidateMarker(f, { root, io: spyIo(["unlink", file]).io }), (e) => e.code === "EIO", "the unlink");
+  assert.ok(existsSync(file));
+  const { ops, io } = spyIo();
+  invalidateMarker(f, { root, io });
+  assert.deepEqual(ops, [["unlink", file], ["open", set], ["fsync", set], ["close", set]]);
+  assert.equal(existsSync(file), false);
+  // Already gone (a crash after the unlink): the directory is still flushed.
+  const again = spyIo();
+  invalidateMarker(f, { root, io: again.io });
+  assert.deepEqual(again.ops, [["unlink", file], ["open", set], ["fsync", set], ["close", set]]);
+});
+
 test("restoreReady: validated only when the agent's record and each of its tags' records are", () => {
   const dir = join(fresh(), "restore");
   const a = newId(), t1 = newId(), t2 = newId();
-  assert.equal(restoreReady(a, [], { dir }), "none");
+  const want = { [`agent-${a}`]: { run: RUN, snapshot: SNAP }, [`tag-${t1}`]: { run: RUN, snapshot: SNAP }, [`tag-${t2}`]: { run: RUN, snapshot: SNAP } };
+  assert.equal(restoreReady(a, [], want, { dir }), "none");
   const va = at("validated", { id: a });
   writeRecord(va, { dir });
-  assert.equal(restoreReady(a, [], { dir }), "validated");
-  assert.equal(restoreReady(a, [t1], { dir }), "none", "a tag folder not restored yet");
-  const tag = (id, path) => { let r = newRecord({ kind: "tag", id, run: RUN, snapshot: SNAP }); for (const s of path) r = step(r, s, { dest: { tag: DEST.home } }); return r; };
+  assert.equal(restoreReady(a, [], want, { dir }), "validated");
+  assert.equal(restoreReady(a, [t1], want, { dir }), "none", "a tag folder not restored yet");
   writeRecord(tag(t1, ["staged", "filling", "published"]), { dir });
-  assert.equal(restoreReady(a, [t1], { dir }), "published");
+  assert.equal(restoreReady(a, [t1], want, { dir }), "published");
   writeRecord(tag(t1, ["staged", "filling", "published", "validated"]), { dir });
   writeRecord(tag(t2, ["not_fitting"]), { dir });
-  assert.equal(restoreReady(a, [t1], { dir }), "validated");
-  assert.equal(restoreReady(a, [t1, t2], { dir }), "not_fitting");
+  assert.equal(restoreReady(a, [t1], want, { dir }), "validated");
+  assert.equal(restoreReady(a, [t1, t2], want, { dir }), "not_fitting");
   writeRecord(step(at("published", { id: a }), "failed", { reason: "bad_form" }), { dir });
-  assert.equal(restoreReady(a, [t1], { dir }), "failed");
-  for (const [x, tags] of [["nope", []], [a, "x"], [a, ["nope"]]]) refused(() => restoreReady(x, tags, { dir }), "bad_form");
+  assert.equal(restoreReady(a, [t1], want, { dir }), "failed");
+  for (const [x, tags] of [["nope", []], [a, "x"], [a, ["nope"]]]) refused(() => restoreReady(x, tags, want, { dir }), "bad_form");
 });
+
+test("restoreReady: every record is bound to the current restore's run and snapshot; a mixed or stale restore is refused", () => {
+  const dir = join(fresh(), "restore");
+  const a = newId(), t = newId();
+  const bind = (agentRun, agentSnap, tagRun, tagSnap) => ({ [`agent-${a}`]: { run: agentRun, snapshot: agentSnap }, [`tag-${t}`]: { run: tagRun, snapshot: tagSnap } });
+  // The agent's set was restored again by the person's new request (RUN2); its tag folder's record is from RUN.
+  writeRecord(tag(t, ["staged", "filling", "published", "validated"]), { dir });
+  let r = retryRecord(step(at("staging", { id: a }), "not_fitting"), { run: RUN2, snapshot: SNAP2 });
+  for (const s of ["staged", "filling", "published", "validated"]) r = step(r, s, { dest: DEST });
+  writeRecord(r, { dir });
+  assert.equal(restoreReady(a, [t], bind(RUN2, SNAP2, RUN, SNAP), { dir }), "validated", "per-set bindings may differ by run when the plan says so");
+  // A mixed run: the plan expects the tag folder from RUN2 too, but its record is RUN's.
+  refused(() => restoreReady(a, [t], bind(RUN2, SNAP2, RUN2, SNAP), { dir }), "not_granted");
+  // A stale snapshot: the same run, another snapshot (the plan's manifest changed).
+  refused(() => restoreReady(a, [t], bind(RUN2, SNAP2, RUN, SNAP2), { dir }), "not_granted");
+  refused(() => restoreReady(a, [t], bind(RUN2, SNAP, RUN, SNAP), { dir }), "not_granted");
+  refused(() => restoreReady(a, [t], bind(RUN, SNAP2, RUN, SNAP), { dir }), "not_granted");
+  // A record from another restore is refused even when it isn't validated, so it never reads as progress.
+  writeRecord(tag(t, ["staged"]), { dir });
+  refused(() => restoreReady(a, [t], bind(RUN2, SNAP2, RUN2, SNAP2), { dir }), "not_granted");
+  // The binding is required for every set, in its closed shape.
+  const good = bind(RUN2, SNAP2, RUN, SNAP);
+  for (const expected of [
+    undefined, null, [], {}, { [`agent-${a}`]: good[`agent-${a}`] }, { ...good, [`tag-${t}`]: { run: RUN } },
+    { ...good, [`tag-${t}`]: { run: RUN, snapshot: SNAP, extra: 1 } }, { ...good, [`tag-${t}`]: { run: "x", snapshot: SNAP } },
+    { ...good, [`tag-${t}`]: { run: RUN, snapshot: "A".repeat(64) } }, { ...good, [`tag-${t}`]: null },
+    Object.assign(Object.create({ [`tag-${t}`]: { run: RUN, snapshot: SNAP } }), { [`agent-${a}`]: good[`agent-${a}`] }),
+  ]) refused(() => restoreReady(a, [t], expected, { dir }), "bad_form");
+  // The binding is checked before any record is read: an absent record set still refuses a bad binding.
+  refused(() => restoreReady(newId(), [], {}, { dir }), "bad_form");
+});
+
+const tag = (id, path) => { let r = newRecord({ kind: "tag", id, run: RUN, snapshot: SNAP }); for (const s of path) r = step(r, s, { dest: { tag: DEST.home } }); return r; };
 
 /**
  * A model fill on a real directory tree, with a crash injected at the `crashAt`-th effect: staging writes files then

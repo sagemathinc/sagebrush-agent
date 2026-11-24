@@ -280,8 +280,10 @@ mod tests {
             }
             Ok(id)
         }
+        /// The REAL adapter's answer (real xattrs), or'ed with the test layer's sets.
         fn acls(&mut self, h: &H) -> io::Result<(bool, bool)> {
-            Ok((self.access.contains(&h.1), self.default.contains(&h.1)))
+            let (a, d) = RealLease.acls(&h.0)?;
+            Ok((a || self.access.contains(&h.1), d || self.default.contains(&h.1)))
         }
         fn try_shared(&mut self, h: &H) -> io::Result<bool> {
             sys::flock_shared_nb(&h.0)
@@ -545,6 +547,71 @@ mod tests {
         t.hook = Some(Box::new(move |n| if n == 2 { h.borrow_mut().take(); }));
         assert_eq!(code(&mut t), 0);
         assert_eq!(t.sleeps, 2);
+    }
+
+    /// Set a real POSIX ACL xattr (python3's os.setxattr: no unsafe code and no setfacl needed). The ACL names one
+    /// extra user with no rights, and its mask and the group and other entries are empty, so the file's mode bits stay
+    /// as they were (`user_obj` = the owner's rights): only the ACL itself differs. False when the filesystem or the
+    /// host can't set one (ENOTSUP, or no python3): the caller then says it fell back.
+    fn set_real_acl(p: &Path, default: bool, user_obj: u16) -> bool {
+        let entries: [(u16, u16, u32); 5] = [(0x01, user_obj, u32::MAX), (0x02, 0, 65534), (0x04, 0, u32::MAX), (0x10, 0, u32::MAX), (0x20, 0, u32::MAX)];
+        let mut blob = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            blob.extend(tag.to_le_bytes());
+            blob.extend(perm.to_le_bytes());
+            blob.extend(id.to_le_bytes());
+        }
+        let hex: String = blob.iter().map(|b| format!("{b:02x}")).collect();
+        let name = if default { "system.posix_acl_default" } else { "system.posix_acl_access" };
+        std::process::Command::new("python3")
+            .args(["-c", "import os,sys; os.setxattr(sys.argv[1], sys.argv[2], bytes.fromhex(sys.argv[3]))"])
+            .arg(p).arg(name).arg(hex)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn real_acls_through_the_real_adapter() {
+        // RealLease.acls itself: none, an access ACL on a file, a default ACL on a directory.
+        let (t, lease) = setup();
+        let f = lease.join("probe");
+        write(&f, b"", 0o600);
+        let open = |p: &Path| -> OwnedFd { fs::File::open(p).unwrap().into() };
+        assert_eq!(RealLease.acls(&open(&f)).unwrap(), (false, false));
+        assert_eq!(RealLease.acls(&open(&lease)).unwrap(), (false, false));
+        if !set_real_acl(&f, false, 6) {
+            eprintln!("fell back: this filesystem (or host) can't set a real POSIX ACL; the test-layer ACL rows still run");
+            return;
+        }
+        assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o7777, 0o600, "the mode is unchanged");
+        assert_eq!(RealLease.acls(&open(&f)).unwrap(), (true, false));
+        assert!(set_real_acl(&lease, true, 7));
+        assert_eq!(RealLease.acls(&open(&lease)).unwrap(), (false, true));
+        drop(t);
+        // End to end, with no test-layer ACL: a real ACL on the record, the tombstone, the lock, the lease directory
+        // (access or default) or an ancestor refuses with 66; the same tree without it passes.
+        for (which, default) in [("record", false), ("tombstone", false), ("lock", false), ("lease", false), ("lease", true), ("sagebrush", true)] {
+            let (mut t, lease) = setup();
+            write(&lease.join(format!("{A}.spent")), b"0\n", 0o600);
+            write(&lease.join(format!("{A}.lock")), b"", 0o600);
+            fs::set_permissions(lease.join(A), fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(code(&mut t), 0, "{which}: control");
+            let (p, user_obj) = match which {
+                "record" => (lease.join(A), 6),
+                "tombstone" => (lease.join(format!("{A}.spent")), 6),
+                "lock" => (lease.join(format!("{A}.lock")), 6),
+                "lease" => (lease.clone(), 7),
+                _ => (t.top.join("run/sagebrush"), 7),
+            };
+            let before = fs::metadata(&p).unwrap().permissions().mode() & 0o7777;
+            assert!(set_real_acl(&p, default, user_obj), "{which}");
+            if !default {
+                // an access ACL's mask becomes the group bits: with these entries, the mode loses only group/other bits
+                assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o7777 & !0o077, before & !0o077, "{which}");
+            }
+            assert_eq!(code(&mut t), 66, "{which} default={default}");
+        }
     }
 
     #[test]

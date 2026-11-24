@@ -402,8 +402,11 @@ fn usage(ctx: &Ctx, snapshot: &str, path: Option<&str>) -> Result<Value> {
         let (p, n) = r.map_err(lib("usage_failed"))?;
         t.add(&p, &n);
     }
-    let (entries, inodes, blocks_upper) = t.finish();
-    Ok(json!({ "snapshot": full(*snap.id), "entries": entries, "inodes": inodes, "blocks_upper": blocks_upper, "block_size": BLOCK }))
+    let u = t.finish();
+    Ok(json!({
+        "snapshot": full(*snap.id), "entries": u.entries, "inodes": u.inodes, "blocks_upper": u.blocks,
+        "peak_inodes": u.peak_inodes, "peak_blocks_upper": u.peak_blocks, "block_size": BLOCK,
+    }))
 }
 
 /// ext4's block size here (the quota filesystem is made with 4 KiB blocks).
@@ -427,17 +430,28 @@ const DX_PER_BLOCK: u64 = 500;
 ///   So the file needs at most B + E0 blocks for its data and extents (a punch that adds an extent has freed the block
 ///   paying for it), plus its extent tree: none while E0 + B fits in the inode (4 extents), else at most
 ///   ceil((E0 + B) / 340) leaf blocks and one more for the index. Extended attributes are never restored.
-/// - a hard link: the inode and its blocks once (by device and inode, when links > 1); every name is a directory entry.
+/// - a hard link: the inode and its blocks once, exactly when the restorer links it (`hardlink_key`: a regular file,
+///   links > 1, nonzero device and inode); every name is a directory entry.
 /// - a directory: its entries take 8 + the name's length rounded up to 4 bytes each, plus 24 for "." and "..". Its
 ///   leaves can be as little as half full after htree splits, so at most 2 * ceil(bytes / 4096) leaf blocks, plus the
 ///   index root and one index block per 500 leaves. The destination directory itself exists; its entries are counted.
 /// - a symlink: a block when its target is longer than 59 bytes, else none (held in the inode).
 /// - every entry but the specials: one inode (hard links once). This count is exact, not a bound.
+///
+/// The PEAK, while a class is filled from its staging (launcher amendment A2 §4): fill-home renames files but makes
+/// every directory and symlink anew in the destination, while the staged copies stay until the staging is discarded.
+/// So at its end every directory and symlink exists twice: the peak adds their inodes (exact) and their blocks (the
+/// directory bound, the destination's own entries included, since data/<leaf> held them too; a block per long symlink)
+/// once more. The launcher's own staging objects (the attempt, data, data/<leaf>, the marker, the parents) are the
+/// space check's to add (restore-space.mjs), not the tree's.
 #[derive(Default)]
 struct Tally {
     entries: u64,
     inodes: u64,
     blocks: u64,
+    /// Directories and symlinks (made anew by the fill, so twice at the peak), and the symlinks' blocks.
+    twice_inodes: u64,
+    link_blocks: u64,
     /// Directory entry bytes per directory (by its path; "" is the destination itself).
     dirs: HashMap<PathBuf, u64>,
     links: HashSet<(u64, u64)>,
@@ -452,28 +466,59 @@ impl Tally {
         let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
         let name = path.file_name().map_or(0, |n| n.len() as u64);
         *self.dirs.entry(parent).or_insert(0) += 8 + name.div_ceil(4) * 4;
-        if node.meta.links > 1 && !node.is_dir() && !self.links.insert((node.meta.device_id, node.meta.inode)) {
-            return; // another name of an inode already counted
+        if let Some(key) = hardlink_key(node) {
+            if !self.links.insert(key) {
+                return; // another name of an inode already counted
+            }
         }
         self.inodes += 1;
         match &node.node_type {
             NodeType::Dir => {
+                self.twice_inodes += 1;
                 self.dirs.entry(path.to_path_buf()).or_insert(0);
             }
             NodeType::Symlink { .. } => {
+                self.twice_inodes += 1;
                 if node.node_type.to_link().as_os_str().len() > FAST_SYMLINK {
                     self.blocks += 1;
+                    self.link_blocks += 1;
                 }
             }
             _ => self.blocks += file_blocks(node.meta.size),
         }
     }
 
-    /// (entries, inodes, blocks_upper).
-    fn finish(&self) -> (u64, u64, u64) {
-        let dirs: u64 = self.dirs.values().map(|bytes| dir_blocks(bytes + 24)).sum();
-        (self.entries, self.inodes, self.blocks + dirs)
+    fn finish(&self) -> Usage {
+        // The destination's own directory (data/<leaf> while staged) is always counted, even with no entry.
+        let root = if self.dirs.contains_key(Path::new("")) { 0 } else { dir_blocks(24) };
+        let dirs: u64 = root + self.dirs.values().map(|bytes| dir_blocks(bytes + 24)).sum::<u64>();
+        Usage {
+            entries: self.entries,
+            inodes: self.inodes,
+            blocks: self.blocks + dirs,
+            peak_inodes: self.inodes + self.twice_inodes,
+            peak_blocks: self.blocks + dirs + dirs + self.link_blocks,
+        }
     }
+}
+
+/// What a restore of a path needs: after the fill (`inodes`, `blocks`) and at its peak, before the staging is
+/// discarded (`peak_*`). Inodes are exact; blocks are upper bounds.
+#[derive(Debug, PartialEq)]
+struct Usage {
+    entries: u64,
+    inodes: u64,
+    blocks: u64,
+    peak_inodes: u64,
+    peak_blocks: u64,
+}
+
+/// The restorer's own rule for which names are one inode (rustic_core 51115c47, commands/restore.rs `hardlink_key`):
+/// a regular file with more than one link and a nonzero device and inode. Anything else (a symlink, a zero id) is
+/// restored as its own inode, so counted as one.
+fn hardlink_key(node: &Node) -> Option<(u64, u64)> {
+    (matches!(node.node_type, NodeType::File) && node.meta.links > 1 && node.meta.device_id != 0 && node.meta.inode != 0)
+        .then_some((node.meta.device_id, node.meta.inode))
 }
 
 /// A regular file's bound (see `Tally`).
@@ -589,13 +634,49 @@ mod tests {
         t.add(Path::new("s60"), &Node::new_node(OsStr::new("s60"), NodeType::from_link(Path::new(&"t".repeat(60))), Metadata::default()));
         // Specials are never restored: not counted at all.
         t.add(Path::new("fifo"), &Node::new_node(OsStr::new("fifo"), NodeType::Fifo, Metadata::default()));
-        let (entries, inodes, blocks) = t.finish();
+        let u = t.finish();
+        let (entries, inodes, blocks) = (u.entries, u.inodes, u.blocks);
         assert_eq!(entries, 7, "a, d, x, y, z, s59, s60");
         assert_eq!(inodes, 6, "x and y are one inode");
         // Files: a 3+1, x 2+1 (once), z 2+1; s60 1; dirs: the destination (a, d, s59, s60) and d (x, y, z).
         let root = dir_blocks(24 + (8 + 4) + (8 + 4) + (8 + 4) + (8 + 4));
         let d = dir_blocks(24 + 3 * (8 + 4));
         assert_eq!(blocks, 4 + 3 + 3 + 1 + root + d);
+        // The peak: d, s59 and s60 exist twice (made anew by the fill); every directory's blocks (the destination's
+        // entries included) and the long symlink's block once more. Files are renamed: once.
+        assert_eq!(u.peak_inodes, 6 + 3);
+        assert_eq!(u.peak_blocks, blocks + root + d + 1);
+    }
+
+    #[test]
+    fn hard_links_exactly_as_the_restorer_makes_them() {
+        let node = |t: NodeType, links, device_id, inode| Node::new_node(OsStr::new("n"), t, Metadata { size: 100, links, device_id, inode, ..Default::default() });
+        let count = |nodes: &[Node]| {
+            let mut t = Tally::default();
+            for (i, n) in nodes.iter().enumerate() {
+                t.add(&PathBuf::from(format!("n{i}")), n);
+            }
+            t.finish().inodes
+        };
+        // Regular files with links > 1 and nonzero ids: one inode.
+        assert_eq!(count(&[node(NodeType::File, 2, 3, 77), node(NodeType::File, 2, 3, 77)]), 1);
+        // A hard-linked symlink pair: the restorer makes two symlinks.
+        let link = || node(NodeType::from_link(Path::new("target")), 2, 3, 78);
+        assert_eq!(count(&[link(), link()]), 2);
+        // Zero device or zero inode: never linked by the restorer, so two inodes.
+        assert_eq!(count(&[node(NodeType::File, 2, 0, 79), node(NodeType::File, 2, 0, 79)]), 2);
+        assert_eq!(count(&[node(NodeType::File, 2, 3, 0), node(NodeType::File, 2, 3, 0)]), 2);
+        // links == 1 with equal ids: two.
+        assert_eq!(count(&[node(NodeType::File, 1, 3, 80), node(NodeType::File, 1, 3, 80)]), 2);
+        assert_eq!(hardlink_key(&node(NodeType::File, 2, 3, 77)), Some((3, 77)));
+        assert_eq!(hardlink_key(&link()), None);
+    }
+
+    #[test]
+    fn an_empty_class() {
+        let u = Tally::default().finish();
+        // Nothing restored, but the destination's (empty) directory bound still counts once, and twice at the peak.
+        assert_eq!(u, Usage { entries: 0, inodes: 0, blocks: dir_blocks(24), peak_inodes: 0, peak_blocks: 2 * dir_blocks(24) });
     }
 
     #[test]
@@ -616,6 +697,6 @@ mod tests {
             t.add(&PathBuf::from(format!("n{i:07}")), &file(0));
         }
         assert_eq!(t.dirs[Path::new("")], 4080);
-        assert_eq!(t.finish().2, 1 + 4 + 1, "the dot entries push the directory into a second block");
+        assert_eq!(t.finish().blocks, 1 + 4 + 1, "the dot entries push the directory into a second block");
     }
 }

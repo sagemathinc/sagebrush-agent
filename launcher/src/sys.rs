@@ -417,3 +417,479 @@ pub fn is_root() -> bool {
     // SAFETY: geteuid takes no arguments and cannot fail.
     unsafe { libc::geteuid() == 0 }
 }
+
+// ---- launcher contract amendment A2 (backup restore): restore-stage and fill-home.
+
+/// A2 constants libc 0.2.191 doesn't export for every target: from the uapi headers (linux/mount.h, linux/quota.h,
+/// linux/fs.h, linux/capability.h).
+pub const FSCONFIG_SET_STRING: libc::c_uint = 1;
+pub const FSCONFIG_CMD_CREATE: libc::c_uint = 6;
+pub const PRJQUOTA: libc::c_int = 2;
+pub const Q_GETQUOTA: libc::c_int = 0x800007;
+pub const QIF_BLIMITS: u32 = 1;
+pub const QIF_SPACE: u32 = 2;
+pub const QIF_ILIMITS: u32 = 4;
+pub const QIF_INODES: u32 = 8;
+pub const QIF_BTIME: u32 = 16;
+pub const QIF_ITIME: u32 = 32;
+/// _IOW('X', 32, struct fsxattr).
+const FS_IOC_FSSETXATTR: libc::Ioctl = 0x401c_5820;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// mkdirat(dir, name, mode).
+pub fn mkdirat(dir: &OwnedFd, name: &CStr, mode: libc::mode_t) -> io::Result<()> {
+    // SAFETY: `dir` is open; `name` is NUL-terminated.
+    let r = unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), mode) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// ioctl(fd, FS_IOC_FSSETXATTR): read the current fsxattr, set the project id and the inherit flag, write it back.
+pub fn set_project(fd: &OwnedFd, projid: u32, inherit: bool) -> io::Result<()> {
+    let mut x = FsXattr { xflags: 0, extsize: 0, nextents: 0, projid: 0, cowextsize: 0, pad: [0; 8] };
+    // SAFETY: `fd` is open; `x` is writable for a whole struct fsxattr.
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), FS_IOC_FSGETXATTR, &mut x as *mut FsXattr) };
+    if r != 0 {
+        return Err(last());
+    }
+    x.projid = projid;
+    x.xflags = if inherit { x.xflags | FS_XFLAG_PROJINHERIT } else { x.xflags & !FS_XFLAG_PROJINHERIT };
+    // SAFETY: `fd` is open; `x` is a whole struct fsxattr, read by the kernel.
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), FS_IOC_FSSETXATTR, &x as *const FsXattr) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// fchown(fd, uid, gid).
+pub fn fchown(fd: &OwnedFd, uid: u32, gid: u32) -> io::Result<()> {
+    // SAFETY: `fd` is open.
+    let r = unsafe { libc::fchown(fd.as_raw_fd(), uid, gid) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// flistxattr(fd, buf): the NUL-separated attribute names, into a caller's fixed buffer.
+pub fn list_xattrs(fd: &OwnedFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `fd` is open; `buf` is writable for its length.
+    let n = unsafe { libc::flistxattr(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 { Err(last()) } else { Ok(n as usize) }
+}
+
+/// fsync(fd) on any descriptor (A2: the fill's placed files, and the marker).
+pub fn fsync_fd(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: `fd` is open.
+    let r = unsafe { libc::fsync(fd.as_raw_fd()) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// openat2(dir, name, { O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, mode, BENEATH | NO_SYMLINKS |
+/// NO_MAGICLINKS | NO_XDEV }): a new file, created exclusively (the completion marker).
+pub fn create_excl(dir: &OwnedFd, name: &CStr, mode: libc::mode_t) -> io::Result<OwnedFd> {
+    let how = OpenHow {
+        flags: (libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
+        mode: mode as u64,
+        resolve: libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_XDEV,
+    };
+    // SAFETY: `dir` is open, `name` is NUL-terminated, `how` lives across the call and its size is passed.
+    let fd = unsafe {
+        libc::syscall(libc::SYS_openat2, dir.as_raw_fd(), name.as_ptr(), &how as *const OpenHow, core::mem::size_of::<OpenHow>())
+    };
+    own(fd)
+}
+
+/// openat2(root, rel, { flags | O_CLOEXEC, 0, RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS }): the restore child's closed
+/// system set only (A2 §3 step 6). Ordinary symlinks are followed INSIDE the root (a distro's /etc/resolv.conf is
+/// often one); magic links never are. RESOLVE_NO_XDEV is deliberately NOT used: resolv.conf may end on /run. The
+/// caller checks the opened object (its kind, root ownership, no group or other write).
+pub fn open_system(root: &OwnedFd, rel: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    let how = OpenHow { flags: (flags | libc::O_CLOEXEC) as u64, mode: 0, resolve: libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS };
+    // SAFETY: `root` is open, `rel` is NUL-terminated, `how` lives across the call and its size is passed.
+    let fd = unsafe {
+        libc::syscall(libc::SYS_openat2, root.as_raw_fd(), rel.as_ptr(), &how as *const OpenHow, core::mem::size_of::<OpenHow>())
+    };
+    own(fd)
+}
+
+/// readlinkat(dir, name, buf): a link's target text, at most buf.len() bytes (A2: proc/self/exe through the root).
+pub fn readlinkat(dir: &OwnedFd, name: &CStr, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `dir` is open, `name` is NUL-terminated, `buf` is writable for its length.
+    let n = unsafe { libc::readlinkat(dir.as_raw_fd(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 { Err(last()) } else { Ok(n as usize) }
+}
+
+/// pread(fd, buf, off): bounded reads of the release binary's ELF headers (A2 S-a).
+pub fn pread(fd: &OwnedFd, buf: &mut [u8], off: u64) -> io::Result<usize> {
+    // SAFETY: `fd` is open; `buf` is writable for its length.
+    let n = unsafe { libc::pread(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), off as libc::off_t) };
+    if n < 0 { Err(last()) } else { Ok(n as usize) }
+}
+
+/// syncfs(fd): everything written on the filesystem, made durable (A2 O1, before the marker).
+pub fn syncfs(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: `fd` is open.
+    let r = unsafe { libc::syncfs(fd.as_raw_fd()) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// The project-quota fields A2 §3.1 reads, copied out of `struct if_dqblk`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Quota {
+    pub bhard: u64,
+    pub bsoft: u64,
+    pub curspace: u64,
+    pub ihard: u64,
+    pub isoft: u64,
+    pub curinodes: u64,
+    pub btime: u64,
+    pub itime: u64,
+    pub valid: u32,
+}
+
+/// quotactl_fd(fd, QCMD(Q_GETQUOTA, PRJQUOTA), projid, &dqblk) (Linux 5.14+).
+pub fn project_quota(fd: &OwnedFd, projid: u32) -> io::Result<Quota> {
+    let mut q = libc::dqblk {
+        dqb_bhardlimit: 0,
+        dqb_bsoftlimit: 0,
+        dqb_curspace: 0,
+        dqb_ihardlimit: 0,
+        dqb_isoftlimit: 0,
+        dqb_curinodes: 0,
+        dqb_btime: 0,
+        dqb_itime: 0,
+        dqb_valid: 0,
+    };
+    let cmd = (Q_GETQUOTA << 8) | (PRJQUOTA & 0xff);
+    // SAFETY: `fd` is open; `q` is a whole, zeroed struct if_dqblk the kernel fills.
+    let r = unsafe { libc::syscall(libc::SYS_quotactl_fd, fd.as_raw_fd(), cmd as libc::c_uint, projid as libc::c_uint, &mut q as *mut libc::dqblk) };
+    if r != 0 {
+        return Err(last());
+    }
+    Ok(Quota {
+        bhard: q.dqb_bhardlimit,
+        bsoft: q.dqb_bsoftlimit,
+        curspace: q.dqb_curspace,
+        ihard: q.dqb_ihardlimit,
+        isoft: q.dqb_isoftlimit,
+        curinodes: q.dqb_curinodes,
+        btime: q.dqb_btime,
+        itime: q.dqb_itime,
+        valid: q.dqb_valid,
+    })
+}
+
+/// fstatfs(fd): (f_bavail, f_ffree), the filesystem half of A2 §3.1.
+pub fn space_left(fd: &OwnedFd) -> io::Result<(u64, u64)> {
+    let mut buf = StatFs { head: [0; 7], fsid: [0; 2], tail: [0; 7] };
+    // SAFETY: `fd` is open; `buf` is writable for a whole struct statfs (asserted above).
+    let r = unsafe { libc::syscall(libc::SYS_fstatfs, fd.as_raw_fd(), &mut buf as *mut StatFs) };
+    if r != 0 {
+        return Err(last());
+    }
+    // struct statfs (64-bit): f_type, f_bsize, f_blocks, f_bfree, f_bavail, f_files, f_ffree, then f_fsid.
+    Ok((buf.head[4], buf.head[6]))
+}
+
+/// The current time in seconds since the epoch (A2 §3.1's grace comparison).
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+// ---- A2: restore-stage's child process.
+
+/// pipe2(O_CLOEXEC): (read end, write end).
+pub fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is writable for two ints.
+    let r = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if r != 0 {
+        return Err(last());
+    }
+    Ok((own(fds[0] as libc::c_long)?, own(fds[1] as libc::c_long)?))
+}
+
+/// fork(): Ok(0) in the child, Ok(pid) in the parent. The launcher has one thread, so the child may allocate.
+pub fn fork() -> io::Result<libc::pid_t> {
+    // SAFETY: the process is single-threaded (no thread is ever spawned), so the child inherits a consistent state.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 { Err(last()) } else { Ok(pid) }
+}
+
+/// waitpid(pid, &status, flags): (pid or 0, status).
+pub fn waitpid(pid: libc::pid_t, flags: libc::c_int) -> io::Result<(libc::pid_t, libc::c_int)> {
+    let mut status: libc::c_int = 0;
+    // SAFETY: `status` is writable for an int.
+    let r = unsafe { libc::waitpid(pid, &mut status, flags) };
+    if r < 0 { Err(last()) } else { Ok((r, status)) }
+}
+
+/// kill(pid, sig).
+pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> io::Result<()> {
+    // SAFETY: plain integer arguments.
+    let r = unsafe { libc::kill(pid, sig) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// getpid() and getppid().
+pub fn getpid() -> libc::pid_t {
+    // SAFETY: no arguments; cannot fail.
+    unsafe { libc::getpid() }
+}
+pub fn getppid() -> libc::pid_t {
+    // SAFETY: no arguments; cannot fail.
+    unsafe { libc::getppid() }
+}
+
+/// sigprocmask(how, {SIGTERM}, NULL): block SIGTERM in the parent (read through a signalfd), unblock it in the child.
+pub fn sigterm_mask(block: bool) -> io::Result<()> {
+    let mut set = core::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: `set` is writable for a sigset_t; sigemptyset initializes it, then sigaddset adds one valid signal.
+    let r = unsafe { libc::sigemptyset(set.as_mut_ptr()) };
+    if r != 0 {
+        return Err(last());
+    }
+    // SAFETY (§6 conversion 2): sigemptyset returned 0, so the set is initialized.
+    let mut set = unsafe { set.assume_init() };
+    // SAFETY: `set` is an initialized sigset_t; SIGTERM is a valid signal.
+    let r = unsafe { libc::sigaddset(&mut set, libc::SIGTERM) };
+    if r != 0 {
+        return Err(last());
+    }
+    let how = if block { libc::SIG_BLOCK } else { libc::SIG_UNBLOCK };
+    // SAFETY: `set` is initialized; the old set isn't asked for.
+    let r = unsafe { libc::sigprocmask(how, &set, core::ptr::null_mut()) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// signalfd(-1, {SIGTERM}, SFD_CLOEXEC | SFD_NONBLOCK): the parent's forwarded SIGTERM, read in its poll loop.
+pub fn sigterm_fd() -> io::Result<OwnedFd> {
+    let mut set = core::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: as in sigterm_mask.
+    let r = unsafe { libc::sigemptyset(set.as_mut_ptr()) };
+    if r != 0 {
+        return Err(last());
+    }
+    // SAFETY (§6 conversion 2): sigemptyset returned 0.
+    let mut set = unsafe { set.assume_init() };
+    // SAFETY: `set` is initialized; SIGTERM is valid.
+    let r = unsafe { libc::sigaddset(&mut set, libc::SIGTERM) };
+    if r != 0 {
+        return Err(last());
+    }
+    // SAFETY: `set` is initialized; -1 asks for a new descriptor.
+    let fd = unsafe { libc::signalfd(-1, &set, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) };
+    own(fd as libc::c_long)
+}
+
+/// poll(fds, timeout_ms): the parent's one wait (A2 S-b).
+pub fn poll(fds: &mut [libc::pollfd], timeout_ms: libc::c_int) -> io::Result<usize> {
+    // SAFETY: `fds` is a writable slice of pollfd of the length passed.
+    let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+    if n < 0 { Err(last()) } else { Ok(n as usize) }
+}
+
+/// read(fd, buf).
+pub fn read(fd: &OwnedFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `fd` is open; `buf` is writable for its length.
+    let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 { Err(last()) } else { Ok(n as usize) }
+}
+
+/// write(fd, buf): bytes written.
+pub fn write(fd: &OwnedFd, buf: &[u8]) -> io::Result<usize> {
+    // SAFETY: `fd` is open; `buf` is readable for its length.
+    let n = unsafe { libc::write(fd.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
+    if n < 0 { Err(last()) } else { Ok(n as usize) }
+}
+
+/// dup2(from, to) onto a raw slot (0, 1 or 2) in the child.
+pub fn dup2(from: &OwnedFd, to: libc::c_int) -> io::Result<()> {
+    // SAFETY: `from` is open; `to` is one of the three standard slots.
+    let r = unsafe { libc::dup2(from.as_raw_fd(), to) };
+    if r < 0 { Err(last()) } else { Ok(()) }
+}
+
+/// close_range(3, ~0U, CLOSE_RANGE_CLOEXEC): every descriptor above 2 marked close-on-exec, DELIBERATELY not closed
+/// (A2 r3.2 P3): execveat still needs the release fd, and the status pipe must close at the exec itself.
+pub fn cloexec_from_3() -> io::Result<()> {
+    // SAFETY: constant arguments; marking descriptors close-on-exec closes nothing now.
+    let r = unsafe { libc::syscall(libc::SYS_close_range, 3 as libc::c_uint, libc::c_uint::MAX, libc::CLOSE_RANGE_CLOEXEC as libc::c_uint) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// _exit(code): the child's end on any pre-exec failure (no destructors, no stdio flush).
+pub fn exit_now(code: libc::c_int) -> ! {
+    // SAFETY: _exit never returns and takes a plain int.
+    unsafe { libc::_exit(code) }
+}
+
+/// prctl(PR_SET_PDEATHSIG, SIGKILL).
+pub fn pdeathsig_kill() -> io::Result<()> {
+    // SAFETY: constant arguments.
+    let r = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// unshare(CLONE_NEWNS).
+pub fn unshare_mount_ns() -> io::Result<()> {
+    // SAFETY: a constant flag.
+    let r = unsafe { libc::unshare(libc::CLONE_NEWNS) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL): nothing this namespace mounts propagates back.
+pub fn make_root_private() -> io::Result<()> {
+    // SAFETY: the path is a NUL-terminated literal; the other pointers are NULL as the call allows.
+    let r = unsafe { libc::mount(core::ptr::null(), c"/".as_ptr(), core::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, core::ptr::null()) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// A detached tmpfs: fsopen("tmpfs"), fsconfig(size, mode), FSCONFIG_CMD_CREATE, fsmount(nosuid, nodev).
+pub fn tmpfs(size: &CStr, mode: &CStr) -> io::Result<OwnedFd> {
+    // SAFETY: the name is a NUL-terminated literal.
+    let fs = own(unsafe { libc::syscall(libc::SYS_fsopen, c"tmpfs".as_ptr(), libc::FSOPEN_CLOEXEC) })?;
+    for (k, v) in [(c"size", size), (c"mode", mode)] {
+        // SAFETY: `fs` is an open fs context; key and value are NUL-terminated.
+        let r = unsafe { libc::syscall(libc::SYS_fsconfig, fs.as_raw_fd(), FSCONFIG_SET_STRING, k.as_ptr(), v.as_ptr(), 0) };
+        if r != 0 {
+            return Err(last());
+        }
+    }
+    // SAFETY: `fs` is open; CMD_CREATE takes no key or value.
+    let r = unsafe { libc::syscall(libc::SYS_fsconfig, fs.as_raw_fd(), FSCONFIG_CMD_CREATE, core::ptr::null::<libc::c_char>(), core::ptr::null::<libc::c_void>(), 0) };
+    if r != 0 {
+        return Err(last());
+    }
+    let attrs = libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV;
+    // SAFETY: `fs` is an open, created fs context.
+    own(unsafe { libc::syscall(libc::SYS_fsmount, fs.as_raw_fd(), libc::FSMOUNT_CLOEXEC, attrs) })
+}
+
+/// mount_setattr(mnt, "", AT_EMPTY_PATH, { attr_set }): read-only, nosuid, nodev, noexec as asked.
+pub fn mount_set(mnt: &OwnedFd, attr_set: u64) -> io::Result<()> {
+    let attr = MountAttr { attr_set, attr_clr: 0, propagation: 0, userns_fd: 0 };
+    // SAFETY: `mnt` is an open mount fd; `attr` lives across the call and its size is passed.
+    let r = unsafe {
+        libc::syscall(libc::SYS_mount_setattr, mnt.as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH, &attr as *const MountAttr, core::mem::size_of::<MountAttr>())
+    };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// fchdir(fd).
+pub fn fchdir(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: `fd` is open.
+    let r = unsafe { libc::fchdir(fd.as_raw_fd()) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// pivot_root(".", "."), then umount2(".", MNT_DETACH), then chdir("/"): the old root stacked under the new one is
+/// detached, and only the new root remains in this namespace.
+pub fn pivot_here() -> io::Result<()> {
+    // SAFETY: both paths are NUL-terminated literals.
+    let r = unsafe { libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c".".as_ptr()) };
+    if r != 0 {
+        return Err(last());
+    }
+    // SAFETY: a NUL-terminated literal; constant flags.
+    let r = unsafe { libc::umount2(c".".as_ptr(), libc::MNT_DETACH) };
+    if r != 0 {
+        return Err(last());
+    }
+    // SAFETY: a NUL-terminated literal.
+    let r = unsafe { libc::chdir(c"/".as_ptr()) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// umask(0): A2 sets every created mode explicitly (r3, O9).
+pub fn umask0() {
+    // SAFETY: a plain integer argument; umask cannot fail.
+    unsafe { libc::umask(0) };
+}
+
+/// The capability header and two data words for version 3 (linux/capability.h): plain data.
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+const _: () = assert!(core::mem::size_of::<CapHeader>() == 8 && core::mem::size_of::<CapData>() == 12);
+
+/// capget for this process: (effective, permitted, inheritable), each a 64-bit mask.
+pub fn capget() -> io::Result<(u64, u64, u64)> {
+    let mut h = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
+    let mut d = [CapData::default(); 2];
+    // SAFETY: `h` is a valid header; `d` has room for exactly the two words version 3 writes.
+    let r = unsafe { libc::syscall(libc::SYS_capget, &mut h as *mut CapHeader, d.as_mut_ptr()) };
+    if r != 0 || h.version != LINUX_CAPABILITY_VERSION_3 {
+        return Err(if r != 0 { last() } else { io::Error::from_raw_os_error(libc::EINVAL) });
+    }
+    let join = |lo: u32, hi: u32| (lo as u64) | ((hi as u64) << 32);
+    Ok((join(d[0].effective, d[1].effective), join(d[0].permitted, d[1].permitted), join(d[0].inheritable, d[1].inheritable)))
+}
+
+/// capset for this process: (effective, permitted, inheritable).
+pub fn capset(effective: u64, permitted: u64, inheritable: u64) -> io::Result<()> {
+    let mut h = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
+    let d = [
+        CapData { effective: effective as u32, permitted: permitted as u32, inheritable: inheritable as u32 },
+        CapData { effective: (effective >> 32) as u32, permitted: (permitted >> 32) as u32, inheritable: (inheritable >> 32) as u32 },
+    ];
+    // SAFETY: `h` is a valid header; `d` holds exactly the two words version 3 reads.
+    let r = unsafe { libc::syscall(libc::SYS_capset, &mut h as *mut CapHeader, d.as_ptr()) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// prctl(PR_CAPBSET_READ, cap): Ok(true/false), or EINVAL past the kernel's last capability.
+pub fn capbset_read(cap: u32) -> io::Result<bool> {
+    // SAFETY: plain integer arguments.
+    let r = unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) };
+    if r < 0 { Err(last()) } else { Ok(r == 1) }
+}
+
+/// prctl(PR_CAPBSET_DROP, cap).
+pub fn capbset_drop(cap: u32) -> io::Result<()> {
+    // SAFETY: plain integer arguments.
+    let r = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL).
+pub fn ambient_clear() -> io::Result<()> {
+    // SAFETY: constant arguments.
+    let r = unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, cap).
+pub fn ambient_is_set(cap: u32) -> io::Result<bool> {
+    // SAFETY: plain integer arguments.
+    let r = unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_IS_SET as libc::c_ulong, cap as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) };
+    if r < 0 { Err(last()) } else { Ok(r == 1) }
+}
+
+// landlock_add_rule for a NET_PORT rule is never needed: the restore ruleset handles only BIND_TCP (no rule allows a
+// bind), and CONNECT_TCP is left unhandled, which is "connect on any port" (Landlock's net rules are per port).
+
+/// execveat(dir, name, argv, envp, 0). Returns only on failure.
+pub fn execveat(dir: &OwnedFd, name: &CStr, argv: &[*const libc::c_char], envp: &[*const libc::c_char]) -> io::Error {
+    debug_assert!(argv.last() == Some(&core::ptr::null()) && envp.last() == Some(&core::ptr::null()));
+    // SAFETY: `dir` is open; `name` is NUL-terminated; both arrays end with NULL and point to live strings.
+    unsafe { libc::syscall(libc::SYS_execveat, dir.as_raw_fd(), name.as_ptr(), argv.as_ptr(), envp.as_ptr(), 0) };
+    last()
+}
+
+/// pidfd_open(pid, 0): a descriptor that polls readable when the child exits (A2 §3 step 9: the parent's one loop).
+pub fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
+    // SAFETY: plain integer arguments.
+    own(unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) })
+}
+
+/// openat2(root, rel, { O_PATH | O_DIRECTORY | O_CLOEXEC, 0, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+/// RESOLVE_NO_MAGICLINKS }): a directory by its path from the root, crossing mounts (A2: the restore child re-opens
+/// the attempt inside its new mount namespace; the caller checks its identity).
+pub fn open_path_dir(root: &OwnedFd, rel: &CStr) -> io::Result<OwnedFd> {
+    openat2(root, rel, libc::O_PATH | libc::O_DIRECTORY, 0)
+}

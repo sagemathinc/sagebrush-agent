@@ -23,10 +23,10 @@ const SRV: &str = "/srv/sagebrush";
 /// O(depth x batch), never O(objects) (A1 §5).
 const BATCH_BYTES: usize = 32 * 1024;
 
-const S_IFMT: u16 = 0o170000;
-const S_IFDIR: u16 = 0o040000;
-const S_IFREG: u16 = 0o100000;
-const S_IFLNK: u16 = 0o120000;
+pub(crate) const S_IFMT: u16 = 0o170000;
+pub(crate) const S_IFDIR: u16 = 0o040000;
+pub(crate) const S_IFREG: u16 = 0o100000;
+pub(crate) const S_IFLNK: u16 = 0o120000;
 
 /// The compiled anchor table (A1 §1): an anchor path and the form of the one name beneath it.
 pub const ANCHORS: [(&str, &str); 9] = [
@@ -41,9 +41,10 @@ pub const ANCHORS: [(&str, &str); 9] = [
     ("/var/lib/sagebrush/secrets", ""),
 ];
 
-/// Whether `name` is `<id><suffix>` for the anchor's suffix.
+/// Whether `name` is `<id><suffix>` for the anchor's suffix; beneath A2's `.restore`, `<run>/<owner>/<class>/<attempt>`.
 pub fn anchor_name_ok(anchor: &str, name: &str) -> bool {
     ANCHORS.iter().any(|(a, suffix)| *a == anchor && name.strip_suffix(suffix).is_some_and(is_id))
+        || (anchor == crate::restore::RESTORE && crate::restore::name_of(name).is_some())
 }
 
 /// How a child is opened beneath its parent (always with RESOLVE_NO_XDEV).
@@ -83,7 +84,7 @@ pub trait Ops {
     fn read(&mut self, root: &Self::H, rel: &str, max: usize) -> io::Result<Vec<u8>>;
 }
 
-fn c(s: &str) -> io::Result<CString> {
+pub(crate) fn c(s: &str) -> io::Result<CString> {
     CString::new(s).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
 }
 
@@ -209,23 +210,23 @@ pub struct Epoch {
     pub mnt_id: u64,
 }
 
-fn identity(msg: &'static str) -> Error {
+pub(crate) fn identity(msg: &'static str) -> Error {
     err(Fail::Identity, msg)
 }
-fn pre(msg: &'static str) -> Error {
+pub(crate) fn pre(msg: &'static str) -> Error {
     err(Fail::Preflight, msg)
 }
 
 /// Map an open/stat error: a mount crossing is an identity refusal (73); unsupported metadata, and anything else, is
 /// preflight_missing (66). Nothing has been changed when either is returned.
-fn open_err(e: io::Error) -> Error {
+pub(crate) fn open_err(e: io::Error) -> Error {
     match e.raw_os_error() {
         Some(libc::EXDEV) => identity("a mount below the anchor"),
         _ => pre("an object can't be opened or read"),
     }
 }
 
-fn kind_of(id: &Ident) -> Option<Kind> {
+pub(crate) fn kind_of(id: &Ident) -> Option<Kind> {
     match id.mode & S_IFMT {
         S_IFDIR => Some(Kind::Dir),
         S_IFREG => Some(Kind::File),
@@ -237,7 +238,7 @@ fn kind_of(id: &Ident) -> Option<Kind> {
 /// The child `name` of `dir`, fully identified. Ok(None) if it doesn't exist. For a directory, also its O_RDONLY
 /// handle (to descend). A symlink is identified by name (never followed); a device, socket or FIFO is refused (73)
 /// without ever being opened for reading.
-fn child<O: Ops>(o: &mut O, dir: &O::H, name: &str, anchor_mnt: u64) -> Result<Option<(Obj, Option<O::H>)>> {
+pub(crate) fn child<O: Ops>(o: &mut O, dir: &O::H, name: &str, anchor_mnt: u64) -> Result<Option<(Obj, Option<O::H>)>> {
     let id = match o.at(dir, name, At::Path) {
         Ok(h) => o.ident(&h).map_err(open_err)?,
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
@@ -274,7 +275,7 @@ fn child<O: Ops>(o: &mut O, dir: &O::H, name: &str, anchor_mnt: u64) -> Result<O
 // ---- the anchor policy (A1 §1)
 
 /// Each component from "/" down to `path`: a root:root directory without group or other write and without an ACL.
-fn anchor_policy<O: Ops>(o: &mut O, root: &O::H, path: &str) -> Result<O::H> {
+pub(crate) fn anchor_policy<O: Ops>(o: &mut O, root: &O::H, path: &str) -> Result<O::H> {
     let rel = &path[1..];
     let mut prefixes = vec![String::new()];
     let mut acc = String::new();
@@ -298,7 +299,7 @@ fn anchor_policy<O: Ops>(o: &mut O, root: &O::H, path: &str) -> Result<O::H> {
     last.ok_or(pre("no anchor"))
 }
 
-fn epoch_now<O: Ops>(o: &mut O, root: &O::H, anchor: &O::H) -> Result<(Epoch, u64)> {
+pub(crate) fn epoch_now<O: Ops>(o: &mut O, root: &O::H, anchor: &O::H) -> Result<(Epoch, u64)> {
     let raw = o.read(root, "proc/sys/kernel/random/boot_id", 64).map_err(|_| pre("no boot id"))?;
     let boot_id = core::str::from_utf8(&raw).ok().and_then(|s| s.strip_suffix('\n')).filter(|s| is_uuid(s)).ok_or(pre("a malformed boot id"))?;
     let mnt_id = o.ident(anchor).map_err(open_err)?.mnt_id;
@@ -316,7 +317,7 @@ fn is_uuid(s: &str) -> bool {
 
 // ---- JSON in and out
 
-fn obj_json(x: &Obj) -> String {
+pub(crate) fn obj_json(x: &Obj) -> String {
     let k = match x.kind {
         Kind::Dir => "dir",
         Kind::File => "file",
@@ -342,15 +343,15 @@ fn head_json(e: &Epoch, fsid: u64) -> String {
     format!("\"epoch\":{{\"boot_id\":{},\"mnt_id\":{}}},\"fsid\":\"{fsid:016x}\"", json::quote(&e.boot_id), e.mnt_id)
 }
 
-fn bad_expect() -> Error {
+pub(crate) fn bad_expect() -> Error {
     err(Fail::Contract, "the expected identity isn't the closed shape")
 }
 
-fn u32_of(v: &Value) -> Result<u32> {
+pub(crate) fn u32_of(v: &Value) -> Result<u32> {
     v.int().and_then(|n| u32::try_from(n).ok()).ok_or(bad_expect())
 }
 
-fn obj_of(v: &Value) -> Result<Obj> {
+pub(crate) fn obj_of(v: &Value) -> Result<Obj> {
     let f = v.exact(&["type", "mode", "uid", "gid", "dev", "ino", "gen", "mnt_id", "projid", "inherit"]).ok_or(bad_expect())?;
     let kind = match f[0].str() {
         Some("dir") => Kind::Dir,
@@ -387,18 +388,18 @@ fn obj_of(v: &Value) -> Result<Obj> {
     Ok(x)
 }
 
-fn epoch_of(v: &Value) -> Result<Epoch> {
+pub(crate) fn epoch_of(v: &Value) -> Result<Epoch> {
     let f = v.exact(&["boot_id", "mnt_id"]).ok_or(bad_expect())?;
     let boot_id = f[0].str().filter(|s| is_uuid(s)).ok_or(bad_expect())?.to_string();
     Ok(Epoch { boot_id, mnt_id: f[1].int().ok_or(bad_expect())? })
 }
 
-fn fsid_of(v: &Value) -> Result<u64> {
+pub(crate) fn fsid_of(v: &Value) -> Result<u64> {
     let s = v.str().filter(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())).ok_or(bad_expect())?;
     u64::from_str_radix(s, 16).map_err(|_| bad_expect())
 }
 
-fn read_expect<O: Ops>(o: &mut O, root: &O::H, path: &str) -> Result<Value> {
+pub(crate) fn read_expect<O: Ops>(o: &mut O, root: &O::H, path: &str) -> Result<Value> {
     let rel = crate::args::rel(path).ok_or(err(Fail::Usage, "bad arguments"))?;
     let raw = o.read(root, rel, MAX_EXPECT).map_err(|_| err(Fail::Contract, "the expected identity can't be read"))?;
     json::parse(&raw).ok_or(bad_expect())
@@ -866,7 +867,10 @@ fn remove_tree_limited<O: Ops>(o: &mut O, anchor: &str, name: &str, expect_path:
     let v = read_expect(o, &root, expect_path)?;
     let f = v.exact(&["epoch", "fsid", "root", "owners"]).ok_or(bad_expect())?;
     let (e_epoch, e_fsid, e_root) = (epoch_of(f[0])?, fsid_of(f[1])?, obj_of(f[2])?);
-    let owners = f[3].arr().filter(|a| !a.is_empty() && a.len() <= 4).ok_or(bad_expect())?.iter().map(u32_of).collect::<Result<Vec<u32>>>()?;
+    // A2: an attempt beneath .restore may hold root and up to 64 tag members' files.
+    let restore = anchor == crate::restore::RESTORE;
+    let max_owners = if restore { 65 } else { 4 };
+    let owners = f[3].arr().filter(|a| !a.is_empty() && a.len() <= max_owners).ok_or(bad_expect())?.iter().map(u32_of).collect::<Result<Vec<u32>>>()?;
     let a = anchor_policy(o, &root, anchor)?;
     // The epoch FIRST, even when the target is absent (A1 r2 §1, TESTS T1).
     let (epoch, fsid) = epoch_now(o, &root, &a)?;
@@ -876,6 +880,26 @@ fn remove_tree_limited<O: Ops>(o: &mut O, anchor: &str, name: &str, expect_path:
     if fsid != e_fsid {
         return Err(identity("another filesystem"));
     }
+    // A2: beneath .restore, the attempt's three staging parents first, each root:root 0700 on the anchor's mount; a
+    // missing one means the attempt is already gone.
+    let (a, name) = if restore {
+        let parts = crate::restore::name_of(name).ok_or(err(Fail::Usage, "bad arguments"))?.parts();
+        let mut cur = a;
+        for part in &parts[..3] {
+            match child(o, &cur, part, epoch.mnt_id)? {
+                Some((x, Some(h))) if x.kind == Kind::Dir && x.uid == 0 && x.gid == 0 && x.mode == 0o700 => cur = h,
+                None => {
+                    o.fsync(&cur).map_err(|_| err(Fail::Partial, "absent; not yet confirmed durable"))?;
+                    return Ok(());
+                }
+                _ => return Err(identity("a staging directory isn't root:root 0700")),
+            }
+        }
+        (cur, parts[3].clone())
+    } else {
+        (a, name.to_string())
+    };
+    let name = name.as_str();
     // Already gone (an earlier call removed it, perhaps with a 75 at its final sync): the anchor is synced again, in
     // this epoch only (A1 r2.4 §5), before that is success.
     let Some((x, h)) = child(o, &a, name, epoch.mnt_id)? else {
@@ -924,59 +948,68 @@ pub fn parse_mount(s: &str) -> Result<&str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    const A: &str = "abcdefghijklmnopqrstuvwxya";
-    const BOOT: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
-    const MNT: u64 = 20;
-    const UID: u32 = 70001;
+    pub(crate) const A: &str = "abcdefghijklmnopqrstuvwxya";
+    pub(crate) const BOOT: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+    pub(crate) const MNT: u64 = 20;
+    pub(crate) const UID: u32 = 70001;
 
     #[derive(Clone, Debug)]
-    struct Node {
-        id: Ident,
-        gen: u32,
-        proj: u32,
-        inherit: bool,
-        acl: bool,
+    pub(crate) struct Node {
+        pub(crate) id: Ident,
+        pub(crate) gen: u32,
+        pub(crate) proj: u32,
+        pub(crate) inherit: bool,
+        pub(crate) acl: bool,
     }
 
-    type Hook = fn(&mut Fake);
+    pub(crate) type Hook = fn(&mut Fake);
 
     /// A fake tree: paths relative to the root ("" is the root). A node whose mnt_id differs from its parent's is a
     /// mount: opening it with NO_XDEV fails EXDEV. Symlinks fail ELOOP. `hook` runs once, when op `.0` has been called
     /// `.1` times; `fail` makes one op fail.
-    struct Fake {
-        nodes: BTreeMap<String, Node>,
-        files: BTreeMap<String, Vec<u8>>,
-        fsid: u64,
-        next_ino: u64,
-        counts: BTreeMap<&'static str, usize>,
-        hook: Option<(&'static str, usize, Hook)>,
-        fail: Option<&'static str>,
+    pub(crate) struct Fake {
+        pub(crate) nodes: BTreeMap<String, Node>,
+        pub(crate) files: BTreeMap<String, Vec<u8>>,
+        pub(crate) fsid: u64,
+        pub(crate) next_ino: u64,
+        pub(crate) counts: BTreeMap<&'static str, usize>,
+        pub(crate) hook: Option<(&'static str, usize, Hook)>,
+        pub(crate) fail: Option<&'static str>,
         /// A kernel that reports a different mount without failing the open (the mnt_id postcondition must refuse).
-        no_exdev: bool,
-        cursors: BTreeMap<u64, usize>,
-        log: Vec<String>,
+        pub(crate) no_exdev: bool,
+        pub(crate) cursors: BTreeMap<u64, usize>,
+        pub(crate) log: Vec<String>,
+        /// A2: extended attributes per path, a fail-with-errno hook (op, nth call, errno), quota and space answers,
+        /// proc/self/exe's target, a project-id skew on set_project, and the cap drop's answer.
+        pub(crate) xattrs: BTreeMap<String, Vec<String>>,
+        pub(crate) errno_at: Option<(&'static str, usize, i32)>,
+        pub(crate) quota: Option<sys::Quota>,
+        pub(crate) space: (u64, u64),
+        pub(crate) exe: String,
+        pub(crate) proj_skew: u32,
+        pub(crate) caps_fail: bool,
     }
 
     /// The fake's batch size: small, so every walk crosses batch boundaries.
     const BATCH: usize = 2;
 
-    fn join(dir: &str, name: &str) -> String {
+    pub(crate) fn join(dir: &str, name: &str) -> String {
         if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") }
     }
-    fn parent(p: &str) -> &str {
+    pub(crate) fn parent(p: &str) -> &str {
         p.rfind('/').map_or("", |i| &p[..i])
     }
-    fn e(n: i32) -> io::Error {
+    pub(crate) fn e(n: i32) -> io::Error {
         io::Error::from_raw_os_error(n)
     }
 
     impl Fake {
-        fn new() -> Fake {
-            let mut f = Fake { nodes: BTreeMap::new(), files: BTreeMap::new(), fsid: 0xabcd_0000_1234, next_ino: 2, counts: BTreeMap::new(), hook: None, fail: None, no_exdev: false, cursors: BTreeMap::new(), log: vec![] };
+        pub(crate) fn new() -> Fake {
+            let mut f = Fake { nodes: BTreeMap::new(), files: BTreeMap::new(), fsid: 0xabcd_0000_1234, next_ino: 2, counts: BTreeMap::new(), hook: None, fail: None, no_exdev: false, cursors: BTreeMap::new(), log: vec![], xattrs: BTreeMap::new(), errno_at: None, quota: None, space: (1 << 20, 1 << 20), exe: String::new(), proj_skew: 0, caps_fail: false };
             f.add("", S_IFDIR | 0o755, 0, 0);
             f.nodes.get_mut("").unwrap().id.attributes = libc::STATX_ATTR_MOUNT_ROOT as u64;
             for d in ["run", "run/sagebrush", "run/sagebrush/binds", "var", "var/lib", "var/lib/sagebrush", "var/lib/sagebrush/contract", "srv", "srv/sagebrush", "srv/sagebrush/agents", "srv/sagebrush/agent-config"] {
@@ -988,22 +1021,22 @@ mod tests {
             f.files.insert("proc/sys/kernel/random/boot_id".into(), format!("{BOOT}\n").into_bytes());
             f
         }
-        fn add(&mut self, p: &str, mode: u16, uid: u32, gid: u32) {
+        pub(crate) fn add(&mut self, p: &str, mode: u16, uid: u32, gid: u32) {
             self.next_ino += 1;
             let id = Ident { attributes: 0, dev: (8, 1), ino: self.next_ino, uid, gid, mode, mnt_id: MNT, nlink: 1, size: 0 };
             self.nodes.insert(p.to_string(), Node { id, gen: 7, proj: 0, inherit: false, acl: false });
         }
-        fn dir(&mut self, p: &str, uid: u32, mode: u16) {
+        pub(crate) fn dir(&mut self, p: &str, uid: u32, mode: u16) {
             self.add(p, S_IFDIR | mode, uid, uid);
         }
-        fn file(&mut self, p: &str, uid: u32, mode: u16) {
+        pub(crate) fn file(&mut self, p: &str, uid: u32, mode: u16) {
             self.add(p, S_IFREG | mode, uid, uid);
         }
-        fn node(&mut self, p: &str) -> &mut Node {
+        pub(crate) fn node(&mut self, p: &str) -> &mut Node {
             self.nodes.get_mut(p).unwrap()
         }
         /// An agent home tree as provisioned: exactly home, var-tmp and sessions, each the agent's, 0700, project = uid.
-        fn agent(&mut self, base: &str) {
+        pub(crate) fn agent(&mut self, base: &str) {
             let d = format!("{base}/{A}");
             self.dir(&d, 0, 0o755);
             for n in ["home", "var-tmp", "sessions"] {
@@ -1014,11 +1047,11 @@ mod tests {
                 x.inherit = true;
             }
         }
-        fn children(&self, dir: &str) -> Vec<String> {
+        pub(crate) fn children(&self, dir: &str) -> Vec<String> {
             let pre = if dir.is_empty() { String::new() } else { format!("{dir}/") };
             self.nodes.keys().filter(|k| !k.is_empty() && k.starts_with(&pre) && !k[pre.len()..].contains('/')).map(|k| k[pre.len()..].to_string()).collect()
         }
-        fn tick(&mut self, op: &'static str) -> io::Result<()> {
+        pub(crate) fn tick(&mut self, op: &'static str) -> io::Result<()> {
             let n = self.counts.entry(op).or_insert(0);
             *n += 1;
             let n = *n;
@@ -1028,22 +1061,28 @@ mod tests {
                     f(self);
                 }
             }
+            if let Some((h, at, errno)) = self.errno_at {
+                if h == op && at == n {
+                    self.errno_at = None;
+                    return Err(e(errno));
+                }
+            }
             if self.fail == Some(op) { Err(e(libc::EIO)) } else { Ok(()) }
         }
-        fn count(&self, op: &str) -> usize {
+        pub(crate) fn count(&self, op: &str) -> usize {
             self.counts.get(op).copied().unwrap_or(0)
         }
     }
 
     /// A fake handle: the path it was opened at, and its own id (each open has its own read cursor, as on Linux).
     #[derive(Clone, Debug)]
-    struct FH {
-        p: String,
-        id: u64,
+    pub(crate) struct FH {
+        pub(crate) p: String,
+        pub(crate) id: u64,
     }
 
     impl Fake {
-        fn handle(&mut self, p: String) -> FH {
+        pub(crate) fn handle(&mut self, p: String) -> FH {
             self.next_ino += 1;
             FH { p, id: self.next_ino }
         }
@@ -1157,14 +1196,14 @@ mod tests {
         }
     }
 
-    fn code<T: std::fmt::Debug>(r: Result<T>) -> i32 {
+    pub(crate) fn code<T: std::fmt::Debug>(r: Result<T>) -> i32 {
         match r {
             Ok(_) => 0,
             Err(x) => x.fail.code(),
         }
     }
 
-    fn expect_file(f: &mut Fake, name: &str, json: String) -> String {
+    pub(crate) fn expect_file(f: &mut Fake, name: &str, json: String) -> String {
         f.files.insert(format!("run/sagebrush/expect/{name}"), json.into_bytes());
         format!("/run/sagebrush/expect/{name}")
     }

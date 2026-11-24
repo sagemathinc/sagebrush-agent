@@ -4,7 +4,7 @@
 // runs: a quota hit stops as not_fitting, out of space and partial steps retry in a new attempt, anything else fails;
 // filling is written before the first fill-home, and a filling record is never filled again.
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
@@ -272,17 +272,36 @@ test("fillExpect: the launcher's identity of the destination plus the class's ow
   assert.throws(() => fillExpect({ ...identity, object: { ...object, dev: 2049 } }, owners), (e) => e.code === "bad_form");
   assert.throws(() => fillExpect({ ...identity, object: { ...object, type: "file" } }, owners), (e) => e.code === "not_granted");
   assert.throws(() => fillExpect({ ...identity, object: { ...object, projid: 70006 } }, owners), (e) => e.code === "not_granted");
+  // The test seam: this process's uid and gid stand for root's (the real caller passes 0 and 0).
+  const me = { rootUid: typeof process.getuid === "function" ? process.getuid() : -1, rootGid: typeof process.getgid === "function" ? process.getgid() : -1 };
   const dir = join(mkdtempSync(join(tmpdir(), "sb-expect-")), "expect");
   const id = newId();
-  const p = writeExpectFile(dir, `agent-${id}-home.json`, fillExpect(identity, owners));
+  assert.throws(() => writeExpectFile(dir, `agent-${id}-home.json`, {}), (e) => e.code === "not_granted", "by default only root's directory");
+  const p = writeExpectFile(dir, `agent-${id}-home.json`, fillExpect(identity, owners), me);
   assert.equal(p, join(dir, `agent-${id}-home.json`));
   assert.deepEqual(JSON.parse(readFileSync(p, "utf8")), fillExpect(identity, owners));
   assert.deepEqual([statSync(dir).mode & 0o777, statSync(p).mode & 0o777], [0o700, 0o600]);
-  for (const name of ["x.json", `agent-${id}-home`, `../agent-${id}-home.json`, `agent-nope-home.json`]) assert.throws(() => writeExpectFile(dir, name, {}), (e) => e.code === "bad_form", name);
+  for (const name of ["x.json", `agent-${id}-home`, `../agent-${id}-home.json`, `agent-nope-home.json`]) assert.throws(() => writeExpectFile(dir, name, {}, me), (e) => e.code === "bad_form", name);
+  // The directory: root's, its group root's, nobody else's mode, never a link.
   const open = join(mkdtempSync(join(tmpdir(), "sb-expect-")), "expect");
   mkdirSync(open, { mode: 0o755 });
-  assert.throws(() => writeExpectFile(open, `agent-${id}-home.json`, {}), (e) => e.code === "not_granted");
-  // A failed flush throws: an expect file the launcher could read half-written never counts.
+  assert.throws(() => writeExpectFile(open, `agent-${id}-home.json`, {}, me), (e) => e.code === "not_granted", "a readable directory");
+  assert.throws(() => writeExpectFile(dir, `agent-${id}-home.json`, {}, { ...me, rootUid: me.rootUid + 1 }), (e) => e.code === "not_granted", "another owner");
+  assert.throws(() => writeExpectFile(dir, `agent-${id}-home.json`, {}, { ...me, rootGid: me.rootGid + 1 }), (e) => e.code === "not_granted", "another group");
+  const linkDir = join(mkdtempSync(join(tmpdir(), "sb-expect-")), "expect");
+  symlinkSync(dir, linkDir);
+  assert.throws(() => writeExpectFile(linkDir, `agent-${id}-home.json`, {}, me), (e) => e.code === "not_granted", "a link to the directory");
+  // A link planted at the name is replaced, never written through; the temp name is fresh and created exclusively.
+  const outside = join(mkdtempSync(join(tmpdir(), "sb-outside-")), "victim");
+  writeFileSync(outside, "untouched");
+  symlinkSync(outside, join(dir, `agent-${id}-sessions.json`));
+  const opened = [];
+  writeExpectFile(dir, `agent-${id}-sessions.json`, { v: 1 }, { ...me, io: { ...realIo, open: (q, f, m) => { opened.push([q, f]); return realIo.open(q, f, m); } } });
+  assert.equal(readFileSync(outside, "utf8"), "untouched");
+  assert.ok(lstatSync(join(dir, `agent-${id}-sessions.json`)).isFile());
+  assert.ok(opened.some(([q, f]) => f === "wx" && /\/\.agent-[a-z2-7]+-sessions\.json\.[0-9a-f]{16}\.tmp$/.test(q)), "an exclusive, fresh temp name");
+  // A failed flush throws, and no temp file is left behind.
   const io = { ...realIo, fsync: () => { throw Object.assign(new Error("EIO"), { code: "EIO" }); } };
-  assert.throws(() => writeExpectFile(dir, `agent-${id}-sessions.json`, {}, { io }), (e) => e.code === "EIO");
+  assert.throws(() => writeExpectFile(dir, `agent-${id}-tag.json`, {}, { ...me, io }), (e) => e.code === "EIO");
+  assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith(".tmp")), []);
 });

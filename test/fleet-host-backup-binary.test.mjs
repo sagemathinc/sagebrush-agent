@@ -12,6 +12,20 @@ import { CODES, checkRequest, parseResult, runBackupOp } from "../lib/fleet/host
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const SNAP = "a".repeat(64);
 
+/**
+ * Whether a process is gone, waiting up to `ms`: no such process, or a zombie (state Z in /proc/<pid>/stat: killed,
+ * only not yet reaped by init, which can take a while on a loaded host).
+ */
+async function gone(pid, ms = 5000) {
+  const t0 = Date.now();
+  for (;;) {
+    try { process.kill(pid, 0); } catch (e) { if (e.code === "ESRCH") return true; }
+    try { if (/^\d+ \(.*\) Z /.test(readFileSync(`/proc/${pid}/stat`, "utf8"))) return true; } catch { return true; }
+    if (Date.now() - t0 > ms) return false;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
 /** A fake binary: `body` is the JavaScript it runs; it sees the request on stdin. Returns { ctx, dir }. */
 function fake(body) {
   const dir = mkdtempSync(join(tmpdir(), "sb-bbin-"));
@@ -79,9 +93,10 @@ fs.writeFileSync(dir + "/gpid", String(g.pid));
 setTimeout(() => {}, 60000);`);
   const r = await runBackupOp({ op: "snapshots" }, ctx, { ms: 600 });
   assert.equal(r.code, "timed_out");
-  await new Promise((res) => setTimeout(res, 300));
   const gpid = Number(readFileSync(join(dir, "gpid"), "utf8"));
-  assert.throws(() => process.kill(gpid, 0), (e) => e.code === "ESRCH", "the grandchild is gone");
+  const dead = await gone(gpid);
+  if (!dead) { try { process.kill(gpid, "SIGKILL"); } catch {} }
+  assert.ok(dead, "the grandchild is gone (or a zombie awaiting its reaper)");
 });
 
 test("a normal settlement kills the group too: a descendant left behind by a binary that succeeded or failed cleanly is gone", async () => {
@@ -95,12 +110,10 @@ setImmediate(() => process.exit(${exit}));`);
     const r = await runBackupOp({ op: "forget", snapshots: [SNAP] }, ctx, { ms: 10000 });
     assert.equal(r.ok, exit === 0, name);
     if (exit !== 0) assert.equal(r.code, "forget_failed", name);
-    await new Promise((res) => setTimeout(res, 300));
     const gpid = Number(readFileSync(join(dir, "gpid"), "utf8"));
-    let alive = true;
-    try { process.kill(gpid, 0); } catch (e) { alive = e.code !== "ESRCH"; }
-    if (alive) { try { process.kill(gpid, "SIGKILL"); } catch {} }
-    assert.equal(alive, false, `${name}: the descendant is killed when the call settles`);
+    const dead = await gone(gpid);
+    if (!dead) { try { process.kill(gpid, "SIGKILL"); } catch {} }
+    assert.ok(dead, `${name}: the descendant is killed when the call settles (gone, or a zombie awaiting its reaper)`);
   }
 });
 

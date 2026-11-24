@@ -5,12 +5,15 @@ ConditionPathExists=!/var/lib/sagebrush/fence/all
 ConditionPathExists=!/var/lib/sagebrush/fence/abcdefghijklmnopqrstuvwxya
 ConditionPathExists=!/var/lib/sagebrush/fence/expiry
 ConditionPathExists=!/var/lib/sagebrush/fence/backup/abcdefghijklmnopqrstuvwxya
+ConditionPathExists=!/var/lib/sagebrush/fence/lease/abcdefghijklmnopqrstuvwxya
+ConditionPathExists=!/var/lib/sagebrush/fence/restore/abcdefghijklmnopqrstuvwxya
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
 Type=simple
-Slice=sagebrush-agents.slice
+Slice=sagebrush-agents-abcdefghijklmnopqrstuvwxya.slice
+ExecStartPre=+/opt/sagebrush/1.2.3/bin/sagebrush-agent-launch lease-check --agent abcdefghijklmnopqrstuvwxya
 ExecStart=/opt/sagebrush/1.2.3/bin/sagebrush-agent-launch exec --agent abcdefghijklmnopqrstuvwxya --contract /run/sagebrush/contract.json --cli /opt/sagebrush/cli/claude-2.1.0
 Restart=on-failure
 RestartSec=5

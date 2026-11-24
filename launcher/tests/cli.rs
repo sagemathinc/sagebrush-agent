@@ -61,6 +61,8 @@ fn kernel_abi() -> i64 {
 /// Where the kernel supports ABI 4, the launcher's positive control MUST succeed: a skip there is a failure.
 fn landlock_abi4() -> bool {
     if kernel_abi() < 4 {
+        // CI sets SB_TEST_REQUIRE_LANDLOCK: there a kernel without ABI 4 fails the job instead of skipping these rows.
+        assert!(std::env::var_os("SB_TEST_REQUIRE_LANDLOCK").is_none(), "SB_TEST_REQUIRE_LANDLOCK is set, but this kernel has no Landlock ABI 4");
         eprintln!("this kernel has no Landlock ABI 4 (independent query): the Landlock rows run on the VM");
         return false;
     }
@@ -319,5 +321,27 @@ fn a2_subcommands_refuse_bad_arguments_then_the_root_guard() {
     let o = run(&a.iter().map(String::as_str).collect::<Vec<_>>());
     assert_eq!(code(&o), 66, "{}", stderr(&o));
     assert_eq!(stderr(&o).lines().count(), 1);
+    assert!(o.stdout.is_empty());
+}
+
+#[test]
+fn a3_lease_check_refuses_bad_arguments_then_the_root_guard() {
+    let run = |args: &[&str]| Command::new(BIN).env_clear().args(args).output().unwrap();
+    for bad in [
+        vec!["lease-check"],
+        vec!["lease-check", "--agent"],
+        vec!["lease-check", "--agent", "not-an-id"],
+        vec!["lease-check", "--agent", A, "--agent", A],
+        vec!["lease-check", "--agent", A, "--extra", "x"],
+        vec!["lease-check", "--agent", A, "--", "x"],
+    ] {
+        let o = run(&bad);
+        assert_eq!(code(&o), 64, "{bad:?}: {}", stderr(&o));
+        assert!(o.stdout.is_empty());
+    }
+    // Well-formed as a non-root user: the root guard (66), one fixed line, nothing on stdout.
+    let o = run(&["lease-check", "--agent", A]);
+    assert_eq!(code(&o), 66, "{}", stderr(&o));
+    assert_eq!(stderr(&o), "sagebrush-agent-launch: preflight_missing: root only\n");
     assert!(o.stdout.is_empty());
 }

@@ -893,3 +893,28 @@ pub fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
 pub fn open_path_dir(root: &OwnedFd, rel: &CStr) -> io::Result<OwnedFd> {
     openat2(root, rel, libc::O_PATH | libc::O_DIRECTORY, 0)
 }
+
+/// flock(fd, LOCK_SH | LOCK_NB) (A3 §2 step 3): Ok(true) when taken, Ok(false) when another description holds it
+/// exclusive (EWOULDBLOCK); any other error is returned.
+pub fn flock_shared_nb(fd: &OwnedFd) -> io::Result<bool> {
+    // SAFETY: `fd` is an open descriptor; the operation is a constant.
+    let r = unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+    if r == 0 {
+        return Ok(true);
+    }
+    let e = last();
+    if e.raw_os_error() == Some(libc::EWOULDBLOCK) { Ok(false) } else { Err(e) }
+}
+
+/// clock_gettime(CLOCK_BOOTTIME) (A3 §2 step 5): (tv_sec, tv_nsec), counting time spent in suspend.
+pub fn clock_boottime() -> io::Result<(i64, i64)> {
+    let mut ts = core::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `ts` is writable for a whole timespec; the clock id is a constant.
+    let r = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, ts.as_mut_ptr()) };
+    if r != 0 {
+        return Err(last());
+    }
+    // SAFETY: clock_gettime returned 0, so the kernel initialized the timespec.
+    let ts = unsafe { ts.assume_init() };
+    Ok((ts.tv_sec as i64, ts.tv_nsec as i64))
+}

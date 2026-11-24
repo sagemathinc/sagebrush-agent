@@ -1,8 +1,8 @@
 // Host backup r3.3 §5 step 7: the space check before any staging says exactly one of three things: "fits" (proven by
-// upper bounds on blocks and inodes within every limit), "doesnt_fit" (proven only when the restored inodes
-// themselves, exact, are over a limit), or "cant_tell" (it refuses, with the person's options). Each class's upper bound
+// upper bounds on blocks and inodes within every limit), "doesnt_fit" (proven only when the staged tree's inodes,
+// a lower bound, are over a limit), or "cant_tell" (it refuses, with the person's options). Each class's upper bound
 // is the larger of its two phases: staged (the staged tree, the attempt, data, its leaf and the marker) and filled at
-// its peak (every directory and symlink twice, the attempt, data and its leaf: the marker is gone before the first
+// its peak (every directory twice, the attempt, data and its leaf: the marker is gone before the first
 // destination write); the filesystem also gets up to 3 parent directories per class.
 import assert from "node:assert/strict";
 import { test } from "./host-linux-only.mjs";

@@ -4,13 +4,14 @@
 // restore plan: the authority for each set's run and snapshot (restoreReady's expected), created once, moved only by
 // a set's new request. Against a fake store that records every call.
 import assert from "node:assert/strict";
-import { mkdtempSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { buildManifest, canonical, sha256 } from "../lib/fleet/host/backup-manifest.mjs";
 import { PLAN, checkPlan, chooseManifest, createPlan, expectedOf, listManifests, newPlan, readPlan, replanSet, updatePlan, withRestoreLock } from "../lib/fleet/host/restore-plan.mjs";
+import { realIo } from "../lib/fleet/host/store.mjs";
 import { newRecord, newRestoreRun, restoreReady, retryRecord, runTime, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
@@ -278,6 +279,42 @@ test("the plan on disk: created once (0600, exclusive; the same plan again is fi
     writeFileSync(join(dir, PLAN), text);
     refused(() => readPlan({ dir }), "bad_form");
   }
+});
+
+test("an identical update is a retry: it makes the plan durable again (file, then directory) and reads it back", async () => {
+  const b = backup("old-host", RUN, "2026-11-24T03:10:00.000Z");
+  const p = newPlan(await chooseManifest(store([b]), b.mid), RRUN);
+  const dir = fresh();
+  createPlan(p, { dir });
+  const k = Object.keys(p.sets)[0];
+  const p2 = replanSet(p, k.split("-")[0], k.slice(k.indexOf("-") + 1), RRUN2);
+  // An io that records [op, path] and can fail one fsync, by path.
+  const spy = (failAt = null) => {
+    const ops = [], fds = new Map();
+    return {
+      ops,
+      io: {
+        ...realIo,
+        open: (q, f, m) => { const fd = realIo.open(q, f, m); fds.set(fd, q); return fd; },
+        fsync: (fd) => { ops.push(["fsync", fds.get(fd)]); if (fds.get(fd) === failAt) throw Object.assign(new Error("EIO"), { code: "EIO" }); return realIo.fsync(fd); },
+        rename: (a, c) => { ops.push(["rename", c]); return realIo.rename(a, c); },
+      },
+    };
+  };
+  // The update's directory fsync fails after its rename: the new plan is visible, but not yet known durable.
+  await assert.rejects(async () => updatePlan(p2, { dir, io: spy(dir).io }), (e) => e.code === "EIO");
+  assert.deepEqual(readPlan({ dir }), p2);
+  // The identical retry flushes the file, then its directory, and only then succeeds; a failure there still throws.
+  await assert.rejects(async () => updatePlan(p2, { dir, io: spy(dir).io }), (e) => e.code === "EIO");
+  await assert.rejects(async () => updatePlan(p2, { dir, io: spy(join(dir, PLAN)).io }), (e) => e.code === "EIO");
+  const ok = spy();
+  updatePlan(p2, { dir, io: ok.io });
+  assert.deepEqual(ok.ops, [["fsync", join(dir, PLAN)], ["fsync", dir]], "the file, then its directory; no rewrite");
+  // A plan on disk that isn't what it claims to be is never reported durable.
+  const text = readFileSync(join(dir, PLAN), "utf8");
+  const tampered = spy();
+  tampered.io.fsync = (fd) => { writeFileSync(join(dir, PLAN), text.replace("}", " }")); return realIo.fsync(fd); };
+  refused(() => updatePlan(p2, { dir, io: tampered.io }), "outcome_unknown");
 });
 
 test("one restore at a time: the restore lock", async () => {

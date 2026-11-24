@@ -473,7 +473,9 @@ fn stage_inner<O: RestoreOps, R: Runner<O::H>>(o: &mut O, r: &mut R, a: &StageAr
     let data = dh.ok_or(identity("data isn't a directory"))?;
     o.chmod(&data, 0o700).map_err(|_| identity("data's mode can't be set"))?;
     let dx = tchild(o, &att, "data", mnt)?.ok_or(identity("data vanished"))?.0;
-    if dx.uid != 0 || dx.gid != 0 || dx.mode != 0o700 || dx.projid != Some(a.projid) || dx.inherit != Some(true) {
+    let di = o.ident(&data).map_err(open_err)?;
+    // The name re-read must be the very directory opened and chmodded (a replacement with equal attributes refuses).
+    if (dx.dev, dx.ino) != (di.dev, di.ino) || dx.uid != 0 || dx.gid != 0 || dx.mode != 0o700 || dx.projid != Some(a.projid) || dx.inherit != Some(true) {
         return Err(identity("data isn't a root 0700 directory of the class's project"));
     }
     // The class's own directory, data/<leaf> (A2 r3.5): the binary's dest, fresh, empty, root 0700, in the project.
@@ -485,11 +487,17 @@ fn stage_inner<O: RestoreOps, R: Runner<O::H>>(o: &mut O, r: &mut R, a: &StageAr
     let leaf_h = lh.ok_or(identity("the class's directory isn't a directory"))?;
     o.chmod(&leaf_h, 0o700).map_err(|_| identity("the class's directory's mode can't be set"))?;
     let lx = tchild(o, &data, lf, mnt)?.ok_or(identity("the class's directory vanished"))?.0;
-    if lx.uid != 0 || lx.gid != 0 || lx.mode != 0o700 || lx.projid != Some(a.projid) || lx.inherit != Some(true) || !o.batch(&leaf_h).map_err(open_err)?.is_empty() {
+    let li = o.ident(&leaf_h).map_err(open_err)?;
+    if (lx.dev, lx.ino) != (li.dev, li.ino) || lx.uid != 0 || lx.gid != 0 || lx.mode != 0o700 || lx.projid != Some(a.projid) || lx.inherit != Some(true) || !o.batch(&leaf_h).map_err(open_err)?.is_empty() {
         return Err(identity("the class's directory isn't a fresh, empty root 0700 directory of the class's project"));
     }
     for h in [&leaf_h, &data, &att, &class_h] {
         o.fsync(h).map_err(|_| err(Fail::Partial, "the attempt can't be synced"))?;
+    }
+    // Still the same directory at the name after the syncs: the child's dest is that path.
+    let again = tchild(o, &data, lf, mnt)?.ok_or(identity("the class's directory vanished"))?.0;
+    if (again.dev, again.ino) != (li.dev, li.ino) {
+        return Err(identity("the class's directory was replaced"));
     }
 
     // 5-10. The child, contained; the parent waits, bounded.
@@ -1492,6 +1500,12 @@ mod tests {
             f.nodes.remove(&leaf_path());
             f.add(&leaf_path(), S_IFREG | 0o700, 0, 0);
         }
+        fn replaced(f: &mut Fake) {
+            f.node(&leaf_path()).id.ino = 99_999; // same owner, mode, project, inherit and emptiness: another inode
+        }
+        fn data_replaced(f: &mut Fake) {
+            f.node(&format!("{}/data", attempt_path("home"))).id.ino = 99_998;
+        }
         let rows: [(&str, &'static str, Hook); 7] = [
             ("pre-made", "mkdir", premade),
             ("another owner", "chmod", foreign),
@@ -1509,6 +1523,25 @@ mod tests {
             assert!(r.seen.is_none(), "{what}: nothing ran");
             assert!(f.hook.is_none(), "{what}: the hook fired");
         }
+        // An actual inode replacement with every attribute equal, after the open and before the re-read: of the leaf
+        // (the 6th chmod is the leaf's) and of data (the 5th is data's).
+        for (what, n, hook) in [("the leaf replaced", 6usize, replaced as Hook), ("data replaced", 5, data_replaced)] {
+            let mut f = host();
+            f.hook = Some(("chmod", n, hook));
+            let mut r = exited(ok_reply());
+            assert_eq!(rcode(&restore_stage(&mut f, &mut r, &stage_args("home"))), 73, "{what}");
+            assert!(r.seen.is_none() && f.hook.is_none(), "{what}");
+            assert!(!f.log.iter().any(|l| l.starts_with("fsync ")), "{what}: refused at the re-read, before any sync");
+        }
+        // Replaced after its own sync (before data's): the re-read after the syncs refuses.
+        let mut f = host();
+        restore_stage(&mut f, &mut exited(ok_reply()), &stage_args("home"));
+        let k = f.log.iter().filter(|l| l.starts_with("fsync ")).position(|l| *l == format!("fsync {}", leaf_path())).unwrap() + 1;
+        let mut f = host();
+        f.hook = Some(("fsync", k + 1, replaced));
+        let mut r = exited(ok_reply());
+        assert_eq!(rcode(&restore_stage(&mut f, &mut r, &stage_args("home"))), 73, "replaced after the sync");
+        assert!(r.seen.is_none() && f.hook.is_none());
     }
 
     #[test]

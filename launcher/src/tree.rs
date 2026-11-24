@@ -1084,12 +1084,15 @@ pub(crate) mod tests {
     pub(crate) struct FH {
         pub(crate) p: String,
         pub(crate) id: u64,
+        /// The inode opened: like a real fd, the handle keeps naming it if the path is replaced afterwards.
+        pub(crate) ino: u64,
     }
 
     impl Fake {
         pub(crate) fn handle(&mut self, p: String) -> FH {
             self.next_ino += 1;
-            FH { p, id: self.next_ino }
+            let ino = self.nodes.get(&p).map_or(0, |n| n.id.ino);
+            FH { p, id: self.next_ino, ino }
         }
     }
 
@@ -1118,7 +1121,8 @@ pub(crate) mod tests {
             Ok(self.handle(p))
         }
         fn ident(&mut self, h: &FH) -> io::Result<Ident> {
-            self.nodes.get(&h.p).map(|n| n.id).ok_or(e(libc::ENOENT))
+            // The opened object's identity: a path replaced since the open still reports the opened inode.
+            self.nodes.get(&h.p).map(|n| Ident { ino: if h.ino != 0 { h.ino } else { n.id.ino }, ..n.id }).ok_or(e(libc::ENOENT))
         }
         fn ident_at(&mut self, dir: &FH, name: &str) -> io::Result<Ident> {
             self.nodes.get(&join(&dir.p, name)).map(|n| n.id).ok_or(e(libc::ENOENT))

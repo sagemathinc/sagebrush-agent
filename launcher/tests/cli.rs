@@ -345,3 +345,33 @@ fn a3_lease_check_refuses_bad_arguments_then_the_root_guard() {
     assert_eq!(stderr(&o), "sagebrush-agent-launch: preflight_missing: root only\n");
     assert!(o.stdout.is_empty());
 }
+
+#[test]
+fn a4_profile_mounts_refuses_bad_arguments_then_the_root_guard() {
+    let run = |args: &[&str]| Command::new(BIN).env_clear().args(args).output().unwrap();
+    for bad in [
+        vec!["profile-mounts"],
+        vec!["profile-mounts", "--name", A, "--op", "create", "--expect-dir", "/x"],
+        vec!["profile-mounts", "--name", A, "--op", "create", "--subpath", "..", "--expect-dir", "/x"],
+        vec!["profile-mounts", "--name", A, "--op", "create", "--subpath", "p", "--subpath", "p", "--expect-dir", "/x"],
+        vec!["profile-mounts", "--name", A, "--op", "clear", "--subpath", "p", "--expect", "/x"],
+        vec!["profile-mounts", "--name", ".locks", "--op", "clear", "--expect", "/x"],
+        vec!["profile-mounts", "--name", A, "--op", "wipe", "--expect", "/x"],
+        vec!["profile-mounts", "--name", A, "--op", "clear", "--expect", "/x", "--", "y"],
+    ] {
+        let o = run(&bad);
+        assert_eq!(code(&o), 64, "{bad:?}: {}", stderr(&o));
+        assert!(o.stdout.is_empty());
+    }
+    for ok in [
+        vec!["profile-mounts", "--name", A, "--op", "create", "--subpath", "projects", "--expect-dir", "/x/d.json"],
+        vec!["profile-mounts", "--name", A, "--op", "clear", "--expect", "/x/c.json"],
+        vec!["identify", "--anchor", "/srv/sagebrush/claude-profiles", "--name", A],
+    ] {
+        let o = run(&ok);
+        assert_eq!(code(&o), 66, "{ok:?}: {}", stderr(&o));
+        assert!(o.stdout.is_empty());
+    }
+    let o = run(&["identify", "--anchor", "/srv/sagebrush/claude-profiles", "--name", ".locks"]);
+    assert_eq!(code(&o), 64);
+}

@@ -14,7 +14,8 @@ import { HostStore } from "../lib/fleet/host/host-store.mjs";
 import { PROFILES_ROOT, PROFILE_QUOTA_INODES, PROFILE_QUOTA_KB, profileDir, profileForbiddenRoots, profileLifecycle } from "../lib/fleet/host/profile-life.mjs";
 import { STORAGE_UID_RANGE } from "../lib/fleet/host/profiles.mjs";
 
-const ME = process.getuid();
+// process.getuid doesn't exist off POSIX; there every test here is skipped (host-linux-only), so ME is never used.
+const ME = process.getuid?.() ?? -1;
 const CL = { harness: "claude", provider: null, auth: "subscription" };
 const BOOT = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
 

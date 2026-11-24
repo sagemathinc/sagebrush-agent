@@ -22,12 +22,14 @@ test("create, bind, retire: each state durable on disk before it is visible", as
   const root = fresh();
   const p = await open(root);
   const pid = newId(), sub = newId();
-  const first = { harness: "claude", provider: null, auth: "subscription", sub, storage_uid: STORAGE_UID_RANGE[0], project_id: PROJECT_RANGE[0], gen: 1, state: "creating" };
+  const first = { harness: "claude", provider: null, auth: "subscription", sub, storage_uid: STORAGE_UID_RANGE[0], project_id: PROJECT_RANGE[0], gen: 1, state: "creating", mountpoints: null, removal: null };
   assert.deepEqual(p.beginCreate(pid, CL, sub), first);
   assert.equal(disk(root).profiles[pid].state, "creating");
   assert.equal(statSync(join(root, "profiles", "profiles.json")).mode & 0o777, 0o600);
+  refused(() => p.markBound(pid), "not_granted"); // the mountpoints aren't recorded yet
+  p.setMountpoints(pid, [{ name: "projects", ino: 12, gen: 7 }]);
   p.markBound(pid);
-  assert.deepEqual(p.profileFor(sub), { pid, ...first, state: "bound" });
+  assert.deepEqual(p.profileFor(sub), { pid, ...first, state: "bound", mountpoints: [{ name: "projects", ino: 12, gen: 7 }] });
   assert.equal(disk(root).profiles[pid].state, "bound");
   // Retiring advances the gen (a stale selection can't match) and is never selectable again.
   assert.equal(p.beginRetire(pid).gen, 2);
@@ -203,4 +205,44 @@ test("anything but the exact closed shape is refused at load", () => {
     "next project past the range end + 1": (s) => { s.next_project = PROJECT_RANGE[1] + 2; },
   };
   for (const [name, f] of Object.entries(cases)) { const s = ok(); f(s); assert.throws(() => checkProfiles(s), (e) => e instanceof FleetError && e.code === "bad_form", name); }
+});
+
+test("piece 2's record fields: mountpoints only while creating and required for bound; a removal only while retiring", async () => {
+  const p = await open(fresh());
+  const pid = newId();
+  p.beginCreate(pid, CL, newId());
+  for (const bad of [null, "x", [{ name: "..", ino: 1, gen: 1 }], [{ name: "a/b", ino: 1, gen: 1 }], [{ name: "p", ino: -1, gen: 1 }],
+    [{ name: "p", ino: 1, gen: 2 ** 32 }], [{ name: "p", ino: 1, gen: 1, x: 1 }], Array.from({ length: 17 }, (_, i) => ({ name: `s${i}`, ino: i, gen: 1 }))]) {
+    refused(() => p.setMountpoints(pid, bad), "bad_form");
+  }
+  refused(() => p.setMountpoints(pid, [{ name: "p", ino: 1, gen: 1 }, { name: "p", ino: 2, gen: 1 }]), "bad_form"); // a duplicate name (the shape check)
+  p.setMountpoints(pid, []);
+  const removal = { epoch: { boot_id: "b", mnt_id: 3 }, fsid: "00000000000000ab", root: { type: "dir" }, owners: [0, STORAGE_UID_RANGE[0]] };
+  refused(() => p.setRemoval(pid, removal), "not_granted"); // not while creating
+  p.markBound(pid);
+  refused(() => p.setMountpoints(pid, []), "not_granted"); // fixed once bound
+  refused(() => p.setRemoval(pid, removal), "not_granted");
+  p.beginRetire(pid);
+  refused(() => p.setRemoval(pid, { ...removal, owners: [] }), "bad_form");
+  refused(() => p.setRemoval(pid, { ...removal, owners: [0, 1, 2] }), "bad_form");
+  assert.deepEqual(p.setRemoval(pid, removal).removal, removal);
+  p.markRetired(pid);
+  assert.deepEqual(p.setRemoval(pid, removal).removal, removal, "a crash leftover's removal may be recorded on a retired record");
+  await p.close();
+});
+
+test("a v2 file (piece 1) loads, and its first commit upgrades every record to v3 with null fields", async () => {
+  const root = fresh();
+  const pid = newId(), sub = newId();
+  mkdirSync(join(root, "profiles"), { recursive: true, mode: 0o700 });
+  const v2 = { v: 2, next_storage_uid: STORAGE_UID_RANGE[0] + 1, next_project: PROJECT_RANGE[0] + 1, profiles: {
+    [pid]: { harness: "claude", provider: null, auth: "subscription", sub, storage_uid: STORAGE_UID_RANGE[0], project_id: PROJECT_RANGE[0], gen: 1, state: "creating" } } };
+  writeFileSync(join(root, "profiles", "profiles.json"), JSON.stringify(v2), { mode: 0o600 });
+  const p = await open(root);
+  assert.equal(p.profile(pid).state, "creating");
+  p.setMountpoints(pid, []);
+  const d = disk(root);
+  assert.equal(d.v, 3);
+  assert.deepEqual([d.profiles[pid].mountpoints, d.profiles[pid].removal], [[], null]);
+  await p.close();
 });

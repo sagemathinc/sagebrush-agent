@@ -204,6 +204,47 @@ test("a recovery while the run waited for idle (a lease stop): the run sees it a
   assert.equal(ctx.groups[agentSliceCgroup(ctx.members[0])].frozen, false);
 });
 
+test("a recovery during the warm pass: the run doesn't come back, its warm snapshot is named for cleanup, nothing is fenced or frozen", async () => {
+  let ctx;
+  ctx = setup("agent", 1, { warm: async () => {
+    await recoverBackup(ctx.members[0], { dir: ctx.d.dir, fenceDir: ctx.d.fenceDir, cg: ctx.deps.cg, ...clock() });
+    return { ok: true, value: { snapshot: { id: W } } };
+  } });
+  const r = await backupSet(ctx.set, RUN, ctx.deps);
+  assert.equal(r.outcome, "abandoned"); assert.equal(r.code, "recovered"); assert.equal(r.warm, W);
+  assert.deepEqual(ctx.binary.calls.map((c) => c.state), ["warm"], "no good pass, no read-back");
+  const j = readJournal({ dir: ctx.d.dir });
+  assert.equal(j.state, "released"); assert.equal(j.aborted, true); assert.equal(j.warm, W, "the warm snapshot stays named, to be forgotten");
+  assert.equal(existsSync(join(ctx.d.fenceDir, "backup", ctx.members[0])), false);
+  assert.equal(ctx.groups[agentSliceCgroup(ctx.members[0])].frozen, false);
+});
+
+test("another run's journal written meanwhile is never overwritten or cleared: during a failed or a good warm pass, the idle wait, the read-back", async () => {
+  const B = () => newJournal("20261124T040000Z-bbbbbbbb", [newId()]);
+  const cases = {
+    "a failed warm pass": (ctx) => ({ warm: () => { ctx.b = B(); writeJournal(ctx.b, { dir: ctx.d.dir }); return { ok: false, code: "destination_unavailable", message: "" }; } }),
+    "a good warm pass": (ctx) => ({ warm: () => { ctx.b = B(); writeJournal(ctx.b, { dir: ctx.d.dir }); return { ok: true, value: { snapshot: { id: W } } }; } }),
+    "the read-back": (ctx) => ({ readback: (req) => { ctx.b = B(); writeJournal(ctx.b, { dir: ctx.d.dir }); return { ok: true, value: { snapshot: { id: req.snapshot }, findings: 0 } }; } }),
+  };
+  for (const [name, answersFor] of Object.entries(cases)) {
+    const ctx = {};
+    Object.assign(ctx, setup("agent", 1, answersFor(ctx))); // the answers run later, once ctx.d is set
+    const r = await backupSet(ctx.set, RUN, ctx.deps);
+    assert.deepEqual(readJournal({ dir: ctx.d.dir }), ctx.b, `${name}: B's journal is exactly as B wrote it`);
+    if (name === "a good warm pass") {
+      assert.equal(r.code, "recovered");
+      assert.ok(!ctx.binary.calls.some((c) => c.state === "good"), `${name}: nothing is frozen for a run that isn't ours`);
+      assert.equal(existsSync(join(ctx.d.fenceDir, "backup", ctx.members[0])), false);
+    }
+  }
+  // during the idle wait
+  const ctx = {};
+  Object.assign(ctx, setup("agent", 1, {}, { activeTurns: async () => { if (!ctx.b) { ctx.b = B(); writeJournal(ctx.b, { dir: ctx.d.dir }); } return 0; } }));
+  const r = await backupSet(ctx.set, RUN, ctx.deps);
+  assert.equal(r.code, "recovered"); assert.deepEqual(readJournal({ dir: ctx.d.dir }), ctx.b);
+  assert.ok(!ctx.binary.calls.some((c) => c.state === "good"));
+});
+
 test("an archive (never live): one good backup and its read-back, no fence and no freeze", async () => {
   const { d, binary, set, deps } = setup("archive", 1);
   const r = await backupSet(set, RUN, deps);

@@ -125,7 +125,9 @@ test("recovery from every journal state: reap the worker, thaw, then lower only 
     const cg = fakeCgroup(groups, { onOp: () => seen.push(existsSync(join(d.fenceDir, "backup", a))) });
     const r = await recoverBackup(a, { dir: d.dir, fenceDir: d.fenceDir, cg, ...clock() });
     assert.deepEqual(r, { run: RUN, reaped: true, thawed: true, backupLowered: true, state: "released" }, state);
-    assert.deepEqual(cg.ops, [["kill", backupScopeCgroup(SCOPE)], ["thaw", agentSliceCgroup(a)]], state);
+    // the reap and thaw outside the lock, then the proofs again under it (a kill on the empty scope; the slice already
+    // reads frozen 0, so no second thaw write)
+    assert.deepEqual(cg.ops, [["kill", backupScopeCgroup(SCOPE)], ["thaw", agentSliceCgroup(a)], ["kill", backupScopeCgroup(SCOPE)]], state);
     assert.ok(seen.every(Boolean), `${state}: the backup fence was up at every cgroup step`);
     assert.equal(existsSync(join(d.fenceDir, "backup", a)), false, state);
     assert.ok(existsSync(join(d.fenceDir, a)), `${state}: the agent cause's fence is untouched`);
@@ -183,6 +185,56 @@ test("the journal lock busy (a hung supervisor): reap and thaw still happen, bac
   assert.ok(took < 2000, `bounded by lockWaitMs (took ${took} ms)`);
 });
 
+/**
+ * The supervisor holds the journal lock while recovery does its outside-lock reap and thaw; then, still holding it,
+ * `meanwhile` changes the cgroups (a refreeze, a restarted worker) before it lets go. Real time and the real lock.
+ */
+async function recoverAcrossAHeldLock(d, a, groups, meanwhile) {
+  const cg = fakeCgroup(groups);
+  let rec;
+  await withJournalLock(async () => {
+    rec = recoverBackup(a, { dir: d.dir, fenceDir: d.fenceDir, cg, lockWaitMs: 5000 });
+    for (let i = 0; i < 400 && !cg.ops.some((o) => o[0] === "thaw"); i++) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(cg.ops.some((o) => o[0] === "thaw"), "recovery thawed outside the lock first");
+    await new Promise((r) => setTimeout(r, 50)); // recovery is now waiting on the lock
+    meanwhile();
+  }, { dir: d.dir });
+  return { r: await rec, cg };
+}
+
+test("refrozen while the supervisor held the lock: the proofs are repeated under the lock before any fence comes down", async () => {
+  const d = dirs();
+  const a = newId();
+  const groups = frozenRun(d, [a]);
+  const slice = agentSliceCgroup(a);
+  const { r, cg } = await recoverAcrossAHeldLock(d, a, groups, () => { groups[slice].frozen = true; });
+  assert.deepEqual(r, { run: RUN, reaped: true, thawed: true, backupLowered: true, state: "released" });
+  assert.equal(groups[slice].frozen, false, "the slice is thawed again before the fence is lowered");
+  assert.equal(cg.ops.filter((o) => o[0] === "thaw").length, 2, "one thaw outside the lock, one under it");
+});
+
+test("refrozen and stuck, or a worker back, while the supervisor held the lock: no fence comes down", async () => {
+  {
+    const d = dirs();
+    const a = newId();
+    const groups = frozenRun(d, [a]);
+    const slice = agentSliceCgroup(a);
+    const { r } = await recoverAcrossAHeldLock(d, a, groups, () => { groups[slice].frozen = true; groups[slice].thaws = false; });
+    assert.equal(r.backupLowered, false);
+    assert.ok(existsSync(join(d.fenceDir, "backup", a)), "the fence stays while the slice is frozen");
+    assert.equal(readJournal({ dir: d.dir }).state, "frozen");
+  }
+  {
+    const d = dirs();
+    const a = newId();
+    const groups = frozenRun(d, [a]);
+    const worker = backupScopeCgroup(SCOPE);
+    const { r } = await recoverAcrossAHeldLock(d, a, groups, () => { groups[worker].procs = 2; groups[worker].dies = false; });
+    assert.equal(r.backupLowered, false);
+    assert.ok(existsSync(join(d.fenceDir, "backup", a)), "the fence stays while a worker runs");
+  }
+});
+
 test("no run, or a run that doesn't name the agent: a no-op that touches nothing", async () => {
   const d = dirs();
   const a = newId(), b = newId();
@@ -232,7 +284,7 @@ test("a tag-folder run: recovering one member reaps the worker and thaws and unf
   const cg = fakeCgroup(groups);
   const r = await recoverBackup(b, { dir: d.dir, fenceDir: d.fenceDir, cg, ...clock() });
   assert.deepEqual(r, { run: RUN, reaped: true, thawed: true, backupLowered: true, state: "released" });
-  assert.deepEqual(cg.ops, [["kill", backupScopeCgroup(SCOPE)], ...[a, b, c].map((x) => ["thaw", agentSliceCgroup(x)])]);
+  assert.deepEqual(cg.ops, [["kill", backupScopeCgroup(SCOPE)], ...[a, b, c].map((x) => ["thaw", agentSliceCgroup(x)]), ["kill", backupScopeCgroup(SCOPE)]]);
   for (const x of [a, b, c]) assert.equal(existsSync(join(d.fenceDir, "backup", x)), false);
 });
 

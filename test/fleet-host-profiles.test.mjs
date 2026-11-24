@@ -231,6 +231,28 @@ test("piece 2's record fields: mountpoints only while creating and required for 
   await p.close();
 });
 
+test("a v2 bound record (piece 1) upgrades to bound with mountpoints null: commits go on, it's never selectable, it retires", async () => {
+  const root = fresh();
+  const pid = newId(), sub = newId();
+  mkdirSync(join(root, "profiles"), { recursive: true, mode: 0o700 });
+  const v2 = { v: 2, next_storage_uid: STORAGE_UID_RANGE[0] + 1, next_project: PROJECT_RANGE[0] + 1, profiles: {
+    [pid]: { harness: "claude", provider: null, auth: "subscription", sub, storage_uid: STORAGE_UID_RANGE[0], project_id: PROJECT_RANGE[0], gen: 1, state: "bound" } } };
+  writeFileSync(join(root, "profiles", "profiles.json"), JSON.stringify(v2), { mode: 0o600 });
+  const p = await open(root);
+  const other = newId();
+  p.beginCreate(other, CL, newId()); // the first commit upgrades the file; the bound record must not fail it
+  const d = disk(root);
+  assert.equal(d.v, 3);
+  assert.deepEqual([d.profiles[pid].state, d.profiles[pid].mountpoints, d.profiles[pid].removal], ["bound", null, null], "no [] invented");
+  assert.equal(checkProfiles(d), true);
+  refused(() => p.setMountpoints(pid, []), "not_granted"); // never made startable in place
+  assert.equal(p.beginRetire(pid).state, "retiring");
+  await p.close();
+  const again = await open(root); // and it loads again
+  assert.equal(again.profile(pid).state, "retiring");
+  await again.close();
+});
+
 test("a v2 file (piece 1) loads, and its first commit upgrades every record to v3 with null fields", async () => {
   const root = fresh();
   const pid = newId(), sub = newId();

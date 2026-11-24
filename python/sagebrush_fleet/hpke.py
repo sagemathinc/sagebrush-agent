@@ -1,4 +1,4 @@
-"""HPKE (RFC 9180) base mode with r2.3 §7's one suite (lib/fleet/core/hpke.mjs): DHKEM(X25519, HKDF-SHA256) 0x0020,
+"""HPKE (RFC 9180) base mode, with Export (§5.3), with r2.3 §7's one suite (lib/fleet/core/hpke.mjs): DHKEM(X25519, HKDF-SHA256) 0x0020,
 HKDF-SHA256 0x0001, AES-256-GCM 0x0002. The labels, the key schedule and every check are here; X25519, HMAC-SHA256
 and AES-256-GCM are the `cryptography` package's. Python can't zero its immutable bytes, so unlike the JavaScript this
 module doesn't try to.
@@ -90,7 +90,23 @@ def _key_schedule(shared: bytes, info: bytes):
     info_hash = _labeled_extract(SUITE, b"", "info_hash", info)
     context = b"\x00" + psk_id_hash + info_hash
     secret = _labeled_extract(SUITE, shared, "secret", b"")
-    return _labeled_expand(SUITE, secret, "key", context, NK), _labeled_expand(SUITE, secret, "base_nonce", context, NN)
+    return (
+        _labeled_expand(SUITE, secret, "key", context, NK),
+        _labeled_expand(SUITE, secret, "base_nonce", context, NN),
+        _labeled_expand(SUITE, secret, "exp", context, NH),
+    )
+
+
+EXPORT_MAX = 255 * NH
+
+
+def _export(exporter_secret: bytes, exporter_context: bytes, length: int) -> bytes:
+    """Export (§5.3): `length` bytes, 1 to 255 * Nh, bound to the context and `exporter_context`; no sequence."""
+    if not isinstance(exporter_context, (bytes, bytearray)):
+        refuse("bad_form", "an exporter context is bytes")
+    if isinstance(length, bool) or not isinstance(length, int) or not 1 <= length <= EXPORT_MAX:
+        refuse("bad_form", f"an exported secret is 1 to {EXPORT_MAX} bytes")
+    return _labeled_expand(SUITE, exporter_secret, "sec", bytes(exporter_context), length)
 
 
 def _nonce_at(base: bytes, seq: int) -> bytes:
@@ -106,7 +122,7 @@ class Sender:
         e = ephemeral or KeyPair.generate()
         z = e.dh(pk_r)
         self.enc = e.raw
-        self._key, self._base = _key_schedule(_shared_secret(z, e.raw, bytes(pk_r)), info)
+        self._key, self._base, self._exp = _key_schedule(_shared_secret(z, e.raw, bytes(pk_r)), info)
         self._seq = start
 
     def seal(self, aad: bytes, pt: bytes) -> bytes:
@@ -116,6 +132,9 @@ class Sender:
         self._seq += 1
         return ct
 
+    def export(self, exporter_context: bytes, length: int) -> bytes:
+        return _export(self._exp, exporter_context, length)
+
 
 class Recipient:
     """A recipient's context: opens only. A refused ciphertext leaves the sequence where it was."""
@@ -124,7 +143,7 @@ class Recipient:
         if encapsulated is None or len(encapsulated) != 32:
             refuse("bad_form", "enc is 32 bytes")
         z = own.dh(encapsulated)
-        self._key, self._base = _key_schedule(_shared_secret(z, bytes(encapsulated), own.raw), info)
+        self._key, self._base, self._exp = _key_schedule(_shared_secret(z, bytes(encapsulated), own.raw), info)
         self._seq = start
 
     def open(self, aad: bytes, ct: bytes) -> bytes:
@@ -139,6 +158,9 @@ class Recipient:
         self._seq += 1
         return pt
 
+    def export(self, exporter_context: bytes, length: int) -> bytes:
+        return _export(self._exp, exporter_context, length)
+
 
 def seal(pk_r: bytes, info: bytes, aad: bytes, pt: bytes, ephemeral: KeyPair | None = None):
     s = Sender(pk_r, info, ephemeral)
@@ -147,3 +169,12 @@ def seal(pk_r: bytes, info: bytes, aad: bytes, pt: bytes, ephemeral: KeyPair | N
 
 def open_(own: KeyPair, encapsulated: bytes, info: bytes, aad: bytes, ct: bytes) -> bytes:
     return Recipient(own, encapsulated, info).open(aad, ct)
+
+
+def send_export(pk_r: bytes, info: bytes, exporter_context: bytes, length: int, ephemeral: KeyPair | None = None):
+    s = Sender(pk_r, info, ephemeral)
+    return s.enc, s.export(exporter_context, length)
+
+
+def receive_export(own: KeyPair, encapsulated: bytes, info: bytes, exporter_context: bytes, length: int) -> bytes:
+    return Recipient(own, encapsulated, info).export(exporter_context, length)

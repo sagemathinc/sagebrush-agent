@@ -13,6 +13,7 @@ import { nodeCrypto } from "../lib/fleet/node-crypto.mjs";
 import { atSequence } from "../lib/fleet/core/hpke.mjs";
 import { checkHpkeFixtures, checkHpkeVector } from "./fleet-fixture-cases.mjs";
 import { build } from "./make-fleet-hpke-fixtures.mjs";
+import { CONTEXTS, LENGTHS, checkExportOracle } from "./hpke-export-oracle.mjs";
 
 const V = JSON.parse(readFileSync(new URL("./fixtures/hpke-x25519-sha256-aes256gcm.json", import.meta.url), "utf8")).vector;
 const FX_TEXT = readFileSync(new URL("./fixtures/fleet-hpke-fixtures.json", import.meta.url), "utf8");
@@ -51,7 +52,7 @@ test("HPKE: the RFC 9180 known-answer vector for §7's suite, with Node's backen
   assert.deepEqual([V.mode, V.kem_id, V.kdf_id, V.aead_id], [0, HPKE.kem, HPKE.kdf, HPKE.aead]);
   const { bad, n } = await checkHpkeVector(core, V);
   assert.deepEqual(bad, []);
-  assert.equal(n, 257);
+  assert.equal(n, 260);
 });
 
 test("the committed fleet HPKE vectors are exactly what the generator builds, and every case passes with Node's backend", async () => {
@@ -212,11 +213,47 @@ test("HPKE contexts have one role (RFC 9180 §5.2): a sender only seals, a recip
   const R = await core.deriveKeyPair(new Uint8Array(32).fill(3));
   const S = await core.setupSender(R.raw, enc("i"));
   const O = await core.setupRecipient(R, S.enc, enc("i"));
-  assert.deepEqual(Object.keys(S).sort(), ["enc", "seal"]);
-  assert.deepEqual(Object.keys(O).sort(), ["open"]);
+  assert.deepEqual(Object.keys(S).sort(), ["enc", "export", "seal"]);
+  assert.deepEqual(Object.keys(O).sort(), ["export", "open"]);
   assert.ok(Object.isFrozen(S) && Object.isFrozen(O), "and nothing can be added to either");
   assert.throws(() => { S.open = O.open; }, TypeError);
   assert.deepEqual(await O.open(new Uint8Array(0), await S.seal(new Uint8Array(0), enc("x"))), enc("x"));
+});
+
+test("HPKE export, every block of long outputs: an independent HKDF-Expand over Node's HMAC, up to the 8160-byte maximum", async () => {
+  const { bad, n } = await checkExportOracle(core, V);
+  assert.deepEqual(bad, []);
+  assert.equal(n, LENGTHS.length * CONTEXTS.length * 4);
+});
+
+test("HPKE export (RFC 9180 §5.3): both sides agree, bound to the context and the exporter context, with no sequence", async () => {
+  const R = await core.deriveKeyPair(new Uint8Array(32).fill(5)), info = enc("export"), x = enc("pop");
+  const S = await core.setupSender(R.raw, info), O = await core.setupRecipient(R, S.enc, info);
+  const a = await S.export(x, 32);
+  assert.equal(a.length, 32);
+  assert.deepEqual(await O.export(x, 32), a, "the recipient derives the sender's secret");
+  assert.deepEqual(await S.export(x, 32), a, "the same arguments, the same secret");
+  assert.notDeepEqual(await S.export(enc("pok"), 32), a, "another exporter context, another secret");
+  assert.notDeepEqual(await S.export(x, 33).then((b) => b.subarray(0, 32)), a, "the length is bound (I2OSP(L) is in the label)");
+  assert.notDeepEqual(await (await core.setupRecipient(R, S.enc, enc("exporu"))).export(x, 32), a, "another info, another secret");
+  const S2 = await core.setupSender(R.raw, info);
+  assert.notDeepEqual(await S2.export(x, 32), a, "another encapsulation, another secret");
+  // (no claim and no counter: an export overlapping a seal runs, and the seal still takes sequence 0)
+  const [ct, during] = await Promise.all([S.seal(new Uint8Array(0), enc("m")), S.export(x, 32)]);
+  assert.deepEqual(during, a);
+  assert.deepEqual(await O.open(new Uint8Array(0), ct), enc("m"));
+  assert.deepEqual(await O.export(x, 32), a, "and a seal or open doesn't change it");
+  // the length is 1 to 255 * 32 bytes, an integer; the exporter context is bytes
+  assert.equal((await S.export(x, 8160)).length, 8160);
+  for (const L of [0, -1, 8161, 1.5, NaN, "32", null]) assert.equal(await code(() => S.export(x, L)), "bad_form", `length ${String(L)}`);
+  for (const c of ["pop", null, undefined, [1]]) assert.equal(await code(() => O.export(c, 32)), "bad_form", `context ${JSON.stringify(c)}`);
+  // single-shot: the encapsulation and the secret, then the recipient's secret from enc alone
+  const one = await core.hpkeSendExport(R.raw, info, x, 32);
+  assert.equal(one.enc.length, 32);
+  assert.deepEqual(await core.hpkeReceiveExport(R, one.enc, info, x, 32), one.secret);
+  assert.notDeepEqual(await core.hpkeReceiveExport(R, one.enc, enc("other"), x, 32), one.secret);
+  assert.equal(await code(() => core.hpkeSendExport(new Uint8Array(31), info, x, 32)), "bad_form");
+  assert.equal(await code(() => core.hpkeReceiveExport(R, new Uint8Array(32), info, x, 32)), "bad_form", "an all-zero enc gives no shared secret");
 });
 
 test("the sequence is an exact counter: the last allowed seal and open work, the next is refused (limit), no nonce repeats", async () => {

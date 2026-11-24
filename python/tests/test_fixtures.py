@@ -4,6 +4,7 @@ through the JavaScript core: the same inputs, and the same result ("ok" or the r
 Run from anywhere: python -I python/tests/test_fixtures.py -v
 """
 
+import hmac as std_hmac
 import json
 import sys
 import unittest
@@ -17,7 +18,7 @@ from sagebrush_fleet import (  # noqa: E402
     parse_canonical, replay, service_key_at, unb64, verify_approval, verify_grant, verify_grant_ack, verify_host_cert, verify_host_op,
     verify_package, verify_strict,
 )
-from sagebrush_fleet.hpke import Recipient, Sender  # noqa: E402
+from sagebrush_fleet.hpke import Recipient, Sender, receive_export, send_export  # noqa: E402
 
 FIXTURES = ROOT / "test" / "fixtures"
 # (the JavaScript checker's case counts: a fixture file that loses cases fails here, not silently)
@@ -156,6 +157,40 @@ class HpkeVector(unittest.TestCase):
         self.assertEqual(O2.open(h(e0["aad"]), h(e0["ct"])).hex(), e0["pt"])
         self.assertEqual(result(lambda: O2.open(h(e0["aad"]), h(e0["ct"]))), "bad_form")
         self.assertEqual(O2.open(h(e1["aad"]), h(e1["ct"])).hex(), e1["pt"])
+        # every exported secret, from both sides and single-shot
+        self.assertEqual(len(V["exports"]), 3)
+        for i, x in enumerate(V["exports"]):
+            with self.subTest(export=i):
+                c = h(x["exporter_context"])
+                self.assertEqual(S.export(c, x["L"]).hex(), x["exported_value"])
+                self.assertEqual(O.export(c, x["L"]).hex(), x["exported_value"])
+                self.assertEqual(send_export(R.raw, h(V["info"]), c, x["L"], E), (h(V["enc"]), h(x["exported_value"])))
+                self.assertEqual(receive_export(R, h(V["enc"]), h(V["info"]), c, x["L"]).hex(), x["exported_value"])
+        # every block of long outputs, against HKDF-Expand written out here over the standard library's HMAC
+        # (independent of the module's own expand), from the vector's exporter_secret; the last block on its own too
+        def expected(ctx, L):
+            info = L.to_bytes(2, "big") + b"HPKE-v1HPKE" + bytes([0, 0x20, 0, 1, 0, 2]) + b"sec" + ctx
+            t, out = b"", b""
+            for i in range(1, (L + 31) // 32 + 1):
+                t = std_hmac.digest(h(V["exporter_secret"]), t + info + bytes([i]), "sha256")
+                out += t
+            return out[:L]
+
+        n = 0
+        for L in (1, 31, 32, 33, 63, 64, 65, 8159, 8160):
+            for c in (b"", b"TestContext", bytes([0xA5]) * 300):
+                want = expected(c, L)
+                for side, got in (("sender", S.export(c, L)), ("recipient", O.export(c, L)),
+                                  ("send_export", send_export(R.raw, h(V["info"]), c, L, E)[1]),
+                                  ("receive_export", receive_export(R, h(V["enc"]), h(V["info"]), c, L))):
+                    with self.subTest(side=side, L=L, context=len(c)):
+                        self.assertEqual(got, want)
+                        self.assertEqual(got[-32:], want[-32:])
+                    n += 1
+        self.assertEqual(n, 9 * 3 * 4)
+        for bad in (0, -1, 8161, 1.5, True, "32", None):
+            self.assertEqual(result(lambda: S.export(b"", bad)), "bad_form", bad)
+        self.assertEqual(result(lambda: O.export("pop", 32)), "bad_form")
 
 
 class HpkeFixtures(Cases):

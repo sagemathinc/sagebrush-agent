@@ -31,7 +31,11 @@ async function host({ continuity = ["projects"], quota = { mount: "/srv" }, seed
     chownSync: (p, uid, gid) => { owners.set(rel(p), [uid, gid]); events.push(`chown ${rel(p)}`); },
     mkdirSync: (p, o) => { const r = fs.mkdirSync(p, o); events.push(`mkdir ${rel(p)}`); return r; },
     openSync: (p, ...a) => { const fd = fs.openSync(p, ...a); fds.set(fd, rel(p)); return fd; },
-    fsyncSync: (fd) => { fs.fsyncSync(fd); events.push(`fsync ${fds.get(fd)}`); },
+    fsyncSync: (fd) => {
+      if (h.fsyncFail === fds.get(fd)) throw Object.assign(new Error("EIO"), { code: "EIO" });
+      fs.fsyncSync(fd);
+      events.push(`fsync ${fds.get(fd)}`);
+    },
     lstatSync: (p, o) => {
       const st = fs.lstatSync(p, o);
       const own = owners.get(rel(p)), ino = inoOf.get(rel(p));
@@ -389,11 +393,56 @@ test("create syncs the new entry's parent after its mkdir, and the directory and
   }
 });
 
+test("the roots: each made directory and its parent entry synced, the first time and on every retry, before anything beneath", async () => {
+  const h = await host();
+  const pid = newId();
+  assert.equal((await h.life.create(pid, CL, newId(), T)).status, "bound");
+  const ev = h.events, PARENT = "/srv/sagebrush", LOCKS = `${PROFILES_ROOT}/.locks`;
+  const mkRoot = ev.indexOf(`mkdir ${PROFILES_ROOT}`), mkLocks = ev.indexOf(`mkdir ${LOCKS}`), mkDir = ev.indexOf(`mkdir ${profileDir(pid)}`);
+  assert.ok(mkRoot >= 0 && mkLocks > mkRoot && mkDir > mkLocks, ev.join(", "));
+  const between = ev.slice(mkLocks, mkDir);
+  for (const d of [PARENT, PROFILES_ROOT, LOCKS]) assert.ok(between.includes(`fsync ${d}`), `${d} synced before the profile: ${between.join(", ")}`);
+  // A retry (the roots already there, perhaps never synced: a crash): synced again.
+  ev.length = 0;
+  const pid2 = newId();
+  assert.equal((await h.life.create(pid2, CL, newId(), T)).status, "bound");
+  const before = ev.slice(0, ev.indexOf(`mkdir ${profileDir(pid2)}`));
+  for (const d of [PARENT, PROFILES_ROOT, LOCKS]) assert.ok(before.includes(`fsync ${d}`), `retry: ${d}: ${before.join(", ")}`);
+  // A creating profile whose directory a crash left unsynced: recovery syncs its entry before going on.
+  const pid3 = newId();
+  h.store.profiles.beginCreate(pid3, CL, newId());
+  fs.mkdirSync(join(h.root, profileDir(pid3)), { mode: 0o700 });
+  ev.length = 0;
+  assert.equal((await h.life.recover(T)).profiles[pid3].status, "bound");
+  const firstSet = ev.findIndex((e) => e === `chown ${profileDir(pid3)}`);
+  assert.ok(ev.slice(0, firstSet).includes(`fsync ${PROFILES_ROOT}`), ev.join(", "));
+  await h.store.close();
+  // A failed sync of a root's parent (or of a root) stops creation before `creating` is committed; a retry syncs again.
+  for (const bad of [PARENT, PROFILES_ROOT, LOCKS]) {
+    const f = await host();
+    f.fsyncFail = bad;
+    const p = newId();
+    await assert.rejects(f.life.create(p, CL, newId(), T), /EIO/, bad);
+    assert.equal(f.store.profiles.profile(p), null, `${bad}: nothing committed`);
+    assert.ok(!f.calls.some((c) => c.startsWith("setquota")), `${bad}: nothing beneath`);
+    f.fsyncFail = null;
+    f.events.length = 0;
+    assert.equal((await f.life.create(p, CL, newId(), T)).status, "bound", `${bad}: the retry`);
+    assert.ok(f.events.includes(`fsync ${bad}`), `${bad}: synced on the retry`);
+    await f.store.close();
+  }
+});
+
 test("bound recovery: only the exact final state passes; a lost label, mount, owner or mountpoint identity parks", async () => {
   const mp = (pid) => join(profileDir(pid), "projects");
   for (const [label, spoil, want] of [
     ["intact", () => {}, undefined],
     ["the label lost", (h, pid) => h.labels.delete(profileDir(pid)), "parked"],
+    ["the limits removed", (h, pid, r) => h.limits.delete(String(r.project_id)), "parked"],
+    ["the limits zeroed", (h, pid, r) => h.limits.set(String(r.project_id), { kb: 0, inodes: 0 }), "parked"],
+    ["the block limit differs", (h, pid, r) => h.limits.set(String(r.project_id), { kb: PROFILE_QUOTA_KB * 2, inodes: PROFILE_QUOTA_INODES }), "parked"],
+    ["the inode limit differs", (h, pid, r) => h.limits.set(String(r.project_id), { kb: PROFILE_QUOTA_KB, inodes: 1 }), "parked"],
+    ["quota -P fails", (h) => { h.codes.quota = 1; }, "parked"],
     ["inherit lost", (h, pid, r) => h.labels.set(profileDir(pid), { id: r.project_id, inherit: false }), "parked"],
     ["another project", (h, pid, r) => h.labels.set(profileDir(pid), { id: r.project_id + 1, inherit: true }), "parked"],
     ["another mount", (h) => { h.dirMnt = 77; }, "parked"],

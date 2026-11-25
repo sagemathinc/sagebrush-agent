@@ -1,6 +1,6 @@
 {
-  "$comment": "The one closed registry of reason and refusal codes (O6/O7 r2.3 §5.4, §5.5). Closed per release: a verifier refuses a name not listed. Lanes add entries by a reviewed change to this file. Host codes come from grader's host r2 and are local (no HTTP status).",
-  "freeze": "db905c9d72ba5d4e18620d3267ea9214992d3a82c735289dda4088970dddc7e3",
+  "$comment": "The one closed registry of reason and refusal codes (O6/O7 r2.3 §5.4, §5.5). Closed per release: a verifier refuses a name not listed. Lanes add entries by a reviewed change to this file. Host codes come from the host design's r2 and are local (no HTTP status).",
+  "freeze": "d34f7d527e78a4ff35be9323c1d06f304672ce8c99aaf1f29c7c5116f32a8ae7",
   "reasons": [
     {
       "name": "bad_form",

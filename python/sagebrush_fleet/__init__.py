@@ -12,11 +12,15 @@ from .core import FleetError, b64, canon_text, is_id, key_id, parse_canonical, u
 from .envelope import open_envelope
 from .hpke import derive_key_pair
 from .sealed import open_cap, verify_package
-from .verify import verify_approval, verify_grant, verify_grant_ack, verify_host_cert, verify_host_op, verify_revocation
+from .verify import (
+    check_transfer_for_host, verify_agent_transfer, verify_approval, verify_grant, verify_grant_ack, verify_host_cert, verify_host_op,
+    verify_revocation, verify_transfer_receipt,
+)
 
 __all__ = [
     "FleetError", "apply_chain_entry", "b64", "canon_text", "derive_key_pair", "device_key", "is_id", "key_id",
     "open_cap", "open_envelope", "parse_canonical", "replay", "require_tier", "service_key_at", "unb64",
+    "check_transfer_for_host", "verify_agent_transfer", "verify_transfer_receipt",
     "verify_approval", "verify_grant", "verify_grant_ack", "verify_host_cert", "verify_host_op", "verify_package",
     "verify_revocation", "verify_strict",
 ]

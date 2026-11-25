@@ -49,6 +49,28 @@ export async function checkFixtures(core, F) {
     const got = await result(() => core.verifyApproval(enc(c.bytes), { ...ctx, chain: st, now: F.now_ms, expect: c.expect_op, current: c.current, used: (a) => c.used.includes(a) }));
     check("approvals", c.name, got, c.expect);
   }
+
+  // moving an agent (r2.4 §3.7): the receipt pair (checks 1-3), then the host's records (checks 4-6)
+  const X = F.transfers;
+  const chains = { honest: await core.replayChain(X.chain.map(enc), ctx), removed: await core.replayChain(X.chain_removed.map(enc), ctx) };
+  for (const c of X.receipts) {
+    const got = await result(() => core.verifyTransferReceipt({ transfer: enc(c.transfer), receipt: enc(c.receipt) }, { ...ctx, chain: chains[c.chain ?? "honest"] }));
+    check("transfer_receipts", c.name, got, c.expect);
+  }
+  const hostOf = (r) => ({
+    id: r.id, fingerprint: r.fingerprint,
+    grantHashAt: (g) => r.grants[g]?.hash ?? null,
+    grantListsAgent: (g, a) => r.grants[g]?.agents.includes(a) ?? false,
+    listedSince: (a) => r.listed_since[a] ?? null,
+    entryGen: (a) => r.entry_gen[a] ?? null,
+    acceptedTransfer: (a) => r.accepted[a] ?? null,
+    nonceSeen: (x) => r.nonces[x] ?? null,
+  });
+  for (const c of X.hosts) {
+    let first = null;
+    const got = await result(() => { first = core.checkTransferForHost(c.pair, hostOf(c.host)).first; });
+    check("transfer_hosts", c.name, got === "ok" ? `ok first=${first}` : got, c.expect === "ok" ? `ok first=${c.first}` : c.expect);
+  }
   return { bad, n };
 }
 

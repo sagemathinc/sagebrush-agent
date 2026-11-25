@@ -175,5 +175,5 @@ test("envelope: the type and signer are in the signed bytes; signer kinds per ty
   const withSig2 = swap({ ...JSON.parse(new TextDecoder().decode(addish)), sig2: env.sig });
   assert.equal(code(() => open(addish, ctx)), "ok");
   assert.equal(code(() => open(withSig2, ctx)), "bad_form");
-  assert.equal(Object.keys(TYPES).length, 13);
+  assert.equal(Object.keys(TYPES).length, 16);
 });

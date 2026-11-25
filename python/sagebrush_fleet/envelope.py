@@ -28,6 +28,9 @@ TYPES = {
     "sb.audit-checkpoint.v1": ("host",),
     "sb.audit-continuity.v1": ("host",),
     "sb.audit-ack.v1": ("service",),
+    "sb.agent-transfer.v1": ("device",),
+    "sb.agent-transfer-receipt.v1": ("service",),
+    "sb.agent-fence-ack.v1": ("host",),
 }
 KINDS = {"device", "host", "recovery", "service"}
 

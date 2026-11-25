@@ -1,5 +1,5 @@
 // Builds test/fixtures/fleet-fixtures.json: the shared vectors every fleet-protocol implementation (this package, the
-// page's mirror, the Python verifier) must pass (design agent-autonomous-schemas.md r2.3 §9). Deterministic: fixed
+// page's mirror, the Python verifier) must pass (design agent-autonomous-schemas.md r2.4 §9). Deterministic: fixed
 // seeds, ids and times, so a rebuild is byte-identical; test/fleet-fixtures.test.mjs checks that and runs every case.
 //
 //   node test/make-fleet-fixtures.mjs > test/fixtures/fleet-fixtures.json
@@ -203,14 +203,79 @@ export async function build() {
     { name: "a host signing a grant", bytes: txt(enc(canonText({ ...JSON.parse(g1), signer: { kind: "host", id: host, alg: "ed25519", key: H.key } }))), expect: "bad_signature" },
   ];
 
+  // ---- 7. moving an agent (r2.4 §3.7): the receipt pair (checks 1-3), then the new host's own (checks 4-6)
+  const tSigned = (type, sg, b) => sha256b64(signedBytes(type, sg, b));
+  const g1Env = JSON.parse(g1);
+  const grantHash = tSigned("sb.host-grant.v1", g1Env.signer, g1Env.body);
+  const nonceT = b64(Uint8Array.from({ length: 16 }, (_, i) => 200 + i));
+  const fromHost = id(30);
+  const tBody = (extra = {}) => ({ fleet, aud: AUD, agent, from_host: fromHost, to_host: host, to_host_key: certBody.fingerprint, gen: 3, grant: grantHash, nonce: nonceT,
+    chain_seq: headAt.seq, at_ms: NOW, not_after_ms: NOW + 600_000, auth_time_ms: NOW, ...extra });
+  const tEnv = (k, sg, b, type = "sb.agent-transfer.v1") => ({ text: txt(seal(type, sg, b, k)), hash: tSigned(type, sg, b) });
+  const T0 = tEnv(N, signer(N, nId), tBody());
+  const rBody = (tHash, extra = {}) => ({ fleet, aud: AUD, agent, from_host: fromHost, to_host: host, to_host_key: certBody.fingerprint, gen: 3, nonce: nonceT,
+    transfer: tHash, chain_seq: s2Seq, at_ms: NOW, ...extra });
+  const rcpt = (k, sg, b, type = "sb.agent-transfer-receipt.v1") => txt(seal(type, sg, b, k));
+  const R0 = rcpt(S2, sv(s2Id, S2), rBody(T0.hash));
+  const withT = (t, extraR = {}) => ({ transfer: t.text, receipt: rcpt(S2, sv(s2Id, S2), rBody(t.hash, extraR)) });
+  const removedChain = [...honest, next(N, nId, "remove", { remove: bId, regrants: [] })];
+  const late = tEnv(N, signer(N, nId), tBody({ at_ms: NOW - 7_200_000, not_after_ms: NOW - 6_600_000, auth_time_ms: NOW - 7_200_000 }));
+  const transfer_receipts = [
+    { name: "a transfer and its receipt", ...withT(T0), expect: "ok" },
+    { name: "the new key at the rotation's boundary", transfer: T0.text, receipt: R0, expect: "ok" },
+    { name: "a receipt signed before the rotation, verified after it", transfer: T0.text, receipt: rcpt(S1, sv(s1Id, S1), rBody(T0.hash, { chain_seq: s1Seq })), expect: "ok" },
+    { name: "the old key at the new key's chain_seq", transfer: T0.text, receipt: rcpt(S1, sv(s1Id, S1), rBody(T0.hash)), expect: "bad_signature" },
+    { name: "a receipt past the pinned head", transfer: T0.text, receipt: rcpt(S2, sv(s2Id, S2), rBody(T0.hash, { chain_seq: s2Seq + 1 })), expect: "device_unknown" },
+    { name: "a receipt for another fleet", transfer: T0.text, receipt: rcpt(S2, sv(s2Id, S2), rBody(T0.hash, { fleet: id(99) })), expect: "bad_form" },
+    { name: "a receipt for another audience", transfer: T0.text, receipt: rcpt(S2, sv(s2Id, S2), rBody(T0.hash, { aud: "https://sagebrush.space" })), expect: "bad_audience" },
+    { name: "a device as a receipt's signer (still well-formed; receipts are the service's)", transfer: T0.text, receipt: txt(enc(canonText({ ...JSON.parse(R0), signer: signer(N, nId) }))), expect: "bad_signature" },
+    { name: "a receipt's body under another type", transfer: T0.text, receipt: rcpt(S2, sv(s2Id, S2), rBody(T0.hash), "sb.audit-ack.v1"), expect: "bad_form" },
+    { name: "the service as a transfer's signer (still well-formed; transfers are a device's)", transfer: txt(enc(canonText({ ...JSON.parse(T0.text), signer: sv(s2Id, S2) }))), receipt: R0, expect: "bad_signature" },
+    { name: "a transfer whose signer wasn't enrolled at its chain_seq", ...withT(tEnv(N2, signer(N2, n2Id), tBody({ chain_seq: 1 }))), expect: "device_unknown" },
+    { name: "a transfer whose signer was removed at the pinned head", chain: "removed", ...withT(tEnv(B, signer(B, bId), tBody())), expect: "device_removed" },
+    { name: "a browser device under the native policy (a transfer widens)", ...withT(tEnv(B, signer(B, bId), tBody())), expect: "device_tier" },
+    { name: "a transfer past its not_after_ms at the resume (the window is the service's check)", ...withT(late), expect: "ok" },
+    { name: "a transfer's body under another type", ...withT(tEnv(N, signer(N, nId), tBody(), "sb.host-op.v1")), expect: "bad_form" },
+    { name: "the receipt names another transfer", transfer: T0.text, receipt: rcpt(S2, sv(s2Id, S2), rBody(late.hash)), expect: "bad_form" },
+    ...["agent", "from_host", "to_host", "to_host_key", "gen", "nonce"].map((k) => ({
+      name: `the receipt's ${k} differs, both signatures valid`, transfer: T0.text,
+      receipt: rcpt(S2, sv(s2Id, S2), rBody(T0.hash, { [k]: k === "gen" ? 4 : k === "nonce" ? b64(new Uint8Array(16).fill(1)) : k === "to_host_key" ? b64(new Uint8Array(32).fill(2)) : id(40) })), expect: "bad_form" })),
+  ];
+  // checks 4-6 over the host's records (JSON: grants by gen with their hash and agents; listed_since, entry_gen,
+  // accepted and nonces by key), for the verified pair above
+  const pair0 = { transfer: tBody(), transferHash: T0.hash };
+  const rec = (over = {}) => ({ id: host, fingerprint: certBody.fingerprint, grants: { 3: { hash: grantHash, agents: [agent] } }, listed_since: { [agent]: 3 },
+    entry_gen: { [agent]: 3 }, accepted: {}, nonces: {}, ...over });
+  const otherHash = b64(new Uint8Array(32).fill(5));
+  const transfer_hosts = [
+    { name: "the first acceptance", pair: pair0, host: rec(), expect: "ok", first: true },
+    { name: "the accepted pair again (a resume retried)", pair: pair0, host: rec({ accepted: { [agent]: { gen: 3, nonce: nonceT, transfer: T0.hash } }, nonces: { [nonceT]: T0.hash } }), expect: "ok", first: false },
+    { name: "to another host", pair: { ...pair0, transfer: tBody({ to_host: id(31) }) }, host: rec(), expect: "not_granted" },
+    { name: "a to_host_key that isn't this host's fingerprint", pair: pair0, host: rec({ fingerprint: otherHash }), expect: "not_granted" },
+    { name: "a grant hash this host never accepted", pair: pair0, host: rec({ grants: { 3: { hash: otherHash, agents: [agent] } } }), expect: "not_granted" },
+    { name: "no grant accepted at that generation", pair: pair0, host: rec({ grants: {} }), expect: "not_granted" },
+    { name: "a grant that doesn't list the agent", pair: pair0, host: rec({ grants: { 3: { hash: grantHash, agents: [] } } }), expect: "not_granted" },
+    { name: "the agent not in the current grant", pair: pair0, host: rec({ listed_since: {}, entry_gen: {} }), expect: "not_granted" },
+    { name: "the agent dropped and re-added after gen", pair: pair0, host: rec({ listed_since: { [agent]: 5 }, entry_gen: { [agent]: 5 } }), expect: "stale_generation" },
+    { name: "an entry generation below gen", pair: pair0, host: rec({ entry_gen: { [agent]: 2 } }), expect: "stale_generation" },
+    { name: "an entry that moved up since (the person edited it)", pair: pair0, host: rec({ entry_gen: { [agent]: 6 } }), expect: "ok", first: true },
+    { name: "an unrelated later grant", pair: pair0, host: rec({ grants: { 3: { hash: grantHash, agents: [agent] }, 4: { hash: otherHash, agents: [agent, id(33)] } } }), expect: "ok", first: true },
+    { name: "the next transfer of a multi-agent restore", pair: pair0, host: rec({ accepted: { [id(32)]: { gen: 3, nonce: b64(new Uint8Array(16).fill(3)), transfer: otherHash } } }), expect: "ok", first: true },
+    { name: "a gen not above the transfer this host accepted", pair: pair0, host: rec({ accepted: { [agent]: { gen: 3, nonce: b64(new Uint8Array(16).fill(4)), transfer: otherHash } } }), expect: "stale_generation" },
+    { name: "a newer move than the one accepted", pair: pair0, host: rec({ accepted: { [agent]: { gen: 2, nonce: b64(new Uint8Array(16).fill(4)), transfer: otherHash } } }), expect: "ok", first: true },
+    { name: "a nonce this host saw for another transfer", pair: pair0, host: rec({ nonces: { [nonceT]: otherHash } }), expect: "replay" },
+    { name: "the nonce seen for this same transfer", pair: pair0, host: rec({ nonces: { [nonceT]: T0.hash } }), expect: "ok", first: true },
+  ];
+
   return {
-    $comment: "Shared fleet-protocol vectors (agent-autonomous-schemas.md r2.3 §9). Built by test/make-fleet-fixtures.mjs; every implementation must agree with every case. Mock data only: no real key, device or host.",
+    $comment: "Shared fleet-protocol vectors (agent-autonomous-schemas.md r2.4 §9, §3.7.5). Built by test/make-fleet-fixtures.mjs; every implementation must agree with every case. Mock data only: no real key, device or host.",
     freeze: FREEZE.sha256,
     aud: AUD, now_ms: NOW, ids, keys,
     canonical, base64url, ids_cases: idCases, ed25519,
     chain: { entries_note: "envelope texts, in order", cases: chain },
     service_keys: { chain: honest, cases: service_keys },
     objects: { chain: honest, host_cert: cert, grants, grant_acks, host_ops, approvals, envelopes },
+    transfers: { chain: honest, chain_removed: removedChain, receipts: transfer_receipts, hosts: transfer_hosts },
   };
 }
 

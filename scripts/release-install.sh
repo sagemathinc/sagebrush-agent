@@ -178,7 +178,8 @@ PIN=$(sed -n 's/^\([0-9a-f]\{64\}\)  sagebrush-agent-launch$/\1/p' "$STAGE/tree/
 case "$LAUNCHER" in /*) ;; *) no "<launcher> must be an absolute path" ;; esac
 [ -f "$LAUNCHER" ] && [ ! -L "$LAUNCHER" ] || no "<launcher> isn't a regular file"
 cp -- "$LAUNCHER" "$STAGE/launch"
-[ "$("$SHA256SUM" < "$STAGE/launch" | cut -d' ' -f1)" = "$PIN" ] || no "the launcher's digest isn't the pinned one"
+GOT=$("$SHA256SUM" < "$STAGE/launch" | cut -d' ' -f1)
+[ "$GOT" = "$PIN" ] || no "the launcher's digest isn't the pinned one (got $GOT, pinned $PIN)"
 fi
 CREATE=""
 if [ "$VERIFY_ONLY" = 0 ]; then

@@ -85,7 +85,8 @@ clean() {
   mkdir -m 0755 "$P"; chown 0:0 "$P"
   systemctl daemon-reload; systemctl reset-failed 2>/dev/null; true
 }
-snap() {
+snap() { snaptext | md5sum; }
+snaptext() {
   { for d in /etc/systemd/system /run/systemd/system /run/systemd/system.control /run/systemd/transient /run/systemd/generator \
        /usr/lib/systemd/system /usr/lib/systemd/system-sleep /usr/lib "$P"; do
       [ -d "$d" ] && find "$d" -maxdepth 2 -printf '%p %u %m %s %T@\n' 2>/dev/null | sort
@@ -93,7 +94,7 @@ snap() {
     systemctl list-units --all --plain --no-legend 2>/dev/null | grep sagebrush-
     systemctl list-unit-files --no-legend 2>/dev/null | grep sagebrush-
     for u in $UNIT sagebrush-backup.service; do systemctl show "$u" -p LoadState -p ActiveState -p DropInPaths -p FragmentPath -p NeedDaemonReload 2>/dev/null; done
-  } | md5sum
+  }
 }
 inst() { (cd "$REPO" && "$INSTALL" "$COMMIT" "$D" "$LAUNCH"); }
 markers() { ls /run/sb-*-ran 2>/dev/null | wc -l; }
@@ -102,9 +103,10 @@ markers() { ls /run/sb-*-ran 2>/dev/null | wc -l; }
 refuses() {
   local label=$1 want=$3 before after m0 out r
   clean; eval "$2"
-  before=$(snap); m0=$(markers)
+  snaptext > /tmp/sb-snap-before; before=$(md5sum < /tmp/sb-snap-before); m0=$(markers)
   out=$(inst 2>&1); r=$?
-  after=$(snap)
+  snaptext > /tmp/sb-snap-after; after=$(md5sum < /tmp/sb-snap-after)
+  [ "$before" = "$after" ] || diff /tmp/sb-snap-before /tmp/sb-snap-after | head -20 | sed 's/^/     changed: /'
   if [ "$r" = 1 ] && [[ "$out" == *"$want"* ]] && [ "$before" = "$after" ] && [ "$(markers)" = "$m0" ]; then ok "install refuses: $label (${out##*release-install: })"
   else bad "install refuses: $label (exit $r, want \"$want\", unchanged=$([ "$before" = "$after" ] && echo yes || echo no), markers $m0->$(markers): ${out:0:300})"; fi
 }
@@ -164,7 +166,7 @@ refuses "a file under /usr/lib/sagebrush" "mkdir -m 0755 /usr/lib/sagebrush && t
 refuses "a unit in /run/systemd/system" "unitfile run > /run/systemd/system/sagebrush-x.service" "a sagebrush systemd entry is present"
 refuses "a unit in system.control" "mkdir -p /run/systemd/system.control && unitfile ctl > /run/systemd/system.control/$UNIT" "a sagebrush systemd entry is present"
 refuses "a generated unit" "mkdir -p /run/systemd/generator && unitfile gen > /run/systemd/generator/sagebrush-y.service" "a sagebrush systemd entry is present"
-refuses "loaded only (file gone, no reload)" "unitfile ld > /etc/systemd/system/sagebrush-x.service && systemctl daemon-reload && rm /etc/systemd/system/sagebrush-x.service" "systemd knows a sagebrush unit"
+refuses "loaded only (file gone, no reload; kept loaded by being active)" "unitfile ld > /etc/systemd/system/sagebrush-x.service && systemctl daemon-reload && systemctl start sagebrush-x.service && rm /etc/systemd/system/sagebrush-x.service" "systemd knows a sagebrush unit"
 refuses "a loaded transient unit" "systemd-run --unit=sagebrush-x --remain-after-exit /bin/true >/dev/null 2>&1" "a sagebrush systemd entry is present"
 refuses "an alias under another name" "unitfile al > /etc/systemd/system/sagebrush-x.service && ln -s /etc/systemd/system/sagebrush-x.service /etc/systemd/system/other.service && systemctl daemon-reload" "a sagebrush systemd entry is present"
 refuses "a drop-in for the supervisor in /run" "mkdir -p /run/systemd/system/$UNIT.d && printf '[Unit]\nConditionPathExists=\n' > /run/systemd/system/$UNIT.d/99-reset.conf" "a sagebrush systemd entry is present"

@@ -11,6 +11,7 @@ import { EXPECT_DIR, archiveLimits, restoreAdapters } from "../lib/fleet/host/re
 import { RESTORE_STAGING, VALIDATE_DIR, fenceFiles } from "../lib/fleet/host/names.mjs";
 import { newRestoreRun } from "../lib/fleet/host/restore-record.mjs";
 import { needOf } from "../lib/fleet/host/restore-space.mjs";
+import { uidEmpty } from "../lib/fleet/host/uid-proof.mjs";
 
 const LAUNCHER = "/usr/lib/sagebrush/sagebrush-agent-launch";
 const refused = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
@@ -40,7 +41,7 @@ function world({ script = () => null, provisioned = (ids) => ({ [ids.a]: { uid: 
     [ids.dead]: { uid: 70003, state: "deleted", life: 1, gen: 0, tags: [], start_failed: null },
   } };
   const recs = provisioned(ids);
-  const calls = [], reports = [], archived = [], procAsked = [], proofAsked = [];
+  const calls = [], reports = [], archived = [], procAsked = [], proofAsked = [], proofPairs = [];
   const run = async (argv, { ms }) => {
     assert.ok(ms > 0);
     calls.push(argv);
@@ -56,11 +57,11 @@ function world({ script = () => null, provisioned = (ids) => ({ [ids.a]: { uid: 
   const ad = restoreAdapters({
     run, launcher: LAUNCHER, mount: "/srv/sagebrush", store, registry: () => registry, provisioner,
     usageOf: async () => USAGE, unrestorable: (k, i, c) => [`${k}/${c}`],
-    procCount: async (x) => { procAsked.push(x); return procs(x); }, uidProof: async (u) => { proofAsked.push(u); return proofs(u); },
+    procCount: async (x) => { procAsked.push(x); return procs(x); }, uidProof: async (u, agent) => { proofAsked.push(u); proofPairs.push([agent, u]); return proofs(u, agent); },
     report: (e) => reports.push(e), root, rootUid: ME.uid, rootGid: ME.gid, ms: 5000,
   });
   const mk = (p) => fs.mkdirSync(join(root, p), { recursive: true });
-  return { root, ad, calls, reports, archived, procAsked, proofAsked, ids, registry, mk };
+  return { root, ad, calls, reports, archived, procAsked, proofAsked, proofPairs, ids, registry, mk };
 }
 const launcherCalls = (w, sub) => w.calls.filter((c) => c[0] === LAUNCHER && c[1] === sub);
 
@@ -203,12 +204,23 @@ test("cleanDest: the pinned destination emptied by remove-tree --contents, its p
   const trm = launcherCalls(t, "remove-tree")[0];
   assert.deepEqual(trm.slice(3, 7), ["--anchor", "/srv/sagebrush/tags", "--name", t.ids.t]);
   assert.deepEqual(JSON.parse(fs.readFileSync(trm[8], "utf8")).owners, [0, 70001, 70002]);
-  assert.deepEqual(t.proofAsked, [70001, 70002]);
+  assert.deepEqual(t.proofPairs, [t.ids.a, t.ids.b].sort().map((x) => [x, t.registry.agents[x].uid]));
+  // One member's user still lingers (a proof that depends on the agent asked for): refused, nothing removed; then,
+  // once it's gone, the retry proves again and empties the folder.
+  let lingering = true;
+  const lg = world({ proofs: (u, agent) => ({ empty: !(lingering && agent === lg.ids.b) }) });
+  for (const x of [lg.ids.a, lg.ids.b]) fence(lg, x);
+  const tagSet = { kind: "tag", id: lg.ids.t, run: RUN, attempt: 1, state: "staging", dirty: true, dest: { tag: { dev, ino: "200" } } };
+  await refused(lg.ad.cleanDest(tagSet), "not_granted");
+  assert.deepEqual(launcherCalls(lg, "remove-tree"), []);
+  lingering = false;
+  await lg.ad.cleanDest(tagSet);
+  assert.equal(launcherCalls(lg, "remove-tree").length, 1);
   // An archive: the deleted agent's uid proven; no fence (it has no live agent).
   const a = world();
   await a.ad.cleanDest({ kind: "archive", id: a.ids.dead, run: RUN, attempt: 1, state: "staging", dirty: true, dest: { archive: { dev, ino: "200" } } });
   assert.deepEqual(launcherCalls(a, "remove-tree")[0].slice(3, 7), ["--anchor", "/srv/sagebrush/archive", "--name", a.ids.dead]);
-  assert.deepEqual(a.proofAsked, [70003]);
+  assert.deepEqual(a.proofPairs, [[a.ids.dead, 70003]]);
   // Refused with NO launcher removal: another object than the pinned one; no fence; a process; a held uid; a proof
   // that fails; a tag with one member unfenced.
   const none = async (x, set, what) => { await refused(x.ad.cleanDest(set), "not_granted"); assert.deepEqual(launcherCalls(x, "remove-tree"), [], what); };
@@ -251,10 +263,18 @@ test("stopped: every agent of the set fenced for restore, its slice empty and it
   w.procAsked.length = 0; w.proofAsked.length = 0;
   assert.equal(await w.ad.stopped(set(w, "tag", w.ids.t)), true);
   assert.deepEqual([w.procAsked, w.proofAsked], [[w.ids.a, w.ids.b].sort(), [w.ids.a, w.ids.b].sort().map((x) => w.registry.agents[x].uid)]);
+  // Each uid proven WITH ITS OWN AGENT (the proof checks that agent's user, its linger), never the tag's id.
+  assert.deepEqual(w.proofPairs.slice(-2), [w.ids.a, w.ids.b].sort().map((x) => [x, w.registry.agents[x].uid]));
   // An archive: the deleted agent's uid proven empty.
   w.proofAsked.length = 0;
   assert.equal(await w.ad.stopped(set(w, "archive", w.ids.dead)), true);
   assert.deepEqual(w.proofAsked, [70003]);
+  assert.deepEqual(w.proofPairs.at(-1), [w.ids.dead, 70003]);
+  // A proof that depends on the agent it's asked for (one member's user still lingers): a tag isn't stopped.
+  const lin = world({ proofs: (u, agent) => ({ empty: agent !== lin.ids.b }) });
+  fence(lin, lin.ids.a); fence(lin, lin.ids.b);
+  assert.equal(await lin.ad.stopped(set(lin, "tag", lin.ids.t)), false, "member b's user lingers");
+  assert.equal(await lin.ad.stopped(set(lin, "agent", lin.ids.a)), true, "a alone is proven");
   // A process in the slice, a held uid, a proof that throws or answers anything else: false, never true.
   for (const over of [{ procs: () => 1 }, { proofs: () => ({ empty: false }) }, { proofs: () => { throw new Error("x"); } }, { procs: () => { throw new Error("x"); } },
     { proofs: () => ({ empty: "yes" }) }, { proofs: () => null }]) {
@@ -336,4 +356,26 @@ test("unrestorableOf is the manifest's list as given; the constructor refuses mi
     assert.throws(() => restoreAdapters({ ...base, [k]: undefined }), (e) => e.code === "bad_form", k);
   }
   assert.throws(() => restoreAdapters({ ...base, launcher: "sagebrush-agent-launch" }), (e) => e.code === "bad_form");
+});
+
+test("the REAL uid-empty proof, per member: a tag whose second member's user lingers is neither stopped nor emptied, until it's gone", async () => {
+  // uidEmpty against the test root: no process holds the uid, no user manager, no session; only a linger file.
+  const quiet = async (argv) => (argv[0] === "systemctl" ? { code: 3, stdout: "inactive\n" } : { code: 0, stdout: "" });
+  let w;
+  w = world({ proofs: (u, agent) => uidEmpty(u, agent, { root: w.root, run: quiet, ms: 5000 }) });
+  fs.mkdirSync(join(w.root, "proc"));
+  for (const x of [w.ids.a, w.ids.b]) { const f = join(w.root, fenceFiles(x).restore); fs.mkdirSync(join(f, ".."), { recursive: true }); fs.writeFileSync(f, ""); }
+  const linger = join(w.root, "var/lib/systemd/linger", `sb-${w.ids.b}`);
+  fs.mkdirSync(join(linger, ".."), { recursive: true });
+  fs.writeFileSync(linger, "");
+  const dev = String(8 * 2 ** 20 + 1);
+  const tagSet = { kind: "tag", id: w.ids.t, run: RUN, attempt: 1, state: "staging", dirty: true, dest: { tag: { dev, ino: "200" } } };
+  assert.equal(await w.ad.stopped(tagSet), false, "b's user lingers");
+  await refused(w.ad.cleanDest(tagSet), "not_granted");
+  assert.deepEqual(launcherCalls(w, "remove-tree"), [], "nothing removed");
+  assert.equal(await w.ad.stopped({ kind: "agent", id: w.ids.a, run: RUN, attempt: 1, state: "published" }), true, "a alone is empty");
+  fs.rmSync(linger);
+  assert.equal(await w.ad.stopped(tagSet), true);
+  await w.ad.cleanDest(tagSet);
+  assert.equal(launcherCalls(w, "remove-tree").length, 1, "emptied once every member is proven");
 });

@@ -115,7 +115,7 @@ test("prereq: an expired Claude login is one reason, claude_login_expired, in ou
   assert.ok(rd.some((e) => e.type === "turn_error" && e.code === "is_error"));
 });
 
-// (astra5's hold on the first cut: only the pinned Claude Code's own sign-in texts are sign-in failures; an error result
+// (the review's hold on the first cut: only the pinned Claude Code's own sign-in texts are sign-in failures; an error result
 //  about any other time limit, authentication or token is said as before, with its text)
 test("prereq: only the pinned Claude Code's sign-in texts are sign-in failures; other timeout, auth and token errors keep their text", async () => {
   const { signInFailure } = await import("../lib/claude-cli.mjs");

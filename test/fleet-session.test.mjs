@@ -1,5 +1,5 @@
 // The browser session driver (lib/fleet/browser/session.mjs) against a fake CDP pipe with the exact interface of
-// macapp's pipe client (send, on, closed, close, pid). Nothing waits on real time: every CDP answer is a barrier the
+// the app's pipe client (send, on, closed, close, pid). Nothing waits on real time: every CDP answer is a barrier the
 // test releases (or an automatic reply for setup calls), and timers run on a manual clock.
 
 import assert from "node:assert/strict";
@@ -338,7 +338,7 @@ test("takeover: terminate that doesn't answer within 3 s, or fails, retires the 
   }
 });
 
-test("time: console objects are released by the app after 60 s; events go to macapp's hook first, Fetch never to the agent", async () => {
+test("time: console objects are released by the app after 60 s; events go to the app's hook first, Fetch never to the agent", async () => {
   const { cdp, seen, session, clock, privileged } = await setup();
   await attach(cdp, { sessionId: "SESS-A", targetId: "REAL-TA" });
   cdp.emit("Runtime.consoleAPICalled", { type: "log", args: [{ type: "object", objectId: "REAL-CO" }], executionContextId: 900001, timestamp: 1 }, "SESS-A");

@@ -26,7 +26,7 @@ test("writer: with a real Writable, the count never passes 2F (data) or 2F + 4 K
     assert.ok(c.charged <= 2 * F, `${what}: charged ${c.charged} > 2F`);
     assert.ok(c.charged + c.reserveHeld <= 2 * F + RESERVE, `${what}: total ${c.charged + c.reserveHeld} > 2F + 4 KiB`);
   };
-  // (daybreak4's case: 32,767 then 65,535 characters)
+  // (the limits review's case: 32,767 then 65,535 characters)
   assert.equal(lw.send("a".repeat(32767)), "ok"); check("first queued"); await tick(); check("first written");
   assert.equal(lw.send("b".repeat(65535)), "ok"); check("second queued"); await tick(); check("second's first chunk");
   // (more, of mixed sizes, while nothing drains: admitted only while they fit)

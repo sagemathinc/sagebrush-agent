@@ -706,6 +706,10 @@ test("H3: filled to the brim, the open turn still finishes with its gap line, an
   assert.equal(JSON.stringify(intent).length, 256);
   for (const t of j.pending()) j.intend(t.turn, intent);
   assert.ok(j.used <= j.max, `with every intent: ${j.used}`);
+  // (and, on top, a refused begin at the widest times: the missed record at its largest; every reserve used at once)
+  assert.equal(j.begin("late", -Number.MAX_SAFE_INTEGER).ok, false);
+  assert.equal(j.begin("late2", Number.MAX_SAFE_INTEGER).ok, false);
+  assert.ok(j.used <= j.max, `with every intent and the widest missed record: ${j.used}`);
   assert.equal(j.used, durable(j));
 });
 
@@ -744,5 +748,55 @@ test("H3: the journal counts UTF-8 bytes, validates turn ids, and refuses a cap 
   assert.ok(f.used <= f.max, `${f.used} <= ${f.max}`);
   assert.equal(f.used, durable(f));
   assert.equal(f.setContext(2, new Uint8Array(101)), false, "over the reserve");
+});
+
+test("H3: a restored state is checked against its cap, and setContext preflights against a state with no reserve room left", () => {
+  const j = new Journal({ max: 65536, contextReserve: 100 });
+  j.begin("t", AT);
+  for (let k = 0; k < 20; k++) j.add(encodeLine({ turn: "t", i: k + 1, role: "user", text: "x".repeat(500) }));
+  j.finish();
+  const s = j.state();
+  // (a cap above the floor but below this state's size: refused on restore)
+  assert.throws(() => Journal.from({ ...s, max: j.used - 1 }), /over its cap/);
+  // (within the cap but with no room left for a context: the context is refused, the state unchanged)
+  const r = Journal.from({ ...s, max: j.used + 10 });
+  assert.equal(r.setContext(1, new Uint8Array(100)), false);
+  assert.equal(r.context, null);
+  assert.ok(r.used <= r.max);
+});
+
+test("H3: at its exact floor with a full context, refused begins still fit: the missed-turn record is reserved", () => {
+  let max = 1;
+  for (;; max++) { try { new Journal({ max, contextReserve: 100 }); break; } catch { /* below the floor */ } }
+  const j = new Journal({ max, contextReserve: 100 });
+  assert.equal(j.setContext(Number.MAX_SAFE_INTEGER, new Uint8Array(100)), true);
+  // (each refused begin, at the widest times, records itself as missed: never past the cap)
+  for (const at of [Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER, 0, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(j.begin("t", at).ok, false);
+    assert.ok(j.used <= j.max, `${j.used} <= ${j.max}`);
+    assert.equal(j.used, durable(j));
+  }
+  // (and a restore of that state is accepted, the same size)
+  const r = Journal.from(JSON.parse(JSON.stringify(j.state())));
+  assert.equal(r.used, j.used);
+  // (control: a cap one byte below the floor is refused at construction)
+  assert.throws(() => new Journal({ max: max - 1, contextReserve: 100 }), RangeError);
+});
+
+test("H3: the reserves are real: the widest missed record always, and the widest gap line while a turn is open", () => {
+  const b64cost = (n) => 4 * Math.ceil(n / 3) + 3; // base64, quotes, separator
+  const W = Number.MAX_SAFE_INTEGER, id = "t".repeat(128);
+  // (the widest missed record, as JSON bytes beyond the "null" it replaces)
+  const widestMissed = te.encode(JSON.stringify({ turns: W, from_ms: -W, to_ms: -W })).length - 4;
+  // (the widest gap line a turn can end with: a 128-byte id, every number at its largest)
+  const widestGap = Math.max(
+    encodeLine({ turn: id, i: W, gap: true, omitted_lines: W, omitted_bytes: W }).length,
+    encodeLine({ turn: id, i: 1, gap: true, turns: W, from_ms: -W, to_ms: -W }).length);
+  assert.ok(widestGap <= 256, `the widest gap line, ${widestGap} bytes, fits GAP_MAX`);
+  const j = new Journal({ max: 1 << 20, contextReserve: 0 });
+  const r0 = j.reserved();
+  assert.ok(r0 >= widestMissed, `held back at rest: ${r0} >= the widest missed record ${widestMissed}`);
+  j.begin(id, AT);
+  assert.ok(j.reserved() - r0 >= b64cost(widestGap), `an open turn holds back ${j.reserved() - r0} >= its widest gap line ${b64cost(widestGap)}`);
 });
 

@@ -54,6 +54,8 @@ async function allLines(store) {
   }
   return out;
 }
+/** The journal's durable bytes: the UTF-8 length of its serialized state. */
+const durable = (j) => te.encode(JSON.stringify(j.state())).length;
 const entryOf = (turn, texts, at_ms = AT, anchor = null) => ({ turn, at_ms, anchor, lines: turnLines(turn, at_ms, texts.map((t) => ({ role: "assistant", text: t }))) });
 async function* chunksOf(text, size = 7) { const b = te.encode(text); for (let i = 0; i < b.length; i += size) yield b.subarray(i, i + size); }
 const jsonl = (records) => records.map((r) => JSON.stringify(r)).join("\n") + "\n";
@@ -384,7 +386,7 @@ test("row 12: the journal counts as it goes: a turn over the cap keeps a prefix 
   const gap = JSON.parse(td.decode(t.lines.at(-1)));
   assert.deepEqual([gap.gap, gap.omitted_lines], [true, omitted]);
   assert.ok(j.used <= 1024 * 1024, `within the cap: ${j.used}`);
-  assert.equal(j.used, JSON.stringify(j.state()).length, "used is the durable bytes, exactly");
+  assert.equal(j.used, durable(j), "used is the durable bytes, exactly");
   // (full: the next turns are missed, then the first one journaled after carries the gap)
   let fill = 0;
   while (j.begin(`e${fill}`, AT).ok) { j.finish(); fill++; }
@@ -551,17 +553,17 @@ test("LIMITS H3: the journal's used is its durable bytes exactly; empty turns, i
   let ok = 0, missed = 0;
   for (let k = 0; k < 5000; k++) { const r = j.begin(`t${k}`, AT + k); if (r.ok) { j.finish(); ok++; } else missed++; }
   assert.ok(missed > 0, "empty turns fill it: their metadata counts");
-  assert.equal(j.used, JSON.stringify(j.state()).length);
+  assert.equal(j.used, durable(j));
   assert.ok(j.used <= 262144);
   // (an intent comes from its reserve, and stays within the cap)
   j.intend("t0", { seq: 1, anchor: { n: 1, seq: 0 } });
-  assert.equal(j.used, JSON.stringify(j.state()).length);
+  assert.equal(j.used, durable(j));
   assert.ok(j.used <= 262144);
   // (a context over its reserve is refused)
   const c = new Journal({ max: 262144, contextReserve: 1000 });
   assert.equal(c.setContext(1, new Uint8Array(1001)), false);
   assert.equal(c.setContext(1, new Uint8Array(1000)), true);
-  assert.equal(c.used, JSON.stringify(c.state()).length);
+  assert.equal(c.used, durable(c));
   // (a restored state over its cap is refused)
   const s = c.state();
   assert.throws(() => Journal.from({ ...s, max: 100 }));
@@ -575,7 +577,7 @@ test("LIMITS H3: the journal's used is its durable bytes exactly; empty turns, i
   const r2 = new Journal({ max: 65536, contextReserve: 0 });
   r2.begin("t", AT);
   assert.equal(r2.add(fitsLine), true, "exactly within the room");
-  assert.equal(r2.used, JSON.stringify(r2.state()).length);
+  assert.equal(r2.used, durable(r2));
 });
 
 test("LIMITS H3: a turn over 64 MiB, streamed from its records into the journal: a prefix, a gap line, the cap held", async () => {
@@ -704,6 +706,43 @@ test("H3: filled to the brim, the open turn still finishes with its gap line, an
   assert.equal(JSON.stringify(intent).length, 256);
   for (const t of j.pending()) j.intend(t.turn, intent);
   assert.ok(j.used <= j.max, `with every intent: ${j.used}`);
-  assert.equal(j.used, JSON.stringify(j.state()).length);
+  assert.equal(j.used, durable(j));
+});
+
+// ---- LIMITS H3 at the second head: waiting calls bounded by bytes; the journal counts UTF-8 and checks its own floor
+test("H3: waiting tool calls hold a fixed size each, whatever their ids: 257 calls with 256 KiB ids", async () => {
+  const { turnLineStream, OPEN_CALLS_MAX } = await import("../lib/agent-log/index.mjs");
+  // (the calls are made lazily, so the test itself holds none of them: what stays live is what the builder keeps)
+  function* calls() { for (let k = 0; k < OPEN_CALLS_MAX + 1; k++) yield { role: "tool_call", name: "n".repeat(1000), call: `${k}`.padEnd(256 * 1024, "x"), input: "i" }; }
+  gc(); gc();
+  const before = process.memoryUsage().heapUsed;
+  const it = turnLineStream("t", AT, calls());
+  const first = it.next();
+  gc(); gc();
+  const delta = process.memoryUsage().heapUsed - before;
+  assert.equal(JSON.parse(td.decode(first.value)).summary.endsWith("no result"), true, "the 257th call writes out the oldest");
+  assert.ok(delta < 8 * 1024 * 1024, `heap held by 256 waiting calls: ${delta}`);
+  const rest = [...it];
+  assert.equal(rest.length, OPEN_CALLS_MAX);
+  assert.ok(rest.every((l) => JSON.parse(td.decode(l)).name.length <= 64));
+});
+
+test("H3: the journal counts UTF-8 bytes, validates turn ids, and refuses a cap below its own floor", () => {
+  const j = new Journal({ max: 65536, contextReserve: 0 });
+  assert.equal(j.begin("é".repeat(50), AT).ok, true);
+  j.add(encodeLine({ turn: "é", i: 1, role: "user", text: "é".repeat(100) }));
+  j.finish();
+  assert.equal(j.used, durable(j), "used is UTF-8 bytes, multibyte ids and lines included");
+  assert.throws(() => new Journal({ max: 65536 }).begin("é".repeat(100), AT), RangeError, "an id over 128 bytes");
+  assert.throws(() => new Journal({ max: 65536 }).begin("t", 1.5), RangeError);
+  assert.throws(() => new Journal({ max: 100, contextReserve: 100 }), RangeError, "a cap smaller than its envelope and context reserve");
+  // (at exactly its floor: a context of exactly the reserve fits, within the cap)
+  let max = 1;
+  for (;; max++) { try { new Journal({ max, contextReserve: 100 }); break; } catch { /* below the floor */ } }
+  const f = new Journal({ max, contextReserve: 100 });
+  assert.equal(f.setContext(1, new Uint8Array(100)), true);
+  assert.ok(f.used <= f.max, `${f.used} <= ${f.max}`);
+  assert.equal(f.used, durable(f));
+  assert.equal(f.setContext(2, new Uint8Array(101)), false, "over the reserve");
 });
 

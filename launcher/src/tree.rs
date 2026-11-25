@@ -976,6 +976,7 @@ pub(crate) mod tests {
     /// A fake tree: paths relative to the root ("" is the root). A node whose mnt_id differs from its parent's is a
     /// mount: opening it with NO_XDEV fails EXDEV. Symlinks fail ELOOP. `hook` runs once, when op `.0` has been called
     /// `.1` times; `fail` makes one op fail.
+    #[derive(Clone)]
     pub(crate) struct Fake {
         pub(crate) nodes: BTreeMap<String, Node>,
         pub(crate) files: BTreeMap<String, Vec<u8>>,

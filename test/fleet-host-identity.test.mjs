@@ -16,7 +16,8 @@ const enc = (s) => new TextEncoder().encode(s);
 const AUD = F.aud, FLEET = F.ids.fleet, HOST = F.ids.host;
 const N = keyFromSeed(Buffer.from(F.keys["device-native"].seed, "hex"));
 const ENTRIES = F.objects.chain.map(enc);
-const UID = process.getuid();
+// process.getuid doesn't exist off POSIX; there every test here is skipped (host-linux-only), so UID is never used.
+const UID = process.getuid?.() ?? -1;
 // A host root with the package's /var/lib/sagebrush (0755, the test's own uid standing for root): nothing creates it.
 const tmp = () => { const r = mkdtempSync(join(tmpdir(), "sb-ident-")); mkdirSync(join(r, "var/lib/sagebrush"), { recursive: true, mode: 0o755 }); return r; };
 const R = { rootUid: UID };
@@ -354,14 +355,15 @@ test("owner and mode come from the descriptor read: a key swapped for a same-byt
   } };
   assert.equal((await classify(h.p, { ...opts(), fsx })).state, "BROKEN");
   // The same swap with a 0600 copy of the same bytes: owner, mode and content all right, but another file than the one
-  // looked at: BROKEN.
+  // looked at: BROKEN. (The original is renamed aside, not unlinked, so it keeps its inode: a filesystem that reuses a
+  // freed inode at once would otherwise hand the copy the same dev and ino, the same object as far as fstat can tell.)
   const k = await host("cert");
   let swapped2 = false;
   const fsx2 = { ...realFs, openSync: (q, ...r) => {
     if (!swapped2 && String(q).endsWith("/keys/sign")) {
       swapped2 = true;
       const bytes = realFs.readFileSync(q);
-      realFs.unlinkSync(q);
+      realFs.renameSync(q, `${q}.aside`);
       realFs.writeFileSync(q, bytes, { mode: 0o600 });
     }
     return realFs.openSync(q, ...r);

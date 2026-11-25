@@ -2,7 +2,7 @@
 // version answer. Rows named "claude-path: …". POSIX only.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { chmodSync, linkSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bindExecutable, boundedRun, CLAUDE_PATH_REASONS, claudeVersionOf, ClaudePathError, minimalEnv, recheck } from "../lib/claude-path.mjs";
@@ -21,6 +21,20 @@ const bind = (p, o = {}) => bindExecutable(p, { lstat: hostLstat, ...o });
 const reason = (fn) => { try { fn(); } catch (e) { if (e instanceof ClaudePathError) return e.reason; throw e; } return "ok"; };
 const areason = async (p) => { try { await p; } catch (e) { if (e instanceof ClaudePathError) return e.reason; throw e; } return "ok"; };
 
+// (a killed process is gone once it's absent or a zombie waiting for init to reap it: a zombie still answers kill(pid, 0),
+//  and under load init can take a moment; up to 2 s)
+async function gone(pid) {
+  for (let i = 0; i < 100; i++) {
+    let state = null;
+    try { state = readFileSync(`/proc/${pid}/stat`, "utf8").replace(/^.*\) /, "")[0]; } catch {
+      let alive = true; try { process.kill(pid, 0); } catch { alive = false; }
+      if (!alive) return true;
+    }
+    if (state === "Z") return true;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  return false;
+}
 function base() {
   const b = mkdtempSync(join(tmpdir(), "sb-cp-")); // (/tmp-like: root-owned sticky above, this folder 0700 and ours)
   chmodSync(b, 0o700);
@@ -123,20 +137,37 @@ test("claude-path: another owner, of the file or of a folder above: wrong_owner;
   rmSync(b, { recursive: true });
 });
 
-test("claude-path: the version answer: exact (with or without one newline); every variant refused", { skip }, async () => {
+test("claude-path: the version answer: exactly '<v> (Claude Code)\n', as the app checks it; every variant refused", { skip }, async () => {
   const b = base(); const S = ["2.1.330"];
-  const v = async (out) => areason(claudeVersionOf(bind(exe(b, `c${Math.random().toString(16).slice(2)}`, `#!/bin/sh\nprintf '${out}'\n`)), S, { lstat: hostLstat }));
-  assert.equal(await v("2.1.330 (Claude Code)\\n"), "ok");
-  assert.equal(await v("2.1.330 (Claude Code)"), "ok");
-  assert.equal(await v("2.1.330 (Claude Code) \\n"), "version_unknown");
-  assert.equal(await v("2.1.330 (Claude Code)\\n\\n"), "version_unknown");
-  assert.equal(await v("2.1.330 (Claude Code)\\nextra\\n"), "version_unknown");
-  assert.equal(await v(" 2.1.330 (Claude Code)\\n"), "version_unknown");
-  assert.equal(await v("2.1.330 (claude code)\\n"), "version_unknown");
-  assert.equal(await v(""), "version_unknown");
-  assert.equal(await v("2.1.331 (Claude Code)\\n"), "version_mismatch");
-  const fail = exe(b, "fails", "#!/bin/sh\necho '2.1.330 (Claude Code)'\nexit 1\n");
-  assert.equal(await areason(claudeVersionOf(bind(fail), S, { lstat: hostLstat })), "no_answer");
+  const v = async (body) => areason(claudeVersionOf(bind(exe(b, `c${Math.random().toString(16).slice(2)}`, `#!/bin/sh\n${body}\n`)), S, { lstat: hostLstat }));
+  const pf = (out) => v(`printf '${out}'`);
+  assert.equal(await pf("2.1.330 (Claude Code)\\n"), "ok");
+  assert.equal(await pf("2.1.330 (Claude Code)"), "version_unknown", "the newline is required");
+  assert.equal(await pf("2.1.330 (Claude Code) \\n"), "version_unknown");
+  assert.equal(await pf("2.1.330 (Claude Code)\\r\\n"), "version_unknown");
+  assert.equal(await pf("2.1.330 (Claude Code)\\n\\n"), "version_unknown");
+  assert.equal(await pf("2.1.330 (Claude Code)\\nextra\\n"), "version_unknown");
+  assert.equal(await pf(" 2.1.330 (Claude Code)\\n"), "version_unknown");
+  assert.equal(await pf("2.1.330 (claude code)\\n"), "version_unknown");
+  assert.equal(await pf("02.1.330 (Claude Code)\\n"), "version_unknown", "a leading zero");
+  assert.equal(await pf("2.01.330 (Claude Code)\\n"), "version_unknown", "a leading zero");
+  assert.equal(await pf("2.1.1234567 (Claude Code)\\n"), "version_unknown", "seven digits");
+  assert.equal(await pf(""), "version_unknown");
+  assert.equal(await pf("2.1.331 (Claude Code)\\n"), "version_mismatch");
+  assert.equal(await pf("2.0.330 (Claude Code)\\n"), "version_mismatch");
+  assert.equal(await v("echo '2.1.330 (Claude Code)'; exit 1"), "no_answer", "a non-zero exit, even with a good answer");
+  assert.equal(await v("echo '2.1.330 (Claude Code)'; echo 'some warning' >&2"), "ok", "stderr within its cap is ignored");
+  assert.equal(await v("echo '2.1.330 (Claude Code)'; head -c 5000 /dev/zero | tr '\\\\0' x >&2"), "version_unknown", "stderr over its cap");
+  rmSync(b, { recursive: true });
+});
+
+test("claude-path: the caps: 4096 bytes accepted, 4097 refused, on stdout and on stderr", { skip, timeout: 20_000 }, async () => {
+  const b = base();
+  for (const [n, over] of [[4096, false], [4097, true]]) for (const fd of ["", " >&2"]) {
+    const f = exe(b, `cap${n}${fd ? "e" : "o"}`, `#!/bin/sh\nhead -c ${n} /dev/zero | tr '\\\\0' x${fd}\n`);
+    const r = await boundedRun(f, [], { env: minimalEnv() });
+    assert.equal(r.overflow, over, `${n} bytes on ${fd ? "stderr" : "stdout"}`);
+  }
   rmSync(b, { recursive: true });
 });
 
@@ -148,9 +179,8 @@ test("claude-path: a hang past 5 s is no_answer, with its whole process group ki
   assert.equal(await areason(claudeVersionOf(bind(f), ["2.1.330"], { lstat: hostLstat })), "no_answer");
   const took = Date.now() - t0;
   assert.ok(took >= 4900 && took < 9000, `took ${took} ms`);
-  const gc = Number(String(await import("node:fs").then((m) => m.readFileSync(pidFile, "utf8"))).trim());
-  let alive = true; try { process.kill(gc, 0); } catch { alive = false; }
-  assert.equal(alive, false, "the grandchild in the group is gone");
+  const gc = Number(readFileSync(pidFile, "utf8").trim());
+  assert.equal(await gone(gc), true, "the grandchild in the group is gone");
   rmSync(b, { recursive: true });
 });
 
@@ -163,19 +193,73 @@ test("claude-path: more than 4 KiB of answer is version_unknown, the group kille
   rmSync(b, { recursive: true });
 });
 
-test("claude-path: the spawn's environment is built, nothing inherited; DISABLE_AUTOUPDATER=1; no shell; stdin closed", { skip }, async () => {
+test("claude-path: the spawn's environment is exactly PATH, HOME and DISABLE_AUTOUPDATER=1; nothing planted gets in", { skip }, async () => {
   const b = base();
-  process.env.SB_PLANTED_SECRET = "must-not-be-seen";
-  const f = exe(b, "envdump", "#!/bin/sh\nenv | sort\nread x && echo GOT-STDIN || echo STDIN-CLOSED\n");
-  const r = await boundedRun(f, [], { env: minimalEnv() });
-  delete process.env.SB_PLANTED_SECRET;
+  const planted = { SB_PLANTED_SECRET: "must-not-be-seen", TMPDIR: "/attacker-tmpdir", TMP: "/attacker-tmp", TEMP: "/attacker-temp", HOME: "/attacker-home", USER: "attacker", PATH: "/attacker-path:" + process.env.PATH };
+  const saved = {}; for (const [k, v] of Object.entries(planted)) { saved[k] = process.env[k]; process.env[k] = v; }
+  let env, r;
+  try {
+    env = minimalEnv(); // (built while every planted variable is set)
+    const f = exe(b, "envdump", "#!/bin/sh\nenv | sort\nread x && echo GOT-STDIN || echo STDIN-CLOSED\n");
+    r = await boundedRun(f, [], { env });
+  } finally { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+  // (the built environment itself, exactly: some Node builds drop TMPDIR from a child's environment on their own, so the
+  //  child's view alone can't prove TMPDIR, TMP and TEMP were never put in)
+  assert.deepEqual(Object.keys(env).sort(), ["DISABLE_AUTOUPDATER", "HOME", "PATH"]);
+  assert.doesNotMatch(JSON.stringify(env), /attacker|SB_PLANTED_SECRET/);
   const keys = r.stdout.split("\n").filter((l) => l.includes("=")).map((l) => l.split("=")[0]).filter((k) => k !== "PWD" && k !== "SHLVL" && k !== "_");
-  assert.deepEqual(keys.sort(), ["DISABLE_AUTOUPDATER", "HOME", "LOGNAME", "PATH", "TMPDIR", "USER"]);
+  assert.deepEqual(keys.sort(), ["DISABLE_AUTOUPDATER", "HOME", "PATH"]);
   assert.match(r.stdout, /^DISABLE_AUTOUPDATER=1$/m);
-  assert.doesNotMatch(r.stdout, /SB_PLANTED_SECRET/);
+  assert.match(r.stdout, /^PATH=\/usr\/bin:\/bin$/m);
+  assert.match(r.stdout, new RegExp(`^HOME=${(await import("node:os")).userInfo().homedir}$`, "m"), "HOME from the account database");
+  assert.doesNotMatch(r.stdout, /attacker|SB_PLANTED_SECRET/);
   assert.match(r.stdout, /STDIN-CLOSED/);
-  const shell = await boundedRun(f + " ; echo injected", [], { env: minimalEnv() });
-  assert.equal(shell.failed || shell.code !== 0, true, "a path is never handed to a shell");
+  const shell = await boundedRun(join(b, "envdump") + " ; echo injected", [], { env });
+  assert.equal(shell.failed, true, "a path is never handed to a shell");
+  rmSync(b, { recursive: true });
+});
+
+test("claude-path: PATH keeps only folders that are root-owned and not writable by group or others", { skip }, () => {
+  const fake = (bad) => (p) => ({ isDirectory: () => true, uid: bad[p]?.uid ?? 0, mode: bad[p]?.mode ?? 0o40755 });
+  assert.equal(minimalEnv({ stat: fake({}) }).PATH, "/usr/bin:/bin");
+  assert.equal(minimalEnv({ stat: fake({ "/bin": { mode: 0o40775 } }) }).PATH, "/usr/bin");
+  assert.equal(minimalEnv({ stat: fake({ "/usr/bin": { uid: 1000 } }) }).PATH, "/bin");
+  assert.equal(minimalEnv({ stat: fake({ "/usr/bin": { uid: 1000 }, "/bin": { mode: 0o40757 } }) }).PATH, "");
+  assert.equal(minimalEnv({ stat: () => { throw new Error("ENOENT"); } }).PATH, "");
+});
+
+test("claude-path: the group is killed while its holder is alive, never after (no signal to a possibly reused group id)", { skip, timeout: 30_000 }, async () => {
+  const b = base();
+  // (the helper exits at once and leaves one child keeping the group alive: that child is killed, by a kill sent
+  //  while the holder still held the id; nothing is signalled after the holder is gone)
+  const pidFile = join(b, "left.pid");
+  const leaves = exe(b, "leaves", `#!/bin/sh\nsleep 60 & echo $! > ${pidFile}\necho done\n`);
+  const t1 = [];
+  const r1 = await boundedRun(leaves, [], { env: minimalEnv(), trace: t1 });
+  assert.equal(r1.code, 0);
+  const left = Number(readFileSync(pidFile, "utf8").trim());
+  assert.equal(await gone(left), true, "the child it left in the group is gone");
+  assert.ok(t1.includes("holder-exit"));
+  assert.deepEqual(t1.slice(t1.indexOf("holder-exit") + 1), [], "no kill after the holder's exit");
+  assert.ok(t1.indexOf("kill") >= 0 && t1.indexOf("kill") < t1.indexOf("holder-exit"));
+  // (an empty group: the helper exits with no child; one kill while the holder is alive, then its exit, nothing after)
+  const t2 = [];
+  await boundedRun(exe(b, "alone", "#!/bin/sh\necho alone\n"), [], { env: minimalEnv(), trace: t2 });
+  assert.deepEqual(t2, ["kill", "holder-exit"]);
+  // (the deadline and the overflow: the same order)
+  const t3 = [];
+  const r3 = await boundedRun(exe(b, "slow", "#!/bin/sh\nsleep 30\n"), [], { env: minimalEnv(), timeoutMs: 300, trace: t3 });
+  assert.equal(r3.timedOut, true);
+  assert.deepEqual(t3.slice(t3.indexOf("holder-exit") + 1), []);
+  const t4 = [];
+  const r4 = await boundedRun(exe(b, "loud", "#!/bin/sh\nhead -c 9000 /dev/zero | tr '\\\\0' x\nsleep 30\n"), [], { env: minimalEnv(), trace: t4 });
+  assert.equal(r4.overflow, true);
+  assert.deepEqual(t4.slice(t4.indexOf("holder-exit") + 1), []);
+  // (a holder already gone is never signalled: the kill function isn't even called)
+  let calls = 0;
+  const t5 = [];
+  await boundedRun(exe(b, "quick", "#!/bin/sh\ntrue\n"), [], { env: minimalEnv(), trace: t5, kill: (...a) => { calls++; return process.kill(...a); } });
+  assert.equal(calls, t5.filter((x) => x === "kill").length);
   rmSync(b, { recursive: true });
 });
 

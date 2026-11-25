@@ -45,31 +45,58 @@ test("the launcher's failure record maps to exactly one reason, and an unknown c
   for (let c = 0; c < 256; c++) assert.notEqual(launcherTurnReason(c), "preflight_missing");
 });
 
+// The contract's table (A5 §8.3), written out here independently of the module under test.
+const CONTRACT = {
+  failed_no_effect: ["profile_identity", "turn_preflight", "landlock_abi"],
+  refused: ["no_profile", "all_blocked", "agent_fenced", "source_unavailable"],
+};
+const REASONLESS = ["authorized", "succeeded", "unknown_effect", "reconciled_no_effect", "reconciled_succeeded"];
+
+test("the module's table is exactly the contract's", () => {
+  assert.deepEqual(Object.keys(TURN_REASONS).sort(), Object.keys(CONTRACT).sort());
+  for (const [p, rs] of Object.entries(CONTRACT)) assert.deepEqual([...TURN_REASONS[p]].sort(), [...rs].sort(), p);
+  assert.deepEqual([...TURN_PHASES_WITHOUT_REASON].sort(), [...REASONLESS].sort());
+});
+
 test("the phase-and-reason table is closed: every pair outside it is refused", () => {
-  const phases = [...Object.keys(TURN_REASONS), ...TURN_PHASES_WITHOUT_REASON];
+  const phases = [...Object.keys(CONTRACT), ...REASONLESS];
   const reasons = registry.reasons.map((r) => r.name);
   let allowed = 0;
   for (const p of [...phases, "aborted", "failed", ""]) {
     for (const r of [...reasons, null, "made_up_reason"]) {
-      const want = TURN_PHASES_WITHOUT_REASON.includes(p) ? r === null : (TURN_REASONS[p] ?? []).includes(r);
+      const want = REASONLESS.includes(p) ? r === null : (CONTRACT[p] ?? []).includes(r);
       assert.equal(turnPairOk(p, r), want, `${p} ${r}`);
       if (want) allowed++;
     }
   }
-  // Exactly the table: 3 failed_no_effect reasons, 4 refused reasons, and the 5 reasonless phases with none.
-  assert.equal(allowed, 3 + 4 + TURN_PHASES_WITHOUT_REASON.length);
+  // Exactly the contract: 3 failed_no_effect reasons, 4 refused reasons, and 5 reasonless phases with none.
+  assert.equal(allowed, 12);
   // busy is never an event's reason, and a refused event can't carry a launcher reason.
   for (const p of phases) assert.equal(turnPairOk(p, "busy"), false, p);
   assert.deepEqual(SUMMARY_ONLY, ["busy"]);
   assert.equal(turnPairOk("refused", "turn_preflight"), false);
   assert.equal(turnPairOk("failed_no_effect", "no_profile"), false);
   // A prototype name is no phase.
-  assert.equal(turnPairOk("constructor", "turn_preflight"), false);
+  for (const p of ["constructor", "__proto__", "toString", "hasOwnProperty"]) assert.equal(turnPairOk(p, "turn_preflight"), false, p);
+});
+
+test("nothing is coerced: a phase or reason that isn't a primitive string is refused, never thrown on", () => {
+  const nullProto = Object.assign(Object.create(null), { x: 1 });
+  const stringy = { toString: () => "refused" };
+  for (const p of [["refused"], ["failed_no_effect"], new String("refused"), stringy, nullProto, 1, true, undefined, null, Symbol("refused")]) {
+    assert.equal(turnPairOk(p, "no_profile"), false, String(typeof p));
+    assert.equal(turnPairOk(p, "profile_identity"), false, String(typeof p));
+    assert.equal(turnPairOk(p, null), false, String(typeof p));
+  }
+  for (const r of [["no_profile"], new String("no_profile"), { toString: () => "no_profile" }, nullProto, 0, false, undefined]) {
+    assert.equal(turnPairOk("refused", r), false, String(typeof r));
+    assert.equal(turnPairOk("succeeded", r), false, `reasonless with ${typeof r}`);
+  }
 });
 
 test("every reason the table names is registered, and an unregistered name is refused", () => {
-  for (const r of [...Object.values(TURN_REASONS).flat(), ...SUMMARY_ONLY]) assert.ok(byName.has(r), r);
-  for (const r of NEW) assert.ok([...Object.values(TURN_REASONS).flat(), ...SUMMARY_ONLY].includes(r), `${r} is used by the table`);
+  for (const r of [...Object.values(CONTRACT).flat(), ...SUMMARY_ONLY]) assert.ok(byName.has(r), r);
+  for (const r of NEW) assert.ok([...Object.values(CONTRACT).flat(), ...SUMMARY_ONLY].includes(r), `${r} is used by the table`);
   assert.equal(turnPairOk("failed_no_effect", "profile_identity_x"), false);
   assert.equal(byName.has("profile_identity_x"), false);
 });

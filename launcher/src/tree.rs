@@ -1099,26 +1099,9 @@ fn remove_contents_limited<O: Ops>(o: &mut O, anchor: &str, name: &str, expect_p
         return Err(identity("the destination has an ACL or other-write"));
     }
     let mut w = Walk { limit, anchor_mnt: epoch.mnt_id, owners, any_owner_from: None, objects: 0, removed: 0 };
-    // Pass 1 over the root's entries, the root itself not locked down; every directory below is, as §5.
-    loop {
-        let names = o.batch(&h).map_err(open_err).map_err(|e| if e.fail == Fail::Preflight { identity(e.msg) } else { e })?;
-        if names.is_empty() {
-            break;
-        }
-        for n in names {
-            w.objects += 1;
-            if w.objects > w.limit {
-                return Err(identity("the tree is too large"));
-            }
-            let (cx, ch) = child(o, &h, &n, w.anchor_mnt)?.ok_or(identity("an entry vanished"))?;
-            if !w.owner_ok(cx.uid, 2) {
-                return Err(identity("an object owned by a foreign uid"));
-            }
-            if let Some(ch) = ch {
-                pass1(o, &mut w, &ch, 2).map_err(|e| if e.fail == Fail::Preflight { identity(e.msg) } else { e })?;
-            }
-        }
-    }
+    // Pass 1 over the root's entries, the root itself not locked down; every directory below is, as §5. Once it has
+    // begun, a lockdown may have happened, so EVERY refusal in it (the root's own entries included) is 73, never 66.
+    contents_pass1(o, &mut w, &h).map_err(|e| if e.fail == Fail::Preflight { identity(e.msg) } else { e })?;
     drop(h);
     // Pass 2: rounds over fresh handles of the root, each re-checked as the same unchanged object.
     let mut rounds = 0usize;
@@ -1138,6 +1121,29 @@ fn remove_contents_limited<O: Ops>(o: &mut O, anchor: &str, name: &str, expect_p
         if !remove_entries(o, &mut w, &rh, 1)? {
             o.fsync(&rh).map_err(|_| err(Fail::Partial, "emptied; not yet confirmed durable"))?;
             return Ok(());
+        }
+    }
+}
+
+/// Pass 1 of `--contents` over the kept root's own entries (the caller maps every refusal to 73).
+fn contents_pass1<O: Ops>(o: &mut O, w: &mut Walk, root: &O::H) -> Result<()> {
+    loop {
+        let names = o.batch(root).map_err(open_err)?;
+        if names.is_empty() {
+            return Ok(());
+        }
+        for n in names {
+            w.objects += 1;
+            if w.objects > w.limit {
+                return Err(identity("the tree is too large"));
+            }
+            let (cx, ch) = child(o, root, &n, w.anchor_mnt)?.ok_or(identity("an entry vanished"))?;
+            if !w.owner_ok(cx.uid, 2) {
+                return Err(identity("an object owned by a foreign uid"));
+            }
+            if let Some(ch) = ch {
+                pass1(o, w, &ch, 2)?;
+            }
         }
     }
 }
@@ -1192,6 +1198,7 @@ pub(crate) mod tests {
         pub(crate) counts: BTreeMap<&'static str, usize>,
         pub(crate) hook: Option<(&'static str, usize, Hook)>,
         pub(crate) fail: Option<&'static str>,
+        pub(crate) fail_after: Option<&'static str>,
         /// A kernel that reports a different mount without failing the open (the mnt_id postcondition must refuse).
         pub(crate) no_exdev: bool,
         pub(crate) cursors: BTreeMap<u64, usize>,
@@ -1252,7 +1259,7 @@ pub(crate) mod tests {
 
     impl Fake {
         pub(crate) fn new() -> Fake {
-            let mut f = Fake { nodes: BTreeMap::new(), files: BTreeMap::new(), fsid: 0xabcd_0000_1234, next_ino: 2, counts: BTreeMap::new(), hook: None, fail: None, no_exdev: false, cursors: BTreeMap::new(), log: vec![], xattrs: BTreeMap::new(), errno_at: None, quota: None, space: (1 << 20, 1 << 20), exe: String::new(), proj_skew: 0, caps_fail: false, joined: false, turn_root_mnt: MNT + 900 };
+            let mut f = Fake { nodes: BTreeMap::new(), files: BTreeMap::new(), fsid: 0xabcd_0000_1234, next_ino: 2, counts: BTreeMap::new(), hook: None, fail: None, fail_after: None, no_exdev: false, cursors: BTreeMap::new(), log: vec![], xattrs: BTreeMap::new(), errno_at: None, quota: None, space: (1 << 20, 1 << 20), exe: String::new(), proj_skew: 0, caps_fail: false, joined: false, turn_root_mnt: MNT + 900 };
             f.add("", S_IFDIR | 0o755, 0, 0);
             f.nodes.get_mut("").unwrap().id.attributes = libc::STATX_ATTR_MOUNT_ROOT as u64;
             for d in ["run", "run/sagebrush", "run/sagebrush/binds", "var", "var/lib", "var/lib/sagebrush", "var/lib/sagebrush/contract", "srv", "srv/sagebrush", "srv/sagebrush/agents", "srv/sagebrush/agent-config"] {
@@ -2020,6 +2027,24 @@ pub(crate) mod tests {
             if what.contains("on the root") {
                 assert!(!f.log.iter().any(|l| l.starts_with("chmod")), "{what}: {:?}", f.log);
             }
+        }
+        // Any pass-1 failure AFTER an earlier entry's directory was locked down: 73 (a lockdown happened), never 66,
+        // whether opening, reading metadata, listing or reading an ACL fails, at the root's own entries or below.
+        // The home's entries are listed `%FFraw`, `link`, `proj`, `z` (sorted keys, two per batch); `proj`'s lockdown
+        // comes first, then the next such operation fails (`generation`: `z`'s, a root entry's own metadata).
+        for op in ["at", "generation", "list", "has_acl"] {
+            let mut f = Fake::new();
+            let d = destinations(&mut f);
+            let (anchor, name, r, owners) = d[0].clone();
+            f.node(&format!("{r}/proj")).id.mode = S_IFDIR | 0o775;
+            f.file(&format!("{r}/z"), UID, 0o600);
+            let x = contents_expect(&mut f, &r, &owners);
+            f.counts.clear();
+            f.log.clear();
+            f.fail_after = Some(op);
+            f.hook = Some(("chmod", 1, |f| f.fail = f.fail_after));
+            assert_eq!(code(remove_contents(&mut f, anchor, &name, &x)), 73, "{op}: {:?}", f.log);
+            assert!(f.log.iter().any(|l| l.starts_with("chmod ")) && f.count("unlink") == 0, "{op}: {:?}", f.log);
         }
         // An other-write bit on the root, recorded so (the identity matches): still refused, before any lockdown.
         let mut f = Fake::new();

@@ -77,7 +77,7 @@ async function world(over = {}) {
   const root = mkdtempSync(join(tmpdir(), "sb-resume-"));
   const e = { root, dir: join(root, "run"), fenceDir: join(root, "fence"), leaseFenceDir: join(root, "fence", "lease"), slice: join(root, "cg") };
   const c = fakeClock(), locks = fakeLocks(), sys = fakeSys(e, { locks });
-  const rec = { lease_id: "L", lg: 1, expiry_tick: c.boot() + 600_000, gen: 5 };
+  const rec = { lease_id: "L", lg: 1, expiry_tick: c.boot() + 600_000, gen: 5, sg: 0 };
   await armWatchdog(A, rec, { sys, clock: c });
   assert.equal(await publish(A, rec, { dir: e.dir, sys, clock: c }), true);
   raiseFence("restore", A, { dir: e.fenceDir });
@@ -414,7 +414,7 @@ test("the supervisor with the REAL liveLease: a published, live record for the c
     const clock = { boot: () => 1_000_000, mono: () => 5_000_000_000 };
     return (a) => liveLease(a, { dir, sys, clock });
   };
-  const rec = (gen) => ({ lease_id: "L7", lg: 3, expiry_tick: 1_000_000 + 600_000, gen });
+  const rec = (gen) => ({ lease_id: "L7", lg: 3, expiry_tick: 1_000_000 + 600_000, gen, sg: 0 });
   // Live, gen = entry_gen (5): the helper is launched with the record's lease_id, lg and gen.
   const ok = supervisor({ liveLease: real({ rec: rec(5) }), checkTransferForHost: () => ({ first: true }) });
   assert.deepEqual(await requestResume(A, ok.opts), { resumed: true, reason: null });

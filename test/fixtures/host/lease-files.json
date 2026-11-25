@@ -1,5 +1,5 @@
 {
- "about": "The execution lease's runtime files, read by both lease.mjs (js) and the launcher's lease-check (rust). A tombstone's value, or null when refused; a record accepted or not. Rust is never more lenient than JS: where they differ (16-digit tombstones are never written by lease.mjs; 5.0 and duplicate keys, lg's or gen's, are never written by its JSON.stringify), Rust refuses, which fails closed.",
+ "about": "The execution lease's runtime files, read by both lease.mjs (js) and the launcher's lease-check (rust). A tombstone's value, or null when refused; a record accepted or not. Rust is never more lenient than JS: where they differ (16-digit tombstones are never written by lease.mjs; 5.0 and duplicate keys, lg's or gen's, are never written by its JSON.stringify), Rust refuses, which fails closed. Records carry sg, the suspend gate's generation (lease-on r1.5 \u00a76.2), a safe integer >= 0. The gate rows decide the suspend gate (\u00a76.1) from the two files' texts (null = absent) and now on CLOCK_BOOTTIME (ms): open is the generation, or null when closed; JS and Rust must agree exactly.",
  "tombstones": [
   {
    "text": "0\n",
@@ -59,52 +59,52 @@
  ],
  "records": [
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":3}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":3,\"sg\":0}",
    "js": true,
    "rust": true
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":9007199254740991,\"expiry_tick\":9007199254740991,\"gen\":3}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":9007199254740991,\"expiry_tick\":9007199254740991,\"gen\":3,\"sg\":0}",
    "js": true,
    "rust": true
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":9007199254740992,\"expiry_tick\":1,\"gen\":3}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":9007199254740992,\"expiry_tick\":1,\"gen\":3,\"sg\":0}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":0,\"expiry_tick\":1,\"gen\":3}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":0,\"expiry_tick\":1,\"gen\":3,\"sg\":0}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":-1,\"gen\":3}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":-1,\"gen\":3,\"sg\":0}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":1,\"x\":1,\"gen\":3}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":1,\"x\":1,\"gen\":3,\"sg\":0}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"lg\":5,\"expiry_tick\":1,\"gen\":3}",
+   "text": "{\"lease_id\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"lg\":5,\"expiry_tick\":1,\"gen\":3,\"sg\":0}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"a b\",\"lg\":5,\"expiry_tick\":1,\"gen\":3}",
+   "text": "{\"lease_id\":\"a b\",\"lg\":5,\"expiry_tick\":1,\"gen\":3,\"sg\":0}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5.0,\"expiry_tick\":1,\"gen\":3}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5.0,\"expiry_tick\":1,\"gen\":3,\"sg\":0}",
    "js": true,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":1,\"lg\":2,\"expiry_tick\":1,\"gen\":3}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":1,\"lg\":2,\"expiry_tick\":1,\"gen\":3,\"sg\":0}",
    "js": true,
    "rust": false
   },
@@ -114,54 +114,257 @@
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":1}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":1,\"sg\":0}",
    "js": true,
    "rust": true
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":9007199254740991}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":9007199254740991,\"sg\":0}",
    "js": true,
    "rust": true
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":0}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":0,\"sg\":0}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":9007199254740992}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":9007199254740992,\"sg\":0}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":\"3\"}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":\"3\",\"sg\":0}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":1.5}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":1.5,\"sg\":0}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":-1}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":-1,\"sg\":0}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":null}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":null,\"sg\":0}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":3.0}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":3.0,\"sg\":0}",
    "js": true,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":2,\"gen\":3}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":2,\"gen\":3,\"sg\":0}",
    "js": true,
    "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":3}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":3,\"sg\":-1}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":3,\"sg\":9007199254740991}",
+   "js": true,
+   "rust": true
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":3,\"sg\":9007199254740992}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":3,\"sg\":\"0\"}",
+   "js": false,
+   "rust": false
+  }
+ ],
+ "gate": [
+  {
+   "name": "both absent",
+   "sleep": null,
+   "reopen": null,
+   "now": 1000,
+   "js": 0,
+   "rust": 0
+  },
+  {
+   "name": "sleep alone",
+   "sleep": "{\"gen\":1,\"phase\":\"pre\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": null,
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "reopen alone",
+   "sleep": null,
+   "reopen": "{\"gen\":1}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "post acknowledged",
+   "sleep": "{\"gen\":3,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":3}",
+   "now": 1000,
+   "js": 3,
+   "rust": 3
+  },
+  {
+   "name": "post unacknowledged",
+   "sleep": "{\"gen\":3,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "pre",
+   "sleep": "{\"gen\":3,\"phase\":\"pre\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "pre with equal reopen",
+   "sleep": "{\"gen\":3,\"phase\":\"pre\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":3}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "reopen ahead",
+   "sleep": "{\"gen\":3,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":4}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "open at G_max",
+   "sleep": "{\"gen\":9007199254740990,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":9007199254740990}",
+   "now": 1000,
+   "js": 9007199254740990,
+   "rust": 9007199254740990
+  },
+  {
+   "name": "terminal generation never opens",
+   "sleep": "{\"gen\":9007199254740991,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":9007199254740991}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "pre_at equal to now",
+   "sleep": "{\"gen\":3,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":1000}",
+   "reopen": "{\"gen\":3}",
+   "now": 1000,
+   "js": 3,
+   "rust": 3
+  },
+  {
+   "name": "pre_at in the future",
+   "sleep": "{\"gen\":3,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":1001}",
+   "reopen": "{\"gen\":3}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "pre_ok false still opens when acknowledged",
+   "sleep": "{\"gen\":3,\"phase\":\"post\",\"pre_ok\":false,\"pre_at\":0}",
+   "reopen": "{\"gen\":3}",
+   "now": 1000,
+   "js": 3,
+   "rust": 3
+  },
+  {
+   "name": "malformed sleep (extra key)",
+   "sleep": "{\"gen\":3,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0,\"x\":1}",
+   "reopen": "{\"gen\":3}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "malformed sleep (missing pre_at)",
+   "sleep": "{\"gen\":3,\"phase\":\"post\",\"pre_ok\":true}",
+   "reopen": "{\"gen\":3}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "malformed sleep (phase)",
+   "sleep": "{\"gen\":3,\"phase\":\"open\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":3}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "sleep gen 0",
+   "sleep": "{\"gen\":0,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":0}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "reopen gen 0 with sleep gen 0",
+   "sleep": "{\"gen\":0,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":0}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "malformed reopen",
+   "sleep": "{\"gen\":3,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":\"3\"}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "reopen extra key",
+   "sleep": "{\"gen\":3,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":3,\"x\":1}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "sleep gen over the safe range",
+   "sleep": "{\"gen\":9007199254740992,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":9007199254740992}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "not JSON",
+   "sleep": "post 3",
+   "reopen": "{\"gen\":3}",
+   "now": 1000,
+   "js": null,
+   "rust": null
   }
  ]
 }

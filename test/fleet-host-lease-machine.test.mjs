@@ -18,6 +18,7 @@ import { MARGIN_MS, helperScope, leaseActivate, leaseThaw, readGate, readRecord,
 import { readRecord as readRestore, writeRecord as writeRestore } from "../lib/fleet/host/restore-record.mjs";
 import { RESUME_HELPER_MS, requestResume, resumeCgroup, resumeRestored } from "../lib/fleet/host/restore-resume.mjs";
 import { IGNORED, LeaseMachine, MAX_TTL_MS, RENEW_MS } from "../lib/fleet/host/lease-machine.mjs";
+import { resumeBase, resumeRequester } from "../lib/fleet/host/host-main.mjs";
 import { agentSlice } from "../lib/fleet/host/names.mjs";
 
 const tmp = (n) => mkdtempSync(join(tmpdir(), `sb-lm-${n}-`));
@@ -1509,5 +1510,26 @@ test("TESTS H2: close() DURING the activation lock's release returns at once; th
   assert.equal(w.machine.current(A), null);
   assert.ok(readTombstone(A, { dir: w.leaseDir }) >= old.lg);
   assert.equal(w.leaseUp(A), true);
+  await w.close();
+});
+
+// ---- lease on's restore resume (lease-on r1.7 §1, C1): the machine's live lease is the ONLY one the resume sees
+
+test("C1 with the REAL executor: resume-restored reaches the resume through resumeRequester with exactly the machine's live lease", async () => {
+  const seen = [];
+  const base = resumeBase({ restoreState: () => "validated", tagsOf: () => [], pairOf: () => null, verifyTransferReceipt: async () => ({}),
+    checkTransferForHost: () => ({}), aud: "https://a", fleet: "F", host: { entryGen: () => 1, recordTransfer: () => {} }, run: async () => ({}),
+    node: "/n", main: "/m", ms: RESUME_HELPER_MS });
+  const w = await world({ resumeOp: () => resumeRequester(base, () => ({ chain: 1 }), async (agent, opts) => {
+    seen.push({ agent, keys: Object.keys(opts).sort(), live: await opts.liveLease(agent) });
+    return { resumed: false, reason: "no_receipt" };
+  }) });
+  await restored(w);
+  const r = await resumeRestoredOp(w);
+  assert.equal(r.status, "refused");
+  assert.equal(seen.length, 1);
+  assert.notEqual(seen[0].live, null);
+  assert.deepEqual(seen[0].live, await w.machine.live(A), "exactly the machine's");
+  assert.ok(!seen[0].keys.includes("chain") && seen[0].keys.includes("verifyCtx"));
   await w.close();
 });

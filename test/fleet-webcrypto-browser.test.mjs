@@ -30,13 +30,16 @@ const RESULT_MS = 60_000; // (from the page's request: until the page reports)
 const SLOW_MS = 3000; // (a page asked for later than this, though the test passes, prints how Chromium started)
 const RECOVERY_KNOWN = ["QIgcRL3kWMdpVNtbHP7lkw", "8f8Zi-ibteyHFwp-PnAVfGC6-_75Je6BNI9mNkG6PM0"];
 
-function findChrome() {
-  if (process.env.SAGEBRUSH_CHROME) return process.env.SAGEBRUSH_CHROME;
-  for (const dir of (process.env.PATH ?? "").split(delimiter))
-    // (Chrome first: on Ubuntu runners /usr/bin/chromium is the snap's wrapper, whose own start-up took 24 s under
-    // load, before Chromium printed anything; the runners also carry Google Chrome)
-    for (const name of ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser"])
-      if (dir && existsSync(join(dir, name))) return join(dir, name);
+// (Google Chrome before Chromium, whichever PATH directory each is in: names outside, directories inside. On Ubuntu
+// runners /usr/bin/chromium is the snap's wrapper, whose own start-up took 24 s under load before Chromium printed
+// anything, and the runners also carry Google Chrome. SAGEBRUSH_CHROME, when set, decides.)
+const BROWSERS = ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser"];
+export function findChrome(env = process.env, exists = existsSync) {
+  if (env.SAGEBRUSH_CHROME) return env.SAGEBRUSH_CHROME;
+  const dirs = (env.PATH ?? "").split(delimiter).filter(Boolean);
+  for (const name of BROWSERS)
+    for (const dir of dirs)
+      if (exists(join(dir, name))) return join(dir, name);
   return null;
 }
 const chrome = process.platform === "linux" ? findChrome() : null;
@@ -172,4 +175,22 @@ test("headless Chromium: the core with the WebCrypto backend passes every shared
     server.close();
     server.closeAllConnections?.();
   }
+});
+
+test("the browser's selection: Google Chrome before Chromium across PATH directories, the override first, none found", () => {
+  const P = (...d) => d.join(delimiter);
+  const at = (...files) => (p) => files.includes(p);
+  // (Chromium in an earlier directory, Google Chrome in a later one: Chrome)
+  assert.equal(findChrome({ PATH: P("/early", "/late") }, at("/early/chromium", "/late/google-chrome-stable")), "/late/google-chrome-stable");
+  assert.equal(findChrome({ PATH: P("/early", "/late") }, at("/early/chromium-browser", "/late/google-chrome")), "/late/google-chrome");
+  // (within one name, the first PATH directory wins)
+  assert.equal(findChrome({ PATH: P("/a", "/b") }, at("/a/google-chrome", "/b/google-chrome")), "/a/google-chrome");
+  assert.equal(findChrome({ PATH: P("/a", "/b") }, at("/b/google-chrome-stable", "/a/google-chrome")), "/b/google-chrome-stable");
+  // (only Chromium: Chromium)
+  assert.equal(findChrome({ PATH: P("/a") }, at("/a/chromium")), "/a/chromium");
+  // (the override decides, whatever PATH holds)
+  assert.equal(findChrome({ SAGEBRUSH_CHROME: "/opt/c", PATH: P("/a") }, at("/a/google-chrome-stable")), "/opt/c");
+  // (nothing, or an empty PATH)
+  assert.equal(findChrome({ PATH: P("/a") }, at()), null);
+  assert.equal(findChrome({}, at("/google-chrome")), null);
 });

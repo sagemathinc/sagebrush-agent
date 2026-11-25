@@ -1013,6 +1013,11 @@ pub(crate) mod tests {
         pub(crate) exe: String,
         pub(crate) proj_skew: u32,
         pub(crate) caps_fail: bool,
+        /// The turn's two mount namespaces (A5 r4.6): set by `setns`. From then on, any lookup through a HOST
+        /// handle is refused and logged as `SEALED ...`; host-only paths can't be reached from a turn handle.
+        pub(crate) joined: bool,
+        /// The turn root's mount id (a private copy has its own; a test makes it the host's).
+        pub(crate) turn_root_mnt: u64,
     }
 
     /// The fake's batch size: small, so every walk crosses batch boundaries.
@@ -1055,7 +1060,7 @@ pub(crate) mod tests {
 
     impl Fake {
         pub(crate) fn new() -> Fake {
-            let mut f = Fake { nodes: BTreeMap::new(), files: BTreeMap::new(), fsid: 0xabcd_0000_1234, next_ino: 2, counts: BTreeMap::new(), hook: None, fail: None, no_exdev: false, cursors: BTreeMap::new(), log: vec![], xattrs: BTreeMap::new(), errno_at: None, quota: None, space: (1 << 20, 1 << 20), exe: String::new(), proj_skew: 0, caps_fail: false };
+            let mut f = Fake { nodes: BTreeMap::new(), files: BTreeMap::new(), fsid: 0xabcd_0000_1234, next_ino: 2, counts: BTreeMap::new(), hook: None, fail: None, no_exdev: false, cursors: BTreeMap::new(), log: vec![], xattrs: BTreeMap::new(), errno_at: None, quota: None, space: (1 << 20, 1 << 20), exe: String::new(), proj_skew: 0, caps_fail: false, joined: false, turn_root_mnt: MNT + 900 };
             f.add("", S_IFDIR | 0o755, 0, 0);
             f.nodes.get_mut("").unwrap().id.attributes = libc::STATX_ATTR_MOUNT_ROOT as u64;
             for d in ["run", "run/sagebrush", "run/sagebrush/binds", "var", "var/lib", "var/lib/sagebrush", "var/lib/sagebrush/contract", "srv", "srv/sagebrush", "srv/sagebrush/agents", "srv/sagebrush/agent-config"] {
@@ -1127,13 +1132,33 @@ pub(crate) mod tests {
         pub(crate) id: u64,
         /// The inode opened: like a real fd, the handle keeps naming it if the path is replaced afterwards.
         pub(crate) ino: u64,
+        /// Opened in the turn's namespace (A5 r4.6), not the host's.
+        pub(crate) turn: bool,
     }
 
     impl Fake {
         pub(crate) fn handle(&mut self, p: String) -> FH {
             self.next_ino += 1;
             let ino = self.nodes.get(&p).map_or(0, |n| n.id.ino);
-            FH { p, id: self.next_ino, ino }
+            FH { p, id: self.next_ino, ino, turn: false }
+        }
+        /// A handle in the same namespace as `from`.
+        pub(crate) fn handle_in(&mut self, p: String, from: &FH) -> FH {
+            let mut h = self.handle(p);
+            h.turn = from.turn;
+            h
+        }
+        /// After `setns`, a lookup through a host handle is refused and recorded (A5 r4.6); before it, nothing.
+        pub(crate) fn sealed(&mut self, op: &str, h: &FH) -> io::Result<()> {
+            if self.joined && !h.turn {
+                self.log.push(format!("SEALED {op} {}", h.p));
+                return Err(e(libc::EBADF));
+            }
+            Ok(())
+        }
+        /// Host paths the unit's view doesn't show (the profiles, the agents' stores, the host's /proc).
+        pub(crate) fn hidden(&self, from: &FH, p: &str) -> bool {
+            from.turn && ["srv/sagebrush/claude-profiles", "srv/sagebrush/agents", "proc"].iter().any(|h| p == *h || p.starts_with(&format!("{h}/")))
         }
     }
 
@@ -1142,13 +1167,21 @@ pub(crate) mod tests {
         fn root(&mut self) -> io::Result<FH> {
             Ok(self.handle(String::new()))
         }
-        fn dir_from_root(&mut self, _root: &FH, rel: &str) -> io::Result<FH> {
+        fn dir_from_root(&mut self, root: &FH, rel: &str) -> io::Result<FH> {
+            self.sealed("open", root)?;
+            if self.hidden(root, rel) {
+                return Err(e(libc::ENOENT));
+            }
             let n = self.nodes.get(rel).ok_or(e(libc::ENOENT))?;
-            if n.id.mode & S_IFMT != S_IFDIR { Err(e(libc::ENOTDIR)) } else { Ok(self.handle(rel.to_string())) }
+            if n.id.mode & S_IFMT != S_IFDIR { Err(e(libc::ENOTDIR)) } else { Ok(self.handle_in(rel.to_string(), root)) }
         }
         fn at(&mut self, dir: &FH, name: impl AsRef<[u8]>, how: At) -> io::Result<FH> {
             self.tick("at")?;
+            self.sealed("at", dir)?;
             let p = join(&dir.p, &key(name.as_ref()));
+            if self.hidden(dir, &p) {
+                return Err(e(libc::ENOENT));
+            }
             let n = self.nodes.get(&p).ok_or(e(libc::ENOENT))?;
             if n.id.mnt_id != self.nodes[&dir.p].id.mnt_id && !self.no_exdev {
                 return Err(e(libc::EXDEV));
@@ -1159,13 +1192,17 @@ pub(crate) mod tests {
             if how == At::Dir && n.id.mode & S_IFMT != S_IFDIR {
                 return Err(e(libc::ENOTDIR));
             }
-            Ok(self.handle(p))
+            Ok(self.handle_in(p, dir))
         }
         fn ident(&mut self, h: &FH) -> io::Result<Ident> {
-            // The opened object's identity: a path replaced since the open still reports the opened inode.
-            self.nodes.get(&h.p).map(|n| Ident { ino: if h.ino != 0 { h.ino } else { n.id.ino }, ..n.id }).ok_or(e(libc::ENOENT))
+            self.sealed("stat", h)?;
+            // The opened object's identity: a path replaced since the open still reports the opened inode. The turn's
+            // root is a private copy of the host's root mount, with its own mount id.
+            let mnt = if h.turn && h.p.is_empty() { Some(self.turn_root_mnt) } else { None };
+            self.nodes.get(&h.p).map(|n| Ident { ino: if h.ino != 0 { h.ino } else { n.id.ino }, mnt_id: mnt.unwrap_or(n.id.mnt_id), ..n.id }).ok_or(e(libc::ENOENT))
         }
         fn ident_at(&mut self, dir: &FH, name: impl AsRef<[u8]>) -> io::Result<Ident> {
+            self.sealed("statat", dir)?;
             self.nodes.get(&join(&dir.p, &key(name.as_ref()))).map(|n| n.id).ok_or(e(libc::ENOENT))
         }
         fn generation(&mut self, h: &FH) -> io::Result<u32> {
@@ -1181,6 +1218,7 @@ pub(crate) mod tests {
         /// At most BATCH names per call from this handle's cursor, then empty forever: a spent handle lists nothing.
         fn batch(&mut self, dir: &FH) -> io::Result<Vec<Vec<u8>>> {
             self.tick("list")?;
+            self.sealed("list", dir)?;
             let at = *self.cursors.get(&dir.id).unwrap_or(&0);
             if at == 0 {
                 self.log.push(format!("list {}", dir.p));
@@ -1257,7 +1295,11 @@ pub(crate) mod tests {
             self.log.push(format!("fsync {}", h.p));
             Ok(())
         }
-        fn read(&mut self, _root: &FH, rel: &str, max: usize) -> io::Result<Vec<u8>> {
+        fn read(&mut self, root: &FH, rel: &str, max: usize) -> io::Result<Vec<u8>> {
+            self.sealed("read", root)?;
+            if self.hidden(root, rel) {
+                return Err(e(libc::ENOENT));
+            }
             let b = self.files.get(rel).ok_or(e(libc::ENOENT))?;
             if b.len() > max { Err(e(libc::EFBIG)) } else { Ok(b.clone()) }
         }

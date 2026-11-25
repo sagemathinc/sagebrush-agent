@@ -12,8 +12,6 @@
 //!   and the move; step 7's re-reads and binds. After step 3 nothing is looked up through a host handle.
 //! - A refusal at step 4, 5 or 7 is 73 (66 for a missing store or a failed operation); every other is 66.
 
-// Part 3a: nothing outside the tests calls this until part 3b adds the real operations and the entry point.
-#![allow(dead_code)]
 
 use crate::args::is_id;
 use crate::err::{err, Error, Fail, Result};
@@ -168,6 +166,8 @@ pub trait TurnOps: ProfileOps {
 #[derive(Debug)]
 /// What steps 2–7 leave: handles in the turn's namespace only (A5 r4.6). Every host handle, the host root's
 /// included, is closed when `stage` returns.
+/// The real run only holds them (closed at step 12); the tests read them.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct Staged<H> {
     pub profile: H,
     pub root: H,
@@ -508,18 +508,18 @@ impl TurnOps for tree::RealOps {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tree::tests::{code, e, join, Fake, FH, A, MNT};
     use crate::tree::{Ops, S_IFDIR, S_IFREG};
 
-    const TURN: &str = "0123456789abcdef0123456789abcdef";
-    const OP: &str = "fedcba9876543210fedcba9876543210";
-    const PID: &str = "bcdefghijklmnopqrstuvwxyza";
-    const AUID: u32 = 70001;
-    const SUID: u32 = 90003;
-    const PROJ: u32 = 100003;
-    const UNIT: u32 = 4242;
+    pub(crate) const TURN: &str = "0123456789abcdef0123456789abcdef";
+    pub(crate) const OP: &str = "fedcba9876543210fedcba9876543210";
+    pub(crate) const PID: &str = "bcdefghijklmnopqrstuvwxyza";
+    pub(crate) const AUID: u32 = 70001;
+    pub(crate) const SUID: u32 = 90003;
+    pub(crate) const PROJ: u32 = 100003;
+    pub(crate) const UNIT: u32 = 4242;
 
     impl TurnOps for Fake {
         type P = u32;
@@ -619,17 +619,17 @@ mod tests {
         }
     }
 
-    fn status(uids: &[u32], gids: &[u32], groups: &str) -> Vec<u8> {
+    pub(crate) fn status(uids: &[u32], gids: &[u32], groups: &str) -> Vec<u8> {
         let j = |v: &[u32]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("\t");
         format!("Name:\tx\nUid:\t{}\nGid:\t{}\nGroups:\t{groups} \n", j(uids), j(gids)).into_bytes()
     }
 
-    fn pdir() -> String {
+    pub(crate) fn pdir() -> String {
         format!("srv/sagebrush/claude-profiles/{PID}")
     }
 
     /// A host with the agent's unit running, a bound profile with two mountpoints, and the agent's session store.
-    fn host(mps: &[&str]) -> (Fake, TurnFile) {
+    pub(crate) fn host(mps: &[&str]) -> (Fake, TurnFile) {
         let mut f = Fake::new();
         for d in ["run", "run/sagebrush", "run/sagebrush/turns"] {
             if !f.nodes.contains_key(d) {
@@ -682,7 +682,15 @@ mod tests {
         (f, tf)
     }
 
-    fn turn_json(tf: &TurnFile) -> String {
+    /// The turn file for `tf`, where `turn` reads it: a root 0700 directory and a root 0600 file.
+    pub(crate) fn with_turn_file(f: &mut Fake, tf: &TurnFile) {
+        f.dir(&format!("run/sagebrush/turns/{TURN}"), 0, 0o700);
+        let p = format!("run/sagebrush/turns/{TURN}/turn.json");
+        f.file(&p, 0, 0o600);
+        f.files.insert(p, turn_json(tf).into_bytes());
+    }
+
+    pub(crate) fn turn_json(tf: &TurnFile) -> String {
         let mps: Vec<String> = tf.mountpoints.iter().map(|(n, i, g)| format!("{{\"name\":{},\"ino\":{i},\"gen\":{g}}}", json::quote(n))).collect();
         let gids: Vec<String> = tf.gids.iter().map(|g| g.to_string()).collect();
         let args: Vec<String> = tf.args.iter().map(|a| json::quote(a)).collect();

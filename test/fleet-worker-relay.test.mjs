@@ -172,6 +172,17 @@ test("control calls: the route, the method, the relay's MAC, the 60 s window and
   assert.equal(await bareOf(w.call("GET", epochsTarget(0), undefined, w.ctx(), { id })), 401, "the same call id again");
   const r = await handleControl({ method: "GET", target: epochsTarget(0), headers: {}, body: new Uint8Array(0) }, w.ctx());
   assert.equal(r.status, 401, "no auth header");
+  // (a call-id store that throws, or rejects: a bare 500, nothing signed, and nothing read after it)
+  for (const [why, consumeCallId] of [["throws", () => { throw new Error("STORE_CANARY"); }], ["rejects", async () => { throw new Error("STORE_CANARY"); }]]) {
+    let after = 0;
+    const c = w.ctx({ consumeCallId, feed: async (since) => { after++; return w.st.feedAnswer(since); }, accountOf: async () => { after++; return w.account; } });
+    for (const [method, target, body] of [["GET", epochsTarget(0), undefined], ["POST", ADMIT_ROUTE, { v: 1, kind: "app" }]]) {
+      const r = await w.call(method, target, body, c);
+      assert.deepEqual([r.status, r.bodyText], [500, ""], `a call-id store that ${why}: ${method}`);
+    }
+    assert.equal(after, 0, `nothing after a call-id store that ${why}`);
+  }
+  assert.equal(await bareOf(w.call("GET", epochsTarget(0), undefined, w.ctx({ consumeCallId: async () => "yes" }))), 401, "only true counts as new");
   const big = await handleControl({ method: "POST", target: ADMIT_ROUTE, headers: {}, body: new Uint8Array(128 * 1024 + 1) }, w.ctx());
   assert.equal(big.status, 413, "a body over 128 KiB, before the MAC");
 });
@@ -211,6 +222,45 @@ test("admit, app: issue then admit, the answer's facts; the token taken once; lo
   await issuedThen("the token past its expiry", "unauthenticated", () => { w.st.now = NOW + APP_TOKEN_MS; }, () => { w.st.now = NOW; });
   const unknown = await w.appAdmit(s, `rt1.${b64(randomBytes(32))}`, nonce());
   assert.deepEqual([unknown.value.result, unknown.value.code], ["refused", "unauthenticated"], "a token never issued");
+});
+
+test("admit, app: the token is spent before the Worker reads its chain or host: a read that fails or finds nothing burns it", async () => {
+  const w = await world();
+  const s = w.session();
+  const cases = [
+    ["a chain read that rejects", { chain: async () => { throw new Error("STORE_CANARY"); } }, 500],
+    ["a chain read that throws", { chain: () => { throw new Error("STORE_CANARY"); } }, 500],
+    ["a host read that rejects", { host: async () => { throw new Error("STORE_CANARY"); } }, 500],
+    ["no chain for the fleet", { chain: async () => null }, "not_granted"],
+    ["no such host", { host: async () => null }, "stale_generation"],
+  ];
+  for (const [why, over, want] of cases) {
+    const request = nonce();
+    const { token } = JSON.parse(text((await w.issue(s, request)).body));
+    const r = await w.appAdmit(s, token, request, w.ctx(over));
+    if (want === 500) assert.deepEqual([r.status, r.bodyText], [500, ""], `${why}: a bare 500`);
+    else assert.deepEqual([r.value.result, r.value.code], ["refused", want], why);
+    assert.equal(w.st.rows.has(await appTokenKey(token)), false, `${why}: the token is gone`);
+    const again = await w.appAdmit(s, token, request);
+    assert.deepEqual([again.value.result, again.value.code], ["refused", "unauthenticated"], `${why}: presented again, with the state fine now`);
+  }
+  // (and an unknown token reads nothing at all)
+  let reads = 0;
+  const r = await w.appAdmit(s, `rt1.${b64(randomBytes(32))}`, nonce(), w.ctx({ chain: async () => { reads++; return null; }, host: async () => { reads++; return null; } }));
+  assert.deepEqual([r.value.code, reads], ["unauthenticated", 0]);
+  // (nor a token whose row fails its own checks: expired, or bound to another open; each burned, nothing read)
+  const counting = () => w.ctx({ chain: async () => { reads++; return null; }, host: async () => { reads++; return null; } });
+  const rq = nonce();
+  const { token: late } = JSON.parse(text((await w.issue(s, rq)).body));
+  w.st.now = NOW + APP_TOKEN_MS;
+  const ex = await w.appAdmit(s, late, rq, counting());
+  w.st.now = NOW;
+  assert.deepEqual([ex.value.code, reads], ["unauthenticated", 0], "expired: nothing read");
+  const rq2 = nonce();
+  const { token: other } = JSON.parse(text((await w.issue(s, rq2)).body));
+  const mm = await w.appAdmit(s, other, rq2, counting(), 1);
+  assert.deepEqual([mm.value.code, reads], ["bad_form", 0], "bound to resume_n 0, presented at 1: nothing read");
+  assert.equal(w.st.rows.size, 0, "both burned");
 });
 
 test("admit, app: two admits presenting one token at once: exactly one ok, one unauthenticated, and the row taken", async () => {

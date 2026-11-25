@@ -44,6 +44,15 @@ test("preflight: bounded; past its time the signal aborts and the answer is a re
   assert.ok(Date.now() - t0 < 150, "didn't wait for the late answer");
   assert.equal(seen.ms, 30);
   assert.equal(seen.signal.aborted, true);
+  // An answer that settles after the deadline while a busy event loop keeps the timer from firing: still refused, and
+  // the signal aborted (the deadline is checked when the answer arrives, not only by the timer).
+  let late;
+  const busy = async (ms, signal) => { late = signal; await null; const until = performance.now() + 30; while (performance.now() < until); return V255; };
+  assert.equal(await hostSystemdPreflight(busy, 1), "qualify_required");
+  assert.equal(late.aborted, true);
+  // The same at a wider deadline: answered in 30 ms of a blocked loop against 20 ms.
+  assert.equal(await hostSystemdPreflight(busy, 20), "qualify_required");
+  assert.equal(late.aborted, true);
   // In time: not aborted.
   let sig;
   assert.equal(await hostSystemdPreflight(async (ms, signal) => { sig = signal; return V255; }, 1000), null);

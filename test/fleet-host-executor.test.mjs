@@ -440,6 +440,42 @@ test("systemd preflight: a paused agent's resume is refused before its fence, st
   await close();
 });
 
+test("systemd preflight: a valid answer after the deadline (a busy event loop) refuses, aborts, audits and latches; no start", async () => {
+  const { sup, store, fx, close } = await setup({ deadlines: { "systemd-version": 200 } });
+  let signal;
+  // The right systemd, answering 300 ms in, with the event loop blocked the whole time (the timer can't fire).
+  fx.systemd = (ms, s) => { signal = s; const until = performance.now() + 300; while (performance.now() < until); return "systemd 255 (255.4-1ubuntu8.19)\n"; };
+  const r = await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  assert.deepEqual(r.ack?.restarted ?? [], []);
+  assert.equal(signal.aborted, true, "the expired effect is aborted");
+  assert.ok(!fx.log.some((l) => l[0] === "unmask" || l[0] === "start"), JSON.stringify(fx.log));
+  assert.ok(!fx.intents.some((i) => i.kind === "agent.start"));
+  assert.equal(store.registry.agent(A).state, "provisioned");
+  assert.deepEqual(fx.audits.filter((a) => a.kind === "agent.start"), [{ kind: "agent.start", agent: A, gen: 1, phase: "refused", reason: "qualify_required" }]);
+  assert.equal(store.qualification.state, "qualify_required");
+  await close();
+});
+
+test("systemd preflight: a paused agent's late valid answer (a busy event loop) refuses the resume: no thaw, latched", async () => {
+  const { sup, store, fx, close } = await setup({ deadlines: { "systemd-version": 200 } });
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
+  await sup.submit({ kind: "pause", authority: "person", agent: A });
+  await sup.submit({ kind: "stop", agent: B, authority: "person" });
+  // The right systemd, answering 300 ms in, with the event loop blocked the whole time.
+  let signal;
+  fx.systemd = (ms, s) => { signal = s; const until = performance.now() + 300; while (performance.now() < until); return "systemd 255 (255.4-1ubuntu8.19)\n"; };
+  fx.log.length = 0;
+  assert.deepEqual(await sup.submit({ kind: "resume", authority: "person", agent: A }), { status: "refused", reason: "qualify_required", started: false });
+  assert.deepEqual([fx.log, store.registry.agent(A).state, fx.units[A].frozen], [[], "paused", true], "no thaw");
+  assert.equal(signal.aborted, true);
+  assert.deepEqual(fx.audits.at(-1), { kind: "agent.resume", agent: A, phase: "refused", reason: "qualify_required" });
+  assert.equal(store.qualification.state, "qualify_required");
+  fx.systemd = undefined;
+  assert.equal((await sup.submit({ kind: "resume", authority: "person", agent: B })).reason, "qualify_required");
+  assert.ok(!fx.log.some((l) => ["unmask", "start", "thaw"].includes(l[0])), JSON.stringify(fx.log));
+  await close();
+});
+
 // ---- lifecycle ops and authority
 
 test("who may do what: the service and the local CLI only narrow; a person also resumes and deletes", async () => {

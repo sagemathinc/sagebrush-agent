@@ -119,22 +119,15 @@ jobs:
           (cd "$RUNNER_TEMP/bb/c" && scripts/launcher-build.sh "$RUNNER_TEMP/launch-2")
           cmp "$RUNNER_TEMP/launch-1" "$RUNNER_TEMP/launch-2"
           sha256sum "$RUNNER_TEMP/launch-1"
-      # The release layout (lease-on r1.7 §2.5): scripts/release-install.sh, as root, twice into two directories; the
-      # launchers byte-identical, and each install's generated manifest equal to the checkout's.
+      # The trust boundary (lease-on r1.12 §2.5, §2.6): the checker, the preload regression and the fresh installer
+      # against the runner's real systemd, as root (scripts/release-trust-test.sh; the runner is disposable).
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24.21.0
+      - run: sudo install -m 0755 -o root -g root "$(readlink -f "$(command -v node)")" /usr/bin/node
       - run: |
-          for d in /opt/sb-release-1 /opt/sb-release-2; do
-            sudo env "PATH=$PATH" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" \
-              GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*' scripts/release-install.sh HEAD "$d"
-          done
-          sudo cmp /opt/sb-release-1/bin/sagebrush-agent-launch /opt/sb-release-2/bin/sagebrush-agent-launch
-          test "$(readlink /opt/sb-release-1/bin/sagebrush-agent)" = sagebrush-agent.mjs
-          node --input-type=module -e '
-            const { leaseManifest } = await import(process.cwd() + "/lib/fleet/host/lease-manifest.mjs");
-            const want = JSON.stringify(leaseManifest(process.cwd()));
-            for (const d of ["/opt/sb-release-1", "/opt/sb-release-2"]) if (JSON.stringify(leaseManifest(d)) !== want) { console.error(d); process.exit(1); }'
+          sudo env "PATH=$PATH" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" \
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*' scripts/release-trust-test.sh
 
   # The turn's syscall policy (schema/fleet/agent-seccomp-policy.json): regenerated from its pin, offline, in the pinned
   # Ubuntu 24.04 image with the pinned systemd, and required byte for byte (scripts/seccomp-policy-ci.sh). The network is

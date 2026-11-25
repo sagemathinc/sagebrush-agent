@@ -97,5 +97,6 @@
   "schema/fleet/host-config.schema.json",
   "schema/fleet/reasons.json",
   "scripts/launcher-build.sh",
-  "scripts/release-install.sh"
+  "scripts/release-install.sh",
+  "scripts/release-trust.sh"
 ]

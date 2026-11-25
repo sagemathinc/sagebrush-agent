@@ -1,31 +1,272 @@
 #!/bin/sh
-# A qualified release's layout (lease-on design r1.7 §2.5, C6), and a bound member of the lease qualification:
+# A qualified release's FRESH install (lease-on design r1.12 §2.5, §2.6), and a bound member of the lease
+# qualification:
 #
-#   scripts/release-install.sh <commit> <dest>        (run as root, from a clone holding <commit>)
+#   scripts/release-install.sh <commit> <dest>        (as root, from a clone holding <commit>, systemd running)
+#   scripts/release-install.sh --verify <dest>         (read-only: the effective unit is exactly the installed one)
 #
-# <dest> (which must not exist) becomes: every file `git archive <commit>` holds; bin/sagebrush-agent-launch, the
-# output of scripts/launcher-build.sh built from that same tree, 0755; bin/sagebrush-agent, a relative link to
-# sagebrush-agent.mjs (what the units run). Root's throughout, with no group or other write: leaseQualified() proves
-# exactly that, from / down to every member. No node_modules: the lease path imports none. Delivering a release to a
-# host is not this script's business; any other layout is simply unqualified.
+# SB_RELEASE_INSTALL_CUT=<step> (tests): stop with status 9 right after that step, as a crash there would.
+#
+# It installs a release and the trust boundary that keeps release code from running as root unless the tree is
+# root's: the checker /usr/lib/sagebrush/release-trust (outside the release), the supervisor unit (ExecStartPre: the
+# checker) and the system-sleep shim (the checker first). It enables and starts nothing; the person does.
+#
+# FRESH hosts only: any earlier sagebrush entrypoint, on disk or known to systemd, refuses with nothing touched.
+# Upgrade-in-place is a launch prerequisite (a later design), not done here. Steps (refusing at the first failure):
+#   0/1 (i)  read-only: <dest> absent; the absence probe; every destination and tool chain proven; what to create.
+#       (ii) create the missing directories, then prove every chain again.
+#   2  close: the closing drop-in (an unmet condition), daemon-reload, its loading verified.
+#   3  the release: git archive, the recipe's launcher, the dispatcher link, root's; the checker passes on it.
+#   4  the checker, the unit and the shim, each atomically (exclusive temp, owner, mode, fsync, rename, dir fsync).
+#   5  daemon-reload.  6  the EFFECTIVE unit verified, still closed.  7  open: the drop-in removed, reload, verified.
+# A cut at any point leaves nothing startable: before step 4 there is no unit; from step 2 to 7 the unit is closed.
 set -eu
+ORIG_PATH=$PATH
+PATH=/usr/bin:/bin
+export PATH
+STAT=/usr/bin/stat
+FIND=/usr/bin/find
+READLINK=/usr/bin/readlink
+SYSTEMCTL=/usr/bin/systemctl
+BUSCTL=/usr/bin/busctl
+ANALYZE=/usr/bin/systemd-analyze
+UNIT=sagebrush-supervisor.service
+ETC=/etc/systemd/system
+DROPDIR=$ETC/$UNIT.d
+CLOSED=$DROPDIR/00-closed.conf
+CLOSED_PATH=/nonexistent/sagebrush-closed
+LIBDIR=/usr/lib/sagebrush
+CHECKER=$LIBDIR/release-trust
+SLEEPDIR=/usr/lib/systemd/system-sleep
+SHIM=$SLEEPDIR/sagebrush-lease
 
-[ "$#" -eq 2 ] || { echo "usage: scripts/release-install.sh <commit> <dest>" >&2; exit 2; }
-commit=$1
-dest=$2
-case "$dest" in /*) ;; *) echo "release-install: <dest> must be absolute" >&2; exit 2 ;; esac
-[ ! -e "$dest" ] && [ ! -L "$dest" ] || { echo "release-install: $dest exists" >&2; exit 1; }
-[ "$(id -u)" -eq 0 ] || { echo "release-install: run as root" >&2; exit 1; }
-git rev-parse --verify --quiet "$commit^{commit}" >/dev/null || { echo "release-install: no such commit" >&2; exit 1; }
+no() { printf 'release-install: %s\n' "$1" >&2; exit 1; }
 
-umask 022
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
-mkdir "$work/tree"
-git archive --format=tar "$commit" | tar -x --no-same-owner --no-same-permissions -C "$work/tree"
-(cd "$work/tree" && scripts/launcher-build.sh "$work/tree/bin/sagebrush-agent-launch")
+[ "$#" -eq 2 ] || no "usage: scripts/release-install.sh <commit> <dest> | --verify <dest>"
+COMMIT=$1
+DEST=$2
+cut() { if [ "${SB_RELEASE_INSTALL_CUT:-}" = "$1" ]; then printf 'release-install: cut after step %s\n' "$1" >&2; exit 9; fi; }
+case "$DEST" in /*) ;; *) no "<dest> must be an absolute path" ;; esac
+case "$DEST" in *[!A-Za-z0-9/._-]*) no "<dest> has characters outside [A-Za-z0-9/._-]" ;; esac
+case "$DEST" in / | */ | *//* | */./* | */../* | */. | */..) no "<dest> isn't a normal path" ;; esac
+[ "$(id -u)" -eq 0 ] || no "run as root"
+VERIFY_ONLY=0
+if [ "$COMMIT" = --verify ]; then VERIFY_ONLY=1; else
+  REPO=$(pwd -P)
+  git -c safe.directory="$REPO" rev-parse --verify --quiet "$COMMIT^{commit}" >/dev/null || no "no such commit"
+fi
+
+# ---- the proofs (the same rules as scripts/release-trust.sh) ----------------------------------------------------------
+word() { case "$1" in d) echo "a directory" ;; f) echo "a regular file" ;; *) echo "a link" ;; esac; }
+meta() {
+  out=$("$STAT" -c '%u %f' -- "$1" 2>/dev/null) || return 0
+  set -- $out
+  printf '%s %s\n' "$1" "$((0x$2))"
+}
+owned() {
+  m=$(meta "$1")
+  [ -n "$m" ] || no "missing or unreadable: $1"
+  set -- "$1" "$2" $m
+  [ "$3" = 0 ] || no "not owned by root: $1"
+  t=$(($4 & 61440))
+  case "$t" in 16384) k=d ;; 32768) k=f ;; 40960) k=l ;; *) no "not a directory, regular file or link: $1" ;; esac
+  case "$2" in any) ;; *) [ "$k" = "$2" ] || no "$(word "$k") where $(word "$2") is required: $1" ;; esac
+  if [ "$k" != l ] && [ $(($4 & 18)) -ne 0 ]; then no "group- or other-writable: $1"; fi
+  return 0
+}
+chain() {
+  p=""
+  rest=${1#/}
+  owned / d
+  while [ -n "$rest" ]; do
+    seg=${rest%%/*}
+    case "$rest" in */*) rest=${rest#*/} ;; *) rest="" ;; esac
+    p="$p/$seg"
+    if [ -n "$rest" ]; then owned "$p" d; else owned "$p" "$2"; fi
+  done
+}
+tool() {
+  p=""
+  rest=${1#/}
+  owned / d
+  while [ -n "$rest" ]; do
+    seg=${rest%%/*}
+    case "$rest" in */*) rest=${rest#*/} ;; *) rest="" ;; esac
+    p="$p/$seg"
+    owned "$p" any
+  done
+  r=$("$READLINK" -f -- "$1" 2>/dev/null) || no "can't resolve: $1"
+  [ -n "$r" ] || no "can't resolve: $1"
+  chain "$r" f
+}
+# an existing install directory may only be the empty, root-owned 0755 trace of a cut install
+empty_trace() {
+  chain "$1" d
+  [ "$("$STAT" -c '%a' -- "$1")" = 755 ] || no "not mode 0755: $1"
+  [ -z "$("$FIND" "$1" -mindepth 1 -print -quit)" ] || no "not empty (an earlier install?): $1"
+}
+prove_all() {
+  for t in /bin/sh "$STAT" "$FIND" "$READLINK" /usr/bin/node "$SYSTEMCTL" "$BUSCTL" "$ANALYZE"; do tool "$t"; done
+  chain "$(dirname "$DEST")" d
+  chain /usr/lib d
+  chain "$ETC" d
+  chain "$SLEEPDIR" d
+  if [ -e "$LIBDIR" ] || [ -L "$LIBDIR" ]; then empty_trace "$LIBDIR"; fi
+  if [ -e "$DROPDIR" ] || [ -L "$DROPDIR" ]; then empty_trace "$DROPDIR"; fi
+  return 0
+}
+
+# ---- phase (i): wholly read-only -------------------------------------------------------------------------------------
+if [ "$VERIFY_ONLY" = 1 ]; then :; else
+if [ -e "$DEST" ] || [ -L "$DEST" ]; then no "<dest> exists: $DEST"; fi
+# The absence probe, on disk: every systemd unit lookup directory, any sagebrush-* entry (a unit, a link, a .d
+# directory, a .wants/.requires/.upholds link) or any link whose target names one. The drop-in directory is allowed
+# only as an empty trace (proven below), so it is skipped here but its contents are not.
+for d in $("$ANALYZE" unit-paths); do
+  [ -d "$d" ] || continue
+  x=$("$FIND" "$d" -maxdepth 2 \( -name 'sagebrush-*' -o -lname '*sagebrush-*' \) ! -path "$DROPDIR" -print -quit 2>/dev/null) \
+    || no "a unit directory can't be read: $d"
+  [ -z "$x" ] || no "a sagebrush systemd entry is present (not a fresh host): $x"
+done
+if [ -e "$SHIM" ] || [ -L "$SHIM" ]; then no "the sleep shim is present (not a fresh host): $SHIM"; fi
+# ... and in systemd: nothing by the name, loaded or as a unit file, in any state
+[ -d /run/systemd/system ] || no "systemd isn't running"
+x=$("$SYSTEMCTL" list-units --all --plain --no-legend --no-pager 'sagebrush-*' 2>&1) || no "systemctl list-units failed"
+[ -z "$x" ] || no "systemd knows a sagebrush unit (not a fresh host): $(printf '%s' "$x" | head -n 1)"
+x=$("$SYSTEMCTL" list-unit-files --no-legend --no-pager 'sagebrush-*' 2>&1) || no "systemctl list-unit-files failed"
+[ -z "$x" ] || no "systemd has a sagebrush unit file (not a fresh host): $(printf '%s' "$x" | head -n 1)"
+for u in "$UNIT" sagebrush-backup.service sagebrush-backup.timer; do
+  s=$("$SYSTEMCTL" show "$u" -p LoadState -p ActiveState -p SubState -p UnitFileState -p FragmentPath -p DropInPaths -p Names -p NeedDaemonReload 2>&1) \
+    || no "systemctl show $u failed"
+  want="LoadState=not-found
+ActiveState=inactive
+SubState=dead
+UnitFileState=
+FragmentPath=
+DropInPaths=
+Names=$u
+NeedDaemonReload=no"
+  [ "$(printf '%s\n' "$s" | sort)" = "$(printf '%s\n' "$want" | sort)" ] || no "systemd's state for $u isn't absent (not a fresh host)"
+done
+prove_all
+fi
+CREATE=""
+if [ "$VERIFY_ONLY" = 0 ]; then
+  [ -e "$LIBDIR" ] || CREATE="$CREATE $LIBDIR"
+  [ -e "$DROPDIR" ] || CREATE="$CREATE $DROPDIR"
+fi
+
+# ---- phase (ii): create, then prove again ----------------------------------------------------------------------------
+[ "$VERIFY_ONLY" = 1 ] || cut 1
+for d in $CREATE; do
+  mkdir -m 0755 -- "$d" || no "can't create $d"
+  chown 0:0 -- "$d"
+  chmod 0755 -- "$d"
+  sync -- "$(dirname "$d")"
+done
+[ "$VERIFY_ONLY" = 1 ] || { cut 1m; prove_all; }
+
+# atomic <target> <mode> <source file>: a fresh temp in the target's proven directory, owner 0:0, exact mode, fsync,
+# rename over the target, fsync of the directory.
+atomic() {
+  dir=$(dirname "$1")
+  tmp=$(mktemp "$dir/.sb-install.XXXXXX") || no "can't create a temp file in $dir"
+  cat -- "$3" > "$tmp"
+  chown 0:0 -- "$tmp"
+  chmod "$2" -- "$tmp"
+  sync -- "$tmp"
+  mv -T -- "$tmp" "$1"
+  sync -- "$dir"
+}
+show() { "$SYSTEMCTL" show "$UNIT" -p "$1" --value; }
+argv_of() { # the single command line of an Exec property, or nothing when there isn't exactly one
+  v=$(show "$1")
+  n=$(printf '%s' "$v" | grep -o '{ path=' | wc -l)
+  [ "$n" -eq 1 ] || return 0
+  printf '%s' "$v" | sed -n 's/.*argv\[\]=\([^;]*\) ;.*/\1/p'
+}
+conditions() {
+  path=$("$BUSCTL" call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager GetUnit s "$UNIT" 2>/dev/null \
+    | sed -n 's/^o "\(.*\)"$/\1/p')
+  [ -n "$path" ] || return 0
+  "$BUSCTL" get-property org.freedesktop.systemd1 "$path" org.freedesktop.systemd1.Unit Conditions 2>/dev/null
+}
+# verify closed|open: the unit systemd will run is exactly this one
+verify() {
+  [ "$(show LoadState)" = loaded ] || return 1
+  [ "$(show FragmentPath)" = "$ETC/$UNIT" ] || return 1
+  [ "$(show Names)" = "$UNIT" ] || return 1
+  [ "$(show NeedDaemonReload)" = no ] || return 1
+  [ "$(show ActiveState)" = inactive ] || return 1
+  [ "$(argv_of ExecStartPre)" = "$CHECKER $DEST" ] || return 1
+  [ "$(argv_of ExecStart)" = "/usr/bin/node $DEST/bin/sagebrush-agent.mjs host run" ] || return 1
+  c=$(conditions)
+  if [ "$1" = closed ]; then
+    [ "$(show DropInPaths)" = "$CLOSED" ] || return 1
+    case "$c" in "a(sbbsi) 1 \"ConditionPathExists\" false false \"$CLOSED_PATH\" "*) ;; *) return 1 ;; esac
+  else
+    [ -z "$(show DropInPaths)" ] || return 1
+    [ "$c" = "a(sbbsi) 0" ] || return 1
+  fi
+  return 0
+}
+render() { sed "s#@RELEASE@#$DEST#g" "$1" > "$2"; }
+if [ "$VERIFY_ONLY" = 1 ]; then
+  [ -d /run/systemd/system ] || no "systemd isn't running"
+  verify open || no "the effective unit isn't exactly the installed one"
+  printf 'release-install: the effective %s is the installed one for %s\n' "$UNIT" "$DEST"
+  exit 0
+fi
+
+# ---- step 2: close -------------------------------------------------------------------------------------------------
+[ -e "$CLOSED_PATH" ] && no "$CLOSED_PATH exists"
+work=$(mktemp -d "$(dirname "$DEST")/.sb-release.XXXXXX") || no "can't create a work directory next to <dest>"
+trap 'rm -rf -- "$work"' EXIT
+printf '[Unit]\nConditionPathExists=%s\n' "$CLOSED_PATH" > "$work/closed.conf"
+atomic "$CLOSED" 0644 "$work/closed.conf"
+"$SYSTEMCTL" daemon-reload
+[ "$(show DropInPaths)" = "$CLOSED" ] || no "the closing drop-in isn't the unit's only drop-in"
+[ "$(show NeedDaemonReload)" = no ] || no "systemd needs a reload after the close"
+[ "$(show ActiveState)" = inactive ] || no "the unit isn't inactive"
+cut 2
+
+# ---- step 3: the release ---------------------------------------------------------------------------------------------
+mkdir -m 0700 -- "$work/tree"
+git -c safe.directory="$REPO" archive --format=tar "$COMMIT" | tar -x --no-same-owner --no-same-permissions -C "$work/tree"
+(cd "$work/tree" && PATH=$ORIG_PATH scripts/launcher-build.sh "$work/tree/bin/sagebrush-agent-launch")
 ln -s sagebrush-agent.mjs "$work/tree/bin/sagebrush-agent"
-chown -R -h 0:0 "$work/tree"
-chmod -R go-w "$work/tree"
-chmod 0755 "$work/tree/bin/sagebrush-agent-launch"
-mv "$work/tree" "$dest"
+chown -R -h 0:0 -- "$work/tree"
+chmod -R go-w -- "$work/tree"
+chmod 0755 -- "$work/tree" "$work/tree/bin/sagebrush-agent-launch"
+mv -T -- "$work/tree" "$DEST"
+sync -- "$(dirname "$DEST")"
+/bin/sh "$DEST/scripts/release-trust.sh" "$DEST" || no "the installed release doesn't pass its own checker"
+cut 3
+
+# ---- step 4: the boundary files --------------------------------------------------------------------------------------
+render "$DEST/lib/fleet/host/units/sagebrush-supervisor.service" "$work/unit"
+render "$DEST/lib/fleet/host/units/sagebrush-lease-sleep" "$work/shim"
+atomic "$CHECKER" 0755 "$DEST/scripts/release-trust.sh"
+atomic "$ETC/$UNIT" 0644 "$work/unit"
+atomic "$SHIM" 0755 "$work/shim"
+cut 4
+
+# ---- steps 5, 6: reload, and the effective unit, still closed --------------------------------------------------------
+"$SYSTEMCTL" daemon-reload
+cut 5
+verify closed || no "the loaded unit isn't exactly the installed one (still closed)"
+cut 6
+
+# ---- step 7: open ----------------------------------------------------------------------------------------------------
+rm -f -- "$CLOSED"
+sync -- "$DROPDIR"
+rmdir -- "$DROPDIR"
+sync -- "$ETC"
+"$SYSTEMCTL" daemon-reload
+if ! verify open; then
+  mkdir -m 0755 -- "$DROPDIR" 2>/dev/null || true
+  atomic "$CLOSED" 0644 "$work/closed.conf"
+  "$SYSTEMCTL" daemon-reload
+  no "the opened unit isn't exactly the installed one (closed again)"
+fi
+printf 'release-install: %s installed at %s; enable and start %s when ready\n' "$COMMIT" "$DEST" "$UNIT"

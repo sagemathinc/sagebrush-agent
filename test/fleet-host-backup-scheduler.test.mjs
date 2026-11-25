@@ -79,7 +79,8 @@ test("status: not set up, or ok / failing with the last success and the oldest c
 
 test("the units: a oneshot in the backup slice, and a daily 03:00 timer that catches up a missed run", () => {
   const u = backupUnits("/opt/sagebrush/release-1");
-  assert.match(u.service, /^ExecStart=\/opt\/sagebrush\/release-1\/bin\/sagebrush-agent host backup run$/m);
+  assert.match(u.service, /^ExecStartPre=\/usr\/lib\/sagebrush\/release-trust \/opt\/sagebrush\/release-1$/m);
+  assert.match(u.service, /^ExecStart=\/usr\/bin\/node \/opt\/sagebrush\/release-1\/bin\/sagebrush-agent\.mjs host backup run$/m);
   assert.match(u.service, /^Type=oneshot$/m); assert.match(u.service, /^Slice=sagebrush-backup\.slice$/m);
   assert.match(u.timer, /^OnCalendar=\*-\*-\* 03:00:00$/m); assert.match(u.timer, /^Persistent=true$/m);
   for (const bad of ["rel", "/a/../b", "/a b", "/a;b"]) refused(() => backupUnits(bad), "bad_form");

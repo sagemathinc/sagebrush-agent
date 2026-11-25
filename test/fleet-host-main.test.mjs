@@ -809,7 +809,7 @@ test("the broker's account: from /etc/passwd by name; absent or malformed is non
 
 test("the unit as shipped: the release's host run as root, refusals (status 3) not restarted, a crash restarted, no ExecStop", () => {
   const u = supervisorUnit("/opt/sagebrush/r1");
-  for (const l of ["ExecStart=/opt/sagebrush/r1/bin/sagebrush-agent host run", "User=root", "Type=simple", "Restart=on-failure", "RestartSec=10s",
+  for (const l of ["ExecStartPre=/usr/lib/sagebrush/release-trust /opt/sagebrush/r1", "ExecStart=/usr/bin/node /opt/sagebrush/r1/bin/sagebrush-agent.mjs host run", "User=root", "Type=simple", "Restart=on-failure", "RestartSec=10s",
     "RestartPreventExitStatus=3", "TimeoutStopSec=30s", "WantedBy=multi-user.target"]) assert.ok(u.split("\n").includes(l), l);
   assert.ok(!/ExecStop/.test(u) && !u.includes("@RELEASE@"));
   for (const bad of ["rel", "/a b", "/a$x", "/a%n", "/a\"b", null]) assert.throws(() => supervisorUnit(bad), (e) => e.code === "bad_form", String(bad));

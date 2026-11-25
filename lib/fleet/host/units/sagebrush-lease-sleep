@@ -1,6 +1,9 @@
 #!/bin/sh
 # Sagebrush: the execution lease's system-sleep hook (lease-on r1.5 §6.4). systemd-sleep runs it with pre or post.
+# The trust boundary first (lease-on r1.12 §2.6): no release code runs as root unless the release tree is root's.
 case "$1" in
-  pre|post) exec /usr/bin/env node "@RELEASE@/lib/fleet/host/lease-main.mjs" lease-sleep "$1" ;;
+  pre|post)
+    /usr/lib/sagebrush/release-trust "@RELEASE@" || exit 1
+    exec /usr/bin/node "@RELEASE@/lib/fleet/host/lease-main.mjs" lease-sleep "$1" ;;
 esac
 exit 0

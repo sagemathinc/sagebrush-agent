@@ -14,7 +14,7 @@ import { canonText } from "../lib/fleet/core/canonical.mjs";
 import { QUALIFIED_MAJOR } from "../lib/fleet/host/host-preflight.mjs";
 import { sleepHook } from "../lib/fleet/host/lease.mjs";
 import { DECLARED, ROOTS, leaseManifest, lex, loadsOf } from "../lib/fleet/host/lease-manifest.mjs";
-import { RECORD, leaseQualified } from "../lib/fleet/host/lease-qualified.mjs";
+import { RECORD, argvOf, leaseQualified } from "../lib/fleet/host/lease-qualified.mjs";
 import { SUBCASES } from "../lib/fleet/host/lease-qual-subcases.mjs";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -46,12 +46,21 @@ function release() {
   fs.chmodSync(join(rel, "bin/sagebrush-agent-launch"), 0o755);
   fs.symlinkSync("sagebrush-agent.mjs", join(rel, "bin/sagebrush-agent"));
   fs.mkdirSync(hookDir, { mode: 0o755 });
+  // the boundary (§2.6): the checker outside the release, the unit file, and systemd's effective unit (a seam)
+  const checker = join(hookDir, "release-trust"), unit = join(hookDir, "sagebrush-supervisor.service");
+  fs.copyFileSync(join(rel, "scripts/release-trust.sh"), checker);
+  fs.chmodSync(checker, 0o755);
+  fs.writeFileSync(unit, fs.readFileSync(join(REPO, "lib/fleet/host/units/sagebrush-supervisor.service"), "utf8").replaceAll("@RELEASE@", rel));
+  fs.chmodSync(unit, 0o644);
+  const exec = (argv) => `{ path=${argv.split(" ")[0]} ; argv[]=${argv} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }`;
   const hook = join(hookDir, "sagebrush-lease");
   fs.writeFileSync(hook, sleepHook(rel));
   fs.chmodSync(hook, 0o755);
   // every directory 0755 (mkdtemp makes 0700, which is fine for trust but normalize it)
   for (const d of [top, rel, hookDir]) fs.chmodSync(d, 0o755);
-  const w = { top, rel, hook, members, over: {} };
+  const w = { top, rel, hook, checker, unit, members, over: {} };
+  w.show = { FragmentPath: unit, DropInPaths: "", NeedDaemonReload: "no", ExecStartPre: exec(`${checker} ${rel}`),
+    ExecStart: exec(`/usr/bin/node ${rel}/bin/sagebrush-agent.mjs host run`) };
   w.fsx = {
     ...fs,
     lstatSync: (p, ...a) => {
@@ -85,7 +94,8 @@ function release() {
     fs.writeFileSync(join(rel, RECORD), text);
     fs.chmodSync(join(rel, RECORD), 0o644);
   };
-  w.q = (o = {}) => leaseQualified(rel, { fsx: w.fsx, kernel: "6.8.12-3-generic", nodeVersion: process.versions.node, cgroupRoot: CG, hookPath: hook, rootUid: UID, ...o });
+  w.q = (o = {}) => leaseQualified(rel, { fsx: w.fsx, kernel: "6.8.12-3-generic", nodeVersion: process.versions.node, cgroupRoot: CG, hookPath: hook, rootUid: UID,
+    checkerPath: checker, unitPath: unit, unitShow: () => ({ ...w.show }), ...o });
   w.write(w.record());
   w.done = () => fs.rmSync(top, { recursive: true, force: true });
   return w;
@@ -372,6 +382,52 @@ test("after qualification, a writable parent refuses before anything is hashed, 
     w.fsx.readFileSync = realRead;
     assert.deepEqual(w.q(), { ok: true });
   } finally { w.done(); }
+});
+
+// ---- the boundary (§2.6): the installed checker and unit, and systemd's effective unit -----------------------------
+
+test("the boundary: the checker missing, other bytes, another mode or owner; the unit file other bytes; each effective-unit fact off: unqualified (boundary)", () => {
+  const w = release();
+  try {
+    assert.deepEqual(w.q(), { ok: true });
+    const bytes = fs.readFileSync(w.checker), unitText = fs.readFileSync(w.unit);
+    around(() => fs.rmSync(w.checker), () => { fs.writeFileSync(w.checker, bytes); fs.chmodSync(w.checker, 0o755); }, () => assert.deepEqual(w.q(), { ok: false, why: "boundary" }, "missing"));
+    around(() => fs.appendFileSync(w.checker, "#\n"), () => fs.writeFileSync(w.checker, bytes), () => assert.deepEqual(w.q(), { ok: false, why: "boundary" }, "other bytes"));
+    for (const mode of [0o644, 0o775, 0o757]) around(() => fs.chmodSync(w.checker, mode), () => fs.chmodSync(w.checker, 0o755), () => assert.deepEqual(w.q(), { ok: false, why: "boundary" }, mode.toString(8)));
+    w.over.lstat = foreign(w.checker);
+    assert.deepEqual(w.q(), { ok: false, why: "boundary" }, "foreign checker");
+    w.over = {};
+    const noPre = String(unitText).replace(/^ExecStartPre=.*\n/m, "");
+    around(() => fs.writeFileSync(w.unit, noPre), () => fs.writeFileSync(w.unit, unitText), () => assert.deepEqual(w.q(), { ok: false, why: "boundary" }, "a unit file without ExecStartPre"));
+    around(() => fs.chmodSync(w.unit, 0o664), () => fs.chmodSync(w.unit, 0o644), () => assert.deepEqual(w.q(), { ok: false, why: "boundary" }, "a writable unit file"));
+    const good = { ...w.show };
+    for (const [why, change] of [
+      ["another fragment", { FragmentPath: "/etc/systemd/system.control/sagebrush-supervisor.service" }],
+      ["a drop-in", { DropInPaths: "/run/systemd/system/sagebrush-supervisor.service.d/override.conf" }],
+      ["a reload pending", { NeedDaemonReload: "yes" }],
+      ["no ExecStartPre", { ExecStartPre: "" }],
+      ["two ExecStartPre", { ExecStartPre: `${good.ExecStartPre} ${good.ExecStartPre}` }],
+      ["another checker", { ExecStartPre: good.ExecStartPre.replaceAll(w.checker, "/usr/lib/sagebrush/other") }],
+      ["the checker for another release", { ExecStartPre: good.ExecStartPre.replaceAll(` ${w.rel} `, ` ${w.rel}x `) }],
+      ["an extra argument", { ExecStartPre: good.ExecStartPre.replace(` ${w.rel} ;`, ` ${w.rel} x ;`) }],
+      ["ExecStart through env", { ExecStart: good.ExecStart.replaceAll("/usr/bin/node", "/usr/bin/env node") }],
+      ["ExecStart another release", { ExecStart: good.ExecStart.replaceAll(w.rel, "/opt/other") }],
+    ]) {
+      w.show = { ...good, ...change };
+      assert.deepEqual(w.q(), { ok: false, why: "boundary" }, why);
+    }
+    w.show = good;
+    assert.deepEqual(w.q({ unitShow: () => { throw new Error("systemctl failed"); } }), { ok: false, why: "boundary" }, "show failing");
+    assert.deepEqual(w.q(), { ok: true });
+  } finally { w.done(); }
+});
+
+test("argvOf: exactly one command line, else null", () => {
+  const one = "{ path=/usr/bin/node ; argv[]=/usr/bin/node /r/bin/sagebrush-agent.mjs host run ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }";
+  assert.equal(argvOf(one), "/usr/bin/node /r/bin/sagebrush-agent.mjs host run");
+  assert.equal(argvOf(`${one} ${one}`), null);
+  assert.equal(argvOf(""), null);
+  assert.equal(argvOf(undefined), null);
 });
 
 // ---- the record (§2.4) -------------------------------------------------------------------------------------------

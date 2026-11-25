@@ -213,6 +213,14 @@ test("the supervisor refuses, launching nothing: each condition in its order, wi
     const t = supervisor({ run: async () => ({ code: 3, stdout }) });
     assert.deepEqual(await requestResume(A, t.opts), want, stdout);
   }
+  // Resumed, but the start couldn't be queued: the person is told (never reported as a plain success).
+  const sf = supervisor({ run: async () => ({ code: 0, stdout: '{"resumed":true,"reason":"start_failed","lowered":true}\n' }) });
+  assert.deepEqual(await requestResume(A, sf.opts), { resumed: true, reason: "start_failed" });
+  const odd = supervisor({ run: async () => ({ code: 0, stdout: '{"resumed":true,"reason":"anything","lowered":true}\n' }) });
+  assert.deepEqual(await requestResume(A, odd.opts), { resumed: true, reason: null });
+  // ... and "start_failed" with resumed false is no answer the helper gives: helper_failed.
+  const neg = supervisor({ run: async () => ({ code: 3, stdout: '{"resumed":false,"reason":"start_failed","lowered":false}\n' }) });
+  assert.deepEqual(await requestResume(A, neg.opts), { resumed: false, reason: "helper_failed" });
 });
 
 test("the helper's happy path: under the EXCLUSIVE lock, restore lowered durably, then the unit's start queued", async () => {

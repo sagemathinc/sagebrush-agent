@@ -63,32 +63,41 @@ pub enum At {
 }
 
 /// The handle operations A1 needs. `RealOps` maps each to one syscall wrapper in `sys`.
+///
+/// Names are bytes (A1 r2.5 §1): a listed name is the raw `getdents64` bytes, and every by-name operation takes it
+/// back unchanged. Nothing requires a name to be UTF-8; fixed names (`"home"`, `"data"`) are passed as their bytes.
 pub trait Ops {
     type H;
     fn root(&mut self) -> io::Result<Self::H>;
     /// openat2 from the trusted root (BENEATH | NO_SYMLINKS | NO_MAGICLINKS), O_RDONLY | O_DIRECTORY; "" is the root.
     fn dir_from_root(&mut self, root: &Self::H, rel: &str) -> io::Result<Self::H>;
-    fn at(&mut self, dir: &Self::H, name: &str, how: At) -> io::Result<Self::H>;
+    fn at(&mut self, dir: &Self::H, name: impl AsRef<[u8]>, how: At) -> io::Result<Self::H>;
     fn ident(&mut self, h: &Self::H) -> io::Result<Ident>;
-    fn ident_at(&mut self, dir: &Self::H, name: &str) -> io::Result<Ident>;
+    fn ident_at(&mut self, dir: &Self::H, name: impl AsRef<[u8]>) -> io::Result<Ident>;
     fn generation(&mut self, h: &Self::H) -> io::Result<u32>;
     fn project(&mut self, h: &Self::H) -> io::Result<(u32, bool)>;
     fn fsid(&mut self, h: &Self::H) -> io::Result<u64>;
     /// The next batch of names from the directory's own read cursor (one getdents64 call's worth, without "." and
-    /// ".."); empty at the end. A handle's cursor only moves forward: a second walk needs a freshly opened handle.
-    fn batch(&mut self, dir: &Self::H) -> io::Result<Vec<String>>;
+    /// ".."), as raw bytes; empty at the end. A handle's cursor only moves forward: a second walk needs a freshly
+    /// opened handle.
+    fn batch(&mut self, dir: &Self::H) -> io::Result<Vec<Vec<u8>>>;
     fn has_acl(&mut self, dir: &Self::H) -> io::Result<bool>;
     fn chmod(&mut self, dir: &Self::H, mode: u16) -> io::Result<()>;
     fn drop_acls(&mut self, dir: &Self::H) -> io::Result<()>;
-    fn unlink(&mut self, dir: &Self::H, name: &str, is_dir: bool) -> io::Result<()>;
-    fn rename(&mut self, from: &Self::H, to: &Self::H, name: &str) -> io::Result<()>;
+    fn unlink(&mut self, dir: &Self::H, name: impl AsRef<[u8]>, is_dir: bool) -> io::Result<()>;
+    fn rename(&mut self, from: &Self::H, to: &Self::H, name: impl AsRef<[u8]>) -> io::Result<()>;
     fn fsync(&mut self, dir: &Self::H) -> io::Result<()>;
     /// A small file read through the trusted root (at most `max` bytes, else EFBIG).
     fn read(&mut self, root: &Self::H, rel: &str, max: usize) -> io::Result<Vec<u8>>;
 }
 
 pub(crate) fn c(s: &str) -> io::Result<CString> {
-    CString::new(s).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+    cb(s.as_bytes())
+}
+
+/// A name's raw bytes as a C string (a NUL inside is EINVAL; a listed name never has one).
+pub(crate) fn cb(b: &[u8]) -> io::Result<CString> {
+    CString::new(b).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
 }
 
 /// The real handle operations: the syscall module, nothing else.
@@ -105,19 +114,19 @@ impl Ops for RealOps {
     fn dir_from_root(&mut self, root: &OwnedFd, rel: &str) -> io::Result<OwnedFd> {
         sys::openat2(root, &c(if rel.is_empty() { "." } else { rel })?, libc::O_RDONLY | libc::O_DIRECTORY, 0)
     }
-    fn at(&mut self, dir: &OwnedFd, name: &str, how: At) -> io::Result<OwnedFd> {
+    fn at(&mut self, dir: &OwnedFd, name: impl AsRef<[u8]>, how: At) -> io::Result<OwnedFd> {
         let flags = match how {
             At::Path => libc::O_PATH,
             At::Dir => libc::O_RDONLY | libc::O_DIRECTORY,
             At::File => libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW,
         };
-        sys::openat2_xdev(dir, &c(name)?, flags)
+        sys::openat2_xdev(dir, &cb(name.as_ref())?, flags)
     }
     fn ident(&mut self, h: &OwnedFd) -> io::Result<Ident> {
         sys::ident(h)
     }
-    fn ident_at(&mut self, dir: &OwnedFd, name: &str) -> io::Result<Ident> {
-        sys::ident_at_nofollow(dir, &c(name)?)
+    fn ident_at(&mut self, dir: &OwnedFd, name: impl AsRef<[u8]>) -> io::Result<Ident> {
+        sys::ident_at_nofollow(dir, &cb(name.as_ref())?)
     }
     fn generation(&mut self, h: &OwnedFd) -> io::Result<u32> {
         sys::inode_generation(h)
@@ -128,7 +137,7 @@ impl Ops for RealOps {
     fn fsid(&mut self, h: &OwnedFd) -> io::Result<u64> {
         sys::fsid(h)
     }
-    fn batch(&mut self, dir: &OwnedFd) -> io::Result<Vec<String>> {
+    fn batch(&mut self, dir: &OwnedFd) -> io::Result<Vec<Vec<u8>>> {
         let mut buf = vec![0u8; BATCH_BYTES];
         loop {
             let n = sys::getdents64(dir, &mut buf)?;
@@ -136,14 +145,8 @@ impl Ops for RealOps {
                 return Ok(Vec::new());
             }
             let names = dirent_names(&buf, n).ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
-            let mut out = Vec::with_capacity(names.len());
-            for nm in names {
-                if nm == b"." || nm == b".." {
-                    continue;
-                }
-                // A name that isn't UTF-8 is refused by the caller as foreign (it can't be any name we made).
-                out.push(String::from_utf8(nm).map_err(|_| io::Error::from_raw_os_error(libc::EILSEQ))?);
-            }
+            // Raw bytes, whatever their encoding (A1 r2.5): a name that isn't UTF-8 is listed like any other.
+            let out: Vec<Vec<u8>> = names.into_iter().filter(|nm| nm != b"." && nm != b"..").collect();
             if !out.is_empty() {
                 return Ok(out);
             }
@@ -159,11 +162,12 @@ impl Ops for RealOps {
         sys::remove_xattr(dir, ACL_ACCESS)?;
         sys::remove_xattr(dir, ACL_DEFAULT)
     }
-    fn unlink(&mut self, dir: &OwnedFd, name: &str, is_dir: bool) -> io::Result<()> {
-        if is_dir { sys::rmdirat(dir, &c(name)?) } else { sys::unlinkat(dir, &c(name)?) }
+    fn unlink(&mut self, dir: &OwnedFd, name: impl AsRef<[u8]>, is_dir: bool) -> io::Result<()> {
+        let n = cb(name.as_ref())?;
+        if is_dir { sys::rmdirat(dir, &n) } else { sys::unlinkat(dir, &n) }
     }
-    fn rename(&mut self, from: &OwnedFd, to: &OwnedFd, name: &str) -> io::Result<()> {
-        let n = c(name)?;
+    fn rename(&mut self, from: &OwnedFd, to: &OwnedFd, name: impl AsRef<[u8]>) -> io::Result<()> {
+        let n = cb(name.as_ref())?;
         sys::rename_noreplace_between(from, &n, to, &n)
     }
     fn fsync(&mut self, dir: &OwnedFd) -> io::Result<()> {
@@ -241,7 +245,8 @@ pub(crate) fn kind_of(id: &Ident) -> Option<Kind> {
 /// The child `name` of `dir`, fully identified. Ok(None) if it doesn't exist. For a directory, also its O_RDONLY
 /// handle (to descend). A symlink is identified by name (never followed); a device, socket or FIFO is refused (73)
 /// without ever being opened for reading.
-pub(crate) fn child<O: Ops>(o: &mut O, dir: &O::H, name: &str, anchor_mnt: u64) -> Result<Option<(Obj, Option<O::H>)>> {
+pub(crate) fn child<O: Ops>(o: &mut O, dir: &O::H, name: impl AsRef<[u8]>, anchor_mnt: u64) -> Result<Option<(Obj, Option<O::H>)>> {
+    let name = name.as_ref();
     let id = match o.at(dir, name, At::Path) {
         Ok(h) => o.ident(&h).map_err(open_err)?,
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
@@ -576,6 +581,8 @@ fn inspect<O: Ops>(o: &mut O, root: &O::H, mount: &str, agent: &str, tree: Tree,
     }
     let mut entries = Vec::with_capacity(names.len());
     for n in names {
+        // Every name these trees may hold is a fixed ASCII one: a name that isn't UTF-8 is an unknown entry (A1 r2.5).
+        let n = String::from_utf8(n).map_err(|_| identity("an entry isn't one of the tree's names"))?;
         let (x, _) = child(o, &h, &n, epoch.mnt_id)?.ok_or(identity("an entry vanished"))?;
         entries.push((n, x));
     }
@@ -810,7 +817,7 @@ fn pass1<O: Ops>(o: &mut O, w: &mut Walk, dir: &O::H, depth: usize) -> Result<()
 /// locked-down mode and absent ACL), and removes every entry it lists, each re-checked and unlinked by name from the
 /// checked handle; rounds repeat until a fresh listing is empty (unlinking while reading may skip a name, never invent
 /// one). Then the caller unlinks the directory itself.
-fn pass2<O: Ops>(o: &mut O, w: &mut Walk, parent: &O::H, name: &str, depth: usize) -> Result<()> {
+fn pass2<O: Ops>(o: &mut O, w: &mut Walk, parent: &O::H, name: &[u8], depth: usize) -> Result<()> {
     if depth > MAX_DEPTH {
         return Err(w.fail("the tree is too deep"));
     }
@@ -935,7 +942,7 @@ fn remove_below<O: Ops>(o: &mut O, a: &O::H, name: &str, x: &Obj, mut w: Walk) -
         // may have been tightened), never 66, which promises zero effects (SEC H2 on part 1).
         pass1(o, &mut w, &h, 1).map_err(|e| if e.fail == Fail::Preflight { identity(e.msg) } else { e })?;
         drop(h); // its read cursor is spent: pass 2 opens every directory afresh
-        pass2(o, &mut w, a, name, 1)?;
+        pass2(o, &mut w, a, name.as_bytes(), 1)?;
     }
     o.unlink(a, name, x.kind == Kind::Dir).map_err(|_| w.fail("the target can't be unlinked"))?;
     w.removed += 1;
@@ -1013,6 +1020,31 @@ pub(crate) mod tests {
 
     pub(crate) fn join(dir: &str, name: &str) -> String {
         if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") }
+    }
+    /// The fake keys its nodes by path STRINGS, each name in §4b's encoded form (lossless; plain ASCII without `%`
+    /// is unchanged). The trait boundary takes and returns raw bytes (A1 r2.5): `key` on the way in, `unkey` out. A
+    /// test names a raw 0xFF byte as `%FF` and a literal `%` as `%25`.
+    pub(crate) fn key(raw: &[u8]) -> String {
+        crate::digest::encode(raw)
+    }
+    pub(crate) fn unkey(k: &str) -> Vec<u8> {
+        let b = k.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            // %XX with two uppercase hex digits is one raw byte; anything else is itself.
+            let hex = |c: u8| (c as char).to_digit(16).filter(|_| !c.is_ascii_lowercase());
+            if b[i] == b'%' {
+                if let (Some(h), Some(l)) = (b.get(i + 1).copied().and_then(hex), b.get(i + 2).copied().and_then(hex)) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        out
     }
     pub(crate) fn parent(p: &str) -> &str {
         p.rfind('/').map_or("", |i| &p[..i])
@@ -1114,9 +1146,9 @@ pub(crate) mod tests {
             let n = self.nodes.get(rel).ok_or(e(libc::ENOENT))?;
             if n.id.mode & S_IFMT != S_IFDIR { Err(e(libc::ENOTDIR)) } else { Ok(self.handle(rel.to_string())) }
         }
-        fn at(&mut self, dir: &FH, name: &str, how: At) -> io::Result<FH> {
+        fn at(&mut self, dir: &FH, name: impl AsRef<[u8]>, how: At) -> io::Result<FH> {
             self.tick("at")?;
-            let p = join(&dir.p, name);
+            let p = join(&dir.p, &key(name.as_ref()));
             let n = self.nodes.get(&p).ok_or(e(libc::ENOENT))?;
             if n.id.mnt_id != self.nodes[&dir.p].id.mnt_id && !self.no_exdev {
                 return Err(e(libc::EXDEV));
@@ -1133,8 +1165,8 @@ pub(crate) mod tests {
             // The opened object's identity: a path replaced since the open still reports the opened inode.
             self.nodes.get(&h.p).map(|n| Ident { ino: if h.ino != 0 { h.ino } else { n.id.ino }, ..n.id }).ok_or(e(libc::ENOENT))
         }
-        fn ident_at(&mut self, dir: &FH, name: &str) -> io::Result<Ident> {
-            self.nodes.get(&join(&dir.p, name)).map(|n| n.id).ok_or(e(libc::ENOENT))
+        fn ident_at(&mut self, dir: &FH, name: impl AsRef<[u8]>) -> io::Result<Ident> {
+            self.nodes.get(&join(&dir.p, &key(name.as_ref()))).map(|n| n.id).ok_or(e(libc::ENOENT))
         }
         fn generation(&mut self, h: &FH) -> io::Result<u32> {
             self.tick("generation")?;
@@ -1147,13 +1179,13 @@ pub(crate) mod tests {
             Ok(self.fsid)
         }
         /// At most BATCH names per call from this handle's cursor, then empty forever: a spent handle lists nothing.
-        fn batch(&mut self, dir: &FH) -> io::Result<Vec<String>> {
+        fn batch(&mut self, dir: &FH) -> io::Result<Vec<Vec<u8>>> {
             self.tick("list")?;
             let at = *self.cursors.get(&dir.id).unwrap_or(&0);
             if at == 0 {
                 self.log.push(format!("list {}", dir.p));
             }
-            let names: Vec<String> = self.children(&dir.p).into_iter().skip(at).take(BATCH).collect();
+            let names: Vec<Vec<u8>> = self.children(&dir.p).into_iter().skip(at).take(BATCH).map(|k| unkey(&k)).collect();
             self.cursors.insert(dir.id, at + names.len());
             Ok(names)
         }
@@ -1181,9 +1213,9 @@ pub(crate) mod tests {
             self.tick("drop_default")?;
             Ok(())
         }
-        fn unlink(&mut self, dir: &FH, name: &str, is_dir: bool) -> io::Result<()> {
+        fn unlink(&mut self, dir: &FH, name: impl AsRef<[u8]>, is_dir: bool) -> io::Result<()> {
             self.tick("unlink")?;
-            let p = join(&dir.p, name);
+            let p = join(&dir.p, &key(name.as_ref()));
             let n = self.nodes.get(&p).ok_or(e(libc::ENOENT))?;
             if is_dir != (n.id.mode & S_IFMT == S_IFDIR) {
                 return Err(e(if is_dir { libc::ENOTDIR } else { libc::EISDIR }));
@@ -1198,9 +1230,10 @@ pub(crate) mod tests {
             self.log.push(format!("unlink {p}"));
             Ok(())
         }
-        fn rename(&mut self, from: &FH, to: &FH, name: &str) -> io::Result<()> {
+        fn rename(&mut self, from: &FH, to: &FH, name: impl AsRef<[u8]>) -> io::Result<()> {
             self.tick("rename")?;
-            let (src, dst) = (join(&from.p, name), join(&to.p, name));
+            let k = key(name.as_ref());
+            let (src, dst) = (join(&from.p, &k), join(&to.p, &k));
             if self.nodes.contains_key(&dst) {
                 return Err(e(libc::EEXIST));
             }
@@ -1211,6 +1244,10 @@ pub(crate) mod tests {
             for k in keys {
                 let n = self.nodes.remove(&k).unwrap();
                 self.nodes.insert(format!("{dst}{}", &k[src.len()..]), n);
+                // A file's (or a symlink's) contents move with it, as the inode does.
+                if let Some(b) = self.files.remove(&k) {
+                    self.files.insert(format!("{dst}{}", &k[src.len()..]), b);
+                }
             }
             self.log.push(format!("rename {src} {dst}"));
             Ok(())
@@ -1598,6 +1635,48 @@ pub(crate) mod tests {
         assert_eq!(f.count("unlink"), 0);
     }
 
+    /// A1 r2.5: names are bytes. The fake keys names encoded (`%FF` is the byte 0xFF), and it finds a node only by
+    /// the encoding of the EXACT bytes it is given, so a converted name would be ENOENT, never this one.
+    fn odd_names(f: &mut Fake, h: &str) {
+        f.file(&format!("{h}/%FF"), UID, 0o600); // a lone invalid byte
+        f.dir(&format!("{h}/%E2%82"), UID, 0o700); // a truncated sequence, holding a file
+        f.file(&format!("{h}/%E2%82/in"), UID, 0o600);
+        f.add(&format!("{h}/%C0%80"), S_IFLNK | 0o777, UID, UID); // an overlong encoding, a symlink
+        f.file(&format!("{h}/é%FE"), UID, 0o600); // valid UTF-8, then 0xFE
+    }
+
+    #[test]
+    fn remove_tree_removes_names_that_are_not_utf8_by_their_exact_bytes() {
+        let mut f = Fake::new();
+        let x = archive_tree(&mut f);
+        let h = format!("srv/sagebrush/archive/{A}/home");
+        odd_names(&mut f, &h);
+        remove_tree(&mut f, "/srv/sagebrush/archive", A, &x).unwrap();
+        assert!(!f.nodes.keys().any(|k| k.starts_with(&format!("srv/sagebrush/archive/{A}"))));
+        for n in ["%FF", "%E2%82/in", "%E2%82", "%C0%80", "é%FE"] {
+            assert!(f.log.contains(&format!("unlink {h}/{n}")), "{n} unlinked by its exact bytes");
+        }
+        // A foreign owner on one of them is still 73 with zero unlinks.
+        let mut f = Fake::new();
+        let x = archive_tree(&mut f);
+        odd_names(&mut f, &h);
+        f.node(&format!("{h}/%E2%82/in")).id.uid = UID + 1;
+        assert_eq!(code(remove_tree(&mut f, "/srv/sagebrush/archive", A, &x)), 73);
+        assert_eq!(f.count("unlink"), 0);
+    }
+
+    #[test]
+    fn inspect_home_a_fourth_entry_that_is_not_utf8_is_an_unknown_entry() {
+        let mut f = Fake::new();
+        f.agent("srv/sagebrush/agents");
+        f.dir(&format!("srv/sagebrush/agents/{A}/%FF"), UID, 0o700);
+        assert_eq!(code(inspect_home(&mut f, "/", A, Tree::Home, false)), 73);
+        let mut g = Fake::new();
+        let _ = config(&mut g);
+        g.file(&format!("srv/sagebrush/agent-config/{A}/gen-1%FF"), 0, 0o600);
+        assert_eq!(code(inspect_home(&mut g, "/", A, Tree::Config, false)), 73, "config: a non-UTF-8 name is no gen-<n>");
+    }
+
     #[test]
     fn the_mnt_id_postcondition_refuses_on_its_own() {
         let mut f = Fake::new();
@@ -1777,7 +1856,7 @@ pub(crate) mod tests {
             let mut o = RealOps;
             let root = o.root().unwrap();
             let h = o.dir_from_root(&root, &d.to_str().unwrap()[1..]).unwrap();
-            assert_eq!(o.batch(&h).unwrap(), vec!["keep".to_string()]);
+            assert_eq!(o.batch(&h).unwrap(), vec![b"keep".to_vec()]);
             assert!(o.batch(&h).unwrap().is_empty(), "the same handle lists nothing again");
             std::fs::remove_dir_all(&d).unwrap();
         }
@@ -1811,6 +1890,40 @@ pub(crate) mod tests {
             remove_below(&mut RealOps, &p, "t", &x, walk(mnt)).unwrap();
             assert!(!t.exists(), "the whole tree is gone");
             assert_eq!(std::fs::read(&outside).unwrap(), b"keep me", "the symlink was unlinked as itself");
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+
+        /// A1 r2.5 on the real kernel: names that aren't UTF-8 (a lone 0xFF, a truncated sequence holding a file, an
+        /// overlong symlink, valid UTF-8 then 0xFE) are listed by getdents64 as bytes and removed by those bytes.
+        #[test]
+        fn names_that_are_not_utf8_are_removed_on_the_real_kernel() {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let base = tmp("bytes");
+            let t = base.join("t");
+            std::fs::create_dir(&t).unwrap();
+            let n = |b: &[u8]| t.join(OsStr::from_bytes(b));
+            std::fs::write(n(b"\xff"), b"x").unwrap();
+            std::fs::create_dir(n(b"\xe2\x82")).unwrap();
+            std::fs::write(n(b"\xe2\x82").join("in"), b"x").unwrap();
+            symlink("/nonexistent", n(b"\xc0\x80")).unwrap();
+            std::fs::write(n(&[0xc3, 0xa9, 0xfe]), b"x").unwrap(); // é then 0xFE
+            let mut o = RealOps;
+            let root = o.root().unwrap();
+            let h = o.dir_from_root(&root, &t.to_str().unwrap()[1..]).unwrap();
+            let mut listed = Vec::new();
+            loop {
+                let b = o.batch(&h).unwrap();
+                if b.is_empty() {
+                    break;
+                }
+                listed.extend(b);
+            }
+            listed.sort();
+            assert_eq!(listed, vec![b"\xc0\x80".to_vec(), vec![0xc3, 0xa9, 0xfe], b"\xe2\x82".to_vec(), b"\xff".to_vec()]);
+            let Some((p, x, mnt)) = open(&base, "t") else { return };
+            remove_below(&mut RealOps, &p, "t", &x, walk(mnt)).unwrap();
+            assert!(!t.exists(), "every name is gone");
             std::fs::remove_dir_all(&base).unwrap();
         }
 

@@ -172,15 +172,16 @@ pub fn unit_cgroup(agent: &str) -> String {
     format!("0::/sagebrush.slice/sagebrush-agents.slice/sagebrush-agents-{agent}.slice/sagebrush-agent-{agent}.service\n")
 }
 
-/// One `/proc/<pid>/status` line's numbers (exactly one such line), e.g. `Uid:` or `Groups:`.
+/// One `/proc/<pid>/status` line's numbers (exactly one line starting with the key and its colon, e.g. `Uid:` or
+/// `Groups:`); a line with the bare key and no colon is no such line.
 fn status_numbers(status: &[u8], key: &str) -> Option<Vec<u32>> {
     let text = std::str::from_utf8(status).ok()?;
-    let mut lines = text.lines().filter(|l| l.split(':').next() == Some(key.trim_end_matches(':')));
-    let line = lines.next()?;
+    let mut lines = text.lines().filter_map(|l| l.strip_prefix(key));
+    let rest = lines.next()?;
     if lines.next().is_some() {
         return None;
     }
-    line[key.len()..].split_whitespace().map(|x| x.parse().ok()).collect()
+    rest.split_whitespace().map(|x| x.parse().ok()).collect()
 }
 
 /// The unit's identity as A5 r4.3 requires it: all four uids and all four gids `agent_uid` (gid = uid for every
@@ -195,8 +196,8 @@ fn unit_identity_ok(status: &[u8], tf: &TurnFile) -> bool {
     four("Uid:") && four("Gid:") && groups.as_deref() == Some(&tf.gids[..])
 }
 
-/// Read the turn file: `<TURNS>/<turn>/turn.json`, the directory root 0700, the file a regular root file with no group
-/// or other bits and one link, read through its own handle (A1's expect rules). Then its closed shape.
+/// Read the turn file: `<TURNS>/<turn>/turn.json`, the directory root 0700, the file a regular root file of exactly
+/// 0600 (no special bits) and one link, read through its own handle (A1's expect rules). Then its closed shape.
 pub fn read_turn_file<O: TurnOps>(o: &mut O, root: &O::H, turn: &str) -> Result<TurnFile> {
     if !hex32(turn) {
         return Err(err(Fail::Usage, "bad arguments"));
@@ -208,7 +209,7 @@ pub fn read_turn_file<O: TurnOps>(o: &mut O, root: &O::H, turn: &str) -> Result<
     }
     let h = o.at(&dir, "turn.json", At::File).map_err(|_| contract())?;
     let fi = o.ident(&h).map_err(|_| contract())?;
-    if kind_of(&fi) != Some(Kind::File) || fi.uid != 0 || fi.gid != 0 || fi.mode & 0o077 != 0 || fi.nlink != 1 {
+    if kind_of(&fi) != Some(Kind::File) || fi.uid != 0 || fi.gid != 0 || fi.mode & 0o7777 != 0o600 || fi.nlink != 1 {
         return Err(contract());
     }
     let raw = o.read_handle(&h, MAX_TURN_FILE).map_err(|_| contract())?;
@@ -359,6 +360,7 @@ mod tests {
             Ok(())
         }
         fn read_handle(&mut self, h: &FH, max: usize) -> io::Result<Vec<u8>> {
+            self.log.push(format!("read {}", h.p));
             let b = self.files.get(&h.p).cloned().ok_or(e(libc::ENOENT))?;
             if b.len() > max { Err(e(libc::EFBIG)) } else { Ok(b) }
         }
@@ -554,6 +556,9 @@ mod tests {
             ("no Gid line", |f, _| { f.files.insert(format!("proc/{UNIT}/status"), format!("Uid:\t{AUID}\t{AUID}\t{AUID}\t{AUID}\nGroups:\t80001\n").into_bytes()); }),
             ("no Groups line", |f, _| { f.files.insert(format!("proc/{UNIT}/status"), format!("Uid:\t{AUID}\t{AUID}\t{AUID}\t{AUID}\nGid:\t{AUID}\t{AUID}\t{AUID}\t{AUID}\n").into_bytes()); }),
             ("a malformed Groups line", |f, _| { f.files.insert(format!("proc/{UNIT}/status"), status(&[AUID; 4], &[AUID; 4], "80001 x")); }),
+            ("a bare Uid line", |f, _| { f.files.insert(format!("proc/{UNIT}/status"), format!("Name:\tx\nUid\nGid:\t{AUID}\t{AUID}\t{AUID}\t{AUID}\nGroups:\t80001\n").into_bytes()); }),
+            ("a bare Gid line", |f, _| { f.files.insert(format!("proc/{UNIT}/status"), format!("Name:\tx\nUid:\t{AUID}\t{AUID}\t{AUID}\t{AUID}\nGid\nGroups:\t80001\n").into_bytes()); }),
+            ("a bare Groups line", |f, _| { f.files.insert(format!("proc/{UNIT}/status"), format!("Name:\tx\nUid:\t{AUID}\t{AUID}\t{AUID}\t{AUID}\nGid:\t{AUID}\t{AUID}\t{AUID}\t{AUID}\nGroups\n").into_bytes()); }),
             ("two Uid lines", |f, _| { let mut b = status(&[AUID; 4], &[AUID; 4], "80001"); b.extend_from_slice(format!("Uid:\t0\t0\t0\t0\n").as_bytes()); f.files.insert(format!("proc/{UNIT}/status"), b); }),
             ("a recycled pid (dead after the reads)", |f, _| { f.files.insert(format!("proc/{UNIT}/dead"), vec![]); }),
         ];
@@ -589,6 +594,13 @@ mod tests {
         tf.gids = vec![80001];
         f.files.insert(format!("proc/{UNIT}/status"), status(&[AUID; 4], &[AUID; 4], ""));
         assert_eq!(code(run(&mut f, &tf)), 66);
+        // A bare Groups line (no colon) is no Groups line, even against empty gids: 66, nothing joined.
+        let (mut f, mut tf) = host(&["projects"]);
+        tf.gids = vec![];
+        f.files.insert(format!("proc/{UNIT}/status"), format!("Uid:\t{AUID}\t{AUID}\t{AUID}\t{AUID}\nGid:\t{AUID}\t{AUID}\t{AUID}\t{AUID}\nGroups\n").into_bytes());
+        assert_eq!(code(run(&mut f, &tf)), 66);
+        assert!(!f.log.iter().any(|l| l.starts_with("setns") || l == "unshare"));
+        assert!(later_effects(&f).is_empty());
         // The positive propagation control: the gid map and the idmap's inside id are agent_uid itself.
         let (mut f, tf) = host(&["projects"]);
         run(&mut f, &tf).unwrap();
@@ -728,7 +740,7 @@ mod tests {
         let (mut f, tf) = host(&["projects"]);
         let good = turn_json(&tf);
         assert_eq!(parse_turn_file(good.as_bytes(), TURN).unwrap(), tf);
-        // Read through its handle, under a root 0700 directory, a root file without group or other bits.
+        // Read through its handle, under a root 0700 directory, a root file of exactly 0600.
         f.dir(&format!("run/sagebrush/turns/{TURN}"), 0, 0o700);
         let p = format!("run/sagebrush/turns/{TURN}/turn.json");
         f.file(&p, 0, 0o600);
@@ -737,14 +749,21 @@ mod tests {
         assert_eq!(read_turn_file(&mut f, &root, TURN).unwrap(), tf);
         for (what, spoil) in [
             ("group-readable", (|f: &mut Fake, p: &str| f.node(p).id.mode = S_IFREG | 0o640) as fn(&mut Fake, &str)),
+            ("owner read-only 0400", |f, p| f.node(p).id.mode = S_IFREG | 0o400),
+            ("owner-executable 0700", |f, p| f.node(p).id.mode = S_IFREG | 0o700),
+            ("setuid 4600", |f, p| f.node(p).id.mode = S_IFREG | 0o4600),
+            ("setgid 2600", |f, p| f.node(p).id.mode = S_IFREG | 0o2600),
+            ("sticky 1600", |f, p| f.node(p).id.mode = S_IFREG | 0o1600),
             ("not root's", |f, p| f.node(p).id.uid = AUID),
             ("two links", |f, p| f.node(p).id.nlink = 2),
             ("the directory 0755", |f, _| f.node(&format!("run/sagebrush/turns/{TURN}")).id.mode = S_IFDIR | 0o755),
         ] {
             let mut g = f.clone();
+            g.log.clear();
             spoil(&mut g, &p);
             let root = g.root().unwrap();
             assert_eq!(code(read_turn_file(&mut g, &root, TURN)), 65, "{what}");
+            assert!(!g.log.iter().any(|l| l.starts_with("read ")), "{what}: not read");
         }
         assert_eq!(code(read_turn_file(&mut f, &root, "NOTHEX")), 64);
         // The closed shape: each field's form and range.

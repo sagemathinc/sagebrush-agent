@@ -485,3 +485,51 @@ test("C7' (i): requestResume with the REAL liveLease over a closed gate, or one 
     assert.ok(!s.kinds().includes("recordTransfer") && !s.kinds().includes("run"), `${label}: nothing launched or recorded`);
   }
 });
+
+// ---- C7 (restore owner on lease-on r1.1/r1.5): the system-sleep hook against a REAL resume helper held at each seam
+
+test("C7: PRE with the real resume helper held at after_lock, after_checks and after_lower: killed with the slice, the lease spent, nothing started", async () => {
+  const { leaseSleep, reopenAfterSleep } = await import("../lib/fleet/host/lease.mjs");
+  for (const seam of ["after_lock", "after_checks", "after_lower"]) {
+    const w = await world();
+    const before = readFileSync(join(w.e.dir, A));
+    let reached = false;
+    w.locks.nextKillable = true; // the helper runs in its scope inside the slice: killed with it
+    const helper = w.resume({ ...w.deps, barrier: async (n) => { if (n === seam) { reached = true; await new Promise(() => {}); } } });
+    helper.catch(() => {});
+    // (lowering restore takes the real fence lock: a real-time wait, bounded at 5 s)
+    for (let i = 0; i < 500 && !reached; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(reached, `${seam}: the helper is held`);
+    const cg = mkdtempSync(join(tmpdir(), "sb-c7-cg-")), units = mkdtempSync(join(tmpdir(), "sb-c7-units-"));
+    writeFileSync(join(units, `sagebrush-agent-${A}.service`), "");
+    const ss = { calls: [], freeze: "0", procs: 1, cgroup: (d) => (d === cg ? d : null),
+      kill: () => { ss.calls.push("kill"); w.locks.killSliceHolders(); ss.procs = 0; }, empty: () => ss.procs === 0,
+      freezeRead: () => ss.freeze, freezeWrite: (_d, v) => { ss.freeze = v; }, maskAll: async () => { ss.calls.push("mask"); } };
+    const o = { dir: w.e.dir, fenceDir: w.e.leaseFenceDir, unitDir: units, agentsCgroup: cg, sys: ss, lock: w.locks.lock, clock: w.c,
+      log: () => {}, now: (() => { let x = 0; return () => (x += 100); })(), wait: async () => {} };
+    const r = await leaseSleep("pre", o);
+    assert.equal(r.ok, true, seam);
+    assert.ok(readTombstone(A, { dir: w.e.dir }) >= w.rec.lg, `${seam}: the lease spent`);
+    assert.ok(existsSync(join(w.e.leaseFenceDir, A)), `${seam}: lease raised`);
+    assert.ok(ss.calls.includes("mask"), `${seam}: masked`);
+    assert.deepEqual(readFileSync(join(w.e.dir, A)), before, `${seam}: the record byte-identical`);
+    assert.equal(w.restoreUp(), seam !== "after_lower", `${seam}: restore ${seam === "after_lower" ? "already lowered by the held helper" : "still raised"}`);
+    assert.ok(!w.sys.calls.some((c) => c[0] === "start"), `${seam}: nothing started`);
+    if (seam !== "after_lock") continue;
+    // The old lease never passes again; a FRESH lease after the reopen resumes (the positive control).
+    await leaseSleep("post", o);
+    assert.deepEqual(await reopenAfterSleep(o), { acted: true, ok: true, gen: 1 });
+    const old = await w.resume(w.deps);
+    assert.deepEqual(old, { resumed: false, reason: "lease_not_live", lowered: false }, "the pre-suspend lease refuses first (spent, and another gate generation)");
+    const fresh = { lease_id: "L2", lg: 2, expiry_tick: w.c.boot() + 600_000, gen: 5, sg: 1 };
+    await armWatchdog(A, fresh, { sys: w.sys, clock: w.c });
+    assert.equal(await publish(A, fresh, { dir: w.e.dir, sys: w.sys, clock: w.c, lock: w.locks.lock }), true);
+    unlinkSync(join(w.e.leaseFenceDir, A)); // as the fresh lease's activation helper lowers it
+    assert.deepEqual(await w.resume(w.deps, 5, "L2", 2), { resumed: true, reason: null, lowered: true });
+    // and the pre-suspend lease, presented directly, refuses
+    const w2 = await world();
+    writeFileSync(join(w2.e.dir, "sleep"), JSON.stringify({ gen: 1, phase: "post", pre_ok: true, pre_at: 0 }), { mode: 0o644 });
+    writeFileSync(join(w2.e.dir, "reopen"), JSON.stringify({ gen: 1 }), { mode: 0o644 });
+    assert.deepEqual(await w2.resume(), { resumed: false, reason: "lease_not_live", lowered: false });
+  }
+});

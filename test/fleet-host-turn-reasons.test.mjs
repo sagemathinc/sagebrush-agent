@@ -28,13 +28,15 @@ test("the seven turn reasons are host entries, each with exactly one meaning", (
 // The host daemon main's entries (host daemon main r1.1 §4, AUDIT-cleared), added after this registry's turn reasons,
 // and its one widening of an entry that existed before: preflight_missing's meaning.
 const DAEMON = ["identity_broken", "host_ended", "lease_unqualified", "bad_config"];
+// The execution lease's suspend gate (lease-on r1.5 §6.5, C8b, T4), host health reasons added after those.
+const GATE = ["suspend_gate_stuck", "suspend_gate_exhausted"];
 const PREFLIGHT_BEFORE = "a required unit, Landlock or path-contract control is missing at start";
 const PREFLIGHT_NOW = "a required host platform, privilege, account, unit, adapter, Landlock or path-contract control is missing at start";
 
 test("every entry that existed before is byte-for-byte unchanged, but for preflight_missing's ruled widening", () => {
   // sha256 of JSON.stringify of the registry's 50 entries before this change, in order (preflight_missing with the
   // meaning it had then: the only later change to any of them).
-  const before = registry.reasons.filter((r) => !NEW.includes(r.name) && !DAEMON.includes(r.name))
+  const before = registry.reasons.filter((r) => !NEW.includes(r.name) && !DAEMON.includes(r.name) && !GATE.includes(r.name))
     .map((r) => (r.name === "preflight_missing" ? { ...r, meaning: PREFLIGHT_BEFORE } : r));
   assert.equal(before.length, 50);
   assert.equal(createHash("sha256").update(JSON.stringify(before)).digest("hex"), "49d4933821966df89ba7ee9fbf2fa006fe5bbf5f356160f47e340fd2e73e854c");
@@ -107,4 +109,16 @@ test("every reason the table names is registered, and an unregistered name is re
   for (const r of NEW) assert.ok([...Object.values(CONTRACT).flat(), ...SUMMARY_ONLY].includes(r), `${r} is used by the table`);
   assert.equal(turnPairOk("failed_no_effect", "profile_identity_x"), false);
   assert.equal(byName.has("profile_identity_x"), false);
+});
+
+test("the suspend gate's two health reasons are host codes, local, registered once, and reportable", async () => {
+  const { HEALTH_REASONS } = await import("../lib/fleet/host/host-state.mjs");
+  for (const n of GATE) {
+    const r = byName.get(n);
+    assert.ok(r, n);
+    assert.deepEqual(Object.keys(r), ["name", "owner", "meaning"], `${n}: a host code is local`);
+    assert.equal(r.owner, "host", n);
+    assert.ok(HEALTH_REASONS.includes(n), `${n} is a health reason`);
+  }
+  assert.equal(registry.reasons.filter((r) => GATE.includes(r.name)).length, 2);
 });

@@ -73,7 +73,7 @@ function fakeFx(fenceDir) {
  * - timers: fake; `fire(kind)` runs the due ones ("expiry": the lease timers, "renew": the cadence).
  * - the service: `respond(reqBytes, over)` answers a request as the service would; `send` defaults to it.
  */
-async function world({ verifier = "fake", root = tmp("state"), fenceDir = tmp("fence"), leaseDir = tmp("lease"), restoreDir = tmp("restore"), b = 1_000_000, resumeOp = null } = {}) {
+async function world({ verifier = "fake", root = tmp("state"), fenceDir = tmp("fence"), leaseDir = tmp("lease"), restoreDir = tmp("restore"), b = 1_000_000, resumeOp = null, sleepOpts = null } = {}) {
   const w = { b, fenceDir, leaseDir, restoreDir, root, helperRuns: [], sent: [], pending: [] };
   const clock = { boot: () => w.b, mono: () => w.b * 1000 + 7_000_000_000 };
   w.clock = clock;
@@ -149,7 +149,8 @@ async function world({ verifier = "fake", root = tmp("state"), fenceDir = tmp("f
     nonce: () => Buffer.from(newId().slice(0, 16)).toString("base64url"), wall: () => 1_800_000_000_000,
   });
   sup = new Supervisor({ store, fx, verify: grantVerify, bodyOf, fenceDir, lease: machine, barrier: async (n, d) => { if (w.barrier) await w.barrier(n, d); },
-    restoreState: (id) => readRestore("agent", id, { dir: restoreDir })?.state ?? null, restoreResume: resumeOp ? resumeOp(w) : null });
+    restoreState: (id) => readRestore("agent", id, { dir: restoreDir })?.state ?? null, restoreResume: resumeOp ? resumeOp(w) : null,
+    ...(sleepOpts ? { sleepOpts: sleepOpts(w) } : {}) });
   Object.assign(w, { sup, machine, close: () => store.close() });
   w.leaseUp = (id) => existsSync(join(fenceDir, "lease", id));
   w.record = (id) => readRecord(id, { dir: leaseDir });
@@ -1310,5 +1311,79 @@ test("the gate: with no gate files at all the gate is open at 0, so a real host 
   await w.fire("renew");
   assert.equal(w.record(A).rec.sg, 0);
   assert.equal(w.fx.u(A).active, true);
+  await w.close();
+});
+
+// ---- the reopen as an executor op (lease-on r1.5 §6.5, S2): void, contain, thaw, acknowledge, then fresh leases
+
+/** The reopen's seams over the world: a parent cgroup that a kill empties; locks that never block. */
+const reopenSeams = (w) => {
+  const cg = tmp("cg"), units = tmp("units");
+  w.sleepSys = { calls: [], freeze: "1", procs: 1,
+    cgroup: (d) => (d === cg ? d : null), kill: () => { w.sleepSys.calls.push("kill"); w.sleepSys.procs = 0; }, empty: () => w.sleepSys.procs === 0,
+    freezeRead: () => w.sleepSys.freeze, freezeWrite: (_d, v) => { w.sleepSys.calls.push(`freeze=${v}`); w.sleepSys.freeze = v; },
+    maskAll: async (u) => { w.sleepSys.calls.push(`mask:${u.length}`); } };
+  return { dir: w.leaseDir, fenceDir: join(w.fenceDir, "lease"), unitDir: units, agentsCgroup: cg, sys: w.sleepSys,
+    lock: async () => ({ release: async () => {} }), now: (() => { let x = 0; return () => (x += 100); })(), wait: async () => {}, log: () => {} };
+};
+
+test("sleep-reopen with no suspend is a NO-OP: the running agent's lease and unit are untouched (C8a)", async () => {
+  const w = await world({ sleepOpts: reopenSeams });
+  await granted(w, [A]);
+  await w.fire("renew");
+  const before = w.machine.current(A);
+  assert.deepEqual(await w.sup.submit({ kind: "sleep-reopen", authority: "host" }), { status: "noop", gen: null });
+  assert.deepEqual(w.machine.current(A), before);
+  assert.equal(w.fx.u(A).active, true);
+  assert.deepEqual(w.sleepSys.calls, []);
+  await w.close();
+});
+
+test("sleep-reopen after a finished suspend: the machine voids, the agent is contained, the gate opens, and only a FRESH lease restarts it", async () => {
+  const w = await world({ sleepOpts: reopenSeams });
+  await granted(w, [A]);
+  await w.fire("renew");
+  const old = w.machine.current(A);
+  assert.equal(old.sg, 0);
+  gateWrite(w, S(1), null); // the hook's post for generation 1 (its PRE would have fenced and frozen already)
+  const r = await w.sup.submit({ kind: "sleep-reopen", authority: "host" });
+  assert.deepEqual(r, { status: "reopened", gen: 1 });
+  assert.equal(w.machine.current(A), null, "voided: nothing from before the suspend is used again");
+  assert.equal(w.leaseUp(A), true, "lease raised by the contain");
+  assert.ok(readTombstone(A, { dir: w.leaseDir }) >= old.lg, "the old record spent");
+  assert.equal(w.sleepSys.freeze, "0", "thawed after the proof");
+  assert.equal(readFileSync(join(w.leaseDir, "reopen"), "utf8"), R(1));
+  // the fresh renewal (due right away) gets a lease under generation 1
+  await w.fire("renew");
+  assert.equal(w.record(A).rec.sg, 1);
+  assert.ok(w.record(A).rec.lg > old.lg);
+  await w.close();
+});
+
+test("sleep-reopen is a host op only; the person, service and local authorities can't submit it", async () => {
+  const w = await world({ sleepOpts: reopenSeams });
+  for (const authority of ["person", "service", "local"]) {
+    await assert.rejects(w.sup.submit({ kind: "sleep-reopen", authority }), (e) => e.code === "not_granted", authority);
+  }
+  await w.close();
+});
+
+test("C7' (iii): a reopen queued behind an in-flight resume-restored starts only after that op ends", async () => {
+  const w = await world({ resumeOp, sleepOpts: reopenSeams });
+  await restored(w);
+  let release;
+  const held = new Promise((r) => { release = r; });
+  const order = [];
+  w.resumeHook = async () => { order.push("resume-start"); await held; order.push("resume-end"); return { resumed: false, reason: "lease_not_live" }; };
+  const resume = resumeRestoredOp(w);
+  for (let i = 0; i < 200 && !order.includes("resume-start"); i++) await new Promise((r) => setImmediate(r));
+  gateWrite(w, S(1), null);
+  const reopen = w.sup.submit({ kind: "sleep-reopen", authority: "host" }).then((r) => { order.push("reopen"); return r; });
+  for (let i = 0; i < 200; i++) await new Promise((r) => setImmediate(r));
+  assert.deepEqual(w.sleepSys.calls, [], "nothing of the reopen ran while the resume op is in flight");
+  release();
+  await resume;
+  assert.deepEqual((await reopen).status, "reopened");
+  assert.deepEqual(order, ["resume-start", "resume-end", "reopen"]);
   await w.close();
 });

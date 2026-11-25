@@ -916,3 +916,22 @@ test("no key on any surface: stderr, events, audit calls, health records, the ex
     }
   }
 });
+
+test("PAIRED with the reopen wired (lease-on r1.5 §6.5): one sleep-reopen before serving, then every sleepReopenMs, cleared at the drain", async () => {
+  const { id } = await paired();
+  const h = harness({ id });
+  const timers = [];
+  h.d.sleepReopenMs = 120000;
+  h.d.every = (fn, ms) => { const t = { fn, ms, cleared: false }; timers.push(t); h.log.push(`every:${ms}`); return t; };
+  h.d.clearEvery = (t) => { t.cleared = true; h.log.push("clearEvery"); };
+  const run = hostRun(h.d);
+  await until(() => h.lines.some((l) => l.serving));
+  const i = h.log.indexOf("submit:sleep-reopen");
+  assert.ok(i > h.log.indexOf("recover") && i < h.log.indexOf("every:120000"), JSON.stringify(h.log));
+  timers[0].fn();
+  await until(() => h.log.filter((x) => x === "submit:sleep-reopen").length === 2);
+  h.term();
+  assert.equal((await run).code, 0);
+  assert.equal(timers[0].cleared, true);
+  assert.ok(h.log.indexOf("clearEvery") < h.log.indexOf("close"), "cleared before the executor closes");
+});

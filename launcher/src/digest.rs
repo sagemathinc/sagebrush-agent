@@ -37,8 +37,11 @@ pub trait DigestOps: RestoreOps {
     fn names_raw(&mut self, dir: &Self::H) -> io::Result<Vec<Vec<u8>>>;
     fn at_raw(&mut self, dir: &Self::H, name: &[u8], how: At) -> io::Result<Self::H>;
     fn ident_at_raw(&mut self, dir: &Self::H, name: &[u8]) -> io::Result<Ident>;
-    /// A symlink's target bytes (never followed).
-    fn readlink_raw(&mut self, dir: &Self::H, name: &[u8]) -> io::Result<Vec<u8>>;
+    /// A handle on the symlink ITSELF: `openat2(dir, name, O_PATH | O_NOFOLLOW, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+    /// RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)`, which for a trailing symlink returns the link, never its target.
+    fn link_at_raw(&mut self, dir: &Self::H, name: &[u8]) -> io::Result<Self::H>;
+    /// The link's target, read through its own handle (`readlinkat(fd, "")`, never followed).
+    fn readlink_handle(&mut self, h: &Self::H) -> io::Result<Vec<u8>>;
     /// `O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC`, 0600.
     fn create_copy(&mut self, dir: &Self::H, name: &str) -> io::Result<Self::H>;
     fn write_all(&mut self, h: &Self::H, data: &[u8]) -> io::Result<()>;
@@ -250,8 +253,10 @@ pub fn tree_digest_limited<O: DigestOps>(o: &mut O, a: &DigestArgs, lim: Limits)
         Some(run) => {
             let va = anchor_policy(o, &root, VALIDATE)?;
             let vm = o.ident(&va).map_err(open_err)?.mnt_id;
-            if vm == mnt {
-                return Err(identity("the validate anchor is on the quota mount"));
+            // On the ROOT filesystem's own mount (SEC S2 on 99b4b391): not the quota mount, and not any third one.
+            let rm = o.ident(&root).map_err(open_err)?.mnt_id;
+            if vm == mnt || vm != rm {
+                return Err(identity("the validate anchor isn't on the root filesystem"));
             }
             let run_h = staging_dir(o, &va, run, vm, projid)?;
             match o.mkdir(&run_h, a.owner, 0o700) {
@@ -385,8 +390,19 @@ fn visit<O: DigestOps>(o: &mut O, dir: &O::H, name: &[u8], path: &[u8], mnt: u64
             Ok(e)
         }
         Some(Kind::Symlink) => {
+            // A2 W1 (SEC S1 on 99b4b391): the link's identity and its target both through ONE handle on the link
+            // itself, then the name re-read: an entry replaced at any point of this is 73, never a mixed pair.
             e.ty = Ty::Symlink;
-            let t = o.readlink_raw(dir, name).map_err(|_| partial("a symlink can't be read"))?;
+            let lh = o.link_at_raw(dir, name).map_err(|_| partial("a symlink can't be opened"))?;
+            let li = o.ident(&lh).map_err(|_| partial("a symlink can't be identified"))?;
+            if kind_of(&li) != Some(Kind::Symlink) || (li.dev, li.ino) != (id.dev, id.ino) || li.mnt_id != mnt {
+                return Err(identity("a changed entry"));
+            }
+            let t = o.readlink_handle(&lh).map_err(|_| partial("a symlink can't be read"))?;
+            let after = o.ident_at_raw(dir, name).map_err(|_| identity("a changed entry"))?;
+            if (after.dev, after.ino) != (li.dev, li.ino) {
+                return Err(identity("a changed entry"));
+            }
             e.size = t.len() as u64;
             e.target = Some(t);
             Ok(e)
@@ -496,9 +512,12 @@ impl DigestOps for tree::RealOps {
     fn ident_at_raw(&mut self, dir: &OwnedFd, name: &[u8]) -> io::Result<Ident> {
         sys::ident_at_nofollow(dir, &cs(name)?)
     }
-    fn readlink_raw(&mut self, dir: &OwnedFd, name: &[u8]) -> io::Result<Vec<u8>> {
+    fn link_at_raw(&mut self, dir: &OwnedFd, name: &[u8]) -> io::Result<OwnedFd> {
+        sys::openat2_xdev(dir, &cs(name)?, libc::O_PATH | libc::O_NOFOLLOW)
+    }
+    fn readlink_handle(&mut self, h: &OwnedFd) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; 4097];
-        let n = sys::readlinkat(dir, &cs(name)?, &mut buf)?;
+        let n = sys::readlinkat(h, c"", &mut buf)?;
         if n >= buf.len() {
             return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
         }
@@ -527,7 +546,7 @@ impl DigestOps for tree::RealOps {
 mod tests {
     use super::*;
     use crate::tree::tests::{e, expect_file, join, Fake, FH, A, BOOT, MNT, UID};
-    use crate::tree::{obj_json, Ops, S_IFDIR, S_IFLNK, S_IFREG};
+    use crate::tree::{obj_json, Ops, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 
     impl DigestOps for Fake {
         fn names_raw(&mut self, dir: &FH) -> io::Result<Vec<Vec<u8>>> {
@@ -539,9 +558,17 @@ mod tests {
         fn ident_at_raw(&mut self, dir: &FH, name: &[u8]) -> io::Result<Ident> {
             self.ident_at(dir, std::str::from_utf8(name).map_err(|_| e(libc::EILSEQ))?)
         }
-        fn readlink_raw(&mut self, dir: &FH, name: &[u8]) -> io::Result<Vec<u8>> {
-            let p = join(&dir.p, std::str::from_utf8(name).unwrap());
-            Ok(self.files.get(&p).cloned().unwrap_or_default())
+        fn link_at_raw(&mut self, dir: &FH, name: &[u8]) -> io::Result<FH> {
+            self.tick("link_at")?;
+            let p = join(&dir.p, std::str::from_utf8(name).map_err(|_| e(libc::EILSEQ))?);
+            if self.nodes.get(&p).ok_or(e(libc::ENOENT))?.id.mode & S_IFMT != S_IFLNK {
+                return Err(e(libc::ENOTDIR));
+            }
+            Ok(self.handle(p))
+        }
+        fn readlink_handle(&mut self, h: &FH) -> io::Result<Vec<u8>> {
+            self.tick("readlink")?;
+            Ok(self.files.get(&h.p).cloned().unwrap_or_default())
         }
         fn create_copy(&mut self, dir: &FH, name: &str) -> io::Result<FH> {
             self.tick("create_copy")?;
@@ -610,7 +637,10 @@ mod tests {
             }
         }
         f.dir(VALIDATE.trim_start_matches('/'), 0, 0o700);
-        f.node(VALIDATE.trim_start_matches('/')).id.mnt_id = MNT + 50;
+        // The root filesystem's own mount: the root and the validate anchor; srv/sagebrush stays the quota mount.
+        for p in ["", "var", "var/lib", "var/lib/sagebrush", VALIDATE.trim_start_matches('/')] {
+            f.node(p).id.mnt_id = MNT + 50;
+        }
         f.agent("srv/sagebrush/agents");
         f
     }
@@ -734,6 +764,30 @@ mod tests {
         assert!(reads < 5, "the walk stopped at the bound ({reads} files read of 20)");
     }
 
+    fn swap_link(f: &mut Fake) {
+        // Another link at the name, after the handle was opened and before the target is read.
+        let p = format!("{}/l", dest());
+        f.node(&p).id.ino += 4000;
+        f.files.insert(p, b"elsewhere".to_vec());
+    }
+
+    #[test]
+    fn a_symlink_replaced_at_the_read_seam_is_73_never_a_mixed_pair() {
+        // SEC S1 on 99b4b391: the identity and the target come through one handle on the link, and the name is
+        // re-read after; a replacement between them refuses.
+        let mut f = host();
+        link(&mut f, "l", b"a/f");
+        let x = expect(&mut f);
+        f.hook = Some(("readlink", 1, swap_link));
+        assert_eq!(code(tree_digest(&mut f, &args(&x, false))), 73);
+        // Replaced between the identification and the handle's open: 73 too.
+        let mut f = host();
+        link(&mut f, "l", b"a/f");
+        let x = expect(&mut f);
+        f.hook = Some(("link_at", 1, swap_link));
+        assert_eq!(code(tree_digest(&mut f, &args(&x, false))), 73);
+    }
+
     #[test]
     fn identity_mismatches_are_73_with_nothing_printed() {
         // Another destination object than the recorded one.
@@ -851,6 +905,19 @@ mod tests {
         let mut f = host();
         let x = expect(&mut f);
         f.node(v).id.mnt_id = MNT;
+        assert_eq!(code(tree_digest(&mut f, &args(&x, true))), 73);
+        // A host whose root filesystem IS the quota mount: the validate anchor, on the root's mount, is then on the quota
+        // mount too, and still refused (73).
+        let mut f = host();
+        let x = expect(&mut f);
+        for p in ["", "var", "var/lib", "var/lib/sagebrush", v] {
+            f.node(p).id.mnt_id = MNT;
+        }
+        assert_eq!(code(tree_digest(&mut f, &args(&x, true))), 73);
+        // The validate anchor on a third mount (neither the root's nor the quota's): 73 (SEC S2).
+        let mut f = host();
+        let x = expect(&mut f);
+        f.node(v).id.mnt_id = MNT + 77;
         assert_eq!(code(tree_digest(&mut f, &args(&x, true))), 73);
         // A main's -wal sibling that is a directory: 73.
         let mut f = host();

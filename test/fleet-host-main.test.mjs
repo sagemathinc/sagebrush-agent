@@ -355,7 +355,7 @@ test("a chain-adopt that ends the certificate: host_ended after its stop; during
   const h = harness({ id, supervisor: () => ({}) });
   const run = hostRun(h.d);
   await until(() => h.log.includes("inputs"));
-  h.made.sup.submit = async () => { h.made.sup.revoked = true; return { status: "revoked" }; };
+  h.made.sup.submit = async () => { h.made.sup.revoked = true; return { status: "revoked", proven: true }; };
   await h.made.sync.submit({ kind: "chain-adopt", authority: "host" });
   const r = await run;
   assert.deepEqual([r.code, refusal(h.lines)], [3, ["host_ended"]]);
@@ -364,6 +364,35 @@ test("a chain-adopt that ends the certificate: host_ended after its stop; during
   assert.equal((await hostRun(g.d)).code, 3);
   assert.deepEqual(refusal(g.lines), ["host_ended"]);
   assert.ok(!g.log.includes("inputs"));
+});
+
+test("SIGTERM while an adoption that ended the certificate is still proving its stop: the close ends it uncommitted; the unproven line, exit 3", async () => {
+  const { id } = await paired();
+  let finish;
+  const h = harness({ id });
+  const run = hostRun(h.d);
+  await until(() => h.log.includes("inputs"));
+  h.made.sup.submit = (op) => (op.kind === "chain-adopt" ? new Promise((r) => { h.made.sup.revoked = true; finish = () => r({ status: "revoked", proven: false }); }) : Promise.resolve({}));
+  h.made.sup.close = async () => { h.log.push("close"); finish(); };
+  const adoption = h.made.sync.submit({ kind: "chain-adopt", authority: "host" });
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+  assert.ok(!h.lines.some((l) => l.refused), "no ending while the stop is unproven");
+  h.term();
+  const r = await run;
+  assert.deepEqual([r.code, r.refused], [3, null]);
+  assert.deepEqual(h.lines.slice(-1), [{ v: 1, containment: "unproven" }]);
+  assert.ok(h.log.includes("close"));
+  assert.deepEqual(await adoption, { status: "revoked", proven: false });
+  // An adoption result that isn't proven never ends serving as host_ended by itself.
+  const g = harness({ id });
+  const run2 = hostRun(g.d);
+  await until(() => g.log.includes("inputs"));
+  g.made.sup.submit = async () => { g.made.sup.revoked = true; return { status: "revoked", proven: false }; };
+  await g.made.sync.submit({ kind: "chain-adopt", authority: "host" });
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+  assert.ok(!g.lines.some((l) => l.refused), "still serving: no host_ended without the proof");
+  g.term();
+  assert.equal((await run2).code, 3);
 });
 
 test("verify: device keys from the snapshot at the call; a signer above the pin refuses device_unknown and asks for one sync", async () => {

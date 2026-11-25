@@ -13,6 +13,9 @@
 //! anchor table and check-parents.
 //!
 //! Amendment A3 (execution lease) adds `lease-check`, root-only, run as the unit's `ExecStartPre=+` (lease.rs).
+//!
+//! Amendment A5 (profiles piece 3) adds `turn`, root-only, run by the supervisor in the turn's scope (turn.rs,
+//! turn_exec.rs). It stays off (64) until the syscall filter lands.
 
 // Unsafe code is refused everywhere except the syscall module and the secret's zeroing Drop (contract §6).
 #![deny(unsafe_code)]
@@ -34,6 +37,7 @@ mod sha256;
 mod stage;
 mod tree;
 mod turn;
+mod turn_exec;
 #[allow(unsafe_code)]
 mod sys;
 
@@ -96,6 +100,14 @@ fn run() -> err::Result<()> {
                 return Err(err(Fail::Preflight, "root only"));
             }
             lease::hold(v[0]).map(drop) // the fd closes here: the shared lock is released before ExecStart
+        }
+        // Launcher contract amendment A5 (turn): root only, the supervisor's turn scope. Off until part 3b-ii adds the
+        // syscall filter: it refuses before touching any descriptor.
+        "turn" => {
+            if !turn_exec::TURN_ENABLED || !after.is_empty() {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            turn_exec::run(&mut tree::RealOps, &mut turn_exec::RealProc::default(), rest)
         }
         "exec" => {
             let v = args::flags(rest, &["agent", "contract", "cli"])?;

@@ -375,3 +375,16 @@ fn a4_profile_mounts_refuses_bad_arguments_then_the_root_guard() {
     let o = run(&["identify", "--anchor", "/srv/sagebrush/claude-profiles", "--name", ".locks"]);
     assert_eq!(code(&o), 64);
 }
+
+#[test]
+fn a5_turn_is_off_until_the_filter_lands_and_refuses_before_touching_a_descriptor() {
+    // No fd 3 or 4 is passed: were the gate after the handshake, an invalid status pipe would be 65. It is 64, with the
+    // fixed usage line and nothing on stdout, for a well-formed turn id as for any other argument.
+    let run = |args: &[&str]| Command::new(BIN).env_clear().args(args).output().unwrap();
+    for args in [vec!["turn", "--turn", "0123456789abcdef0123456789abcdef"], vec!["turn"], vec!["turn", "--turn", "x", "--", "y"]] {
+        let o = run(&args);
+        assert_eq!(code(&o), 64, "{args:?}: {}", stderr(&o));
+        assert_eq!(stderr(&o).trim_end(), "sagebrush-agent-launch: usage: bad arguments", "{args:?}");
+        assert!(o.stdout.is_empty());
+    }
+}

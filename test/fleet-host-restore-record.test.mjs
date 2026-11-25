@@ -14,7 +14,7 @@ import { CAUSES, fenced, lowerFence, raiseFence, stop } from "../lib/fleet/host/
 import { RESTORE_DIR, RESTORE_STAGING, fenceFiles } from "../lib/fleet/host/names.mjs";
 import { realIo } from "../lib/fleet/host/store.mjs";
 import {
-  CLASSES, FAILED_REASONS, KINDS, MAX_ATTEMPTS, RESTORE_RUN, STATES, checkRecord, markerPath, newRecord, newRestoreRun, ownerOf,
+  CLASSES, FAILED_REASONS, IMPORTS, KINDS, MAX_ATTEMPTS, RESTORE_RUN, STATES, checkRecord, importsDone, markerPath, newRecord, newRestoreRun, ownerOf, sameDest,
   readMarker, readRecord, recordName, recoveryStep, restoreReady, retryRecord, runTime, stagingDir, stagingName, step as rawStep,
   writeRecord, digestsWhole, checkFillReport, readFillReport, writeFillReport, readRegular, MAX_RECORD_BYTES,
 } from "../lib/fleet/host/restore-record.mjs";
@@ -24,14 +24,26 @@ const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError &&
 const T1 = 1795400000000;
 const RUN = newRestoreRun(T1, () => Buffer.alloc(6)), RUN2 = newRestoreRun(T1 + 86400000, () => Buffer.alloc(6, 1));
 const SNAP = "a".repeat(64), SNAP2 = "b".repeat(64);
-const DEST = { home: { dev: "2049", ino: "131" }, sessions: { dev: "2049", ino: "132" } };
+/** A class's bound identity: device and inode, owner, group, permission bits and project. */
+const ID = (ino) => ({ dev: "2049", ino, uid: 70000, gid: 70000, mode: 0o700, projid: 70000 });
+const DEST = { home: ID("131"), sessions: ID("132") };
+const HX = (c) => c.repeat(64);
 const fresh = () => mkdtempSync(join(tmpdir(), "sb-restore-"));
 /** A class's digest list hash, as its restore-stage would report it (distinct per class and attempt). */
 const H = (r, cls) => String(CLASSES[r.kind].indexOf(cls) + 1).repeat(2) + r.attempt + "f".repeat(61);
 /** Every class's hash not yet recorded, recorded (the "digest" step), as a whole staging records them. */
 const dig = (r) => CLASSES[r.kind].reduce((x, c) => (x.digests !== null && Object.hasOwn(x.digests, c) ? x : rawStep(x, "digest", { cls: c, sha256: H(x, c) })), r);
-/** The steps, where reaching staged first records every class's hash (as the fill does). */
-const step = (r, to, o) => (to === "staged" && !r.dirty && r.state === "staging" && !digestsWhole(r) ? rawStep(dig(r), "staged", o) : rawStep(r, to, o));
+/** The steps, where reaching staged first binds the destination (if unbound) and records every class's hash (as the fill does). */
+/** An agent's two imports, each pending then done (bound to its expected result's hash). */
+const importAll = (r) => (r.imports === null ? r : IMPORTS.reduce((x, which) => rawStep(rawStep(x, "import", { which, phase: "pending", sha256: HX("c") }), "import", { which, phase: "done", sha256: HX("c") }), r));
+/** The steps, where reaching staged first binds the destination (if unbound) and records every class's hash, and
+ * validated from published goes through files_validated and the imports (as the restore does). */
+const step = (r, to, o) => {
+  if (to === "validated" && r.state === "published") return rawStep(importAll(rawStep(r, "files_validated")), "validated", o);
+  if (to !== "staged" || r.dirty || r.state !== "staging") return rawStep(r, to, o);
+  const b = r.dest === null ? rawStep(r, "bind", { dest: o?.dest ?? DEST }) : r;
+  return rawStep(digestsWhole(b) ? b : dig(b), "staged", o);
+};
 
 /** A record in `state`, reached by the steps themselves (never hand-built), for kind "agent". */
 function at(state, { attempt = 1, id = newId() } = {}) {
@@ -39,9 +51,11 @@ function at(state, { attempt = 1, id = newId() } = {}) {
   for (let i = 1; i < attempt; i++) r = step(r, "retry");
   const path = {
     staging: [], staged: ["staged"], filling: ["staged", "filling"], published: ["staged", "filling", "published"],
-    validated: ["staged", "filling", "published", "validated"], not_fitting: ["not_fitting"], failed: ["failed"],
+    files_validated: ["staged", "filling", "published", "files_validated"],
+    validated: ["staged", "filling", "published", "files_validated", "imports", "validated"], not_fitting: ["not_fitting"], failed: ["failed"],
+    abandoned: ["abandoned"],
   }[state];
-  for (const s of path) r = step(r, s, { dest: DEST, reason: "outcome_unknown" });
+  for (const s of path) r = s === "imports" ? importAll(r) : step(r, s, { dest: DEST, reason: "outcome_unknown" });
   return r;
 }
 
@@ -134,20 +148,38 @@ test("restore runs: the launcher's 16 characters of [a-z2-7], ordered by their d
 test("the record's closed shape: a new record, and every invariant refused", () => {
   const id = newId();
   const r = newRecord({ kind: "agent", id, run: RUN, snapshot: SNAP });
-  assert.deepEqual(r, { v: 1, kind: "agent", id, run: RUN, snapshot: SNAP, attempt: 1, state: "staging", dest: null, digests: null, dirty: false, reason: null });
+  assert.deepEqual(r, { v: 1, kind: "agent", id, run: RUN, snapshot: SNAP, attempt: 1, state: "staging", dest: null, digests: null, dirty: false, reason: null,
+    imports: { config: { state: "none" }, context: { state: "none" } } });
+  for (const kind of ["archive", "tag"]) assert.equal(newRecord({ kind, id, run: RUN, snapshot: SNAP }).imports, null, `${kind}: no imports`);
   const f = at("filling");
+  const fv = at("files_validated");
   const bad = [
     [r, { v: 2 }], [r, { kind: "host" }], [r, { id: "nope" }], [r, { run: "x" }], [r, { snapshot: "A".repeat(64) }],
     [r, { snapshot: SNAP.slice(1) }], [r, { attempt: 0 }], [r, { attempt: MAX_ATTEMPTS + 1 }], [r, { attempt: 1.5 }],
     [r, { attempt: "1" }], [r, { state: "done" }], [r, { dirty: 0 }], [r, { reason: "limit" }], [r, { extra: 1 }],
-    // a destination is the kind's exact classes, each a decimal identity
-    [f, { dest: { home: DEST.home } }], [f, { dest: { ...DEST, archive: DEST.home } }], [f, { dest: { ...DEST, home: { dev: 1, ino: "2" } } }],
-    [f, { dest: { ...DEST, home: { dev: "01", ino: "2" } } }], [f, { dest: { ...DEST, home: { dev: "1", ino: "2", x: 1 } } }],
+    // a destination is the kind's exact classes, each an identity: decimal device and inode, u32 owner, group and
+    // project, permission bits only
+    [f, { dest: { home: DEST.home } }], [f, { dest: { ...DEST, archive: DEST.home } }], [f, { dest: { ...DEST, home: { ...DEST.home, dev: 1 } } }],
+    [f, { dest: { ...DEST, home: { ...DEST.home, dev: "01" } } }], [f, { dest: { ...DEST, home: { ...DEST.home, x: 1 } } }],
+    [f, { dest: { ...DEST, home: { dev: "1", ino: "2" } } }], [f, { dest: { ...DEST, home: { ...DEST.home, uid: -1 } } }],
+    [f, { dest: { ...DEST, home: { ...DEST.home, gid: 2 ** 32 } } }], [f, { dest: { ...DEST, home: { ...DEST.home, mode: 0o10000 } } }],
+    [f, { dest: { ...DEST, home: { ...DEST.home, mode: "448" } } }], [f, { dest: { ...DEST, home: { ...DEST.home, projid: 1.5 } } }],
     [f, { dest: { tag: DEST.home } }],
-    // filling, published and validated need a destination; dirty needs one; filling is dirty; staged/published/validated aren't
-    [f, { dest: null }], [at("published"), { dest: null, dirty: false }], [at("validated"), { dest: null }],
-    [r, { dirty: true }], [f, { dirty: false }], [at("published"), { dirty: true }], [at("validated"), { dirty: true }],
-    [at("staged"), { dest: DEST, dirty: true }],
+    // staged and every later state need a bound destination; dirty needs one; filling is dirty; staged, published,
+    // files_validated, validated and abandoned aren't
+    [at("staged"), { dest: null }], [f, { dest: null }], [at("published"), { dest: null, dirty: false }], [fv, { dest: null }], [at("validated"), { dest: null }],
+    [r, { dirty: true }], [f, { dirty: false }], [at("published"), { dirty: true }], [fv, { dirty: true }], [at("validated"), { dirty: true }],
+    [at("staged"), { dest: DEST, dirty: true }], [at("abandoned"), { dest: DEST, dirty: true }],
+    // imports: an agent's two, each none, or pending or done with a hash; an archive's or a tag's null
+    [r, { imports: null }], [r, { imports: { config: { state: "none" } } }], [r, { imports: { ...r.imports, x: { state: "none" } } }],
+    [fv, { imports: { ...r.imports, config: { state: "pending" } } }], [fv, { imports: { ...r.imports, config: { state: "done", sha256: "A".repeat(64) } } }],
+    [fv, { imports: { ...r.imports, config: { state: "failed", sha256: HX("c") } } }], [fv, { imports: { ...r.imports, config: { state: "none", sha256: HX("c") } } }],
+    [newRecord({ kind: "tag", id: newId(), run: RUN, snapshot: SNAP }), { imports: r.imports }],
+    // imports move only from files_validated on; validated needs every one done
+    ...["staging", "staged", "filling", "published", "not_fitting"].map((s) => [at(s), { imports: { ...r.imports, config: { state: "pending", sha256: HX("c") } } }]),
+    [at("validated"), { imports: { ...r.imports, context: { state: "done", sha256: HX("c") } } }],
+    [at("validated"), { imports: { config: { state: "done", sha256: HX("c") }, context: { state: "pending", sha256: HX("c") } } }],
+    [at("abandoned"), { reason: "bad_form" }],
     // reasons: not_fitting is limit, failed one of FAILED_REASONS, every other state none
     [at("not_fitting"), { reason: "outcome_unknown" }], [at("not_fitting"), { reason: null }], [at("failed"), { reason: "limit" }],
     [at("failed"), { reason: null }], [at("failed"), { reason: "in_progress" }], [at("published"), { reason: "bad_form" }],
@@ -162,14 +194,15 @@ test("the record's closed shape: a new record, and every invariant refused", () 
 
 test("steps: exactly the allowed ones, from exactly the allowed states", () => {
   const allowed = {
-    staged: ["staging"], filling: ["staged"], published: ["filling"], validated: ["published"],
-    not_fitting: ["staging", "filling"], failed: ["staging", "staged", "filling", "published"],
+    staged: ["staging"], filling: ["staged"], published: ["filling"], files_validated: ["published"], validated: [],
+    not_fitting: ["staging", "filling"], failed: ["staging", "staged", "filling", "published", "files_validated"],
     retry: ["staging", "staged", "filling"], clean: [],
+    abandoned: ["staging", "staged", "filling", "published", "files_validated", "not_fitting", "failed"],
   };
   for (const [to, from] of Object.entries(allowed)) {
     for (const s of STATES) {
       const r = at(s);
-      const go = () => step(r, to, { dest: DEST, reason: "bad_form" });
+      const go = () => (to === "staged" ? step : rawStep)(r, to, { dest: DEST, reason: "bad_form" });
       if (from.includes(s)) assert.ok(go(), `${s} -> ${to}`);
       else refused(go, "not_granted");
     }
@@ -178,33 +211,99 @@ test("steps: exactly the allowed ones, from exactly the allowed states", () => {
   refused(() => step({ ...at("staging"), v: 0 }, "staged"), "bad_form");
 });
 
-test("steps: filling records the destination, once per run; a stop out of filling stays dirty; clean only when dirty", () => {
+test("steps: bind records the destination before the first effect, once per run; filling asserts it; a stop out of filling stays dirty; clean only when dirty", () => {
+  const s = at("staging");
+  refused(() => rawStep(s, "bind"), "bad_form");
+  refused(() => rawStep(s, "bind", { dest: { home: DEST.home } }), "bad_form");
+  refused(() => rawStep(s, "bind", { dest: { tag: DEST.home } }), "bad_form");
+  refused(() => rawStep(dig(s), "staged"), "bad_form", "nothing is staged before the destination is bound");
+  const b = rawStep(s, "bind", { dest: DEST });
+  assert.deepEqual([b.state, b.dirty, b.dest], ["staging", false, DEST]);
+  assert.notEqual(b.dest, DEST, "the record keeps its own copy");
+  refused(() => rawStep(b, "bind", { dest: DEST }), "not_granted", "bound once");
+  for (const st of ["staged", "filling", "published", "files_validated", "validated", "not_fitting", "failed", "abandoned"]) refused(() => rawStep(at(st), "bind", { dest: DEST }), "not_granted");
+  // filling asserts the identities read now are exactly the bound ones, field by field; it never sets them.
   const r = at("staged");
   refused(() => step(r, "filling"), "bad_form");
-  refused(() => step(r, "filling", { dest: { home: DEST.home } }), "bad_form");
-  refused(() => step(r, "filling", { dest: { tag: DEST.home } }), "bad_form");
-  const f = step(r, "filling", { dest: DEST });
+  for (const k of ["dev", "ino", "uid", "gid", "mode", "projid"]) {
+    const v = DEST.home[k];
+    const other = typeof v === "string" ? String(Number(v) + 1) : v + 1;
+    refused(() => step(r, "filling", { dest: { ...DEST, home: { ...DEST.home, [k]: other } } }), "bad_form");
+  }
+  const f = step(r, "filling", { dest: structuredClone(DEST) });
   assert.deepEqual([f.state, f.dirty, f.dest], ["filling", true, DEST]);
-  assert.notEqual(f.dest, DEST, "the record keeps its own copy");
   // A later attempt fills the same destination only.
   const again = step(step(f, "retry"), "clean");
   assert.deepEqual([again.state, again.attempt, again.dirty, again.dest], ["staging", 2, false, DEST]);
   const staged2 = step(again, "staged");
-  refused(() => step(staged2, "filling", { dest: { ...DEST, home: { dev: "2049", ino: "999" } } }), "bad_form");
+  refused(() => step(staged2, "filling", { dest: { ...DEST, home: { ...DEST.home, ino: "999" } } }), "bad_form");
   assert.equal(step(staged2, "filling", { dest: structuredClone(DEST) }).attempt, 2);
-  // published clears dirty; validated keeps the destination.
+  // published clears dirty; files_validated, then the imports, then validated keep the destination.
   const p = step(f, "published");
-  assert.deepEqual([p.dirty, step(p, "validated").dest], [false, DEST]);
+  assert.deepEqual([p.dirty, step(p, "files_validated").dest], [false, DEST]);
   // A stop keeps dirty as it was.
   for (const to of ["not_fitting", "failed"]) {
-    const s = step(f, to, { reason: "outcome_unknown" });
-    assert.deepEqual([s.state, s.dirty], [to, true]);
-    const c = step(s, "clean");
-    assert.deepEqual([c.state, c.dirty, c.reason], [to, false, s.reason]);
+    const x = step(f, to, { reason: "outcome_unknown" });
+    assert.deepEqual([x.state, x.dirty], [to, true]);
+    const c = step(x, "clean");
+    assert.deepEqual([c.state, c.dirty, c.reason], [to, false, x.reason]);
     refused(() => step(c, "clean"), "not_granted");
   }
   assert.equal(step(at("staging"), "not_fitting").reason, "limit");
-  for (const st of ["staging", "not_fitting", "failed", "published", "validated", "staged"]) refused(() => step(at(st), "clean"), "not_granted");
+  for (const st of ["staging", "not_fitting", "failed", "published", "files_validated", "validated", "staged", "abandoned"]) refused(() => step(at(st), "clean"), "not_granted");
+  assert.ok(sameDest("agent", DEST, structuredClone(DEST)));
+});
+
+test("imports: an agent's, from files_validated: none, then pending bound to a hash, then done with the SAME hash; validated needs both", () => {
+  const fv = at("files_validated");
+  assert.deepEqual(fv.imports, { config: { state: "none" }, context: { state: "none" } });
+  refused(() => step(fv, "validated"), "not_granted");
+  const imp = (r, which, phase, sha256 = HX("c")) => rawStep(r, "import", { which, phase, sha256 });
+  // Only from none to pending, and from pending to done with the same hash; never done first, never back, never twice.
+  refused(() => imp(fv, "config", "done"), "not_granted");
+  const p = imp(fv, "config", "pending");
+  assert.deepEqual(p.imports.config, { state: "pending", sha256: HX("c") });
+  refused(() => imp(p, "config", "pending"), "not_granted");
+  refused(() => imp(p, "config", "done", HX("d")), "not_granted", "done is bound to the pending hash");
+  const d = imp(p, "config", "done");
+  refused(() => imp(d, "config", "pending"), "not_granted");
+  refused(() => imp(d, "config", "done"), "not_granted");
+  refused(() => step(d, "validated"), "not_granted", "context isn't done");
+  for (const [which, phase, sha256] of [["x", "pending", HX("c")], ["config", "pending", "A".repeat(64)], ["config", "pending", undefined], [undefined, "pending", HX("c")]]) {
+    refused(() => rawStep(fv, "import", { which, phase, sha256 }), "bad_form");
+  }
+  refused(() => imp(fv, "config", "failed"), "not_granted");
+  const v = step(imp(imp(d, "context", "pending"), "context", "done"), "validated");
+  assert.equal(v.state, "validated");
+  assert.ok(importsDone(v));
+  // Only from files_validated: before it, after it, and for a set without imports.
+  for (const st of ["staging", "staged", "filling", "published", "validated", "not_fitting", "failed", "abandoned"]) refused(() => imp(at(st), "config", "pending"), "not_granted");
+  // An archive or a tag folder has none: files_validated goes to validated directly.
+  for (const kind of ["archive", "tag"]) {
+    let r = newRecord({ kind, id: newId(), run: RUN, snapshot: SNAP });
+    const dest = { [CLASSES[kind][0]]: DEST.home };
+    r = rawStep(r, "bind", { dest });
+    r = rawStep(rawStep(r, "digest", { cls: CLASSES[kind][0], sha256: HX("e") }), "staged");
+    r = rawStep(rawStep(rawStep(rawStep(r, "filling", { dest }), "published"), "files_validated"), "validated");
+    assert.deepEqual([r.state, r.imports], ["validated", null], kind);
+  }
+  // A failure after the files are validated is a stop, the imports as they were.
+  const fl = step(p, "failed", { reason: "outcome_unknown" });
+  assert.deepEqual([fl.state, fl.imports.config.state], ["failed", "pending"]);
+});
+
+test("abandoned: the person's give-up, from every state but validated, terminal, never dirty, nothing after it", () => {
+  for (const st of STATES) {
+    const r = st === "filling" ? at("filling") : at(st);
+    if (["validated", "abandoned"].includes(st)) { refused(() => rawStep(r, "abandoned"), "not_granted"); continue; }
+    const a = rawStep(r, "abandoned");
+    assert.deepEqual([a.state, a.dirty, a.reason, a.dest, a.imports], ["abandoned", false, null, r.dest, r.imports], st);
+    for (const to of ["bind", "staged", "filling", "published", "files_validated", "validated", "retry", "clean", "failed", "not_fitting", "abandoned"]) {
+      refused(() => rawStep(a, to, { dest: DEST, reason: "bad_form" }), "not_granted");
+    }
+    refused(() => rawStep(a, "import", { which: "config", phase: "pending", sha256: HX("c") }), "not_granted");
+    refused(() => retryRecord(a, { run: RUN2, snapshot: SNAP }), "not_granted");
+  }
 });
 
 test("steps: a failure names one of FAILED_REASONS, all in the closed reasons list", () => {
@@ -222,6 +321,13 @@ test("steps: automatic retries are a new attempt each, dirty once a destination 
   r = step(r, "retry");
   assert.equal(r.attempt, MAX_ATTEMPTS);
   refused(() => step(r, "retry"), "limit");
+  // Bound but never filled (staging or staged): a retry has nothing to clean, the destination still bound.
+  for (const st of ["staged"]) {
+    const x = step(at(st), "retry");
+    assert.deepEqual([x.state, x.dirty, x.dest], ["staging", false, DEST], st);
+  }
+  const bs = step(rawStep(at("staging"), "bind", { dest: DEST }), "retry");
+  assert.deepEqual([bs.dirty, bs.dest], [false, DEST]);
   const f = at("filling", { attempt: 2 });
   const r3 = step(f, "retry");
   assert.deepEqual([r3.attempt, r3.dirty, r3.dest], [3, true, DEST]);
@@ -243,7 +349,7 @@ test("a stop is restarted only by the person's new request: a new run, attempt 1
 });
 
 test("digest list hashes (A2 r3.8.3): recorded class by class while staging, once each; staged and after need all", () => {
-  const s = at("staging");
+  const s = rawStep(at("staging"), "bind", { dest: DEST });
   const h = rawStep(s, "digest", { cls: "home", sha256: H(s, "home") });
   assert.deepEqual([h.state, h.digests], ["staging", { home: H(s, "home") }]);
   refused(() => rawStep(h, "digest", { cls: "home", sha256: "e".repeat(64) }), "not_granted"); // never replaced
@@ -273,7 +379,7 @@ test("digest list hashes (A2 r3.8.3): recorded class by class while staging, onc
     refused(() => checkRecord({ ...at(st), digests: { home: H(s, "home") } }), "bad_form");
     refused(() => checkRecord({ ...at(st), digests: null }), "bad_form");
   }
-  const tg = newRecord({ kind: "tag", id: newId(), run: RUN, snapshot: SNAP });
+  const tg = rawStep(newRecord({ kind: "tag", id: newId(), run: RUN, snapshot: SNAP }), "bind", { dest: { tag: DEST.home } });
   refused(() => rawStep(tg, "digest", { cls: "home", sha256: H(s, "home") }), "bad_form");
   assert.equal(rawStep(rawStep(tg, "digest", { cls: "tag", sha256: H(tg, "tag") }), "staged").state, "staged");
 });
@@ -304,7 +410,10 @@ test("fill reports: bound to the run, attempt and class; paths in A2 §4b's code
 test("recovery's first step: from every record state and every disk state, every class's marker exactly its name", () => {
   const whole = (r) => Object.fromEntries(CLASSES[r.kind].map((c) => [c, stagingName(r, c)]));
   assert.equal(recoveryStep(null, { markers: {}, begun: false }), "start");
-  const s = at("staging");
+  // Unbound (a crash between the record and its bind): bind first, whatever is on disk.
+  const u = at("staging");
+  for (const begun of [true, false]) assert.equal(recoveryStep(u, { markers: whole(u), begun }), "bind");
+  const s = rawStep(u, "bind", { dest: DEST });
   assert.equal(recoveryStep(s, { markers: {}, begun: false }), "stage");
   assert.equal(recoveryStep(s, { markers: {}, begun: true }), "retry");
   // Every marker but not every class's digest list hash: the lists can't be trusted, so a retry, never a promote.
@@ -339,7 +448,14 @@ test("recovery's first step: from every record state and every disk state, every
     assert.equal(recoveryStep(step(x, "clean"), { markers: {}, begun: false }), "none", `${to}, cleaned: only the person restarts it`);
   }
   assert.equal(recoveryStep(at("published"), { markers: {}, begun: false }), "validate");
+  // An agent's files validated: its imports; an archive's or a tag folder's: complete (validated, no imports).
+  assert.equal(recoveryStep(at("files_validated"), { markers: {}, begun: false }), "import");
+  assert.equal(recoveryStep(rawStep(at("files_validated"), "import", { which: "config", phase: "pending", sha256: HX("c") }), { markers: {}, begun: false }), "import");
+  const tgv = tag(newId(), ["staged", "filling", "published"]);
+  assert.equal(recoveryStep(rawStep(tgv, "files_validated"), { markers: {}, begun: false }), "complete");
   assert.equal(recoveryStep(at("validated"), { markers: {}, begun: false }), "none");
+  // Abandoned is terminal, never cleaned or stepped by recovery.
+  for (const st of ["staging", "filling", "published"]) assert.equal(recoveryStep(rawStep(at(st), "abandoned"), { markers: {}, begun: true }), "none", st);
   refused(() => recoveryStep({ ...s, state: "x" }, { markers: {}, begun: false }), "bad_form");
 });
 
@@ -509,7 +625,7 @@ const tag = (id, path) => { let r = newRecord({ kind: "tag", id, run: RUN, snaps
 function model(root, id, { crashAt = Infinity, quotaAt = null, crashOnMove = null } = {}) {
   const dir = join(root, "restore"), stage = join(root, "staging"), home = join(root, "home"), sessions = join(root, "sessions");
   for (const d of [dir, stage, home, sessions]) mkdirSync(d, { recursive: true });
-  const ident = (p) => { const s = statSync(p, { bigint: true }); return { dev: String(s.dev), ino: String(s.ino) }; };
+  const ident = (p) => { const s = statSync(p, { bigint: true }); return { dev: String(s.dev), ino: String(s.ino), uid: Number(s.uid), gid: Number(s.gid), mode: Number(s.mode & 0o7777n), projid: 0 }; };
   const dest = { home: ident(home), sessions: ident(sessions) };
   const into = { home, sessions };
   const m = { fills: [], effects: 0, home, sessions, stage, dir };
@@ -555,7 +671,7 @@ function model(root, id, { crashAt = Infinity, quotaAt = null, crashOnMove = nul
     },
     validate(r) {
       const ok = CLASSES.agent.every((c) => JSON.stringify(tree(into[c])) === JSON.stringify(SNAPSHOT[c]));
-      return save(ok ? step(r, "validated") : step(r, "failed", { reason: "bad_form" }));
+      return save(ok ? step(r, "files_validated") : step(r, "failed", { reason: "bad_form" }));
     },
   };
   m.recover = ({ run = RUN } = {}) => {
@@ -566,8 +682,10 @@ function model(root, id, { crashAt = Infinity, quotaAt = null, crashOnMove = nul
         begun: CLASSES.agent.some((c) => existsSync(stagingDir(r, c, stage))),
       };
       const s = recoveryStep(r, disk);
-      if (s === "none") return r;
-      if (s === "start") ops.stage(save(newRecord({ kind: "agent", id, run, snapshot: SNAP })));
+      // (an agent's files_validated is settled for the files: its imports are another driver's)
+      if (s === "none" || s === "import") return r;
+      if (s === "start") save(newRecord({ kind: "agent", id, run, snapshot: SNAP }));
+      else if (s === "bind") save(step(r, "bind", { dest }));
       else if (s === "stage") ops.stage(r);
       else if (s === "promote") save(step(r, "staged"));
       else if (s === "fill") ops.fill(r);
@@ -591,7 +709,7 @@ const left = (m, run, id) => Object.fromEntries(CLASSES.agent.map((c) => {
 
 test("T5: a crash at any effect of a restore recovers to exactly the snapshot, never filling a consumed attempt", () => {
   const whole = model(fresh(), newId());
-  assert.equal(whole.recover().state, "validated");
+  assert.equal(whole.recover().state, "files_validated");
   assert.deepEqual(filled(whole), SNAPSHOT);
   assert.ok(whole.effects > 15, `${whole.effects} effects`);
   for (let crashAt = 1; crashAt <= whole.effects; crashAt++) {
@@ -600,7 +718,7 @@ test("T5: a crash at any effect of a restore recovers to exactly the snapshot, n
     assert.throws(() => m.recover(), (e) => e.crash === true, `crash at ${crashAt}`);
     const after = model(root, id); // the restart: no crash this time
     const r = after.recover();
-    assert.equal(r.state, "validated", `crash at ${crashAt}`);
+    assert.equal(r.state, "files_validated", `crash at ${crashAt}`);
     assert.deepEqual(filled(after), SNAPSHOT, `crash at ${crashAt}`);
     const fills = [...m.fills, ...after.fills];
     assert.equal(new Set(fills).size, fills.length, `crash at ${crashAt}: an attempt filled twice: ${fills}`);
@@ -639,7 +757,7 @@ test("H2: a quota hit in the fill is cleaned once and stops, through any crash; 
   writeRecord(retryRecord(nf, { run: RUN2, snapshot: SNAP }), { dir: m.dir });
   const later = model(root, id);
   const r = later.recover();
-  assert.deepEqual([r.state, r.run, r.attempt], ["validated", RUN2, 1]);
+  assert.deepEqual([r.state, r.run, r.attempt], ["files_validated", RUN2, 1]);
   assert.deepEqual(filled(later), SNAPSHOT);
   assert.deepEqual(left(later, RUN, id), { home: [], sessions: [] }, "the old run's staging is discarded");
   assert.deepEqual(left(later, RUN2, id), { home: ["1"], sessions: ["1"] });

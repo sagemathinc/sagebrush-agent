@@ -703,8 +703,12 @@ test("a lease lowers only lease: with agent, backup or an unvalidated restore up
 /** A real restore record for the agent in `state` (validated: a restored agent waiting for the person's resume). */
 function restoreRecord(w, id, state) {
   const reason = state === "failed" ? "not_found" : state === "not_fitting" ? "limit" : null;
+  const ident = (ino) => ({ dev: "1", ino, uid: 70000, gid: 70000, mode: 0o700, projid: 70000 });
+  // A validated agent's imports are both done; before files_validated (and in a stop out of staging) none has begun.
+  const done = { state: "done", sha256: "d".repeat(64) };
+  const imports = state === "validated" ? { config: done, context: done } : { config: { state: "none" }, context: { state: "none" } };
   writeRestore({ v: 1, kind: "agent", id, run: "aaaaaaaaaaaaaaaa", snapshot: "a".repeat(64), attempt: 1, state, reason, dirty: false,
-    dest: { home: { dev: "1", ino: "2" }, sessions: { dev: "1", ino: "3" } }, digests: { home: "b".repeat(64), sessions: "c".repeat(64) } }, { dir: w.restoreDir });
+    dest: { home: ident("2"), sessions: ident("3") }, digests: { home: "b".repeat(64), sessions: "c".repeat(64) }, imports }, { dir: w.restoreDir });
 }
 
 test("a restored agent waiting for its resume (restore up, record validated): the helper lowers lease, systemd skips its start, and nothing else starts it", async () => {

@@ -270,7 +270,7 @@ test("close: every set terminal-for-close, per kind; anything else refuses, nami
   records(h, { agent: "validated", archive: "validated", tag: "staging" });
   mkdirSync(join(h.dir, ABANDON), { recursive: true });
   writeFileSync(join(h.dir, ABANDON, `tag-${h.m.t}.json`), "{}");
-  assert.deepEqual(closeBlockers(readPlan({ dir: h.dir }), { dir: h.dir, restoreRaised }), [`tag-${h.m.t}: abandoning`]);
+  assert.deepEqual(closeBlockers(readPlan({ dir: h.dir }), { dir: h.dir, restoreRaised, uid: UID }), [`tag-${h.m.t}: abandoning`]);
   await rejects(attempt(), "not_granted");
   // Abandoned: closes. Requests and the host store's copy are removed; restoreOpen is false; the archive is read-only.
   records(h, { agent: "validated", archive: "validated", tag: "abandoned" });
@@ -333,5 +333,147 @@ test("closePlan: the one commit point, durable and idempotent; a closed plan's s
   for (const closed of [{}, { at: "5" }, { at: 5, x: 1 }, null]) {
     writeFileSync(join(dir, PLAN), JSON.stringify({ ...p, closed }) + "\n");
     refused(() => readPlan({ dir }), "bad_form");
+  }
+});
+
+// ---- Paths: every restore-owned directory proven a real private directory; nothing followed through a link ---------
+
+/** An outside directory with a file in it, and a way to see it untouched. */
+function outside(h, run = RUN) {
+  const ext = join(h.root, "outside");
+  mkdirSync(join(ext, run), { recursive: true });
+  writeFileSync(join(ext, run, "keep"), "outside bytes");
+  writeFileSync(join(ext, "keep"), "outside bytes");
+  return { ext, intact: () => readFileSync(join(ext, run, "keep"), "utf8") === "outside bytes" && readFileSync(join(ext, "keep"), "utf8") === "outside bytes" && readdirSync(ext).sort().join() === [run, "keep"].sort().join() };
+}
+
+test("begin never follows a link at the host store's copy or the requests: refused, the outside untouched", async () => {
+  for (const at of [HOSTSTORE_COPY, REQUESTS]) {
+    const h = host();
+    mkdirSync(h.dir, { recursive: true, mode: 0o700 });
+    const o = outside(h);
+    symlinkSync(o.ext, join(h.dir, at));
+    await rejects(h.run(), "not_granted");
+    assert.ok(o.intact(), `${at}: the outside is byte-identical`);
+    assert.ok(!existsSync(join(o.ext, `agent-${h.m.a}`)), `${at}: no request written outside`);
+    if (at === HOSTSTORE_COPY) assert.ok(!h.calls.some((c) => c[0] === "restoreHostStore"), "nothing restored");
+  }
+  // The restore directory itself a link: refused.
+  const h = host();
+  const o = outside(h);
+  symlinkSync(o.ext, h.dir);
+  await assert.rejects(h.run());
+  assert.ok(o.intact());
+});
+
+test("a partial copy holding a link to the outside: discarded link by link, the outside untouched, then begin completes", async () => {
+  const h = host();
+  mkdirSync(join(h.dir, HOSTSTORE_COPY, RUN, "sub"), { recursive: true, mode: 0o700 });
+  const o = outside(h);
+  symlinkSync(o.ext, join(h.dir, HOSTSTORE_COPY, RUN, "dirlink"));
+  symlinkSync(join(o.ext, "keep"), join(h.dir, HOSTSTORE_COPY, RUN, "sub", "filelink"));
+  await h.run();
+  assert.ok(o.intact(), "the links were unlinked, never followed");
+  assert.deepEqual(readdirSync(join(h.dir, HOSTSTORE_COPY, RUN)), ["registry.json"], "the copy is the fresh one");
+});
+
+test("close never follows a link: at closed/, at an archived entry, at abandon/, and its cleanup unlinks links in place", async () => {
+  const ready = async () => {
+    const h = host();
+    await h.run();
+    records(h, { agent: "validated", archive: "validated", tag: "validated" });
+    return h;
+  };
+  const attempt = (h) => close({ now: () => 7, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID });
+  // closed/ a link to the outside: refused after the commit, the outside untouched; once it is a real directory, close finishes.
+  let h = await ready();
+  let o = outside(h);
+  symlinkSync(o.ext, join(h.dir, CLOSED));
+  await rejects(attempt(h), "not_granted");
+  assert.ok(o.intact());
+  rmSync(join(h.dir, CLOSED));
+  assert.deepEqual(await attempt(h), { closed: 7 });
+  // An archived entry already there as a link, or not 0400: refused.
+  for (const plant of [(p) => symlinkSync(join(o.ext, "keep"), p), (p) => writeFileSync(p, readFileSync(join(h.dir, PLAN)), { mode: 0o644 })]) {
+    h = await ready();
+    o = outside(h);
+    mkdirSync(join(h.dir, CLOSED, RUN), { recursive: true, mode: 0o700 });
+    plant(join(h.dir, CLOSED, RUN, PLAN));
+    await rejects(attempt(h), "not_granted");
+    assert.ok(o.intact());
+  }
+  // abandon/ a link to an outside directory: refused BEFORE the commit (the done check proves the directory), with
+  // nothing read through it. With no intent outside, only the directory proof stops it before the commit.
+  h = await ready();
+  o = outside(h);
+  symlinkSync(o.ext, join(h.dir, ABANDON));
+  await rejects(attempt(h), "not_granted");
+  assert.equal(restoreOpen({ dir: h.dir }), true, "not committed");
+  assert.ok(o.intact());
+  // The cleanup: a link planted inside requests/ and the copy is unlinked, never followed.
+  h = await ready();
+  o = outside(h);
+  symlinkSync(o.ext, join(h.dir, REQUESTS, "zz-link"));
+  symlinkSync(join(o.ext, "keep"), join(h.dir, HOSTSTORE_COPY, RUN, "filelink"));
+  assert.deepEqual(await attempt(h), { closed: 7 });
+  assert.ok(o.intact() && !existsSync(join(h.dir, REQUESTS)) && !existsSync(join(h.dir, HOSTSTORE_COPY)));
+});
+
+// ---- The locks: losing either holder stops the operation at once; nothing more is done -----------------------------
+
+/** Kill the real flock holding `path` (its child process), as an OOM kill or a crash would. */
+function killHolder(path) {
+  let n = 0;
+  for (const pid of readdirSync("/proc").filter((p) => /^[0-9]+$/.test(p))) {
+    let cmd;
+    try { cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0"); } catch { continue; }
+    if (cmd[0].endsWith("flock") && cmd.includes(path)) { process.kill(Number(pid), "SIGKILL"); n += 1; }
+  }
+  assert.ok(n > 0, `a holder of ${path} was found`);
+}
+const settle = () => new Promise((r) => setTimeout(r, 200));
+
+test("begin: the exclusion's or the restore lock's holder killed at each step: outcome_unknown, nothing more done, a backup can't overlap", async () => {
+  const steps = ["begin:locked", "begin:bound", "begin:planned", "begin:copying", "begin:copied", "begin:imported", "begin:requested"];
+  for (const which of ["exclusion", "restore"]) {
+    for (const step of steps) {
+      const h = host();
+      const path = which === "exclusion" ? h.exclusion.path : join(h.dir, ".lock");
+      const onStep = async (name) => { if (name === step) { killHolder(path); await settle(); } };
+      await rejects(begin(SNAP, h.deps, { dir: h.dir, exclusion: h.exclusion, onStep }), "outcome_unknown");
+      const s = state(h);
+      const label = `${which} lost at ${step}`;
+      // Nothing after the step: the effects the step's successors make are all absent.
+      const i = steps.indexOf(step);
+      if (i < 1) assert.equal(s.begin, null, label);
+      if (i < 2) assert.equal(s.plan, null, label);
+      if (i < 4) assert.ok(!h.calls.some((c) => c[0] === "restoreHostStore"), label);
+      if (i < 5) assert.ok(!h.calls.some((c) => c[0] === "importHostStore"), label);
+      if (i < 6) assert.ok(s.requests === null || Object.keys(s.requests).length === 0, label);
+      assert.notEqual(s.begin === null ? null : JSON.parse(s.begin).state, "done", label);
+      // The exclusion is free (its holder is gone); a backup takes it, and begin writes nothing more meanwhile.
+      if (which === "exclusion") {
+        const backup = await lockFile(h.exclusion.path);
+        const before = JSON.stringify(state(h));
+        await settle();
+        assert.equal(JSON.stringify(state(h)), before, `${label}: nothing written while the backup holds it`);
+        await backup.release();
+      }
+    }
+  }
+});
+
+test("close: a holder killed before the commit leaves the restore open; after it, nothing more is archived or removed, and close again finishes", async () => {
+  for (const [step, committed] of [["close:locked", false], ["close:checked", false], ["close:committed", true], ["close:archived", true]]) {
+    const h = host();
+    await h.run();
+    records(h, { agent: "validated", archive: "validated", tag: "validated" });
+    const onStep = async (name) => { if (name === step) { killHolder(h.exclusion.path); await settle(); } };
+    await rejects(close({ now: () => 7, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID, onStep }), "outcome_unknown");
+    assert.equal(restoreOpen({ dir: h.dir }), !committed, step);
+    assert.ok(existsSync(join(h.dir, REQUESTS)), `${step}: the requests weren't removed`);
+    if (step !== "close:archived") assert.ok(!existsSync(join(h.dir, CLOSED, RUN, PLAN)), `${step}: nothing archived`);
+    // Close again (the locks fresh): it finishes, with the first close time when it had committed.
+    assert.deepEqual(await close({ now: () => 9, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID }), { closed: committed ? 7 : 9 });
   }
 });

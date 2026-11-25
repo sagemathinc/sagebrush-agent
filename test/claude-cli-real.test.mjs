@@ -67,7 +67,7 @@ test("cli: a turn calls our tool after an Allow; ours is the dynamic server; the
   const api = await fakeAnthropic(echoOnce(), {
     onRequest: (_b, n) => {
       if (n !== 0) return;
-      cmdline = readFileSync(`/proc/${child.pid}/cmdline`, "utf8").split("\0");
+      cmdline = readFileSync(`/proc/${child.helperPid}/cmdline`, "utf8").split("\0");
       const i = cmdline.indexOf("--mcp-config");
       configSeen = existsSync(cmdline[i + 1]);
     },
@@ -552,11 +552,14 @@ test("cli: output held open after exit by a group that outlives its KILLs: the r
   const realKill = process.kill;
   let pg = null;
   process.kill = (pid, sig) => { if (pg !== null && pid === -pg && sig === "SIGKILL") return true; return realKill.call(process, pid, sig); };
+  // (the group's id from the spawn on: the KILL comes once, at the child's exit, before the loop below ends)
+  const watch = setInterval(() => { if (q.child && pg === null) { pg = q.child.pid; clearInterval(watch); } }, 1);
   try {
     const t0 = Date.now();
     let err = null;
     try { for await (const _ of q) {} } catch (e) { err = e; }
-    pg = q.child.pid;
+    clearInterval(watch);
+    assert.equal(pg, q.child.pid);
     assert.match(String(err?.message), /output stayed open/);
     let reap = null;
     try { await q.return(); } catch (e) { reap = e; }

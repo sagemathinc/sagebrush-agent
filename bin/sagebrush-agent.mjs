@@ -21,7 +21,7 @@
 // `codex` on PATH), as `codex app-server` with that computer's Codex login and
 // settings: only over the runner, and only for a connection with shell and files on.
 //
-//   sagebrush-agent --pair-stdin --origin http://127.0.0.1:<port> --port 0
+//   sagebrush-agent --pair-stdin --origin http://127.0.0.1:<port> --port 0 [--claude-path <absolute path>]
 //
 // is how the desktop app starts it (lib/pair-stdin.mjs): the app's own page is the only origin, the app hands the one-time
 // code over stdin, and the agent prints only {"v":1,"listening":<port>} on stdout. The end of stdin stops it.
@@ -32,7 +32,7 @@ import { AgentServer, DEFAULT_ORIGINS, TEXT } from "../lib/server.mjs";
 import { stdinChunks } from "../lib/stdio.mjs";
 import { pairOrigin, readPairLine } from "../lib/pair-stdin.mjs";
 import { stdioOutput } from "../lib/stdout-thread.mjs";
-import { baseUrlSet, claudeBinary, claudeMode, claudeSignedIn, claudeVersionProblem, cliCreateServer, cliDeleteSession, cliQuery, sdkGuard, SETUP_TEXT } from "../lib/claude-cli.mjs";
+import { baseUrlSet, CLAUDE_PIN, claudeBinary, claudeMode, claudeSignedIn, claudeVersionProblem, cliCreateServer, cliDeleteSession, cliQuery, sdkGuard, SETUP_TEXT } from "../lib/claude-cli.mjs";
 
 
 // (r2 §6: Claude is never pointed at another endpoint from here; refused before anything starts)
@@ -60,11 +60,22 @@ let codex = false;
 let loopbackFlags = false;
 let pairStdin = false;
 let portGiven = null;
+let claudePathGiven = null;
 const given = [];
 for (let i = 0; i < args.length; i++) {
   if (args[i] === "--port") { portGiven = String(args[++i]); port = Number(portGiven); loopbackFlags = true; }
   else if (args[i] === "--origin") { given.push(String(args[++i])); loopbackFlags = true; }
   else if (args[i] === "--pair-stdin") pairStdin = true;
+  else if (args[i] === "--claude-path") {
+    if (claudePathGiven !== null || i + 1 >= args.length) { console.error("--claude-path takes exactly one path"); process.exit(2); }
+    claudePathGiven = String(args[++i]);
+  } else if (args[i] === "--claude-path-reasons") {
+    // (the closed list of --claude-path's refusal words, one JSON line: the desktop app mirrors it and tests it)
+    if (args.length !== 1) { console.error("--claude-path-reasons takes no other argument"); process.exit(2); }
+    const { CLAUDE_PATH_REASONS } = await import("../lib/claude-path.mjs");
+    process.stdout.write(JSON.stringify(CLAUDE_PATH_REASONS) + "\n");
+    process.exit(0);
+  }
   else if (args[i] === "--stdio") stdio = true;
   else if (args[i] === "--codex") codex = true;
   else if (args[i] === "--help" || args[i] === "-h") {
@@ -92,6 +103,10 @@ if (pairStdin) {
     process.exit(2);
   }
   origins = [given[0]];
+} else if (claudePathGiven !== null) {
+  // (a chosen Claude Code is the app's alone: from the command line or a runner, the pinned one runs, unchanged)
+  console.error("--claude-path works only with --pair-stdin (the desktop app's launch)");
+  process.exit(2);
 } else {
   origins = [...DEFAULT_ORIGINS, ...given.map(exactOrigin)];
 }
@@ -125,9 +140,31 @@ if (process.env.SAGEBRUSH_AGENT_FAKE === "1") {
   // login (lib/claude-cli.mjs). Nothing here reads, holds or passes that login.
   client = "claude-code";
   query = cliQuery;
+  if (claudePathGiven !== null) {
+    // (the app's --claude-path: the Claude Code the person chose or the app downloaded, bound once and checked here as a
+    //  second line (lib/claude-path.mjs), its version in the set this agent tested; re-checked before every spawn;
+    //  every spawn with the built environment. A refusal is one word on stderr, exit 3; never the bundled one or PATH)
+    const cp = await import("../lib/claude-path.mjs");
+    const say = (e) => { if (e instanceof cp.ClaudePathError) { console.error(e.reason); process.exit(3); } throw e; };
+    let bound;
+    try {
+      bound = cp.bindExecutable(claudePathGiven);
+      await cp.claudeVersionOf(bound, [CLAUDE_PIN]);
+    } catch (e) { say(e); }
+    const env = cp.minimalEnv();
+    const recheck = () => {
+      try { return cp.recheck(bound); } catch (e) { if (e instanceof cp.ClaudePathError) console.error(e.reason); throw e; }
+    };
+    query = (params) => cliQuery(params, { bin: bound.path, env, recheck });
+  }
   createServer = cliCreateServer;
   deleteSession = (id) => cliDeleteSession(id);
   mcpSource = "dynamic";
+} else if (claudePathGiven !== null) {
+  // (a chosen Claude Code runs with the person's own Claude login: an API key or a cloud provider set here would make
+  //  it SDK mode, which never runs that binary; refused rather than silently ignoring the choice)
+  console.error("--claude-path runs Claude Code with your own Claude login: unset the API key or cloud provider variable");
+  process.exit(2);
 } else {
   // SDK mode: only where the environment selects an API key or a cloud provider; each query is held until the SDK's
   // initialize answer shows that credential and no Claude login (sdkGuard).

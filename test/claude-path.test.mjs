@@ -2,11 +2,11 @@
 // version answer. Rows named "claude-path: …". POSIX only.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bindExecutable, boundedRun, CLAUDE_PATH_REASONS, claudeVersionOf, ClaudePathError, minimalEnv, recheck } from "../lib/claude-path.mjs";
+import { bindExecutable, boundedRun, heldSpawn, CLAUDE_PATH_REASONS, claudeVersionOf, ClaudePathError, minimalEnv, recheck } from "../lib/claude-path.mjs";
 
 const skip = process.platform === "win32" ? "POSIX only" : false;
 const UID = process.getuid?.();
@@ -369,5 +369,102 @@ test("claude-path: a hard link to the bound file from elsewhere doesn't change i
   linkSync(f, join(b, "second-name"));
   // (the link count changes, but the identity is device, inode, size, mtime, mode and owner: unchanged)
   assert.equal(reason(() => recheck(r, { lstat: hostLstat })), "ok");
+  rmSync(b, { recursive: true });
+});
+
+// (a long run's holder: CliRun's spawn. The rows record every signal sent to the group, and when)
+const exitOf = (held) => new Promise((r) => { held.once("exit", (code, signal) => r({ code, signal })); held.once("error", (e) => r({ error: e })); });
+const readPid = async (f) => { for (let i = 0; i < 200; i++) { try { const t = readFileSync(f, "utf8").trim(); if (t) return Number(t); } catch {} await new Promise((r) => setTimeout(r, 10)); } throw new Error("no pid"); };
+function recordKills(pg) {
+  const realKill = process.kill, log = [];
+  process.kill = function (pid, sig) { if (pid === -pg()) log.push(sig); return realKill.call(process, pid, sig); };
+  return { log, restore: () => { process.kill = realKill; } };
+}
+
+test("claude-path: a long run's group gets TERM, then KILL at the helper's exit; a grandchild that ignores TERM is ended; no signal after the holder is gone", { skip, timeout: 30_000 }, async () => {
+  const b = base();
+  const gp = join(b, "gp");
+  const f = exe(b, "helper", `#!/bin/sh\n(trap '' TERM; exec sleep 600) &\necho $! > ${JSON.stringify(gp)}\nexec sleep 600\n`);
+  const held = heldSpawn(f, [], { env: {}, cwd: b });
+  const exited = exitOf(held);
+  const grandchild = await readPid(gp);
+  const k = recordKills(() => held.pid);
+  try {
+    const t0 = Date.now();
+    const err = await held.end({ graceMs: 10_000, boundMs: 10_000 });
+    assert.equal(err, null);
+    assert.ok(Date.now() - t0 < 5_000, "the KILL came at the helper's exit, not after the grace");
+    assert.deepEqual(k.log, ["SIGTERM", "SIGKILL"]);
+    assert.equal((await exited).signal, "SIGTERM", "the helper ended on the TERM");
+    assert.equal(held.alive(), false);
+    assert.equal(held.signal("SIGKILL"), false, "nothing is sent once the holder is gone");
+    assert.deepEqual(k.log, ["SIGTERM", "SIGKILL"]);
+    assert.ok(await gone(grandchild), "the grandchild is gone");
+  } finally { k.restore(); try { process.kill(grandchild, "SIGKILL"); } catch {} }
+  rmSync(b, { recursive: true });
+});
+
+test("claude-path: a long run whose helper ignores TERM is KILLed after the grace", { skip, timeout: 30_000 }, async () => {
+  const b = base();
+  const pf = join(b, "pid");
+  const f = exe(b, "helper", `#!/bin/sh\ntrap '' TERM\necho $$ > ${JSON.stringify(pf)}\nexec sleep 600\n`);
+  const held = heldSpawn(f, [], { env: {}, cwd: b });
+  const exited = exitOf(held);
+  const pid = await readPid(pf);
+  const k = recordKills(() => held.pid);
+  try {
+    const t0 = Date.now();
+    assert.equal(await held.end({ graceMs: 400, boundMs: 10_000 }), null);
+    assert.ok(Date.now() - t0 >= 400, "TERM was ignored: the KILL waited for the grace");
+    assert.deepEqual(k.log, ["SIGTERM", "SIGKILL"]);
+    await exited;
+    assert.ok(await gone(pid));
+  } finally { k.restore(); try { process.kill(pid, "SIGKILL"); } catch {} }
+  rmSync(b, { recursive: true });
+});
+
+test("claude-path: a long run's output ends when the helper and its group let go of it, while the holder still lives", { skip, timeout: 30_000 }, async () => {
+  const b = base();
+  const f = exe(b, "helper", "#!/bin/sh\necho hi\necho err >&2\n");
+  const held = heldSpawn(f, [], { env: {}, cwd: b });
+  let out = "";
+  held.stdout.setEncoding("utf8").on("data", (d) => { out += d; });
+  held.stderr.resume();
+  const ended = (st) => new Promise((r) => st.once("end", r));
+  let t;
+  try {
+    const r = await Promise.race([Promise.all([ended(held.stdout), ended(held.stderr), exitOf(held)]).then(() => "ended"),
+      new Promise((res) => { t = setTimeout(() => res("still open"), 5_000); })]);
+    assert.equal(r, "ended", "nothing but the helper held its output");
+    assert.equal(out, "hi\n");
+    assert.equal(held.alive(), true, "the holder keeps the group's id until it is ended");
+  } finally { clearTimeout(t); assert.equal(await held.end({ graceMs: 10_000, boundMs: 10_000 }), null); }
+  assert.equal(held.alive(), false);
+  rmSync(b, { recursive: true });
+});
+
+test("claude-path: a long run that can't start says so; its holder is ended", { skip, timeout: 30_000 }, async () => {
+  const held = heldSpawn("/nonexistent/claude", [], { env: {}, cwd: "/" });
+  const r = await exitOf(held);
+  assert.match(String(r.error?.message), /ENOENT/);
+  assert.equal(await held.end({ graceMs: 10_000, boundMs: 10_000 }), null);
+  assert.equal(held.alive(), false);
+});
+
+test("claude-path: when this process dies, the holder ends its own group (nothing is left running)", { skip, timeout: 30_000 }, async () => {
+  const b = base();
+  const pf = join(b, "pid");
+  const f = exe(b, "helper", `#!/bin/sh\ntrap '' TERM\necho $$ > ${JSON.stringify(pf)}\nexec sleep 600\n`);
+  const lib = new URL("../lib/claude-path.mjs", import.meta.url).href;
+  const parent = spawn(process.execPath, ["--input-type=module", "-e",
+    `import { heldSpawn } from ${JSON.stringify(lib)}; const h = heldSpawn(${JSON.stringify(f)}, [], { env: {}, cwd: "/" }); console.log(h.pid); setInterval(() => {}, 1 << 30);`],
+  { stdio: ["ignore", "pipe", "inherit"] });
+  const holderPid = Number(await new Promise((r) => parent.stdout.once("data", (d) => r(String(d).trim()))));
+  const helper = await readPid(pf);
+  parent.kill("SIGKILL");
+  try {
+    assert.ok(await gone(holderPid), "the holder is gone");
+    assert.ok(await gone(helper), "the helper, which ignores TERM, is gone");
+  } finally { try { process.kill(helper, "SIGKILL"); } catch {} try { process.kill(-holderPid, "SIGKILL"); } catch {} }
   rmSync(b, { recursive: true });
 });

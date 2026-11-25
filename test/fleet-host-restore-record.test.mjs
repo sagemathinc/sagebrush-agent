@@ -3,6 +3,7 @@
 // destination is cleaned before anything is staged or filled; a stop is never retried but by the person's new request;
 // only a validated restore lowers the restore fence. The last rows crash a model fill at every point and recover.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,7 +16,7 @@ import { realIo } from "../lib/fleet/host/store.mjs";
 import {
   CLASSES, FAILED_REASONS, KINDS, MAX_ATTEMPTS, RESTORE_RUN, STATES, checkRecord, markerPath, newRecord, newRestoreRun, ownerOf,
   readMarker, readRecord, recordName, recoveryStep, restoreReady, retryRecord, runTime, stagingDir, stagingName, step as rawStep,
-  writeRecord, digestsWhole, checkFillReport, readFillReport, writeFillReport,
+  writeRecord, digestsWhole, checkFillReport, readFillReport, writeFillReport, readRegular,
 } from "../lib/fleet/host/restore-record.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
@@ -592,4 +593,38 @@ test("automatic retries stop at MAX_ATTEMPTS: a set that crashes in every fill f
   assert.deepEqual([r.state, r.reason, r.attempt, r.dirty], ["failed", "outcome_unknown", MAX_ATTEMPTS, false]);
   assert.deepEqual([after.fills, filled(after)], [[], EMPTY], "never filled again; the partial fill removed");
   assert.equal(model(root, id).recover().state, "failed", "and it stays failed: only the person restarts it");
+});
+
+test("readRegular: lstat, a no-follow open, fstat of the SAME object; anything demonstrably not a regular file is bad_form, I/O errors throw", () => {
+  const dir = fresh();
+  const p = join(dir, "f");
+  writeFileSync(p, "hello");
+  assert.equal(readRegular(p, 100, "it").toString(), "hello");
+  assert.equal(readRegular(join(dir, "none"), 100, "it"), null);
+  refused(() => readRegular(p, 4, "it"), "bad_form"); // longer than it can be
+  // Through fsx stubs, each seam alone:
+  const st = fs.lstatSync(p);
+  const like = (o) => Object.assign(Object.create(Object.getPrototypeOf(st)), st, o);
+  const swapped = { ...fs, fstatSync: (fd) => like({ ino: st.ino + 1 }) };
+  refused(() => readRegular(p, 100, "it", swapped), "bad_form"); // another object behind the open
+  const otherDev = { ...fs, fstatSync: (fd) => like({ dev: st.dev + 1 }) };
+  refused(() => readRegular(p, 100, "it", otherDev), "bad_form");
+  for (const code of ["ENXIO", "ELOOP", "EISDIR", "ENODEV"]) {
+    const x = { ...fs, openSync: () => { throw Object.assign(new Error(code), { code }); } };
+    refused(() => readRegular(p, 100, "it", x), "bad_form"); // it changed type between lstat and open
+  }
+  for (const code of ["EIO", "EACCES", "EMFILE"]) {
+    const x = { ...fs, openSync: () => { throw Object.assign(new Error(code), { code }); } };
+    assert.throws(() => readRegular(p, 100, "it", x), (e) => e.code === code, code); // an interruption, as it is
+    const y = { ...fs, lstatSync: () => { throw Object.assign(new Error(code), { code }); } };
+    assert.throws(() => readRegular(p, 100, "it", y), (e) => e.code === code, code);
+  }
+  const short = { ...fs, readSync: () => 0 };
+  refused(() => readRegular(p, 100, "it", short), "bad_form");
+  // Real objects that aren't regular files: a link, a directory, a FIFO, a socket.
+  fs.symlinkSync(p, join(dir, "l"));
+  fs.mkdirSync(join(dir, "d"));
+  execFileSync("mkfifo", [join(dir, "q")]);
+  execFileSync("python3", ["-I", "-c", "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])", join(dir, "s")]);
+  for (const n of ["l", "d", "q", "s"]) refused(() => readRegular(join(dir, n), 100, "it"), "bad_form");
 });

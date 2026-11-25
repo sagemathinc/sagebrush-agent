@@ -805,6 +805,9 @@ test("validation of sessions: each SQLite database's private copy passes quick_c
   await failedAs({ ...opts(), beforeDigest: (cls, d) => { if (cls === "sessions") { const b = readFileSync(join(d, "live.db-wal")); b[40] ^= 1; writeFileSync(join(d, "live.db-wal"), b); } } }, "bad_form", "a damaged WAL in the destination");
 });
 
+/** A Unix socket bound at `path` and left there (its listener gone): an open of it gives ENXIO. */
+const unixSocket = (path) => execFileSync("python3", ["-I", "-c", "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])", path]);
+
 test("permanent list or report faults are a durable failed; an interruption stays published and is validated again", async () => {
   const list = (w, id, cls) => join(attemptDir(w, id, cls), "data", "digests.json");
   const report = (w, id, cls) => join(w.dir, `agent-${id}.${cls}.fill.json`);
@@ -816,6 +819,8 @@ test("permanent list or report faults are a durable failed; an interruption stay
     // (not empty: an empty directory has size 0 on some filesystems, and would fail as malformed JSON anyway)
     "a report replaced by a directory": (w, id) => { rmSync(report(w, id, "home")); mkdirSync(report(w, id, "home")); writeFileSync(join(report(w, id, "home"), "x"), "{}"); },
     "a report replaced by a link": (w, id) => { const p = report(w, id, "sessions"); renameSync(p, p + ".x"); symlinkSync(p + ".x", p); },
+    "the list replaced by a socket": (w, id) => { rmSync(list(w, id, "home")); unixSocket(list(w, id, "home")); },
+    "a report replaced by a socket": (w, id) => { rmSync(report(w, id, "sessions")); unixSocket(report(w, id, "sessions")); },
     "a report replaced by a FIFO": (w, id) => { rmSync(report(w, id, "home")); execFileSync("mkfifo", [report(w, id, "home")]); },
     "a report replaced by another attempt's": (w, id) => { const x = JSON.parse(readFileSync(report(w, id, "home"), "utf8")); writeFileSync(report(w, id, "home"), JSON.stringify({ ...x, attempt: 2 }) + "\n"); },
   };

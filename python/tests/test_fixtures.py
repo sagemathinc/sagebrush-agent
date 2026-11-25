@@ -22,7 +22,7 @@ from sagebrush_fleet.hpke import Recipient, Sender, receive_export, send_export 
 
 FIXTURES = ROOT / "test" / "fixtures"
 # (the JavaScript checker's case counts: a fixture file that loses cases fails here, not silently)
-COUNTS = {"fleet": 195, "hpke": 34}
+COUNTS = {"fleet": 201, "hpke": 34}
 
 
 def load(name):

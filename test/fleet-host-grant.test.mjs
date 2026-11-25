@@ -113,7 +113,7 @@ const fresh = () => join(mkdtempSync(join(tmpdir(), "sb-grant-")), "state");
 const okIntent = () => { const log = []; const f = async (r) => { log.push(r); }; f.log = log; return f; };
 const stateFile = (root) => join(root, "grant", "state.json");
 /** begin's records input: these grants list no agents. */
-const E = { entries: {} };
+const E = { entries: {}, hash: sha256b64(Buffer.from("the signed bytes")) };
 const stateOnDisk = (root) => JSON.parse(readFileSync(stateFile(root), "utf8"));
 /** Open the host store and return its grant view, with close() closing the store. */
 const GrantState = { open: async (root, opts) => { const h = await HostStore.open(root, opts); const g = h.grants; g.close = () => h.close(); g.store = h; return g; } };
@@ -127,7 +127,7 @@ test("begin: the intent first; then grant bytes; then ONE atomic state commit; s
   await s.begin(1, bytes, digest, ["broker-gen", "start:a"], intent, E);
   assert.equal(intent.log.length, 1);
   assert.equal(intent.log[0].gen, 1);
-  assert.deepEqual(stateOnDisk(dir), { v: 2, gen: 1, digest, phase: "applying", plan: [{ step: "broker-gen", done: false }, { step: "start:a", done: false }], ack: null, proof: {}, records: {} });
+  assert.deepEqual(stateOnDisk(dir), { v: 2, gen: 1, digest, hash: E.hash, phase: "applying", plan: [{ step: "broker-gen", done: false }, { step: "start:a", done: false }], ack: null, proof: {}, records: {} });
   assert.deepEqual(s.steps(), ["broker-gen", "start:a"]);
   assert.equal(s.ack, null);
   s.done(0);
@@ -270,7 +270,7 @@ for (const step of ["open", "write", "fsync", "rename", "dirfsync"]) {
     await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a"], okIntent(), E), /ENOSPC/);
     assert.equal(s.poisoned, false);
     assert.deepEqual(s.pending(), { phase: "applied", gen: 0, remaining: [] });
-    assert.deepEqual(stateOnDisk(dir), { v: 2, gen: 0, digest: null, phase: "applied", plan: [], ack: null, proof: {}, records: {} });
+    assert.deepEqual(stateOnDisk(dir), { v: 2, gen: 0, digest: null, hash: null, phase: "applied", plan: [], ack: null, proof: {}, records: {} });
     assert.deepEqual(readdirSync(join(dir, "grant", "grants")), []); // no partial file left to block a retry
     await s.close();
     const again = await GrantState.open(dir);
@@ -331,29 +331,31 @@ test("anything but the exact closed state is refused at load and left as found",
   const d43 = "A".repeat(43);
   const variants = [
     "{",
-    { v: 2, gen: 7, digest: null, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: "false" }] , ack: null, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: "yes" }] , ack: null, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: d43, phase: "applying", plan: [{ step: 12, done: false }] , ack: null, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: false, extra: 1 }] , ack: null, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: d43, phase: "applying", plan: [{ step: "", done: false }] , ack: null, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [{ step: "a", done: true }] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
-    { v: 2, gen: 0, digest: null, phase: "applying", plan: [] , ack: null, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [], extra: 1 , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: "short", phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {} },
-    { v: 2, gen: -1, digest: null, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: d43, phase: "done", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [] },
-    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [], ack: null, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: d43, phase: "applying", plan: [], ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: "no", restarted: [] }, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: ["x"] }, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [], extra: 1 }, proof: {}, records: {} },
-    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] } },
-    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: [] },
-    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: { x: "not_empty" } },
-    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: { abcdefghijklmnopqrstuvwxya: "maybe" } },
+    { v: 2, gen: 7, digest: null, hash: d43, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applying", plan: [{ step: "a", done: "false" }] , ack: null, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applying", plan: [{ step: "a", done: "yes" }] , ack: null, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applying", plan: [{ step: 12, done: false }] , ack: null, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applying", plan: [{ step: "a", done: false, extra: 1 }] , ack: null, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applying", plan: [{ step: "", done: false }] , ack: null, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [{ step: "a", done: true }] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 0, digest: null, hash: null, phase: "applying", plan: [] , ack: null, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], extra: 1 , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: "short", hash: d43, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: null, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: "short", phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {} },
+    { v: 2, gen: -1, digest: null, hash: null, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "done", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [] },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: null, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applying", plan: [], ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: { narrowed: "no", restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: ["x"] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [], extra: 1 }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] } },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: [] },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: { x: "not_empty" } },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: { abcdefghijklmnopqrstuvwxya: "maybe" } },
   ];
   for (const v of variants) {
     const dir = fresh();

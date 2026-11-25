@@ -19,10 +19,12 @@ const tmp = (n) => join(mkdtempSync(join(tmpdir(), "sb-exec-")), n);
 
 // ---- a grant is JSON here; `verify` stands in for the §3.2 check (tested in grant.mjs)
 const bytesOf = (body) => Buffer.from(JSON.stringify(body));
+/** The stand-in's signed-bytes hash: deliberately NOT the envelope digest, so a mix-up of the two fails. */
+const signedHash = (bytes) => sha256b64(Buffer.concat([Buffer.from("signed:"), bytes]));
 const verify = (bytes) => {
   const body = JSON.parse(String(bytes));
   if (body.expired) throw new FleetError("grant_expired", "expired");
-  return { body, digest: sha256b64(bytes) };
+  return { body, digest: sha256b64(bytes), hash: signedHash(bytes) };
 };
 const bodyOf = (bytes) => JSON.parse(String(bytes));
 const entry = (agent, { tags = [], x = 1 } = {}) => ({ agent, tags, config: { x } });
@@ -487,7 +489,8 @@ test("the transfer records follow accepted grants' entries, not the plan: an exp
   assert.equal(r.status, "applied");
   assert.deepEqual([store.registry.agent(A).gen, rec(A).entry_gen, rec(A).listed_since], [2, 1, 1]);
   assert.deepEqual([rec(B).entry_gen, rec(B).listed_since], [2, 1]);
-  assert.equal(store.grants.digestAt(1), sha256b64(grant(1, [entry(A), entry(B)])));
+  assert.equal(store.grants.hashAt(1), signedHash(grant(1, [entry(A), entry(B)])), "the signed-bytes hash, not the envelope digest");
+  assert.notEqual(store.grants.hashAt(1), sha256b64(grant(1, [entry(A), entry(B)])));
   // A dropped: its records go with it
   await sup.submit({ kind: "grant", bytes: grant(3, [entry(B, { x: 2 })]) });
   assert.deepEqual([rec(A), rec(B).entry_gen, rec(B).listed_since], [null, 2, 1]);

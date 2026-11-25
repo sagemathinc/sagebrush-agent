@@ -6,11 +6,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
-import { FleetError, newId, sha256b64 } from "../lib/fleet/index.mjs";
+import { FleetError, newId, sha256b64, b64, keyFromSeed, seal, signedBytes, applyChainEntry, hostFingerprint, verifyHostCert, verifyGrant as coreVerifyGrant } from "../lib/fleet/index.mjs";
+import { x25519Generate } from "../lib/fleet/channel/noise.mjs";
 import { checkTransferForHost } from "../lib/fleet/core/verify.mjs";
-import { checkGrantState, entryDigest, nextRecords } from "../lib/fleet/host/grant.mjs";
+import { checkGrantState, entryDigest, nextRecords, verifyGrant as hostVerifyGrant } from "../lib/fleet/host/grant.mjs";
 import { HostStore } from "../lib/fleet/host/host-store.mjs";
-import { MAX_NONCES, checkTransfers, hostRecords, recordTransfer } from "../lib/fleet/host/host-records.mjs";
+import { MAX_NONCES, checkTransfers, hostRecords, hostRecordsFromCert, recordTransfer } from "../lib/fleet/host/host-records.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
@@ -20,13 +21,17 @@ const d = (s) => sha256b64(Buffer.from(String(s)));
 const X = newId(), Y = newId(), Z = newId();
 const HOST = newId(), FP = d("cert");
 
-/** Accept generation `gen` listing `entries` (agent id -> entry digest), and finish it. Returns its digest. */
+/**
+ * Accept generation `gen` listing `entries` (agent id -> entry digest), and finish it. Returns its signed-bytes hash, a
+ * stand-in distinct from the envelope digest (the real one is the last test's).
+ */
 async function accept(store, gen, entries) {
   const bytes = Buffer.from(`grant ${gen} ${JSON.stringify(entries)}`), digest = sha256b64(bytes);
-  await store.grants.begin(gen, bytes, digest, ["a"], okIntent, { entries });
+  const hash = d(`signed ${gen} ${JSON.stringify(entries)}`);
+  await store.grants.begin(gen, bytes, digest, ["a"], okIntent, { entries, hash });
   store.grants.done(0);
   store.grants.finish({ narrowed: false, restarted: [] });
-  return digest;
+  return hash;
 }
 
 test("nextRecords: added, changed, identical, dropped", () => {
@@ -53,7 +58,7 @@ test("records move with the highwater: entry_gen, listed_since, every accepted d
   assert.deepEqual(g.record(X), { entry: d("x2"), entry_gen: 4, listed_since: 1 });
   assert.deepEqual(g.record(Y), { entry: d("y1"), entry_gen: 2, listed_since: 2 });
   assert.equal(g.record(Z), null);
-  assert.deepEqual([g.digestAt(1), g.digestAt(2), g.digestAt(3), g.digestAt(4), g.digestAt(5), g.digestAt(0), g.digestAt(-1), g.digestAt(1.5)],
+  assert.deepEqual([g.hashAt(1), g.hashAt(2), g.hashAt(3), g.hashAt(4), g.hashAt(5), g.hashAt(0), g.hashAt(-1), g.hashAt(1.5)],
     [d1, d2, null, d4, null, null, null, null]);
   // the current generation's digest is the state's; each earlier one is in accepted/<gen>
   const dir = join(root, "grant", "accepted");
@@ -77,12 +82,27 @@ test("an earlier generation's digest is written before the next one is accepted;
   store = await HostStore.open(root);
   await accept(store, 2, { [X]: d("x1") });
   assert.equal(readFileSync(join(dir, "1"), "utf8"), d1);
-  assert.equal(store.grants.digestAt(1), d1);
+  assert.equal(store.grants.hashAt(1), d1);
   // A missing marker reads as null (the check then refuses); a corrupt one is refused.
   rmSync(join(dir, "1"));
-  assert.equal(store.grants.digestAt(1), null);
+  assert.equal(store.grants.hashAt(1), null);
   writeFileSync(join(dir, "1"), "not a digest");
-  refused(() => store.grants.digestAt(1), "bad_form");
+  refused(() => store.grants.hashAt(1), "bad_form");
+  await store.close();
+});
+
+test("begin without a valid signed-bytes hash is refused before the intent is appended or any byte written", async () => {
+  const root = fresh();
+  const store = await HostStore.open(root);
+  const bytes = Buffer.from("g1");
+  let intents = 0;
+  const intent = async () => { intents++; };
+  for (const hash of [undefined, null, "", "short", 7, sha256b64(bytes) + "x"]) {
+    await rejects(store.grants.begin(1, bytes, sha256b64(bytes), ["a"], intent, { entries: { [X]: d(1) }, hash }), "bad_form");
+  }
+  assert.equal(intents, 0, "refused before the intent");
+  assert.deepEqual(readdirSync(join(root, "grant", "grants")), [], "and before the grant bytes");
+  assert.equal(store.grants.highwater.gen, 0);
   await store.close();
 });
 
@@ -90,7 +110,7 @@ test("begin without records input is refused before anything is accepted", async
   const store = await HostStore.open(fresh());
   const bytes = Buffer.from("g1");
   for (const entries of [undefined, null, [], { "not-an-id": d(1) }, { [X]: "short" }]) {
-    await rejects(store.grants.begin(1, bytes, sha256b64(bytes), ["a"], okIntent, { entries }), "bad_form");
+    await rejects(store.grants.begin(1, bytes, sha256b64(bytes), ["a"], okIntent, { entries, hash: d("h") }), "bad_form");
   }
   assert.equal(store.grants.highwater.gen, 0);
   await store.close();
@@ -120,7 +140,7 @@ test("v:1 grant state: empty becomes v:2; one that accepted a grant is refused a
 });
 
 test("the grant state's records: closed shape", () => {
-  const base = { v: 2, gen: 4, digest: d(4), phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: {} };
+  const base = { v: 2, gen: 4, digest: d(4), hash: d("signed 4"), phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: {} };
   assert.equal(checkGrantState({ ...base, records: { [X]: { entry: d(1), entry_gen: 4, listed_since: 1 } } }), true);
   for (const records of [null, [], { bad: { entry: d(1), entry_gen: 1, listed_since: 1 } },
     { [X]: { entry: "x", entry_gen: 1, listed_since: 1 } }, { [X]: { entry: d(1), entry_gen: 1 } },
@@ -192,7 +212,7 @@ test("a dropped agent: records and accepted transfer gone, nonces kept; a re-lis
   assert.equal(host.acceptedTransfer(X), null);
   refused(() => checkTransferForHost(pair(X, 1, d1, N(2), d("t2")), host), "not_granted");
   // a transfer for the new listing is a first acceptance again; recording it replaces the old one
-  const d3 = store.grants.digestAt(3);
+  const d3 = store.grants.hashAt(3);
   assert.deepEqual(checkTransferForHost(pair(X, 3, d3, N(6), d("t6")), host), { first: true });
   recordTransfer(store, X, T(3, N(6), d("t6")));
   assert.deepEqual(host.acceptedTransfer(X), T(3, N(6), d("t6")));
@@ -277,15 +297,108 @@ test("a re-listing with no record in between: the earlier listing's transfer, st
   await store.close();
 });
 
-test("a stray marker past the highwater is never read: digestAt is null beyond the accepted generation", async () => {
+test("a stray marker past the highwater is never read: hashAt is null beyond the accepted generation", async () => {
   const root = fresh();
   const store = await HostStore.open(root);
   const d1 = await accept(store, 1, { [X]: d("x1") });
   await accept(store, 2, { [X]: d("x1") });
   // A file where a future generation's marker would go (planted: begin never writes one past the highwater).
   writeFileSync(join(root, "grant", "accepted", "5"), d1);
-  assert.equal(store.grants.digestAt(5), null);
-  assert.equal(store.grants.digestAt(3), null);
-  assert.equal(store.grants.digestAt(1), d1);
+  assert.equal(store.grants.hashAt(5), null);
+  assert.equal(store.grants.hashAt(3), null);
+  assert.equal(store.grants.hashAt(1), d1);
   await store.close();
 });
+
+// ---- interoperability: the hash a real transfer carries, and the fingerprint from the real certificate
+
+/** A fleet with a native device, this host's verified certificate, and a grant sealed by that device for `gen`. */
+async function realFleet() {
+  const AUD = "https://dev.sagebrush.space", fleet = newId(), host = newId();
+  const N = keyFromSeed(new Uint8Array(32).fill(41)), rec = keyFromSeed(new Uint8Array(32).fill(42)), nId = newId();
+  const sN = { kind: "device", id: nId, alg: "ed25519", key: N.key };
+  const chain = (await applyChainEntry(null, seal("sb.device-chain.v1", sN, { fleet, aud: AUD, seq: 0, prev: "", op: "genesis", at_ms: 1, auth_time_ms: 1,
+    device: { id: nId, alg: "ed25519", key: b64(N.raw), name: "mac", tier: "native" }, recovery_key: { alg: "ed25519", key: b64(rec.raw) } }, N), { aud: AUD, fleet })).state;
+  const H = keyFromSeed(new Uint8Array(32).fill(43)), encKey = x25519Generate();
+  const fp = await hostFingerprint(host, H.raw, encKey.raw);
+  const cert = await verifyHostCert(seal("sb.host-cert.v1", sN, { fleet, aud: AUD, chain_seq: 0, host, sign_key: b64(H.raw), enc_key: b64(encKey.raw),
+    fingerprint: b64(fp), name: "box", at_ms: 1 }, N), { aud: AUD, fleet, chain });
+  const config = { files: { rw: [], ro: [] }, network: { mode: "none", allow: [], lan_allow: [] }, programs: "run", mcp_allow: null, gpu: false,
+    resources: { memory_max_mb: 1024, tasks_max: 1024, cpu_weight: 100, cpu_quota_pct: null, io_weight: 100, disk_gb: 10, nofile: 65536 },
+    wakes: [], turns: { per_day: 10, wall_s: 7200 } };
+  const tag = newId();
+  // The host checks a full config; the fleet schema (core) admits only {} until host r2-final is imported, so the core
+  // path is exercised on a grant with config {} (`core: true`), the host path on one with the full config.
+  const body = (gen, x, core) => ({ fleet, aud: AUD, host, gen, cert: cert.hash, chain_seq: 0, at_ms: 1000 + gen, not_before_ms: 1000, not_after_ms: 10_000,
+    auth_time_ms: 1000, agents: [{ agent: X, name: `worker-${x}`, client: "claude", root: false, tags: [tag], workspace: [{ path: "/Course", access: "write" }],
+      broker: ["messages"], spend_cap_cents: 0, config_schema: 1, config: core ? {} : config }],
+    tags: [{ tag, name: "course-1" }], subscriptions: [], offline: { revocation_check_s: 900, horizon_s: 3600 } });
+  const grant = (gen, x = 1, core = false) => { const b = body(gen, x, core); return { body: b, bytes: seal("sb.host-grant.v1", sN, b, N), signed: signedBytes("sb.host-grant.v1", sN, b) }; };
+  const resolveKey = (sg) => { if (sg.key === N.key) return N.raw; throw new FleetError("device_unknown"); };
+  const hostCtx = { aud: AUD, fleet, host, cert: cert.hash, now: 5000, resolveKey, hostInfo: { ramMb: 8192, cpus: 4 } };
+  const coreCtx = (current) => ({ aud: AUD, fleet, chain, cert, current, now: 5000 });
+  return { cert, grant, hostCtx, coreCtx };
+}
+
+/** Accept a real grant the way the executor does: the host's verify, its entries and its signed-bytes hash. */
+async function acceptReal(store, g, ctx) {
+  const v = hostVerifyGrant(g.bytes, ctx);
+  await store.grants.begin(v.body.gen, g.bytes, v.digest, ["a"], okIntent, { entries: Object.fromEntries(v.body.agents.map((a) => [a.agent, entryDigest(a)])), hash: v.hash });
+  store.grants.done(0);
+  store.grants.finish({ narrowed: false, restarted: [] });
+  return v;
+}
+
+test("the core check's grant hash is the SHA-256 of signedBytes(type, signer, body): the value a transfer carries", async () => {
+  const { grant, coreCtx } = await realFleet();
+  for (const [gen, cur] of [[1, null], [2, "prev"]]) {
+    const g = grant(gen, gen, true), prev = grant(1, 1, true);
+    const c = await coreVerifyGrant(g.bytes, coreCtx(cur && { gen: 1, bytes: prev.bytes, body: prev.body }));
+    assert.equal(c.hash, sha256b64(g.signed), `gen ${gen}`);
+    assert.notEqual(c.hash, sha256b64(g.bytes), "never the envelope's digest");
+  }
+});
+
+test("the service's transfer passes 5a: a real signed grant accepted, historical and after a reopen", async () => {
+  const { cert, grant, hostCtx } = await realFleet();
+  const root = fresh();
+  let store = await HostStore.open(root);
+  const g1 = grant(1);
+  // The service's value (the core check's `hash`, previous test): the SHA-256 of the grant's SIGNED bytes.
+  const c1 = { hash: sha256b64(g1.signed) };
+  const v1 = await acceptReal(store, g1, hostCtx);
+  assert.equal(v1.hash, c1.hash, "the host stores the same hash the service computes");
+  assert.notEqual(v1.digest, c1.hash, "and it isn't the envelope's digest");
+  let host = hostRecordsFromCert(store, cert);
+  const tr = (gen, grantHash, i) => ({ transfer: { agent: X, gen, grant: grantHash, nonce: N(i), to_host: cert.body.host, to_host_key: cert.body.fingerprint }, receipt: {}, transferHash: d(`t${i}`) });
+  assert.equal(host.grantHashAt(1), c1.hash);
+  assert.deepEqual(checkTransferForHost(tr(1, c1.hash, 1), host), { first: true });
+  refused(() => checkTransferForHost(tr(1, v1.digest, 2), host), "not_granted"); // the envelope digest is no grant hash
+  // gen 2 (X's entry changed): gen 1's hash is now served from its marker, gen 2's from the state.
+  const g2 = grant(2, 2);
+  const c2 = { hash: sha256b64(g2.signed) };
+  await acceptReal(store, g2, hostCtx);
+  assert.deepEqual([host.grantHashAt(1), host.grantHashAt(2)], [c1.hash, c2.hash]);
+  assert.deepEqual(checkTransferForHost(tr(1, c1.hash, 3), host), { first: true });
+  assert.deepEqual(checkTransferForHost(tr(2, c2.hash, 4), host), { first: true });
+  // After a reopen: the same answers from disk.
+  await store.close();
+  store = await HostStore.open(root);
+  host = hostRecordsFromCert(store, cert);
+  assert.deepEqual([host.grantHashAt(1), host.grantHashAt(2)], [c1.hash, c2.hash]);
+  assert.deepEqual(checkTransferForHost(tr(2, c2.hash, 5), host), { first: true });
+  await store.close();
+});
+
+test("hostRecordsFromCert: the id and fingerprint are the verified certificate's own fields", async () => {
+  const { cert } = await realFleet();
+  const store = await HostStore.open(fresh());
+  const host = hostRecordsFromCert(store, cert);
+  assert.equal(host.id, cert.body.host);
+  assert.equal(host.fingerprint, cert.body.fingerprint, "the string the person compared, and a transfer's to_host_key");
+  for (const bad of [null, {}, { body: {} }, { body: { host: "x", fingerprint: cert.body.fingerprint } }, { body: { host: cert.body.host, fingerprint: 7 } }]) {
+    refused(() => hostRecordsFromCert(store, bad), "bad_form");
+  }
+  await store.close();
+});
+

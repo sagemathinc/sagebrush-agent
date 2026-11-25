@@ -425,6 +425,7 @@ fn usage(ctx: &Ctx, snapshot: &str, path: Option<&str>) -> Result<Value> {
     Ok(json!({
         "snapshot": full(*snap.id), "entries": u.entries, "inodes": u.inodes, "blocks_upper": u.blocks,
         "peak_inodes": u.peak_inodes, "peak_blocks_upper": u.peak_blocks, "block_size": BLOCK,
+        "listing_bytes_upper": u.listing_bytes,
     }))
 }
 
@@ -462,6 +463,11 @@ const DX_PER_BLOCK: u64 = 500;
 /// staging is discarded. So at its end every directory exists twice: the peak adds their inodes (exact) and their blocks
 /// (the directory bound, the destination's own entries included, since data/<leaf> held them too) once more. The launcher's own staging objects (the attempt, data, data/<leaf>, the marker, the parents) are the
 /// space check's to add (restore-space.mjs), not the tree's.
+///
+/// The DIGEST LIST the restore writes beside the class (data/digests.json, launcher amendment A2 §4b) is one more file
+/// in staging, from the stage until the attempt is discarded: `listing_bytes` bounds its length, from the same lines
+/// the list is made of (digests.rs), every name its own line (hard links included), each mode at its widest (4 digits:
+/// set-id is never listed), every size exact. The space check charges it as a file of that many bytes.
 #[derive(Default)]
 struct Tally {
     entries: u64,
@@ -472,6 +478,9 @@ struct Tally {
     /// Directory entry bytes per directory (by its path; "" is the destination itself).
     dirs: HashMap<PathBuf, u64>,
     links: HashSet<(u64, u64)>,
+    /// The digest list's entry lines so far (bytes), and its files' sizes (its trailer's total).
+    listing: u64,
+    total: u64,
 }
 
 impl Tally {
@@ -480,6 +489,16 @@ impl Tally {
             return; // never restored
         }
         self.entries += 1;
+        // The list's line of this name: mode 1023 (0o1777) is the widest a listed mode can be.
+        let raw = path.as_os_str().as_bytes();
+        self.listing += match &node.node_type {
+            NodeType::Dir => crate::digests::line_dir(raw, 1023).len(),
+            NodeType::Symlink { .. } => crate::digests::line_symlink(raw, node.node_type.to_link().as_os_str().as_bytes()).len(),
+            _ => {
+                self.total += node.meta.size;
+                crate::digests::line_file(raw, node.meta.size, 1023, &[0; 32]).len()
+            }
+        } as u64;
         let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
         let name = path.file_name().map_or(0, |n| n.len() as u64);
         *self.dirs.entry(parent).or_insert(0) += 8 + name.div_ceil(4) * 4;
@@ -513,6 +532,7 @@ impl Tally {
             blocks: self.blocks + dirs,
             peak_inodes: self.inodes + self.twice_inodes,
             peak_blocks: self.blocks + dirs + dirs,
+            listing_bytes: (b"{\"v\":1}\n".len() + format!("{{\"count\":{},\"total_bytes\":{}}}\n", self.entries, self.total).len()) as u64 + self.listing,
         }
     }
 }
@@ -526,6 +546,8 @@ struct Usage {
     blocks: u64,
     peak_inodes: u64,
     peak_blocks: u64,
+    /// The digest list's length at most (exact but for the modes' widths).
+    listing_bytes: u64,
 }
 
 /// The restorer's own rule for which names are one inode (rustic_core 51115c47, commands/restore.rs `hardlink_key`):
@@ -702,7 +724,34 @@ mod tests {
     fn an_empty_class() {
         let u = Tally::default().finish();
         // Nothing restored, but the destination's (empty) directory bound still counts once, and twice at the peak.
-        assert_eq!(u, Usage { entries: 0, inodes: 0, blocks: dir_blocks(24), peak_inodes: 0, peak_blocks: 2 * dir_blocks(24) });
+        let list = "{\"v\":1}\n{\"count\":0,\"total_bytes\":0}\n".len() as u64;
+        assert_eq!(u, Usage { entries: 0, inodes: 0, blocks: dir_blocks(24), peak_inodes: 0, peak_blocks: 2 * dir_blocks(24), listing_bytes: list });
+    }
+
+    #[test]
+    fn the_listing_bound_is_at_least_the_list_the_restore_writes() {
+        // A real tree, listed by digests.rs, against the tally of the same names: at least, and only by the modes' widths.
+        let d = std::env::temp_dir().join(format!("sb-usage-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("dir/sub")).unwrap();
+        std::fs::write(d.join("a"), b"hello").unwrap();
+        std::fs::write(d.join("dir/%x\u{1}"), b"").unwrap();
+        std::os::unix::fs::symlink("../a\u{e9}", d.join("dir/l")).unwrap();
+        std::fs::write(d.join(OsStr::from_bytes(b"\xff")), b"12").unwrap();
+        let list = crate::digests::listing(&d).unwrap();
+        let mut t = Tally::default();
+        let meta = |size| Metadata { size, links: 1, ..Default::default() };
+        t.add(Path::new("a"), &Node::new_node(OsStr::new("a"), NodeType::File, meta(5)));
+        t.add(Path::new("dir"), &Node::new_node(OsStr::new("dir"), NodeType::Dir, meta(0)));
+        t.add(Path::new("dir/sub"), &Node::new_node(OsStr::new("sub"), NodeType::Dir, meta(0)));
+        t.add(Path::new("dir/%x\u{1}"), &Node::new_node(OsStr::new("%x\u{1}"), NodeType::File, meta(0)));
+        t.add(Path::new("dir/l"), &Node::new_node(OsStr::new("l"), NodeType::from_link(Path::new("../a\u{e9}")), meta(0)));
+        t.add(Path::new(OsStr::from_bytes(b"\xff")), &Node::new_node(OsStr::from_bytes(b"\xff"), NodeType::File, meta(2)));
+        let u = t.finish();
+        assert!(u.listing_bytes >= list.len() as u64, "{} < {}", u.listing_bytes, list.len());
+        // Over only by the mode digits: at most one per line here (every real mode has 3 digits), 5 mode-bearing lines.
+        assert!(u.listing_bytes - list.len() as u64 <= 6, "{} vs {}", u.listing_bytes, list.len());
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

@@ -25,12 +25,20 @@ test("the seven turn reasons are host entries, each with exactly one meaning", (
   assert.equal(new Set(names).size, names.length);
 });
 
-test("every entry that existed before is byte-for-byte unchanged, preflight_missing's meaning included", () => {
-  // sha256 of JSON.stringify of the registry's 50 entries before this change, in order.
-  const before = registry.reasons.filter((r) => !NEW.includes(r.name));
+// The host daemon main's entries (host daemon main r1.1 §4, AUDIT-cleared), added after this registry's turn reasons,
+// and its one widening of an entry that existed before: preflight_missing's meaning.
+const DAEMON = ["identity_broken", "host_ended", "lease_unqualified", "bad_config"];
+const PREFLIGHT_BEFORE = "a required unit, Landlock or path-contract control is missing at start";
+const PREFLIGHT_NOW = "a required host platform, privilege, account, unit, adapter, Landlock or path-contract control is missing at start";
+
+test("every entry that existed before is byte-for-byte unchanged, but for preflight_missing's ruled widening", () => {
+  // sha256 of JSON.stringify of the registry's 50 entries before this change, in order (preflight_missing with the
+  // meaning it had then: the only later change to any of them).
+  const before = registry.reasons.filter((r) => !NEW.includes(r.name) && !DAEMON.includes(r.name))
+    .map((r) => (r.name === "preflight_missing" ? { ...r, meaning: PREFLIGHT_BEFORE } : r));
   assert.equal(before.length, 50);
   assert.equal(createHash("sha256").update(JSON.stringify(before)).digest("hex"), "49d4933821966df89ba7ee9fbf2fa006fe5bbf5f356160f47e340fd2e73e854c");
-  assert.equal(byName.get("preflight_missing").meaning, "a required unit, Landlock or path-contract control is missing at start");
+  assert.equal(byName.get("preflight_missing").meaning, PREFLIGHT_NOW);
   // The unit start's own mapping is untouched: its codes are still preflight_missing, never a turn's reason.
   for (const c of [65, 66, 68, 69]) assert.equal(launcherExit(c), "preflight_missing", String(c));
   assert.equal(launcherExit(67), "landlock_abi");

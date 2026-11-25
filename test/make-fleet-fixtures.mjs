@@ -204,6 +204,19 @@ export async function build() {
     { name: "a browser device widens under the native policy", bytes: grant(B, bId, {}), current: null, expect: "device_tier" },
     { name: "a tag the grant doesn't name", bytes: grant(N, nId, { agents: [{ ...a0, tags: [id(77)] }] }), current: null, expect: "bad_form" },
   ];
+  // a lineage under the native policy (§3.2, the fleet page's anchored walk): the native first grant g1, then two
+  // successive browser-signed narrowings, each verified against the one before it, as the host accepted them; on its
+  // own (current null) a narrowing is a widening and refused; then a browser-signed widening of the last
+  const n2 = grant(B, bId, { gen: 2, agents: [{ ...a0, workspace: [{ path: "/Algebra", access: "read" }] }] });
+  const n3 = grant(B, bId, { gen: 3, not_after_ms: NOW + 1_800_000, agents: [{ ...a0, workspace: [{ path: "/Algebra", access: "read" }] }] });
+  const w4 = grant(B, bId, { gen: 4, not_after_ms: NOW + 1_800_000, agents: [{ ...a0, workspace: [{ path: "/Algebra", access: "write" }] }] });
+  grants.push(
+    { name: "a lineage: a browser narrowing of the native first grant", bytes: n2, current: { gen: 1, bytes: g1 }, expect: "ok" },
+    { name: "a lineage: a second browser narrowing, of the first narrowing", bytes: n3, current: { gen: 2, bytes: n2 }, expect: "ok" },
+    { name: "a lineage: the first browser narrowing on its own", bytes: n2, current: null, expect: "device_tier" },
+    { name: "a lineage: the second browser narrowing on its own", bytes: n3, current: null, expect: "device_tier" },
+    { name: "a lineage: a browser widening of the second narrowing", bytes: w4, current: { gen: 3, bytes: n3 }, expect: "device_tier" },
+  );
   const op = (k, kid, o, extra = {}) => txt(seal("sb.host-op.v1", signer(k, kid), { fleet, aud: AUD, chain_seq: headAt.seq, op_id: id(60 + Object.keys(extra).length), op: o, host, agent: "all", gen: 3, at_ms: NOW, not_after_ms: NOW + 600_000, ...extra }, k));
   const host_ops = [
     { name: "a pause", bytes: op(B, bId, "pause"), current_gen: 3, expect: "ok" },
@@ -235,6 +248,7 @@ export async function build() {
   const grant_acks = [
     { name: "an ack of the current generation", bytes: ack0, current_gen: 3, expect: "ok" },
     { name: "an ack of an older generation", bytes: ack("sb.grant-ack.v1", hostSigner, ackBody({ gen: 2 }), H), current_gen: 3, expect: "ok" },
+    { name: "an ack of the first grant", bytes: ack("sb.grant-ack.v1", hostSigner, ackBody({ gen: 1 }), H), current_gen: 1, expect: "ok" },
     { name: "an ack ahead of the grant", bytes: ack("sb.grant-ack.v1", hostSigner, ackBody({ gen: 4 }), H), current_gen: 3, expect: "stale_generation" },
     { name: "signed by a key other than the certified host's", bytes: ack("sb.grant-ack.v1", hostSigner, ackBody(), N2), current_gen: 3, expect: "bad_signature" },
     { name: "another host", bytes: ack("sb.grant-ack.v1", { ...hostSigner, id: agent }, ackBody({ host: agent }), H), current_gen: 3, expect: "bad_signature" },
@@ -367,6 +381,21 @@ export async function build() {
     { name: "ttl_ms one past its bound", bytes: lease({ ttl_ms: 600_001 }), expect: "bad_form" },
   ].map((c) => ({ ...c, outstanding: c.outstanding === undefined ? outstanding : c.outstanding }));
 
+  // ---- 9. the old host's fence acknowledgement (r2.4 §3.7.4): the envelope's check, by the host's certified key
+  const fbody = (extra = {}) => ({ fleet, aud: AUD, agent, host, gen: 3, transfer: b64(new Uint8Array(32).fill(11)), boot_id: BOOT, proven_empty: true, at_ms: NOW, ...extra });
+  const fb = fbody();
+  const fence_acks = [
+    { name: "an acknowledgement", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fb, H)), expect: "ok", hash: sha256b64(signedBytes("sb.agent-fence-ack.v1", hs, fb)) },
+    { name: "signed by a device", bytes: rawSeal("sb.agent-fence-ack.v1", signer(N, nId), fb, N), expect: "bad_signature" },
+    { name: "another host key under this host's id", bytes: txt(seal("sb.agent-fence-ack.v1", { ...hs, key: H2.key }, fb, H2)), expect: "bad_signature" },
+    { name: "this host's signature under another key id", bytes: rawSeal("sb.agent-fence-ack.v1", { ...hs, key: H2.key }, fb, H), expect: "bad_signature" },
+    { name: "a body naming another host", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ host: id(57) }), H)), expect: "bad_signature" },
+    { name: "proven_empty false", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ proven_empty: false }), H)), expect: "bad_form" },
+    { name: "another fleet", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ fleet: id(58) }), H)), expect: "bad_form" },
+    { name: "another audience", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ aud: "https://sagebrush.space" }), H)), expect: "bad_audience" },
+    { name: "an extra field", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ reason: "x" }), H)), expect: "bad_form" },
+  ];
+
   return {
     $comment: "Shared fleet-protocol vectors (agent-autonomous-schemas.md r2.5 §9, §3.7.5, §3.8.3). Built by test/make-fleet-fixtures.mjs; every implementation must agree with every case. Mock data only: no real key, device or host.",
     freeze: FREEZE.sha256,
@@ -375,6 +404,7 @@ export async function build() {
     chain: { entries_note: "envelope texts, in order", cases: chain },
     service_keys: { chain: honest, cases: service_keys },
     lease_keys: { chain: leased, chain_cases: lease_chain, cases: lease_keys },
+    fence_acks: { chain: honest, host_cert: cert, cases: fence_acks },
     leases: { chain: leased, host_cert: cert, host: host, host_key: certBody.fingerprint, requests: lease_requests, leases },
     objects: { chain: honest, host_cert: cert, grants, grant_acks, host_ops, approvals, envelopes },
     transfers: { chain: honest, chain_removed: removedChain, receipts: transfer_receipts, hosts: transfer_hosts },

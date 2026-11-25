@@ -1,13 +1,18 @@
 // The browser lane's sidecar frames (browser-lane3-runtime.md, "The two sidecars and their IPC" and SEC §1): exact
-// framing, canonical heads, one closed schema per kind on its one path, bodies only on the four kinds that carry one,
-// and a decoder that is dead after its first error.
+// framing, canonical heads, one closed schema per kind on its one path, bodies only on the five kinds that carry one
+// (net.token's exactly one relay token), and a decoder that is dead after its first error.
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { randomBytes } from "node:crypto";
 import { createEncoder, createDecoder, FrameError, KINDS, LIMITS, isAnswer } from "../lib/fleet/browser/frames.mjs";
 
-const SENDERS = { "net.start": "rust", "net.record": "rust", "net.policy": "rust", "net.takeover": "rust", "net.resume": "rust", "net.retire": "rust", "rust.net_hello": "net", "rust.net_state": "net", "cdp.start": "rust", "cdp.proxy_auth": "rust", "cdp.takeover": "rust", "cdp.resume": "rust", "cdp.retire": "rust", "rust.cdp_state": "cdp", "rust.takeover_done": "cdp", "rust.takeover_failed": "cdp", "cdp.command": "net", "net.result": "cdp", "net.event": "cdp", "net.refused": "cdp" };
-const BODY = new Set(["cdp.command", "net.result", "net.event", "net.record"]);
+const SENDERS = { "net.token": "rust", "net.token_refused": "rust", "rust.token_request": "net", "net.start": "rust", "net.record": "rust", "net.policy": "rust", "net.takeover": "rust", "net.resume": "rust", "net.retire": "rust", "rust.net_hello": "net", "rust.net_state": "net", "cdp.start": "rust", "cdp.proxy_auth": "rust", "cdp.takeover": "rust", "cdp.resume": "rust", "cdp.retire": "rust", "rust.cdp_state": "cdp", "rust.takeover_done": "cdp", "rust.takeover_failed": "cdp", "cdp.command": "net", "net.result": "cdp", "net.event": "cdp", "net.refused": "cdp" };
+const BODY = new Set(["cdp.command", "net.result", "net.event", "net.record", "net.token"]);
+const REQ = "AbCdEfGhIjKlMnOpQrStUw"; // (22 base64url characters, the last one of A Q g w: 128 bits)
+const TOKEN = Buffer.from(`rt1.${randomBytes(32).toString("base64url")}`, "latin1");
+/** A body this kind accepts. */
+const bodyFor = (kind) => (kind === "net.result" ? Buffer.from('{"result":{"x":1}}') : kind === "net.token" ? TOKEN : BODY.has(kind) ? Buffer.from(`{"x":"${kind}"}`) : Buffer.alloc(0));
 
 /** One valid head for each kind. */
 const SAMPLE = {
@@ -31,6 +36,9 @@ const SAMPLE = {
   "net.result": { seq: 9007199254740991 },
   "net.event": {},
   "net.refused": { seq: 7, reason: "takeover" },
+  "net.token": { request: REQ },
+  "net.token_refused": { request: REQ, reason: "rate" },
+  "rust.token_request": { request: REQ, resume_n: 3 },
 };
 const to = (kind) => kind.split(".")[0];
 const head = (kind, extra = {}) => ({ to: to(kind), kind, ...SAMPLE[kind], ...extra });
@@ -49,7 +57,8 @@ function raw(h, body = Buffer.alloc(0), { total, headLen } = {}) {
 const canonical = (o) => JSON.stringify(Object.fromEntries(Object.entries(o).sort(([a], [b]) => (a < b ? -1 : 1))));
 const codeOf = (fn) => { try { fn(); } catch (e) { if (e instanceof FrameError) return e.code; throw e; } return "ok"; };
 
-test("frames: the tables are the doc's: 20 kinds, each with one sender and one receiver, bodies on exactly four", () => {
+test("frames: the tables are the doc's: 23 kinds, each with one sender and one receiver, bodies on exactly five", () => {
+  assert.equal(Object.keys(KINDS).length, 23);
   assert.deepEqual(Object.keys(KINDS).sort(), Object.keys(SENDERS).sort());
   for (const [kind, k] of Object.entries(KINDS)) {
     assert.equal(k.from, SENDERS[kind], kind);
@@ -62,7 +71,7 @@ test("frames: the tables are the doc's: 20 kinds, each with one sender and one r
 
 test("frames: every kind round-trips from its sender to its receiver, with and without the sender named", () => {
   for (const kind of Object.keys(KINDS)) {
-    const body = kind === "net.result" ? Buffer.from('{"result":{"x":1}}') : BODY.has(kind) ? Buffer.from(`{"x":"${kind}"}`) : Buffer.alloc(0);
+    const body = bodyFor(kind);
     const bytes = createEncoder({ from: SENDERS[kind] })(head(kind), body);
     for (const d of [createDecoder({ to: to(kind), from: SENDERS[kind] }), createDecoder({ to: to(kind) })]) {
       const [f, ...more] = d.push(bytes);
@@ -164,7 +173,7 @@ test("frames: unknown kinds and kinds off their path are refused", () => {
 });
 
 test("frames: closed schemas: a missing field, an extra field, or a value out of bounds is refused", () => {
-  const dec = (kind, h) => codeOf(() => createDecoder({ to: to(kind) }).push(raw(canonical(h))));
+  const dec = (kind, h) => codeOf(() => createDecoder({ to: to(kind) }).push(raw(canonical(h), kind === "net.token" ? TOKEN : Buffer.alloc(0))));
   for (const kind of Object.keys(KINDS)) {
     assert.equal(dec(kind, head(kind)), "ok", kind);
     assert.equal(dec(kind, head(kind, { extra: 1 })), "schema", `${kind} extra`);
@@ -187,22 +196,46 @@ test("frames: closed schemas: a missing field, an extra field, or a value out of
     ["cdp.proxy_auth", { proxy_port: 1023 }], ["cdp.proxy_auth", { proxy_port: 65536 }], ["cdp.proxy_auth", { proxy_port: "50123" }], ["cdp.proxy_auth", { proxy_port: 0 }],
     ["rust.cdp_state", { state: "READY" }], ["cdp.takeover", { reason: 1 }],
     ["cdp.command", { seq: -1 }], ["cdp.command", { seq: "1" }], ["net.result", { seq: true }],
+    ["rust.token_request", { request: "AbCdEfGhIjKlMnOpQrStUv" }], ["rust.token_request", { request: "AbCdEfGhIjKlMnOpQrStU" }],
+    ["rust.token_request", { request: "AbCdEfGhIjKlMnOpQrStUww" }], ["rust.token_request", { request: "AbCdEfGhIjKlMnOpQrSt+w" }],
+    ["rust.token_request", { resume_n: -1 }], ["rust.token_request", { resume_n: "1" }], ["rust.token_request", { resume_n: null }],
+    ["net.token", { request: 7 }], ["net.token_refused", { reason: "refused" }], ["net.token_refused", { reason: "Rate" }],
     ["net.refused", { reason: "filter" }], ["net.refused", { reason: "credits" }], ["net.refused", { reason: "bad " }], ["net.refused", { reason: "Abandoned" }], ["net.refused", { reason: "unknown" }],
   ];
   for (const [kind, x] of out) assert.equal(dec(kind, head(kind, x)), "schema", `${kind} ${JSON.stringify(x).slice(0, 60)}`);
+  // (a resume_n past the safe integers never reaches the schema: canonical JSON refuses the number itself)
+  assert.equal(dec("rust.token_request", head("rust.token_request", { resume_n: 2 ** 53 })), "head");
   // (at the caps: accepted)
   for (const [kind, x] of [["net.start", { session: "s".repeat(64) }], ["net.start", { relay_url: "wss://" + "r".repeat(2042) }], ["rust.net_hello", { proxy_port: 1024 }], ["rust.net_hello", { proxy_port: 65535 }], ["cdp.proxy_auth", { proxy_port: 1024 }], ["cdp.proxy_auth", { proxy_port: 65535 }], ["rust.net_state", { reason: "r".repeat(256) }], ["cdp.start", { chrome_pid: 2 ** 31 - 1 }], ["net.refused", { reason: "bad" }], ["net.refused", { reason: "takeover" }], ["net.refused", { reason: "abandoned" }]]) {
     assert.equal(dec(kind, head(kind, x)), "ok", `${kind} ${JSON.stringify(x).slice(0, 60)}`);
   }
 });
 
-test("frames: a body only on cdp.command, net.result, net.event and net.record", () => {
+test("frames: a body only on cdp.command, net.result, net.event, net.record and net.token", () => {
   for (const kind of Object.keys(KINDS)) {
-    const got = codeOf(() => createDecoder({ to: to(kind) }).push(raw(canonical(head(kind)), Buffer.from("x"))));
+    const b = kind === "net.token" ? TOKEN : kind === "net.result" ? Buffer.from('{"result":{}}') : Buffer.from("x");
+    const got = codeOf(() => createDecoder({ to: to(kind) }).push(raw(canonical(head(kind)), b)));
     assert.equal(got, BODY.has(kind) ? "ok" : "body", kind);
-    const b = kind === "net.result" ? Buffer.from('{"result":{}}') : Buffer.from("x");
     assert.equal(codeOf(() => createEncoder({ from: SENDERS[kind] })(head(kind), b)), BODY.has(kind) ? "ok" : "body", kind);
   }
+});
+
+test("frames: net.token's body is exactly one relay token in its form, both ways; the token never rides in a head", () => {
+  const t = TOKEN.toString("latin1");
+  const bad = [
+    "", t.slice(0, -1), `${t}A`, `rt2${t.slice(3)}`, `${t.slice(0, -1)}B`, `${t.slice(0, 20)}+${t.slice(21)}`,
+    `${t.slice(0, 46)}\n`, ` ${t.slice(1)}`, `rt1.${randomBytes(33).toString("base64url")}`, `rt1.${randomBytes(32).toString("base64")}`,
+  ];
+  for (const x of bad) {
+    const b = Buffer.from(x, "latin1");
+    assert.equal(codeOf(() => createDecoder({ to: "net" }).push(raw(canonical(head("net.token")), b))), "body", JSON.stringify(x));
+    assert.equal(codeOf(() => createEncoder({ from: "rust" })(head("net.token"), b)), "body", JSON.stringify(x));
+  }
+  // (and a token as a head field: no kind has one)
+  assert.equal(codeOf(() => createDecoder({ to: "net" }).push(raw(canonical(head("net.token", { token: t }))))), "schema");
+  assert.equal(codeOf(() => createDecoder({ to: "net" }).push(raw(canonical(head("net.token_refused", { token: t }))))), "schema");
+  // (a token that would fit is still refused when its frame's errors are reported: messages carry no body bytes)
+  try { createDecoder({ to: "net" }).push(raw(canonical(head("net.token")), Buffer.from(`${t.slice(0, -1)}B`, "latin1"))); } catch (e) { assert.ok(!e.message.includes(t.slice(4, 20))); }
 });
 
 test("frames: the size limit, exactly: a frame at 64 MiB + 64 KiB passes, one byte more doesn't (both directions)", () => {

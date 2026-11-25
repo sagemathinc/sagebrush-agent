@@ -322,7 +322,7 @@ for (const out of OUTPUTS) {
 
 test("the fake model: imported only with SAGEBRUSH_AGENT_FAKE=1, and nothing on the wire can select it", () => {
   const read = (p) => readFileSync(fileURLToPath(new URL(p, import.meta.url)), "utf8");
-  const bin = read("../bin/sagebrush-agent.mjs");
+  const bin = read("../bin/sagebrush-agent-chat.mjs"); // (the chat agent; bin/sagebrush-agent.mjs only dispatches)
   // (one import of it, dynamic, inside the environment check)
   const imports = [...bin.matchAll(/import\(["']\.\.\/lib\/fake\.mjs["']\)/g)];
   assert.equal(imports.length, 1);

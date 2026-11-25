@@ -146,10 +146,10 @@ test("row 2: truncation order: whole messages oldest first (a call with its resu
   assert.ok(lines.at(-1).text === "last");
   assert.ok(lines[0].truncated.messages >= 2);
   // (no summary, one oversized message: cut, head and tail kept)
-  const one = buildContext(header, { summary: null, dropped: 0, messages: [{ role: "tool_result", call: "c", output: "H" + "z".repeat(200000) + "T", error: false }] }, { max });
+  const one = buildContext(header, { summary: null, dropped: 0, messages: [{ role: "tool_call", name: "t", call: "c", input: "i" }, { role: "tool_result", call: "c", output: "H" + "z".repeat(200000) + "T", error: false }] }, { max });
   const ol = sizes(one).lines.map((l) => JSON.parse(l));
   assert.equal(ol[0].truncated.cut_message, true);
-  assert.ok(ol[1].output.startsWith("H") && ol[1].output.endsWith("T") && ol[1].output.includes("characters cut"));
+  assert.ok(ol[2].output.startsWith("H") && ol[2].output.endsWith("T") && ol[2].output.includes("characters cut"));
   // (the header and the summary alone over the cap: the summary is cut)
   const s = buildContext(header, { summary: "S" + "q".repeat(100000), dropped: 0, messages: [{ role: "user", text: "u" }] }, { max });
   const sl = sizes(s).lines.map((l) => JSON.parse(l));
@@ -161,7 +161,7 @@ test("row 2: truncation order: whole messages oldest first (a call with its resu
 });
 
 test("row 2: at the real CONTEXT_MAX: an 8 MiB tool result plus a summary stays within the cap", () => {
-  const r = buildContext(header, { summary: "s", dropped: 0, messages: [{ role: "tool_result", call: "c", output: "w".repeat(CONTEXT_MAX), error: false }] });
+  const r = buildContext(header, { summary: "s", dropped: 0, messages: [{ role: "tool_call", name: "t", call: "c", input: "i" }, { role: "tool_result", call: "c", output: "w".repeat(CONTEXT_MAX), error: false }] });
   assert.ok(r.bytes.length <= CONTEXT_MAX);
   assert.equal(r.truncated.cut_message, true);
 });
@@ -186,10 +186,12 @@ test("row 3: one turn published, then a lost acknowledgement at every write: the
 test("row 3: the same turn id with different content is a mismatch, never counted as saved", async () => {
   const e = entryOf("t1", ["a", "b"]);
   const changed = entryOf("t1", ["A", "b"]);
-  // (a FINISHED turn is done, whatever is asked again under its id)
+  // (a FINISHED turn is done only for its own journal: the same id with other content is a mismatch (TESTS T1))
   const done = fakeStore();
   assert.equal((await publishTurn(done, e)).state, "done");
-  assert.deepEqual(await publishTurn(done, changed), { state: "done", seq: 1 });
+  assert.deepEqual(await publishTurn(done, e), { state: "done", seq: 1 });
+  assert.equal((await publishTurn(done, changed)).state, "mismatch");
+  assert.equal((await publishTurn(done, { ...e, lines: e.lines.slice(0, 1) })).state, "mismatch", "a journal with fewer lines");
   // (an UNFINISHED turn whose published line differs from the journal's: mismatch, nothing written)
   const half = fakeStore();
   await publishTurnPartial(half, e, 2);
@@ -381,15 +383,18 @@ test("row 12: the journal counts as it goes: a turn over the cap keeps a prefix 
   assert.ok(kept > 0 && omitted > 0);
   const gap = JSON.parse(td.decode(t.lines.at(-1)));
   assert.deepEqual([gap.gap, gap.omitted_lines], [true, omitted]);
-  assert.ok(j.used + 2 * LINE_MAX + 128 * 1024 <= 1024 * 1024 + LINE_MAX, `within the cap with its reserves: ${j.used}`);
+  assert.ok(j.used <= 1024 * 1024, `within the cap: ${j.used}`);
+  assert.equal(j.used, JSON.stringify(j.state()).length, "used is the durable bytes, exactly");
   // (full: the next turns are missed, then the first one journaled after carries the gap)
-  assert.equal(j.begin("m1", AT + 1).ok, false);
+  let fill = 0;
+  while (j.begin(`e${fill}`, AT).ok) { j.finish(); fill++; }
   assert.equal(j.begin("m2", AT + 2).ok, false);
+  for (let k = 0; k < fill; k++) j.retireTurn(`e${k}`);
   j.retireTurn("t");
   const b = j.begin("next", AT + 3);
   assert.deepEqual(b, { ok: true, first: 2 });
   const g = JSON.parse(td.decode(j.open.lines[0]));
-  assert.deepEqual([g.gap, g.turns, g.from_ms, g.to_ms], [true, 2, AT + 1, AT + 2]);
+  assert.deepEqual([g.gap, g.turns, g.from_ms, g.to_ms], [true, 2, AT, AT + 2]);
 });
 
 test("row 12: retirement: a turn only by its own marker; the context slot by any newer acknowledgement; the state survives a restart", () => {
@@ -493,3 +498,212 @@ test("row 12: once a line of a turn is omitted, every later one is too (the kept
   while (j.add(big)) { /* fill */ }
   assert.equal(j.add(encodeLine({ turn: "t", i: 99, role: "user", text: "tiny" })), false);
 });
+
+// ---- LIMITS H1-H3 and TESTS T1-T3 on the first head: independent measurements and the controls they asked for
+import v8 from "node:v8";
+import vm from "node:vm";
+v8.setFlagsFromString("--expose-gc");
+const gc = vm.runInNewContext("gc");
+const arrayBuffers = () => { gc(); gc(); return process.memoryUsage().arrayBuffers; };
+
+test("LIMITS H1: a 16 MiB line in reused 1 MiB chunks: the ArrayBuffers actually live stay within the cap plus one chunk", async () => {
+  const { RAW_LINE_MAX } = await import("../lib/agent-log/index.mjs");
+  const chunk = new Uint8Array(1024 * 1024).fill(120);
+  const base = arrayBuffers();
+  let peak = 0;
+  async function* gen() {
+    for (let k = 0; k < 16; k++) { peak = Math.max(peak, arrayBuffers() - base); yield chunk; }
+    yield te.encode("\n");
+  }
+  let len = 0;
+  for await (const x of boundedLines(gen(), { max: RAW_LINE_MAX })) { peak = Math.max(peak, arrayBuffers() - base); len = x.line?.length ?? -1; }
+  assert.equal(len, RAW_LINE_MAX, "the line of exactly the cap is kept");
+  assert.ok(peak <= RAW_LINE_MAX + chunk.length, `live ArrayBuffers ${peak} > ${RAW_LINE_MAX + chunk.length}`);
+});
+
+test("LIMITS H2: every field is charged (call ids included), the budget is validated, and the newest message is never evicted", async () => {
+  const { WINDOW_BUDGET, messageCost } = await import("../lib/agent-log/index.mjs");
+  const item = (payload) => ({ type: "response_item", payload });
+  const recs = [];
+  for (let k = 0; k < 30; k++) recs.push(item({ type: "function_call", name: "f", call_id: `${k}`.padEnd(100000, "x"), arguments: "" }), item({ type: "function_call_output", call_id: `${k}`.padEnd(100000, "x"), output: "" }));
+  const w = await contextWindow(boundedLines(chunksOf(jsonl(recs), 65536)), "codex", { budget: 1024 });
+  assert.ok(w.messages.length <= 2, `${w.messages.length} kept`);
+  assert.ok(w.held <= 1024 + w.messages.reduce((a, m) => a + messageCost(m), 0), `held ${w.held}`);
+  assert.ok(w.messages.length === 0 || w.messages.every((m) => m.role !== "tool_result" || w.messages.some((c) => c.role === "tool_call" && c.call === m.call)), "never a result without its call");
+  for (const b of [0, -1, 1.5, 8 * CONTEXT_MAX + 1]) await assert.rejects(contextWindow(boundedLines(chunksOf("")), "codex", { budget: b }), RangeError);
+  // (the default bounds a long stream with no compaction: 40 messages of 1 MiB)
+  async function* long() { for (let k = 0; k < 40; k++) yield te.encode(JSON.stringify({ type: "user", message: { role: "user", content: "é".repeat(512 * 1024) } }) + "\n"); }
+  const d = await contextWindow(boundedLines(long()), "claude-code");
+  assert.ok(d.held <= WINDOW_BUDGET + messageCost(d.messages.at(-1)), `held ${d.held}`);
+  assert.ok(d.dropped > 0);
+  // (one oversized result is kept whole by the window; the context's truncation cuts it)
+  const big = await contextWindow(boundedLines(chunksOf(jsonl([
+    { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "c", name: "Bash", input: {} }] } },
+    { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "c", content: "z".repeat(9 * 1024 * 1024) }] } },
+  ]), 1 << 20)), "claude-code", { budget: 1024 });
+  assert.equal(big.messages.at(-1).output.length, 9 * 1024 * 1024, "the newest result whole in the window");
+  const ctx = buildContext(header, big);
+  assert.ok(ctx.bytes.length <= CONTEXT_MAX && ctx.truncated.cut_message);
+});
+
+test("LIMITS H3: the journal's used is its durable bytes exactly; empty turns, intents and contexts are all counted and capped", () => {
+  const j = new Journal({ max: 262144, contextReserve: 0 });
+  let ok = 0, missed = 0;
+  for (let k = 0; k < 5000; k++) { const r = j.begin(`t${k}`, AT + k); if (r.ok) { j.finish(); ok++; } else missed++; }
+  assert.ok(missed > 0, "empty turns fill it: their metadata counts");
+  assert.equal(j.used, JSON.stringify(j.state()).length);
+  assert.ok(j.used <= 262144);
+  // (an intent comes from its reserve, and stays within the cap)
+  j.intend("t0", { seq: 1, anchor: { n: 1, seq: 0 } });
+  assert.equal(j.used, JSON.stringify(j.state()).length);
+  assert.ok(j.used <= 262144);
+  // (a context over its reserve is refused)
+  const c = new Journal({ max: 262144, contextReserve: 1000 });
+  assert.equal(c.setContext(1, new Uint8Array(1001)), false);
+  assert.equal(c.setContext(1, new Uint8Array(1000)), true);
+  assert.equal(c.used, JSON.stringify(c.state()).length);
+  // (a restored state over its cap is refused)
+  const s = c.state();
+  assert.throws(() => Journal.from({ ...s, max: 100 }));
+  // (the room is exact: a line whose cost is the room fits; the next base64 step doesn't)
+  const r = new Journal({ max: 65536, contextReserve: 0 });
+  r.begin("t", AT);
+  const room = r.room();
+  const n = Math.floor((room - 1 - 2) / 4) * 3;
+  const fitsLine = new Uint8Array(n), over = new Uint8Array(n + 3);
+  assert.equal(r.add(over), false, "one base64 step over the room");
+  const r2 = new Journal({ max: 65536, contextReserve: 0 });
+  r2.begin("t", AT);
+  assert.equal(r2.add(fitsLine), true, "exactly within the room");
+  assert.equal(r2.used, JSON.stringify(r2.state()).length);
+});
+
+test("LIMITS H3: a turn over 64 MiB, streamed from its records into the journal: a prefix, a gap line, the cap held", async () => {
+  const { turnLinesFromRecords } = await import("../lib/agent-log/index.mjs");
+  const text = "w".repeat(60000);
+  async function* records() { for (let k = 0; k < 1200; k++) yield te.encode(JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } }) + "\n"); }
+  const j = new Journal();
+  const b = j.begin("big", AT);
+  let kept = 0, omitted = 0;
+  for await (const l of turnLinesFromRecords("big", AT, "claude-code", boundedLines(records()), b.first)) (j.add(l) ? kept++ : omitted++);
+  const t = j.finish();
+  assert.equal(kept + omitted, 1200);
+  assert.ok(omitted > 0 && kept > 0);
+  assert.equal(JSON.parse(td.decode(t.lines.at(-1))).omitted_lines, omitted);
+  assert.ok(j.used <= j.max);
+});
+
+test("TESTS T2: a call and its result pair by id, not by position: crossed calls, in the window and in the context's truncation", async () => {
+  const A = { role: "tool_call", name: "a", call: "A", input: "x".repeat(CONTEXT_MAX) }, Bc = { role: "tool_call", name: "b", call: "B", input: "b" };
+  const Ar = { role: "tool_result", call: "A", output: "ar", error: false }, Br = { role: "tool_result", call: "B", output: "br", error: false };
+  const ctx = buildContext(header, { summary: "s", dropped: 0, messages: [A, Bc, Ar, Br] });
+  const kept = td.decode(ctx.bytes).split("\n").filter(Boolean).slice(1).map((l) => JSON.parse(l));
+  assert.ok(!kept.some((m) => m.role === "tool_result" && m.call === "A"), "A's result went with A's call");
+  assert.ok(kept.some((m) => m.call === "B" && m.role === "tool_call") && kept.some((m) => m.call === "B" && m.role === "tool_result"));
+  // (the window: A's result arriving after its call was evicted is dropped on arrival)
+  const recs = [
+    { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "A", name: "a", input: { big: "x".repeat(3000) } }] } },
+    { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "B", name: "b", input: {} }] } },
+    { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "A", content: "ar" }] } },
+    { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "B", content: "br" }] } },
+  ];
+  const w = await contextWindow(boundedLines(chunksOf(jsonl(recs), 4096)), "claude-code", { budget: 1000 });
+  assert.ok(!w.messages.some((m) => m.call === "A"), "nothing of A remains");
+  assert.deepEqual(w.messages.map((m) => `${m.role}:${m.call}`), ["tool_call:B", "tool_result:B"]);
+});
+
+test("TESTS T3: the intent completes before the allocating write; the scan reads nothing before the anchor; the aborted marker's digest is the lines'", async () => {
+  // (the intent: awaited, and only then the compare-and-set)
+  const events = [];
+  const s = fakeStore({ before: async (p, op) => { events.push(op); } });
+  await publishTurn(s, { ...entryOf("t1", ["x"]), onIntent: async () => { await new Promise((r) => setTimeout(r, 20)); events.push("intent"); } });
+  assert.ok(events.indexOf("intent") >= 0 && events.indexOf("intent") < events.indexOf("cas"), events.join());
+  // (the anchor: many segments, and a late turn's publication reads none before its anchor's)
+  const m = fakeStore();
+  for (let k = 0; k < 60; k++) await publishTurn(m, entryOf(`f${k}`, ["y".repeat(60000)]));
+  const segs = (await m.list("transcript/")).length;
+  assert.ok(segs >= 3, `${segs} segments`);
+  const anchor = await anchorNow(m);
+  const reads = [];
+  const realRead = m.read;
+  m.read = async (p) => { reads.push(p); return realRead(p); };
+  // (the FIRST publication scans back for the turn, finding nothing: no further than the anchor's segment)
+  await publishTurn(m, entryOf("late", ["z"], AT, anchor));
+  const nums = reads.filter((p) => p.startsWith("transcript/")).map((p) => Number(/(\d+)\.jsonl/.exec(p)[1]));
+  assert.ok(nums.every((n) => n >= anchor.n), `read ${nums} before anchor ${anchor.n}`);
+  // (the aborted marker: its sha256 and count, checked against an independent hash of exactly the lines present)
+  const a = fakeStore();
+  const eA = entryOf("tA", ["a1", "a2", "a3"]);
+  await publishTurnPartial(a, eA, 3);
+  const seen = await observeTail(a);
+  assert.equal((await abortStalled(a, seen, 0, STALL_MS)).state, "aborted");
+  const marker = (await allLines(a)).at(-1).value;
+  const present = eA.lines.slice(0, 2);
+  const framed = new Uint8Array(present.reduce((x, l) => x + l.length + 1, 0));
+  let o = 0; for (const l of present) { framed.set(l, o); o += l.length; framed[o++] = 10; }
+  const want = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", framed)), (x) => x.toString(16).padStart(2, "0")).join("");
+  assert.deepEqual({ lines: marker.lines, sha256: marker.sha256, seq: marker.seq, i: marker.i }, { lines: 2, sha256: want, seq: 1, i: 3 });
+});
+
+// ---- the rows a mutant run at the fix head showed missing
+test("H1: a whole line inside a chunk is yielded as a view of that chunk, never a copy", async () => {
+  const chunk = te.encode("one\ntwo\nthree\n");
+  async function* gen() { yield chunk; }
+  for await (const x of boundedLines(gen())) assert.equal(x.line.buffer, chunk.buffer);
+});
+
+test("T2: evicting a call takes its result with it even when the result isn't the newest message", async () => {
+  // (the call is the big one: evicting it alone brings the window within budget, so its small result would stay
+  // behind as an orphan unless it goes with its call)
+  const recs = [
+    { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "A", name: "a", input: { big: "x".repeat(2000) } }] } },
+    { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "A", content: "r" }] } },
+    { type: "user", message: { role: "user", content: "u".repeat(100) } },
+    { type: "user", message: { role: "user", content: "last" } },
+  ];
+  const w = await contextWindow(boundedLines(chunksOf(jsonl(recs), 4096)), "claude-code", { budget: 1000 });
+  assert.ok(!w.messages.some((m) => m.role === "tool_result" && !w.messages.some((c) => c.role === "tool_call" && c.call === m.call)), JSON.stringify(w.messages.map((m) => m.role)));
+  assert.equal(w.messages.at(-1).text, "last");
+});
+
+test("T2: a result whose call isn't in the context is dropped even when everything fits", () => {
+  const r = buildContext(header, { summary: "s", dropped: 0, messages: [{ role: "tool_result", call: "gone", output: "o", error: false }, { role: "user", text: "u" }] });
+  const kept = td.decode(r.bytes).split("\n").filter(Boolean).slice(1).map((l) => JSON.parse(l));
+  assert.deepEqual(kept.map((m) => m.role), ["summary", "user"]);
+});
+
+test("row 6: a tool line holds exactly its fields: never any output", () => {
+  const [l] = turnLines("t", AT, [{ role: "tool_call", name: "Bash", call: "c", input: "ls" }, { role: "tool_result", call: "c", output: "o", error: false }]);
+  assert.deepEqual(Object.keys(JSON.parse(td.decode(l))).sort(), ["at_ms", "i", "name", "role", "summary", "turn"]);
+});
+
+test("T1: a published finished turn with FEWER lines than the journal under its id is a mismatch", async () => {
+  const s = fakeStore();
+  assert.equal((await publishTurn(s, entryOf("t", ["a"]))).state, "done");
+  const more = entryOf("t", ["a", "b"]);
+  assert.equal((await publishTurn(s, more)).state, "mismatch");
+});
+
+test("H3: filled to the brim, the open turn still finishes with its gap line, and every pending intent fits, within the cap", () => {
+  const j = new Journal({ max: 65536, contextReserve: 0 });
+  const small = (k) => encodeLine({ turn: `t${k}`, i: 1, role: "user", text: "x".repeat(40) });
+  let k = 0;
+  for (;;) {
+    const r = j.begin(`t${k}`, AT);
+    if (!r.ok) break;
+    // (at most 40 lines a turn, so several turns are pending when the brim is reached; the last one omits)
+    for (let n = 0; n < 40 && j.add(small(k)); n++) { /* fill */ }
+    j.finish();
+    k++;
+  }
+  assert.ok(k > 1);
+  assert.ok(j.used <= j.max, `${j.used}`);
+  // (each pending turn's intent at its maximum size: exactly what its reserve holds)
+  const intent = { seq: 9007199254740991, anchor: { n: 9007199254740991, seq: 9007199254740991 }, pad: "" };
+  intent.pad = "p".repeat(256 - JSON.stringify(intent).length);
+  assert.equal(JSON.stringify(intent).length, 256);
+  for (const t of j.pending()) j.intend(t.turn, intent);
+  assert.ok(j.used <= j.max, `with every intent: ${j.used}`);
+  assert.equal(j.used, JSON.stringify(j.state()).length);
+});
+

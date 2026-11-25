@@ -916,3 +916,47 @@ test("no key on any surface: stderr, events, audit calls, health records, the ex
     }
   }
 });
+
+test("PAIRED with the reopen wired (lease-on r1.5 §6.5): one sleep-reopen before serving, then every sleepReopenMs, cleared at the drain", async () => {
+  const { id } = await paired();
+  const h = harness({ id });
+  const timers = [];
+  h.d.sleepReopenMs = 120000;
+  h.d.every = (fn, ms) => { const t = { fn, ms, cleared: false }; timers.push(t); h.log.push(`every:${ms}`); return t; };
+  h.d.clearEvery = (t) => { t.cleared = true; h.log.push("clearEvery"); };
+  const run = hostRun(h.d);
+  await until(() => h.lines.some((l) => l.serving));
+  const i = h.log.indexOf("submit:sleep-reopen");
+  assert.ok(i > h.log.indexOf("recover") && i < h.log.indexOf("every:120000"), JSON.stringify(h.log));
+  timers[0].fn();
+  await until(() => h.log.filter((x) => x === "submit:sleep-reopen").length === 2);
+  h.term();
+  assert.equal((await run).code, 0);
+  assert.equal(timers[0].cleared, true);
+  assert.ok(h.log.indexOf("clearEvery") < h.log.indexOf("close"), "cleared before the executor closes");
+});
+
+test("TESTS H2: SIGTERM while the FIRST reopen is held: the drain isn't held by it (sync stopped, inputs stopped, close), no serving line, exit 0", async () => {
+  const { id } = await paired();
+  let releaseFirst, closed = false;
+  const h = harness({ id, supervisor: (_x, ev) => ({
+    submit: async (op) => { ev("submit", op.kind); if (op.kind === "sleep-reopen") await new Promise((r) => { releaseFirst = r; }); return { status: "noop" }; },
+    // the real executor's close cuts the running reopen short (the executor rows); here it releases the held submit
+    close: async () => { ev("close"); closed = true; releaseFirst?.(); },
+  }) });
+  h.d.sleepReopenMs = 120000;
+  h.d.every = () => { h.log.push("every"); return {}; };
+  h.d.clearEvery = () => h.log.push("clearEvery");
+  const run = hostRun(h.d);
+  await until(() => h.log.includes("submit:sleep-reopen"));
+  h.term();
+  const out = await Promise.race([run, new Promise((r) => setTimeout(() => r("HELD"), 2000))]);
+  assert.notEqual(out, "HELD", "the drain isn't held by the first reopen");
+  if (out === "HELD") { releaseFirst?.(); await run; } // (a held run released, so the file still ends)
+  assert.equal(out.code, 0);
+  assert.ok(closed);
+  assert.ok(!h.lines.some((l) => l.serving), "no serving line after SIGTERM");
+  assert.ok(!h.log.includes("every"), "no reopen timer started");
+  for (const e of ["syncStop", "inputsStop", "close"]) assert.ok(h.log.includes(e), e);
+  assert.ok(h.log.indexOf("syncStop") < h.log.indexOf("close"));
+});

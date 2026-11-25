@@ -369,3 +369,39 @@ async function provisionWithoutQuotas(s) {
   const p = provisioner({ run: async (argv, o) => (argv[0] === "chattr" || argv[0] === "setquota" ? assert.fail("no quota calls") : s.runRaw(argv, o)), fsx: s.fsx, root: s.root, rootUid: 0, tagGid: (t) => ({ [T1]: G1, [T2]: G2 })[t], quota: null, checkParents: async () => {} });
   await p.provision(A, UID, grantAgent(), 5000);
 }
+
+test("a restored archive: archive/<id> root 0755 and archive-config/<id> root 0700, in the uid's project under exactly the given limits", async () => {
+  const s = setup();
+  const limits = { kib: 4 * 123, inodes: 57 };
+  await s.p.archive(A, UID, limits, 5000);
+  const ARCH = `/srv/sagebrush/archive/${A}`, CARCH = `/srv/sagebrush/archive-config/${A}`;
+  assert.deepEqual([s.stat(`srv/sagebrush/archive/${A}`), s.stat(`srv/sagebrush/archive-config/${A}`)], [[0, 0, 0o755], [0, 0, 0o700]]);
+  assert.deepEqual([s.stat("srv/sagebrush/archive"), s.stat("srv/sagebrush/archive-config")], [[0, 0, 0o700], [0, 0, 0o700]]);
+  // The quota in its own units, the limits given (never the grant's), set and verified BEFORE each is published.
+  assert.deepEqual(cmds(s.calls, "setquota"), [1, 2].map(() => ["setquota", "-P", String(UID), "0", String(limits.kib), "0", String(limits.inodes), "/srv"]));
+  assert.deepEqual(cmds(s.calls, "chattr").map((c) => c.at(-1)), [join(s.root, ARCH), join(s.root, CARCH)]);
+  for (const p of [ARCH, CARCH]) assert.deepEqual(s.proj.get(join(s.root, p)), { id: UID, inherit: true });
+  // No user, group or agent tree is made: only the archive.
+  assert.deepEqual([cmds(s.calls, "useradd"), cmds(s.calls, "groupadd")], [[], []]);
+  assert.equal(fs.existsSync(join(s.root, "srv/sagebrush/agents", A)), false);
+  // The parents checked before (missing allowed) and strictly after they exist.
+  assert.deepEqual(s.checks.map((c) => c.allowMissing), [true, false]);
+  // Again: the exact final state is adopted, nothing re-run.
+  const n = mutating(s.calls).length;
+  await s.p.archive(A, UID, limits, 5000);
+  assert.equal(mutating(s.calls).length, n);
+  // Refused: no limits, a uid outside the range, a bad id; a parents check that fails stops it before anything.
+  for (const [a, u, l] of [[A, UID, null], [A, UID, { kib: 0, inodes: 5 }], [A, UID, { kib: 8, inodes: 1 }], [A, 5, limits], ["nope", UID, limits]]) {
+    await assert.rejects(s.p.archive(a, u, l, 5000), host);
+  }
+  const r = setup({ refuseCheck: (allowMissing) => allowMissing });
+  await assert.rejects(r.p.archive(A, UID, limits, 5000), host);
+  assert.deepEqual(mutating(r.calls), []);
+  // An archive that exists in another state (a foreign owner, populated) is refused, never relabelled.
+  const x = setup();
+  fs.mkdirSync(join(x.root, "srv/sagebrush/archive", A), { recursive: true });
+  fs.writeFileSync(join(x.root, "srv/sagebrush/archive", A, "f"), "x");
+  fs.chmodSync(join(x.root, "srv/sagebrush/archive"), 0o700);
+  await assert.rejects(x.p.archive(A, UID, limits, 5000), host);
+  assert.deepEqual(cmds(x.calls, "setquota"), []);
+});

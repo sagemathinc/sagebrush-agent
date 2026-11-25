@@ -179,19 +179,22 @@ test("the plan is restoreReady's authority: records of the plan's run and snapsh
   const dir = fresh();
   const agent = b.ids[0], tag = b.t;
   const rec = (kind, id, run, dest) => {
-    let r = newRecord({ kind, id, run, snapshot: p.sets[`${kind}-${id}`].snapshot });
+    let r = step(newRecord({ kind, id, run, snapshot: p.sets[`${kind}-${id}`].snapshot }), "bind", { dest });
     for (const cls of CLASSES[kind]) r = step(r, "digest", { cls, sha256: "d".repeat(64) });
-    for (const s of ["staged", "filling", "published", "validated"]) r = step(r, s, { dest });
-    return r;
+    for (const s of ["staged", "filling", "published", "files_validated"]) r = step(r, s, { dest });
+    // An agent's imports, each pending then done; an archive or a tag folder has none.
+    if (r.imports !== null) for (const which of ["config", "context"]) for (const phase of ["pending", "done"]) r = step(r, "import", { which, phase, sha256: "c".repeat(64) });
+    return step(r, "validated");
   };
-  const home = { home: { dev: "1", ino: "2" }, sessions: { dev: "1", ino: "3" } };
+  const ident = (ino) => ({ dev: "1", ino, uid: 70000, gid: 70000, mode: 0o700, projid: 70000 });
+  const home = { home: ident("2"), sessions: ident("3") };
   writeRecord(rec("agent", agent, RRUN, home), { dir });
-  writeRecord(rec("tag", tag, RRUN, { tag: { dev: "1", ino: "4" } }), { dir });
+  writeRecord(rec("tag", tag, RRUN, { tag: ident("4") }), { dir });
   assert.equal(restoreReady(agent, [tag], expectedOf(p), { dir }), "validated");
   // The person's new request for the tag folder: re-planned to RRUN2; the old record no longer resumes anything.
   const p2 = replanSet(p, "tag", tag, RRUN2);
   refused(() => restoreReady(agent, [tag], expectedOf(p2), { dir }), "not_granted");
-  writeRecord(rec("tag", tag, RRUN2, { tag: { dev: "1", ino: "4" } }), { dir });
+  writeRecord(rec("tag", tag, RRUN2, { tag: ident("4") }), { dir });
   assert.equal(restoreReady(agent, [tag], expectedOf(p2), { dir }), "validated");
   // The record for the new request starts from the stopped one (retryRecord) on the plan's new run.
   const stopped = step(newRecord({ kind: "agent", id: agent, run: RRUN, snapshot: p.sets[`agent-${agent}`].snapshot }), "not_fitting");

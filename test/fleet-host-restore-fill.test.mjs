@@ -15,7 +15,7 @@ import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { EXIT, classPaths, destOf, fillExpect, outcomeOf, ownersOf, restoreFiller, writeExpectFile } from "../lib/fleet/host/restore-fill.mjs";
 import { realIo } from "../lib/fleet/host/store.mjs";
-import { MAX_ATTEMPTS, newRestoreRun, ownerOf, readFillReport, readRecord, retryRecord, writeRecord } from "../lib/fleet/host/restore-record.mjs";
+import { MAX_ATTEMPTS, newRecord, newRestoreRun, ownerOf, readFillReport, readRecord, retryRecord, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 import { copyKey, encodePath, quote } from "../lib/fleet/host/restore-validate.mjs";
 
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
@@ -178,7 +178,7 @@ test("an agent restored: each class staged then filled, by exactly these launche
   const seen = [];
   const w = world("agent", { onCall: (args) => { if (args[0] === "fill-home") seen.push(readRecord("agent", id, { dir: w.dir })?.state); } });
   const r = await w.fill("agent", id, planOf("agent", id));
-  assert.deepEqual([r.state, r.attempt, r.dirty], ["validated", 1, false]);
+  assert.deepEqual([r.state, r.attempt, r.dirty], ["files_validated", 1, false]);
   assert.deepEqual(w.calls, [
     ["restore-stage", "--mount", "/srv/sagebrush", "--owner", `a-${id}`, "--class", "home", "--run", RUN, "--attempt", "1", "--projid", "70000", "--snapshot", SNAP, "--path", `srv/sagebrush/agents/${id}/home`],
     ["restore-stage", "--mount", "/srv/sagebrush", "--owner", `a-${id}`, "--class", "sessions", "--run", RUN, "--attempt", "1", "--projid", "70000", "--snapshot", SNAP, "--path", `srv/sagebrush/agents/${id}/sessions`],
@@ -189,11 +189,60 @@ test("an agent restored: each class staged then filled, by exactly these launche
   ]);
   assert.deepEqual(seen, ["filling", "filling"], "the record says filling before every fill-home");
   assert.deepEqual([tree(w.dests.home), tree(w.dests.sessions)], [DATA.home, DATA.sessions]);
-  assert.deepEqual(r.dest.home, { dev: String(8 * 2 ** 20 + 1), ino: String(statSync(w.dests.home).ino) });
+  assert.deepEqual(r.dest.home, { dev: String(8 * 2 ** 20 + 1), ino: String(statSync(w.dests.home).ino), uid: 70000, gid: 70000, mode: 0o700, projid: 70000 });
   // Settled: calling again does nothing more.
   const n = w.calls.length;
-  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "validated");
+  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "files_validated");
   assert.equal(w.calls.length, n);
+});
+
+test("the destination is bound, durably, BEFORE the first effect: every class's identity in the record before any launch", async () => {
+  const id = newId();
+  const atFirst = [];
+  const w = world("agent", { onCall: (args) => { if (atFirst.length === 0) atFirst.push(readRecord("agent", id, { dir: w.dir })); } });
+  const r = await w.fill("agent", id, planOf("agent", id));
+  assert.equal(r.state, "files_validated");
+  const [first] = atFirst;
+  assert.equal(w.calls[0][0], "restore-stage");
+  assert.deepEqual([first.state, first.attempt, first.digests], ["staging", 1, null], "read back from disk at the first launch");
+  for (const cls of ["home", "sessions"]) {
+    assert.deepEqual(first.dest[cls], { dev: String(8 * 2 ** 20 + 1), ino: String(statSync(w.dests[cls]).ino), uid: 70000, gid: 70000, mode: 0o700, projid: 70000 }, cls);
+  }
+  assert.deepEqual(r.dest, first.dest, "the bound destination never changes");
+  // An agent's files validated is settled for this driver: calling again never writes validated (its imports aren't done).
+  const n = w.calls.length;
+  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "files_validated");
+  assert.equal(w.calls.length, n);
+  assert.equal(readRecord("agent", id, { dir: w.dir }).state, "files_validated");
+});
+
+test("a crash between the record and its bind: the next call binds first, then stages", async () => {
+  const id = newId();
+  const seen = [];
+  const w = world("agent", { onCall: () => { if (seen.length === 0) seen.push(readRecord("agent", id, { dir: w.dir })); } });
+  writeRecord(newRecord({ kind: "agent", id, run: RUN, snapshot: SNAP }), { dir: w.dir }); // the crash: created, never bound
+  const r = await w.fill("agent", id, planOf("agent", id));
+  assert.equal(r.state, "files_validated");
+  assert.deepEqual([seen[0].state, seen[0].attempt], ["staging", 1], "the same record, attempt 1: an unbound record isn't a crashed attempt");
+  assert.notEqual(seen[0].dest, null, "bound before the first launch");
+  assert.deepEqual(w.calls.map((a) => a[0]).slice(0, 2), ["restore-stage", "restore-stage"]);
+});
+
+test("a destination that is no longer the bound one when filling starts fails the set: nothing is moved into it", async () => {
+  for (const field of ["ino", "uid", "gid", "mode", "projid"]) {
+    const id = newId();
+    let staged = false;
+    const w = world("agent", {
+      onCall: (args) => { if (args[0] === "restore-stage") staged = true; },
+      // After staging (the bind came before it), home's identity changes in one field: replaced, re-owned, re-moded.
+      identify: (cls, o) => (staged && cls === "home" ? { ...o, [field]: field === "ino" ? o.ino + 1 : field === "mode" ? 0o755 : o[field] + 1 } : o),
+    });
+    const r = await w.fill("agent", id, planOf("agent", id));
+    assert.deepEqual([r.state, r.reason], ["failed", "outcome_unknown"], field);
+    assert.ok(!w.calls.some((a) => a[0] === "fill-home"), `${field}: no fill-home`);
+    assert.deepEqual([tree(w.dests.home), tree(w.dests.sessions)], [{}, {}], `${field}: both destinations untouched`);
+    assert.equal(r.dirty, false, `${field}: never filling, so nothing to clean`);
+  }
 });
 
 test("an archive and a tag folder: one class each, the a- and t- owners", async () => {
@@ -201,7 +250,7 @@ test("an archive and a tag folder: one class each, the a- and t- owners", async 
     const id = newId();
     const w = world(kind);
     const r = await w.fill(kind, id, planOf(kind, id));
-    assert.equal(r.state, "validated", kind);
+    assert.equal(r.state, "validated", kind, "no imports: its files validated is the set validated");
     const o = `${kind === "tag" ? "t" : "a"}-${id}`;
     assert.deepEqual(w.calls.map((a) => [a[0], a[4], a[6]]), [["restore-stage", o, kind], ["fill-home", o, kind], ["tree-digest", o, kind]]);
     assert.deepEqual(tree(w.dests[kind]), DATA[kind]);
@@ -239,7 +288,7 @@ test("out of space (77), a partial step (75) and an existing attempt (74) retry 
       const id = newId();
       const w = world("agent", { script: (op, cls, attempt) => (op === where && cls === "home" && attempt === 1 ? code : 0) });
       const r = await w.fill("agent", id, planOf("agent", id));
-      assert.deepEqual([r.state, r.attempt], ["validated", 2], `${code} in ${where}`);
+      assert.deepEqual([r.state, r.attempt], ["files_validated", 2], `${code} in ${where}`);
       assert.deepEqual([tree(w.dests.home), tree(w.dests.sessions)], [DATA.home, DATA.sessions], `${code} in ${where}`);
       // Attempt 1 is never filled after attempt 2 began; a fill failure cleaned the destination before re-staging.
       const fills = w.calls.filter((a) => a[0] === "fill-home").map((a) => `${a[6]}:${a[10]}`);
@@ -272,14 +321,14 @@ test("a staged attempt without every marker exactly its name is never filled: a 
   const id = newId();
   const w = world("agent");
   // As a lying or interrupted launcher would leave it: both classes' data present, the sessions marker another attempt's.
-  writeRecord({ v: 1, kind: "agent", id, run: RUN, snapshot: SNAP, attempt: 1, state: "staging", dest: null, digests: null, dirty: false, reason: null }, { dir: w.dir });
+  writeRecord({ v: 1, kind: "agent", id, run: RUN, snapshot: SNAP, attempt: 1, state: "staging", dest: null, digests: null, dirty: false, reason: null, imports: { config: { state: "none" }, context: { state: "none" } } }, { dir: w.dir });
   for (const cls of ["home", "sessions"]) {
     const att = join(w.stage, RUN, `a-${id}`, cls, "1");
     mkdirSync(join(att, "data", cls), { recursive: true });
     writeFileSync(join(att, ".complete"), cls === "home" ? `${RUN}/a-${id}/home/1` : `${RUN}/a-${id}/sessions/2`);
   }
   const r = await w.fill("agent", id, planOf("agent", id));
-  assert.deepEqual([r.state, r.attempt], ["validated", 2], "the torn attempt was retried");
+  assert.deepEqual([r.state, r.attempt], ["files_validated", 2], "the torn attempt was retried");
   assert.ok(!w.calls.some((a) => a[0] === "fill-home" && a[10] === "1"), "never filled");
   // And a launcher that exits 0 but leaves a wrong marker: checked before the record steps to staged.
   const id2 = newId();
@@ -291,7 +340,7 @@ test("a staged attempt without every marker exactly its name is never filled: a 
     }
   } });
   const r2 = await w2.fill("agent", id2, planOf("agent", id2));
-  assert.deepEqual([r2.state, r2.attempt], ["validated", 2]);
+  assert.deepEqual([r2.state, r2.attempt], ["files_validated", 2]);
   assert.ok(!w2.calls.some((a) => a[0] === "fill-home" && a[10] === "1"));
 });
 
@@ -304,7 +353,7 @@ test("a crash after filling is written: the next call never refills that attempt
   await assert.rejects(w.fill("agent", id, planOf("agent", id)), /killed/);
   assert.deepEqual([readRecord("agent", id, { dir: w.dir }).state, readRecord("agent", id, { dir: w.dir }).attempt], ["filling", 1]);
   const r = await w.fill("agent", id, planOf("agent", id));
-  assert.deepEqual([r.state, r.attempt], ["validated", 2]);
+  assert.deepEqual([r.state, r.attempt], ["files_validated", 2]);
   assert.deepEqual(w.cleaned, [2], "the partly filled destination emptied first");
   const fills = w.calls.filter((a) => a[0] === "fill-home").map((a) => `${a[6]}:${a[10]}`);
   assert.deepEqual(fills, ["home:1", "sessions:1", "home:2", "sessions:2"]);
@@ -317,7 +366,7 @@ test("refusals: a set not in the plan, a record of another restore, missing adap
   const id = newId();
   const w = world("agent");
   await rejects(w.fill("agent", newId(), planOf("agent", id)), "not_found");
-  writeRecord({ v: 1, kind: "agent", id, run: RUN2, snapshot: SNAP, attempt: 1, state: "staging", dest: null, digests: null, dirty: false, reason: null }, { dir: w.dir });
+  writeRecord({ v: 1, kind: "agent", id, run: RUN2, snapshot: SNAP, attempt: 1, state: "staging", dest: null, digests: null, dirty: false, reason: null, imports: { config: { state: "none" }, context: { state: "none" } } }, { dir: w.dir });
   await rejects(w.fill("agent", id, planOf("agent", id)), "not_granted");
   const ac = new AbortController();
   ac.abort();
@@ -363,8 +412,10 @@ test("fillExpect: the launcher's identity of the destination plus the class's ow
   assert.throws(() => fillExpect({ ...identity, object: { ...object, projid: 70006 } }, owners), (e) => e.code === "not_granted");
   assert.throws(() => fillExpect({ ...identity, object: { ...object, inherit: false } }, owners), (e) => e.code === "not_granted", "no inherit flag");
   // destOf pins the device encoding: [major, minor] as major * 2^20 + minor.
-  assert.deepEqual(destOf({ ...object, dev: [8, 1], ino: 42 }), { dev: "8388609", ino: "42" });
-  assert.deepEqual(destOf({ ...object, dev: [259, 3], ino: 7 }), { dev: String(259 * 1048576 + 3), ino: "7" });
+  assert.deepEqual(destOf({ ...object, dev: [8, 1], ino: 42 }), { dev: "8388609", ino: "42", uid: 70005, gid: 70005, mode: 0o700, projid: 70005 });
+  assert.deepEqual(destOf({ ...object, dev: [259, 3], ino: 7 }), { dev: String(259 * 1048576 + 3), ino: "7", uid: 70005, gid: 70005, mode: 0o700, projid: 70005 });
+  // Permission bits only (the type bits never), and the owner, group and project as identified.
+  assert.equal(destOf({ ...object, mode: 0o40755 }).mode, 0o755);
   // The test seam: this process's uid and gid stand for root's (the real caller passes 0 and 0).
   const me = { rootUid: typeof process.getuid === "function" ? process.getuid() : -1, rootGid: typeof process.getgid === "function" ? process.getgid() : -1 };
   const dir = join(mkdtempSync(join(tmpdir(), "sb-expect-")), "expect");
@@ -433,17 +484,17 @@ test("a validated set's consumed staging is discarded only after validated is du
   const id = newId();
   const w = world("agent");
   const r = await w.fill("agent", id, planOf("agent", id));
-  assert.equal(r.state, "validated");
+  assert.equal(r.state, "files_validated");
   // The staged copies (directories, symlinks, the emptied data) don't stay charged: nothing of the set is left.
   for (const cls of ["home", "sessions"]) assert.deepEqual(readdirSync(join(w.stage, RUN, `a-${id}`, cls)), [], cls);
   // A crash in that discard: the next call repairs it, with no launcher call.
   const id2 = newId();
   const w2 = world("agent", { failDiscards: 1 });
   await assert.rejects(w2.fill("agent", id2, planOf("agent", id2)), /crash in discard/);
-  assert.equal(readRecord("agent", id2, { dir: w2.dir }).state, "validated");
+  assert.equal(readRecord("agent", id2, { dir: w2.dir }).state, "files_validated");
   assert.ok(existsSync(join(w2.stage, RUN, `a-${id2}`, "home", "1")), "left by the crash");
   const n = w2.calls.length;
-  assert.equal((await w2.fill("agent", id2, planOf("agent", id2))).state, "validated");
+  assert.equal((await w2.fill("agent", id2, planOf("agent", id2))).state, "files_validated");
   assert.equal(w2.calls.length, n, "no launcher call");
   assert.equal(existsSync(join(w2.stage, RUN, `a-${id2}`, "home", "1")), false, "discarded now");
 });
@@ -460,7 +511,7 @@ test("a new attempt is staged only after every earlier one is discarded: two att
     },
   });
   const r = await w.fill("agent", id, planOf("agent", id));
-  assert.deepEqual([r.state, r.attempt], ["validated", 2]);
+  assert.deepEqual([r.state, r.attempt], ["files_validated", 2]);
   assert.deepEqual(seen, [[false, false], [false, false]], "attempt 1's partial staging is gone before attempt 2 stages either class");
 });
 
@@ -492,7 +543,7 @@ test("validation: each class's hash is recorded as it stages, then the filled tr
   const id = newId();
   const w = world("agent", { onCall: (args) => { if (args[0] === "tree-digest") seen.push(readRecord("agent", id, { dir: w.dir })); } });
   const r = await w.fill("agent", id, planOf("agent", id));
-  assert.equal(r.state, "validated");
+  assert.equal(r.state, "files_validated");
   // The record held both hashes from staging on, each the hash of the list the class's restore-stage wrote.
   assert.deepEqual(Object.keys(r.digests), ["home", "sessions"]);
   for (const cls of ["home", "sessions"]) assert.match(r.digests[cls], /^[0-9a-f]{64}$/);
@@ -501,7 +552,7 @@ test("validation: each class's hash is recorded as it stages, then the filled tr
   assert.deepEqual(seen.map((x) => x.state), ["published", "published"]);
   // The fill reports were saved for the attempt; validated is durable before the attempt is discarded.
   assert.deepEqual(readFillReport(r, "home", { dir: w.dir }), { v: 1, run: RUN, attempt: 1, cls: "home", refused: [], unexpected: [], truncated: false });
-  assert.equal(readRecord("agent", id, { dir: w.dir }).state, "validated");
+  assert.equal(readRecord("agent", id, { dir: w.dir }).state, "files_validated");
   assert.equal(existsSync(attemptDir(w, id, "home")), false);
   // The sessions listing's copy directory is fresh each run and removed after it.
   assert.deepEqual(w.copiesRemoved, [1, 1]);
@@ -511,7 +562,7 @@ test("validation: each class's hash is recorded as it stages, then the filled tr
 test("validation: a changed filled tree fails: a same-size byte change, missing, extra, type, size, mode, set-id, link target", async () => {
   const seed = (cls, d) => { if (cls === "home") { symlinkSync("a.txt", join(d, "ln")); mkdirSync(join(d, "sub")); writeFileSync(join(d, "sub", "c.txt"), "C"); } };
   const ok = await settle({ seed });
-  assert.equal(ok.r.state, "validated", "the seeded tree validates as filled");
+  assert.equal(ok.r.state, "files_validated", "the seeded tree validates as filled");
   const rows = {
     "a same-size byte change": (d) => writeFileSync(join(d, "a.txt"), "Z"),
     "a missing file": (d) => rmSync(join(d, "b.txt")),
@@ -595,14 +646,14 @@ test("validation: a malformed list fails even when the binary reported its exact
 test("validation subtracts exactly the manifest's unrestorable entries and fill's refused subtrees; nothing else is excused", async () => {
   // The manifest's unrestorable b.txt, absent after the fill: validated. Another omission besides it: failed.
   const gone = (...names) => (cls, d) => { if (cls === "home") for (const n of names) rmSync(join(d, n), { recursive: true }); };
-  assert.equal((await settle({ unrestorable: (c) => (c === "home" ? ["b.txt"] : []), beforeDigest: gone("b.txt") })).r.state, "validated");
+  assert.equal((await settle({ unrestorable: (c) => (c === "home" ? ["b.txt"] : []), beforeDigest: gone("b.txt") })).r.state, "files_validated");
   await failedAs({ unrestorable: (c) => (c === "home" ? ["b.txt"] : []), beforeDigest: gone("b.txt", "a.txt") }, "bad_form", "an additional omission");
   await failedAs({ unrestorable: (c) => (c === "home" ? ["b.txt"] : []) }, "bad_form", "an unrestorable entry that is present anyway");
   await failedAs({ unrestorable: (c) => (c === "home" ? ["nope"] : []) }, "bad_form", "an unrestorable path the list doesn't hold");
   // fill refused a directory (another owner's) with 2 files: entries 3, the directory itself included (A2 r3.9).
   const seed = (cls, d) => { if (cls === "home") { mkdirSync(join(d, "x%é")); writeFileSync(join(d, "x%é", "1"), "1"); writeFileSync(join(d, "x%é", "2"), "2"); } };
   const refusedDir = (entries, path = "x%25é") => ({ seed, beforeDigest: gone("x%é"), report: (c) => (c === "home" ? { refused: [{ path, uid: 0, gid: 0, entries }] } : {}) });
-  assert.equal((await settle(refusedDir(3))).r.state, "validated", "the refused subtree, by its encoded path");
+  assert.equal((await settle(refusedDir(3))).r.state, "files_validated", "the refused subtree, by its encoded path");
   for (const n of [2, 4, 0]) await failedAs(refusedDir(n), "bad_form", `a refused directory counted ${n}`);
   // A refused path not in the codec's form ("%" unencoded): fill's line isn't the closed shape, so every attempt is
   // unusable, and the set fails once they are spent; never validated.
@@ -610,11 +661,11 @@ test("validation subtracts exactly the manifest's unrestorable entries and fill'
   assert.deepEqual([raw.r.state, raw.r.reason, raw.r.attempt], ["failed", "outcome_unknown", MAX_ATTEMPTS]);
   // The subtree is matched on path + "/": a neighbour sharing the prefix ("x%é2", "x%é.txt") is not excused.
   const neighbours = (cls, d) => { seed(cls, d); if (cls === "home") { writeFileSync(join(d, "x%é2"), "n"); writeFileSync(join(d, "x%é.txt"), "n"); } };
-  assert.equal((await settle({ ...refusedDir(3), seed: neighbours })).r.state, "validated", "the neighbours stay, compared as placed");
+  assert.equal((await settle({ ...refusedDir(3), seed: neighbours })).r.state, "files_validated", "the neighbours stay, compared as placed");
   await failedAs({ ...refusedDir(3), seed: neighbours, beforeDigest: gone("x%é", "x%é2") }, "bad_form", "a neighbour missing is not excused");
   // A refused empty directory is entries 1.
   const empty = (entries) => ({ seed: (c, d) => { if (c === "home") mkdirSync(join(d, "e")); }, beforeDigest: gone("e"), report: (c) => (c === "home" ? { refused: [{ path: "e", uid: 0, gid: 0, entries }] } : {}) });
-  assert.equal((await settle(empty(1))).r.state, "validated");
+  assert.equal((await settle(empty(1))).r.state, "files_validated");
   await failedAs(empty(0), "bad_form", "a refused empty directory counted 0");
   // Exactly 1000 refused entries (the report's bound) still validate; 1001 can't be reported (the line row, below).
   const many = Array.from({ length: 1000 }, (_, i) => `r${String(i).padStart(4, "0")}`);
@@ -623,13 +674,13 @@ test("validation subtracts exactly the manifest's unrestorable entries and fill'
     beforeDigest: (c, d) => { if (c === "home") for (const n of many) rmSync(join(d, n)); },
     report: (c) => (c === "home" ? { refused: many.map((path) => ({ path, uid: 0, gid: 0, entries: 1 })) } : {}),
   });
-  assert.equal(thousand.r.state, "validated", "1000 refused");
+  assert.equal(thousand.r.state, "files_validated", "1000 refused");
   await failedAs(refusedDir(3, "y"), "bad_form", "a refused path the list doesn't hold");
   // ... even when nothing else differs (fill names an entry the backup never had).
   await failedAs({ report: (c) => (c === "home" ? { refused: [{ path: "y", uid: 0, gid: 0, entries: 1 }] } : {}) }, "bad_form", "only an unknown refused path");
   // A refused file is entries 1; refused, yet present in the destination, is extra.
   const file = (entries, keep = false) => ({ beforeDigest: keep ? undefined : gone("a.txt"), report: (c) => (c === "home" ? { refused: [{ path: "a.txt", uid: 0, gid: 0, entries }] } : {}) });
-  assert.equal((await settle(file(1))).r.state, "validated");
+  assert.equal((await settle(file(1))).r.state, "files_validated");
   await failedAs(file(0), "bad_form", "a refused file counted 0");
   await failedAs(file(1, true), "bad_form", "a refused file that is placed anyway");
   // A report that is truncated, or lists anything unexpected, is never excused.
@@ -647,7 +698,7 @@ test("validation needs the set stopped and fenced; tree-digest's transient exits
   assert.ok(!w.calls.some((a) => a[0] === "tree-digest"));
   assert.ok(existsSync(attemptDir(w, id, "home")));
   stoppedNow = true;
-  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "validated");
+  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "files_validated");
   for (const v of [false, undefined, 1, "true"]) {
     const i = newId(), x = world("agent", { stopped: async () => v });
     await rejects(x.fill("agent", i, planOf("agent", i)), "not_granted");
@@ -655,17 +706,17 @@ test("validation needs the set stopped and fenced; tree-digest's transient exits
   // 75 (a read error mid-walk) twice, then 0: validated, the class listed three times.
   let n = 0;
   const flaky = await settle({ script: (op, cls) => (op === "tree-digest" && cls === "home" && ++n <= 2 ? EXIT.partial : 0) });
-  assert.equal(flaky.r.state, "validated");
+  assert.equal(flaky.r.state, "files_validated");
   assert.equal(flaky.w.calls.filter((a) => a[0] === "tree-digest" && a[6] === "home").length, 3);
   // Transient every time: failed after DIGEST_TRIES, never re-staged.
   const always = await failedAs({ script: (op, cls) => (op === "tree-digest" && cls === "home" ? EXIT.partial : 0) }, "outcome_unknown", "75 every time");
   assert.equal(always.w.calls.filter((a) => a[0] === "tree-digest").length, 3);
   // 74 (a stale copy directory): removed before each sessions listing, so a leftover from a crash is cleared.
   const left = await settle({ seed: () => {}, onCall: () => {} });
-  assert.equal(left.r.state, "validated");
+  assert.equal(left.r.state, "files_validated");
   const id3 = newId();
   const w3 = world("agent", { onCall: (args) => { if (args[0] === "tree-digest" && args[6] === "home") mkdirSync(join(w3.base, "copies", RUN, `a-${id3}`), { recursive: true }); } });
-  assert.equal((await w3.fill("agent", id3, planOf("agent", id3))).state, "validated", "a leftover copy directory removed first");
+  assert.equal((await w3.fill("agent", id3, planOf("agent", id3))).state, "files_validated", "a leftover copy directory removed first");
   // Usage or limit (64) is bad_form; the root guard, an identity or anything else is outcome_unknown.
   await failedAs({ script: (op) => (op === "tree-digest" ? 64 : 0) }, "bad_form", "64");
   for (const code of [66, 72, 73]) await failedAs({ script: (op) => (op === "tree-digest" ? code : 0) }, "outcome_unknown", String(code));
@@ -710,7 +761,7 @@ test("validation: a crash at any point repeats it against the same recorded hash
     assert.equal(mid.state, "published", at);
     assert.ok(existsSync(join(attemptDir(w, id, "home"), "data", "digests.json")), `${at}: the lists survive until validated`);
     const r = await w.fill("agent", id, planOf("agent", id));
-    assert.deepEqual([r.state, r.attempt, r.digests], ["validated", 1, mid.digests], at);
+    assert.deepEqual([r.state, r.attempt, r.digests], ["files_validated", 1, mid.digests], at);
     assert.equal(w.calls.filter((a) => a[0] === "restore-stage").length, 2, `${at}: not re-staged`);
   }
   // Killed right after published was written (before validation began): the same.
@@ -718,7 +769,7 @@ test("validation: a crash at any point repeats it against the same recorded hash
   const id = newId();
   const w = world("agent", { stopped: async () => { if (crash) { crash = false; throw new Error("killed"); } return true; } });
   await assert.rejects(w.fill("agent", id, planOf("agent", id)), /killed/);
-  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "validated");
+  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "files_validated");
   // The tree changed between the crash and the retry: the retry fails it (the same hashes, the same list).
   let crash2 = true, broken = false;
   const id2 = newId();
@@ -750,7 +801,7 @@ test("restore-stage's and fill-home's lines: exactly the closed success shapes, 
   for (const [what, f] of Object.entries(stageRows)) {
     let first = true;
     const { r, w } = await settle({ stdout: (op, cls, t) => (op === "restore-stage" && cls === "sessions" && first ? ((first = false), f(t)) : good(t)) });
-    assert.deepEqual([r.state, r.attempt], ["validated", 2], what);
+    assert.deepEqual([r.state, r.attempt], ["files_validated", 2], what);
     assert.ok(!w.calls.some((a) => a[0] === "fill-home" && a[10] === "1"), `${what}: attempt 1 never filled`);
   }
   const fillRows = {
@@ -763,7 +814,7 @@ test("restore-stage's and fill-home's lines: exactly the closed success shapes, 
   for (const [what, f] of Object.entries(fillRows)) {
     let first = true;
     const { r } = await settle({ stdout: (op, cls, t) => (op === "fill-home" && cls === "home" && first ? ((first = false), f(t)) : t) });
-    assert.deepEqual([r.state, r.attempt], ["validated", 2], what);
+    assert.deepEqual([r.state, r.attempt], ["files_validated", 2], what);
   }
 });
 
@@ -792,7 +843,7 @@ test("validation of sessions: each SQLite database's private copy passes quick_c
   const opts = (o = {}) => ({ seed: seedWith(o.over), skipCopy: o.skipCopy, afterCopy: o.afterCopy });
   // Sound: validated; the copies were made and removed.
   const ok = await settle(opts());
-  assert.equal(ok.r.state, "validated");
+  assert.equal(ok.r.state, "files_validated");
   // Corruption already in the backup (so the list matches the tree): quick_check catches it.
   const bad = Buffer.from(files["plain.db"]);
   for (let i = bad.length - 8192; i < bad.length - 4096; i++) bad[i] = 0x5a;
@@ -844,7 +895,7 @@ test("permanent list or report faults are a durable failed; an interruption stay
   const w = world("agent", { stopped: async () => { if (fault) { fault = false; throw Object.assign(new Error("EIO"), { code: "EIO" }); } return true; } });
   await assert.rejects(w.fill("agent", id, planOf("agent", id)), /EIO/);
   assert.equal(readRecord("agent", id, { dir: w.dir }).state, "published");
-  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "validated");
+  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "files_validated");
   // The same for the report: unreadable for a moment (EACCES) is no verdict.
   if (process.getuid?.() !== 0) {
     const id3 = newId();
@@ -853,7 +904,7 @@ test("permanent list or report faults are a durable failed; an interruption stay
     await assert.rejects(w3.fill("agent", id3, planOf("agent", id3)), (e) => e.code === "EACCES");
     assert.equal(readRecord("agent", id3, { dir: w3.dir }).state, "published");
     chmodSync(q, 0o600);
-    assert.equal((await w3.fill("agent", id3, planOf("agent", id3))).state, "validated");
+    assert.equal((await w3.fill("agent", id3, planOf("agent", id3))).state, "files_validated");
   }
   // A read of the list that fails for another reason than its form (here EACCES, standing in for an I/O error) is
   // the same: thrown, still published, validated once it reads.
@@ -864,7 +915,7 @@ test("permanent list or report faults are a durable failed; an interruption stay
     await assert.rejects(w2.fill("agent", id2, planOf("agent", id2)), (e) => e.code === "EACCES");
     assert.equal(readRecord("agent", id2, { dir: w2.dir }).state, "published");
     chmodSync(p, 0o600);
-    assert.equal((await w2.fill("agent", id2, planOf("agent", id2))).state, "validated");
+    assert.equal((await w2.fill("agent", id2, planOf("agent", id2))).state, "files_validated");
   }
 });
 
@@ -878,7 +929,7 @@ test("names through the whole restore: a literal %, bytes that aren't UTF-8, UTF
     writeFileSync(join(d, "d", "%x"), "y");
   };
   const ok = await settle({ seed });
-  assert.equal(ok.r.state, "validated");
+  assert.equal(ok.r.state, "files_validated");
   // The list the binary wrote is in raw order (the paths as encoded, in that order).
   let seen = null;
   await settle({ seed, listOf: (cls, t) => { if (cls === "home") seen = t; return t; } });

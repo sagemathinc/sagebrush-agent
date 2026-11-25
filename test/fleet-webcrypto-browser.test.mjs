@@ -19,7 +19,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import path, { posix } from "node:path";
 import { test } from "node:test";
 
 const ROOT = new URL("..", import.meta.url);
@@ -32,14 +32,15 @@ const RECOVERY_KNOWN = ["QIgcRL3kWMdpVNtbHP7lkw", "8f8Zi-ibteyHFwp-PnAVfGC6-_75J
 
 // (Google Chrome before Chromium, whichever PATH directory each is in: names outside, directories inside. On Ubuntu
 // runners /usr/bin/chromium is the snap's wrapper, whose own start-up took 24 s under load before Chromium printed
-// anything, and the runners also carry Google Chrome. SAGEBRUSH_CHROME, when set, decides.)
+// anything, and the runners also carry Google Chrome. SAGEBRUSH_CHROME, when set, decides. `paths` is the platform's
+// path module by default; the selection row passes posix, so it reads the same on every runner.)
 const BROWSERS = ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser"];
-export function findChrome(env = process.env, exists = existsSync) {
+export function findChrome(env = process.env, exists = existsSync, paths = path) {
   if (env.SAGEBRUSH_CHROME) return env.SAGEBRUSH_CHROME;
-  const dirs = (env.PATH ?? "").split(delimiter).filter(Boolean);
+  const dirs = (env.PATH ?? "").split(paths.delimiter).filter(Boolean);
   for (const name of BROWSERS)
     for (const dir of dirs)
-      if (exists(join(dir, name))) return join(dir, name);
+      if (exists(paths.join(dir, name))) return paths.join(dir, name);
   return null;
 }
 const chrome = process.platform === "linux" ? findChrome() : null;
@@ -111,7 +112,7 @@ test("headless Chromium: the core with the WebCrypto backend passes every shared
   const launches = [];
   /** One launch with its own profile and process group; stop() kills it and waits, bounded, then removes the profile. */
   const launch = () => {
-    const profile = mkdtempSync(join(tmpdir(), "fleet-webcrypto-"));
+    const profile = mkdtempSync(path.join(tmpdir(), "fleet-webcrypto-"));
     // (--no-sandbox: containers and Ubuntu 24.04 runners refuse the namespaces Chromium's sandbox needs, and the page
     // loads nothing but the files above, from this loopback server)
     const args = ["--headless=new", "--no-sandbox", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--password-store=basic",
@@ -178,19 +179,20 @@ test("headless Chromium: the core with the WebCrypto backend passes every shared
 });
 
 test("the browser's selection: Google Chrome before Chromium across PATH directories, the override first, none found", () => {
-  const P = (...d) => d.join(delimiter);
+  const P = (...d) => d.join(posix.delimiter);
   const at = (...files) => (p) => files.includes(p);
+  const find = (env, exists) => findChrome(env, exists, posix);
   // (Chromium in an earlier directory, Google Chrome in a later one: Chrome)
-  assert.equal(findChrome({ PATH: P("/early", "/late") }, at("/early/chromium", "/late/google-chrome-stable")), "/late/google-chrome-stable");
-  assert.equal(findChrome({ PATH: P("/early", "/late") }, at("/early/chromium-browser", "/late/google-chrome")), "/late/google-chrome");
+  assert.equal(find({ PATH: P("/early", "/late") }, at("/early/chromium", "/late/google-chrome-stable")), "/late/google-chrome-stable");
+  assert.equal(find({ PATH: P("/early", "/late") }, at("/early/chromium-browser", "/late/google-chrome")), "/late/google-chrome");
   // (within one name, the first PATH directory wins)
-  assert.equal(findChrome({ PATH: P("/a", "/b") }, at("/a/google-chrome", "/b/google-chrome")), "/a/google-chrome");
-  assert.equal(findChrome({ PATH: P("/a", "/b") }, at("/b/google-chrome-stable", "/a/google-chrome")), "/b/google-chrome-stable");
+  assert.equal(find({ PATH: P("/a", "/b") }, at("/a/google-chrome", "/b/google-chrome")), "/a/google-chrome");
+  assert.equal(find({ PATH: P("/a", "/b") }, at("/b/google-chrome-stable", "/a/google-chrome")), "/b/google-chrome-stable");
   // (only Chromium: Chromium)
-  assert.equal(findChrome({ PATH: P("/a") }, at("/a/chromium")), "/a/chromium");
+  assert.equal(find({ PATH: P("/a") }, at("/a/chromium")), "/a/chromium");
   // (the override decides, whatever PATH holds)
-  assert.equal(findChrome({ SAGEBRUSH_CHROME: "/opt/c", PATH: P("/a") }, at("/a/google-chrome-stable")), "/opt/c");
+  assert.equal(find({ SAGEBRUSH_CHROME: "/opt/c", PATH: P("/a") }, at("/a/google-chrome-stable")), "/opt/c");
   // (nothing, or an empty PATH)
-  assert.equal(findChrome({ PATH: P("/a") }, at()), null);
-  assert.equal(findChrome({}, at("/google-chrome")), null);
+  assert.equal(find({ PATH: P("/a") }, at()), null);
+  assert.equal(find({}, at("/google-chrome")), null);
 });

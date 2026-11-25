@@ -14,6 +14,7 @@ import {
   reopenAfterSleep, sleepHealth, sleepHook, writeRecord,
 } from "../lib/fleet/host/lease.mjs";
 import { withGateHealth } from "../lib/fleet/host/host-state.mjs";
+import { realIo } from "../lib/fleet/host/store.mjs";
 
 const MAX = 2 ** 53 - 1;
 const A = newId(), B = newId(), C = newId();
@@ -177,6 +178,49 @@ test("PRE's failures keep pre_ok false and the parent frozen: unreadable discove
     assert.notEqual(sys.freeze, "0", `${label}: never thawed`);
     assert.equal(readGate({ dir: t.dir, clock }).open, false, `${label}: closed`);
   }
+});
+
+test("TESTS H1: PRE is ok (exit 0) ONLY with pre_ok durably written: the close's or pre_ok's rename or fsync failing is a failure, the parent never thawed", async () => {
+  // io failing only the n-th durable write of the sleep file, at one step (rename, or fsync), the rest real
+  const failing = (nth, step) => {
+    let n = 0, sleepFd = null;
+    return {
+      ...realIo,
+      open: (p, f, m) => { const fd = realIo.open(p, f, m); if (p.includes(`.${SLEEP_FILE}.`)) { n++; sleepFd = fd; } return fd; },
+      fsync: (fd) => { if (step === "fsync" && n === nth && fd === sleepFd) throw Object.assign(new Error("EIO"), { code: "EIO" }); return realIo.fsync(fd); },
+      close: (fd) => { if (fd === sleepFd) sleepFd = null; return realIo.close(fd); }, // (a descriptor number is reused)
+      rename: (a, b) => { if (step === "rename" && n === nth && b.endsWith(`/${SLEEP_FILE}`)) throw Object.assign(new Error("EIO"), { code: "EIO" }); return realIo.rename(a, b); },
+    };
+  };
+  for (const [label, nth, step, file] of [
+    ["the close's rename", 1, "rename", null],
+    ["the close's fsync", 1, "fsync", null],
+    ["pre_ok's rename", 2, "rename", { gen: 1, phase: "pre", pre_ok: false, pre_at: 1_000_010 }],
+    ["pre_ok's fsync", 2, "fsync", { gen: 1, phase: "pre", pre_ok: false, pre_at: 1_000_010 }],
+  ]) {
+    const t = world(), locks = fakeLocks();
+    unit(t, A); record(t, A, 2);
+    const sys = fakeSys(t);
+    const r = await leaseSleep("pre", opts(t, sys, locks, { io: failing(nth, step) }));
+    assert.equal(r.ok, false, label);
+    assert.equal(r.pre_ok, false, label);
+    const now = existsSync(join(t.dir, SLEEP_FILE)) ? JSON.parse(readFileSync(join(t.dir, SLEEP_FILE), "utf8")) : null;
+    assert.deepEqual(now, file, `${label}: the file`);
+    // the containment still ran in full (a failed write never skips it), and nothing thawed
+    assert.ok(existsSync(join(t.fenceDir, A)) && readTombstone(A, { dir: t.dir }) >= 2, `${label}: contained`);
+    assert.equal(sys.freeze, "1", `${label}: frozen, never thawed`);
+  }
+  // the control: the same world with real io is ok, pre_ok written
+  const t = world(), locks = fakeLocks();
+  unit(t, A); record(t, A, 2);
+  const r = await leaseSleep("pre", opts(t, fakeSys(t), locks, { io: failing(0, "rename") }));
+  assert.deepEqual([r.ok, r.pre_ok], [true, true]);
+  assert.equal(JSON.parse(readFileSync(join(t.dir, SLEEP_FILE), "utf8")).pre_ok, true);
+});
+
+test("lease-main's exit status is leaseSleep's ok: 0 only with pre_ok", async () => {
+  const src = readFileSync(new URL("../lib/fleet/host/lease-main.mjs", import.meta.url), "utf8");
+  assert.match(src, /process\.exitCode = out\.ok \? 0 : 3;/);
 });
 
 test("PRE spends under the activation lock, killing the parent and retrying when a holder has it (never waiting unbounded)", async () => {

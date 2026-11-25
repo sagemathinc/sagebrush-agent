@@ -59,7 +59,7 @@ test("agent #23's tags schema compiles under the closed validator, and agrees wi
     assert.equal(bad(() => v({ id, name })), "bad_form", name);
     assert.equal(validTagName(name), false);
   }
-  assert.equal(FREEZE.revision, "r2.3");
+  assert.equal(FREEZE.revision, "r2.4.1");
 });
 
 test("closed validator: number is any finite number, integers included; integer is unchanged", () => {

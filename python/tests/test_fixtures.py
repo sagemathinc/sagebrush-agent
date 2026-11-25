@@ -16,13 +16,13 @@ sys.path.insert(0, str(ROOT / "python"))
 from sagebrush_fleet import (  # noqa: E402
     FleetError, apply_chain_entry, canon_text, derive_key_pair, device_key, is_id, key_id, open_cap, open_envelope,
     parse_canonical, replay, service_key_at, unb64, verify_approval, verify_grant, verify_grant_ack, verify_host_cert, verify_host_op,
-    verify_package, verify_strict,
+    verify_package, verify_strict, verify_transfer_receipt, check_transfer_for_host,
 )
 from sagebrush_fleet.hpke import Recipient, Sender, receive_export, send_export  # noqa: E402
 
 FIXTURES = ROOT / "test" / "fixtures"
 # (the JavaScript checker's case counts: a fixture file that loses cases fails here, not silently)
-COUNTS = {"fleet": 91, "hpke": 34}
+COUNTS = {"fleet": 130, "hpke": 34}
 
 
 def load(name):
@@ -126,9 +126,33 @@ class FleetFixtures(Cases):
             **self.ctx, "chain": st, "now": self.F["now_ms"], "expect": c["expect_op"], "current": c.get("current"), "used": lambda a: a in c["used"],
         })), c["expect"]) for c in O["approvals"]))
 
+    def test_transfer_receipts(self):
+        X = self.F["transfers"]
+        chains = {"honest": replay([enc(x) for x in X["chain"]], self.ctx), "removed": replay([enc(x) for x in X["chain_removed"]], self.ctx)}
+        self.each("transfer_receipts", ((c["name"], result(lambda: verify_transfer_receipt(
+            {"transfer": enc(c["transfer"]), "receipt": enc(c["receipt"])}, {**self.ctx, "chain": chains[c.get("chain", "honest")]})), c["expect"]) for c in X["receipts"]))
+
+    def test_transfer_hosts(self):
+        def host_of(r):
+            return {
+                "id": r["id"], "fingerprint": r["fingerprint"],
+                "grant_hash_at": lambda g: (r["grants"].get(str(g)) or {}).get("hash"),
+                "grant_lists_agent": lambda g, a: a in (r["grants"].get(str(g)) or {}).get("agents", []),
+                "listed_since": lambda a: r["listed_since"].get(a), "entry_gen": lambda a: r["entry_gen"].get(a),
+                "accepted_transfer": lambda a: r["accepted"].get(a), "nonce_seen": lambda x: r["nonces"].get(x),
+            }
+
+        def run(c):
+            out = {}
+            got = result(lambda: out.update(check_transfer_for_host({"transfer": c["pair"]["transfer"], "transfer_hash": c["pair"]["transferHash"]}, host_of(c["host"]))))
+            return f"ok first={str(out['first']).lower()}" if got == "ok" else got
+
+        self.each("transfer_hosts", ((c["name"], run(c), f"ok first={str(c['first']).lower()}" if c["expect"] == "ok" else c["expect"]) for c in self.F["transfers"]["hosts"]))
+
     def test_zz_every_case_ran(self):
         """(named to run last in the class) the JavaScript checker's count of cases, all of them run here"""
-        groups = ["canonical", "base64url", "ids", "ed25519", "chain", "service_keys", "envelopes", "grants", "grant_acks", "host_ops", "approvals"]
+        groups = ["canonical", "base64url", "ids", "ed25519", "chain", "service_keys", "envelopes", "grants", "grant_acks", "host_ops", "approvals",
+                  "transfer_receipts", "transfer_hosts"]
         missing = [g for g in groups if g not in Cases.ran]
         if missing:
             self.skipTest(f"run alone: {missing} not run")

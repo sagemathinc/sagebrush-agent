@@ -1,4 +1,4 @@
-// The fleet schema set (schema/fleet/fleet.schema.json, reasons.json, purpose-codes.json) against O6/O7 r2.3: every
+// The fleet schema set (schema/fleet/fleet.schema.json, reasons.json, purpose-codes.json) against O6/O7 r2.4: every
 // definition compiles; a valid body of each type passes and each kind of mistake is refused; the reason registry is
 // closed and covers every code the library raises; the purpose codes agree with their display list.
 import assert from "node:assert/strict";
@@ -35,9 +35,14 @@ const samples = {
     purpose: "codex-access-token", gen: 1, chain_seq: 3, at_ms: 1, not_after_ms: 2, enc: key32, ct: "AAAA" },
   "device-chain": { fleet, aud: AUD, seq: 0, prev: "", op: "genesis", at_ms: 1, auth_time_ms: 1,
     device: { id: newId(), alg: "ed25519", key: key32, name: "William's laptop", tier: "browser" }, recovery_key: { alg: "ed25519", key: key32 } },
+  "agent-transfer": { fleet, aud: AUD, agent, from_host: newId(), to_host: host, to_host_key: h, gen: 4, grant: h, nonce: "A".repeat(22),
+    chain_seq: 3, at_ms: 1, not_after_ms: 2, auth_time_ms: 1 },
+  "agent-transfer-receipt": { fleet, aud: AUD, agent, from_host: newId(), to_host: host, to_host_key: h, gen: 4, nonce: "A".repeat(22), transfer: h,
+    chain_seq: 3, at_ms: 1 },
+  "agent-fence-ack": { fleet, aud: AUD, agent, host, gen: 2, transfer: h, boot_id: "0f6c2b5e-8d3a-4c1e-9b7f-2a4d6e8f0a1c", proven_empty: true, at_ms: 1 },
 };
 
-test("fleet.schema.json: pinned to r2.3; every definition compiles; one valid body of each type passes", () => {
+test("fleet.schema.json: pinned to r2.4; every definition compiles; one valid body of each type passes", () => {
   assert.ok(doc.$comment.includes(FREEZE.sha256));
   for (const t of Object.keys(doc.$defs)) body(t);
   for (const [t, x] of Object.entries(samples)) assert.equal(body(t)(x), true, t);
@@ -65,6 +70,15 @@ test("fleet bodies: an extra field, a missing one, a wrong id, a non-canonical v
   assert.ok(refused(dc, { ...G, op: "recover", recovery_key: undefined }), "recover carries its rotation");
   assert.ok(refused(dc, { ...G, device: { ...G.device, tier: "keychain" } }));
   assert.ok(refused(dc, { ...G, prev: "x" }));
+  // moving an agent (r2.4 §3.7): each body closed; the fence ack only ever says proven_empty: true
+  const tr = body("agent-transfer"), T = samples["agent-transfer"];
+  for (const x of [{ ...T, extra: 1 }, (({ grant, ...r }) => r)(T), { ...T, gen: 0 }, { ...T, nonce: "A".repeat(21) + "B" }, { ...T, to_host_key: h.slice(0, 42) + "B" }])
+    assert.ok(refused(tr, x), JSON.stringify(x).slice(0, 80));
+  const rc = body("agent-transfer-receipt"), Rc = samples["agent-transfer-receipt"];
+  for (const x of [{ ...Rc, grant: h }, (({ transfer, ...r }) => r)(Rc), { ...Rc, auth_time_ms: 1 }]) assert.ok(refused(rc, x), JSON.stringify(x).slice(0, 80));
+  const fa = body("agent-fence-ack"), F = samples["agent-fence-ack"];
+  for (const x of [{ ...F, proven_empty: false }, (({ proven_empty, ...r }) => r)(F), { ...F, boot_id: "0F6C2B5E-8D3A-4C1E-9B7F-2A4D6E8F0A1C" },
+    { ...F, boot_id: "not-a-uuid" }, { ...F, transfer: "x" }]) assert.ok(refused(fa, x), JSON.stringify(x).slice(0, 80));
 });
 
 test("reasons.json: closed, unique, and every code the fleet library raises is in it", () => {

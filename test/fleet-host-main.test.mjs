@@ -13,6 +13,7 @@ import { b64, hostFingerprint, keyFromSeed, newId, replayChain, seal, sha256b64 
 import { classify, firstBoot, hostPaths } from "../lib/fleet/host/identity.mjs";
 import { ADAPTERS, CONFIG_MAX, CONTAIN_RETRY_MS, INITIAL_SYNC_MS, RESUME_BASE_KEYS, brokerAccount, hostResetIdentity, hostRun, readHostConfig, realContainSys, resumeBase, resumeRequester, supervisorUnit } from "../lib/fleet/host/host-main.mjs";
 import { RESUME_HELPER_MS, requestResume } from "../lib/fleet/host/restore-resume.mjs";
+import { expectedOf } from "../lib/fleet/host/restore-plan.mjs";
 import { QUALIFIED_MAJOR } from "../lib/fleet/host/host-preflight.mjs";
 import { HEALTH_REASONS, hostState } from "../lib/fleet/host/host-state.mjs";
 import { Supervisor } from "../lib/fleet/host/executor.mjs";
@@ -1090,4 +1091,69 @@ test("the host's own wiring asks leaseQualified with the release root alone: no 
   const args = [...src.matchAll(/leaseQualified\(([^)]*)\)/g)].map((m) => m[1]);
   assert.ok(args.includes("release") && args.every((a) => a === "" || a === "release"), JSON.stringify(args));
   assert.match(src, /\n    leaseQualified: \(\) => leaseQualified\(release\),\n/);
+});
+
+// ---- the restore resume's validation gate through hostRun (restore owner, #172 H1): requestResume records a NEW
+// transfer receipt durably before its helper runs, so a restore that isn't validated must refuse BEFORE the pair is read
+
+/** A valid restore plan naming `agent` and its `tags`. */
+const RPLAN = (agent, tags) => {
+  const hex = (c) => c.repeat(64), set = (c) => ({ run: "aaaaaaaaaaaaaaaa", snapshot: hex(c), tree: hex(c) });
+  return { v: 1, host: "h1", manifest: hex("1"), sha256: hex("2"), hoststore: hex("3"),
+    sets: Object.fromEntries([[`agent-${agent}`, set("4")], ...tags.map((t, i) => [`tag-${t}`, set(String(5 + i))])]) };
+};
+
+/**
+ * One resume request through hostRun (lease on, qualified) with the REAL requestResume and the base hostRun builds,
+ * over a store whose registry lists the agent with two tags. `plan`: false for none, true for one naming the agent
+ * and its tags. Spies: restoreReady (answering `verdict`), pairOf (a pair, counted), the transfer record, the helper.
+ */
+async function resumeGate({ plan, verdict = "validated" }) {
+  const { id } = await paired();
+  const agent = newId(), tags = [newId(), newId()];
+  const p = plan ? RPLAN(agent, tags) : null;
+  const s = { readyCalls: [], pairCalls: 0, recorded: [], helper: 0 };
+  const h = harness({ id, config: { lease: "on" }, qualified: { ok: true } });
+  h.d.openStore = async () => ({
+    grants: { highwater: { gen: 0 }, record: () => null },
+    registry: { agent: (x) => (x === agent ? { tags: [...tags] } : null) },
+    transfers: { record: (...a) => { s.recorded.push(a); } },
+    close: async () => {},
+  });
+  h.d.readPlan = () => p;
+  h.d.restoreReady = (...a) => { s.readyCalls.push(a); return verdict; };
+  h.d.pairOf = () => { s.pairCalls++; return { transfer: "T", receipt: "R" }; };
+  h.d.runHelper = async () => { s.helper++; return { code: 0, stdout: "" }; };
+  h.d.requestResume = requestResume;
+  const run = hostRun(h.d);
+  await until(() => h.lines.some((l) => l.serving));
+  const r = await h.made.supervisor.restoreResume.request(agent, { liveLease: async () => ({ lease_id: "L", lg: 3, gen: 1, expiry_tick: 1 }) });
+  h.term();
+  await run;
+  return { r, s, agent, tags, plan: p };
+}
+
+test("the resume gate (a): no restore plan: not_validated; restoreReady never asked; no pair read, nothing recorded, no helper", async () => {
+  const { r, s } = await resumeGate({ plan: false });
+  assert.deepEqual(r, { resumed: false, reason: "not_validated" });
+  assert.deepEqual([s.readyCalls.length, s.pairCalls, s.recorded.length, s.helper], [0, 0, 0, 0]);
+});
+
+test("the resume gate (b): a plan: restoreReady gets exactly (the agent, its registry tags, expectedOf(plan)); every non-validated verdict refuses before the pair is read", async () => {
+  for (const verdict of ["none", "importing", "files_validated", "abandoned", "failed"]) {
+    const { r, s, agent, tags, plan } = await resumeGate({ plan: true, verdict });
+    assert.deepEqual(r, { resumed: false, reason: "not_validated" }, verdict);
+    assert.equal(s.readyCalls.length, 1, verdict);
+    assert.deepEqual(s.readyCalls[0], [agent, tags, expectedOf(plan)], `${verdict}: the agent, its registry tags (not []), expectedOf(plan)`);
+    assert.deepEqual([s.pairCalls, s.recorded.length, s.helper], [0, 0, 0], `${verdict}: nothing read, recorded or launched`);
+  }
+});
+
+test("the resume gate (c): validated: the request passes the gate and reaches the receipt checks (the pair read and verified)", async () => {
+  const { r, s, agent, tags, plan } = await resumeGate({ plan: true, verdict: "validated" });
+  assert.deepEqual(s.readyCalls, [[agent, tags, expectedOf(plan)]]);
+  assert.equal(s.pairCalls, 1, "the pair is read only after the gate");
+  assert.equal(r.resumed, false);
+  assert.equal(r.reason, "receipt", "the real verifier refused the fake pair: the receipt checks ran");
+  assert.deepEqual([s.recorded.length, s.helper], [0, 0]);
 });

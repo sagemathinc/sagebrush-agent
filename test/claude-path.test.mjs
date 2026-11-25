@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bindExecutable, boundedRun, CLAUDE_PATH_REASONS, claudeVersionOf, ClaudePathError, minimalEnv, recheck } from "../lib/claude-path.mjs";
@@ -230,10 +230,10 @@ test("claude-path: PATH keeps a folder only if it and every folder above it, res
   });
   const P = (o) => minimalEnv(o).PATH;
   assert.equal(P(fs()), "/usr/bin:/bin");
-  assert.equal(P(fs({ "/": { uid: 2001, mode: 0o40775 } })), "", "a bad / excludes both (this host's case)");
-  assert.equal(P(fs({ "/usr": { mode: 0o40775 } })), "", "a group-writable /usr excludes /usr/bin, and /bin resolved into it");
-  assert.equal(P(fs({ "/usr": { uid: 1000 } })), "", "a /usr owned by someone else");
-  assert.equal(P(fs({ "/usr/bin": { mode: 0o40757 } })), "", "the leaf itself");
+  assert.equal(P(fs({ "/": { uid: 2001, mode: 0o40775 } })), "/dev/null", "a bad / excludes both (this host's case)");
+  assert.equal(P(fs({ "/usr": { mode: 0o40775 } })), "/dev/null", "a group-writable /usr excludes /usr/bin, and /bin resolved into it");
+  assert.equal(P(fs({ "/usr": { uid: 1000 } })), "/dev/null", "a /usr owned by someone else");
+  assert.equal(P(fs({ "/usr/bin": { mode: 0o40757 } })), "/dev/null", "the leaf itself");
   assert.equal(P(fs({ "/opt": { mode: 0o40777 } }, "/opt/bin")), "/usr/bin", "/bin's resolved ancestry is what's checked");
   assert.equal(P(fs({}, "/opt/bin")), "/usr/bin:/bin");
   // (every step as written: a /usr that is itself a link into an open folder excludes /usr/bin, though /usr/bin's own
@@ -243,10 +243,32 @@ test("claude-path: PATH keeps a folder only if it and every folder above it, res
   // (a link anywhere on a resolved chain excludes the folder: a resolved chain holds no link)
   const linky = { realpath: (p) => p, lstat: (p) => ({ isDirectory: () => true, isSymbolicLink: () => p === "/usr", uid: 0n, mode: 0o40755n }) };
   assert.equal(P(linky), "/bin", "a link at /usr on /usr/bin's chain excludes it");
-  assert.equal(P({ realpath: () => { throw new Error("ENOENT"); }, lstat: fs().lstat }), "");
-  assert.equal(P({ realpath: (p) => p, lstat: () => { throw new Error("EACCES"); } }), "");
+  assert.equal(P({ realpath: () => { throw new Error("ENOENT"); }, lstat: fs().lstat }), "/dev/null");
+  assert.equal(P({ realpath: (p) => p, lstat: () => { throw new Error("EACCES"); } }), "/dev/null");
   // (the real "/" of this host, as it is: if others can write it, nothing qualifies here)
-  if ((Number(lstatSync("/").mode) & 0o022) !== 0) assert.equal(minimalEnv().PATH, "");
+  if ((Number(lstatSync("/").mode) & 0o022) !== 0) assert.equal(minimalEnv().PATH, "/dev/null");
+});
+
+// (an empty PATH is one null entry, which a lookup takes as the current folder: with nothing qualified, a helper
+//  sitting in the run's working folder must not be found by name)
+test("claude-path: with no folder qualified, PATH is /dev/null and a helper in the working folder isn't found", { skip }, () => {
+  const none = minimalEnv({ lstat: () => { throw new Error("EACCES"); }, realpath: (p) => p }).PATH;
+  assert.equal(none, "/dev/null");
+  const dir = mkdtempSync(join(tmpdir(), "sb-cwd-"));
+  const mark = join(dir, "ran");
+  writeFileSync(join(dir, "sbhelper"), `#!/bin/sh\necho x > ${JSON.stringify(mark)}\n`);
+  chmodSync(join(dir, "sbhelper"), 0o755);
+  const shells = ["/bin/sh", "/bin/bash", "/bin/dash", "/bin/zsh"].filter((s) => existsSync(s));
+  for (const sh of shells) {
+    // (the control: an empty PATH does find it, so the row can tell the two apart)
+    const ctl = spawnSync(sh, ["-c", "sbhelper"], { cwd: dir, env: { PATH: "" } });
+    assert.equal(ctl.status, 0, `${sh}: an empty PATH finds the helper in the working folder`);
+    assert.ok(existsSync(mark)); rmSync(mark);
+    const r = spawnSync(sh, ["-c", "sbhelper"], { cwd: dir, env: { PATH: none } });
+    assert.equal(r.status, 127, `${sh}: not found through /dev/null`);
+    assert.equal(existsSync(mark), false, `${sh}: the helper didn't run`);
+  }
+  assert.ok(shells.length >= 1);
 });
 
 test("claude-path: the group is killed while its holder is alive, never after (no signal to a possibly reused group id)", { skip, timeout: 30_000 }, async () => {

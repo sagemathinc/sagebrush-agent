@@ -108,6 +108,21 @@ jobs:
           SB_TEST_REQUIRE_LANDLOCK: "1"
       - run: cargo build --locked --release --manifest-path launcher/Cargo.toml
 
+  # The turn's syscall policy (schema/fleet/agent-seccomp-policy.json): regenerated from its pin, offline, in the pinned
+  # Ubuntu 24.04 image with the pinned systemd, and required byte for byte (scripts/seccomp-policy-ci.sh). The network is
+  # used only to pull the image by digest and fetch the five hash-pinned .debs, before the run.
+  seccomp-policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.21.0
+      - run: sh scripts/seccomp-policy-ci.sh
+
   # The Python reference verifier (python/): every case of both shared fleet fixture files, each with the JavaScript
   # checker's result, the RFC 9180 vector, and its own rule rows. Its one dependency, cryptography (with cffi and
   # pycparser), is installed by hash.

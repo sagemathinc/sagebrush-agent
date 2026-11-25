@@ -14,7 +14,9 @@ import * as core from "../lib/fleet/core/index.mjs";
 import { Supervisor } from "../lib/fleet/host/executor.mjs";
 import { fenceCauses, fenced, holdsFenceLock, raiseFence } from "../lib/fleet/host/fence.mjs";
 import { HostStore } from "../lib/fleet/host/host-store.mjs";
-import { MARGIN_MS, helperScope, leaseActivate, readRecord, readTombstone, watchdogTimer } from "../lib/fleet/host/lease.mjs";
+import { MARGIN_MS, helperScope, leaseActivate, leaseThaw, readRecord, readTombstone, thawScope, watchdogTimer } from "../lib/fleet/host/lease.mjs";
+import { readRecord as readRestore, writeRecord as writeRestore } from "../lib/fleet/host/restore-record.mjs";
+import { resumeCgroup, resumeRestored } from "../lib/fleet/host/restore-resume.mjs";
 import { IGNORED, LeaseMachine, MAX_TTL_MS, RENEW_MS } from "../lib/fleet/host/lease-machine.mjs";
 import { agentSlice } from "../lib/fleet/host/names.mjs";
 
@@ -41,7 +43,9 @@ function fakeFx(fenceDir) {
     appendIntent: async (r) => { log.push(["intent", r.kind ?? r.op]); },
     audit: (r) => { audits.push(r); },
     brokerGen: async () => {}, brokerRevoke: async () => {},
-    stopUnit: async (id) => { log.push(["stop", id]); u(id).active = false; },
+    stopUnit: async (id) => { log.push(["stop", id]); u(id).active = false; u(id).frozen = false; },
+    freeze: async (id) => { log.push(["freeze", id]); u(id).frozen = true; },
+    thaw: async (id) => { if (!u(id).frozen || !u(id).active) throw new Error("not frozen"); log.push(["thaw", id]); u(id).frozen = false; },
     procCount: async (id) => (u(id).active ? 1 : 0),
     mask: async (id) => { log.push(["mask", id]); u(id).masked = true; },
     unmask: async (id) => { log.push(["unmask", id]); u(id).masked = false; },
@@ -51,7 +55,7 @@ function fakeFx(fenceDir) {
     isActive: async (id) => u(id).active,
     publishMap: async () => {}, sendAck: async () => {},
     sys: {
-      stop: (unit) => { log.push(["sys-stop", unit]); for (const [id, s] of Object.entries(units)) if (unit === "sagebrush-agents.slice" || idOf(unit) === id) { if (!s.stuck) s.active = false; } },
+      stop: (unit) => { log.push(["sys-stop", unit]); for (const [id, s] of Object.entries(units)) if (unit === "sagebrush-agents.slice" || idOf(unit) === id) { if (!s.stuck) { s.active = false; s.frozen = false; } } },
       jobs: () => [], cancel: () => {}, rootUnits: () => [],
       activeAgentUnits: () => Object.entries(units).filter(([, s]) => s.active).map(([id]) => `sagebrush-agent-${id}.service`),
       procCount: (unit) => Object.entries(units).filter(([id, s]) => s.active && (unit === "sagebrush-agents.slice" || idOf(unit) === id)).length,
@@ -69,8 +73,8 @@ function fakeFx(fenceDir) {
  * - timers: fake; `fire(kind)` runs the due ones ("expiry": the lease timers, "renew": the cadence).
  * - the service: `respond(reqBytes, over)` answers a request as the service would; `send` defaults to it.
  */
-async function world({ verifier = "fake", root = tmp("state"), fenceDir = tmp("fence"), leaseDir = tmp("lease"), b = 1_000_000 } = {}) {
-  const w = { b, fenceDir, leaseDir, root, helperRuns: [], sent: [], pending: [] };
+async function world({ verifier = "fake", root = tmp("state"), fenceDir = tmp("fence"), leaseDir = tmp("lease"), restoreDir = tmp("restore"), b = 1_000_000 } = {}) {
+  const w = { b, fenceDir, leaseDir, restoreDir, root, helperRuns: [], sent: [], pending: [] };
   const clock = { boot: () => w.b, mono: () => w.b * 1000 + 7_000_000_000 };
   w.clock = clock;
   w.advance = (ms) => { w.b += ms; };
@@ -97,19 +101,23 @@ async function world({ verifier = "fake", root = tmp("state"), fenceDir = tmp("f
   // The helper: lease.mjs's own leaseActivate, run as its scope would be, its unmask and start through the executor's
   // fake units. `w.helperCode` overrides its exit; `w.helperHook` runs first.
   const run = async (argv) => {
-    const i = argv.indexOf("lease-activate");
-    const [agent, leaseId, lg] = argv.slice(i + 1);
-    w.helperRuns.push({ agent, leaseId, lg: Number(lg), underFenceLock: holdsFenceLock(), slice: argv.find((a) => a.startsWith("--slice=")) });
-    if (w.helperHook) await w.helperHook(agent);
+    const cmd = argv.find((a) => a === "lease-activate" || a === "lease-thaw");
+    const [agent, leaseId, lg] = argv.slice(argv.indexOf(cmd) + 1);
+    w.helperRuns.push({ cmd, agent, leaseId, lg: Number(lg), underFenceLock: holdsFenceLock(), slice: argv.find((a) => a.startsWith("--slice=")) });
+    if (w.helperHook) await w.helperHook(agent, cmd);
     if (w.helperCode !== undefined) return { code: w.helperCode, stdout: "" };
     const hsys = {
       ...lsys,
-      selfCgroup: () => `/sagebrush.slice/sagebrush-agents.slice/${agentSlice(agent)}/${helperScope(agent)}`,
+      selfCgroup: () => `/sagebrush.slice/sagebrush-agents.slice/${agentSlice(agent)}/${cmd === "lease-thaw" ? thawScope(agent) : helperScope(agent)}`,
+      thaw: async (unit) => fx.thaw(idOf(unit)),
       unmask: async (unit) => fx.unmask(idOf(unit)),
-      start: async (unit) => fx.start(idOf(unit)),
+      // systemctl start --no-block: systemd skips it while any fence file of the unit's conditions exists.
+      start: async (unit) => { const id = idOf(unit); fx.log.push(["helper-start", id]); if (!fx.u(id).masked && !fenced(id, { dir: fenceDir })) fx.u(id).active = true; },
     };
-    const r = await leaseActivate(agent, leaseId, Number(lg), { dir: leaseDir, fenceDir: join(fenceDir, "lease"), sys: hsys, clock });
-    return { code: r.activated ? 0 : 3, stdout: JSON.stringify(r) };
+    const opts = { dir: leaseDir, fenceDir: join(fenceDir, "lease"), sys: hsys, clock };
+    const r = cmd === "lease-thaw" ? await leaseThaw(agent, leaseId, Number(lg), opts) : await leaseActivate(agent, leaseId, Number(lg), opts);
+    w.helperRuns.at(-1).result = r;
+    return { code: (r.activated ?? r.thawed) ? 0 : 3, stdout: JSON.stringify(r) };
   };
   const fakeTimers = {
     set: (ms, fn) => { const h = { at: w.b + ms, ms, fn }; w.pending.push(h); return h; },
@@ -140,7 +148,8 @@ async function world({ verifier = "fake", root = tmp("state"), fenceDir = tmp("f
     dir: leaseDir, sys: lsys, clock, run, timers: fakeTimers, bootId: () => w.bootId ?? BOOT_ID,
     nonce: () => Buffer.from(newId().slice(0, 16)).toString("base64url"), wall: () => 1_800_000_000_000,
   });
-  sup = new Supervisor({ store, fx, verify: grantVerify, bodyOf, fenceDir, lease: machine, barrier: async (n, d) => { if (w.barrier) await w.barrier(n, d); } });
+  sup = new Supervisor({ store, fx, verify: grantVerify, bodyOf, fenceDir, lease: machine, barrier: async (n, d) => { if (w.barrier) await w.barrier(n, d); },
+    restoreState: (id) => readRestore("agent", id, { dir: restoreDir })?.state ?? null });
   Object.assign(w, { sup, machine, close: () => store.close() });
   w.leaseUp = (id) => existsSync(join(fenceDir, "lease", id));
   w.record = (id) => readRecord(id, { dir: leaseDir });
@@ -660,7 +669,7 @@ test("no request for an agent not listed, ended, or stopped by a person; a resum
   await w.close();
 });
 
-test("a lease lowers only lease: with another fence up the helper never runs, and nothing else is lowered", async () => {
+test("a lease lowers only lease: with agent, backup or an unvalidated restore up, the helper never runs, and nothing else is lowered", async () => {
   for (const other of ["restore", "agent", "backup"]) {
     const w = await world();
     const req = await asked(w);
@@ -673,6 +682,160 @@ test("a lease lowers only lease: with another fence up the helper never runs, an
     assert.equal(w.fx.u(A).active, false);
     await w.close();
   }
+});
+
+/** A real restore record for the agent in `state` (validated: a restored agent waiting for the person's resume). */
+function restoreRecord(w, id, state) {
+  const reason = state === "failed" ? "not_found" : state === "not_fitting" ? "limit" : null;
+  writeRestore({ v: 1, kind: "agent", id, run: "aaaaaaaaaaaaaaaa", snapshot: "a".repeat(64), attempt: 1, state, reason, dirty: false,
+    dest: { home: { dev: "1", ino: "2" }, sessions: { dev: "1", ino: "3" } }, digests: { home: "b".repeat(64), sessions: "c".repeat(64) } }, { dir: w.restoreDir });
+}
+
+test("a restored agent waiting for its resume (restore up, record validated): the helper lowers lease, systemd skips its start, and nothing else starts it", async () => {
+  const w = await world();
+  const req = await asked(w);
+  raiseFence("restore", A, { dir: w.fenceDir });
+  restoreRecord(w, A, "validated");
+  const r = await w.sup.submit({ kind: "lease-response", authority: "host", agent: A, bytes: w.respond(req) });
+  assert.equal(r.status, "accepted");
+  assert.equal(r.started, false);
+  assert.deepEqual(w.helperRuns.map((h) => h.cmd), ["lease-activate"]);
+  assert.equal(w.helperRuns[0].underFenceLock, false);
+  assert.equal(w.leaseUp(A), false, "lease lowered: the resume helper requires it down");
+  assert.deepEqual(fenceCauses(A, { dir: w.fenceDir }), ["restore"]);
+  assert.ok(w.fx.log.some((l) => l[0] === "helper-start" && l[1] === A), "the helper queued its start");
+  assert.ok(!w.fx.log.some((l) => l[0] === "start"), "no start effect from the executor itself");
+  assert.equal(w.fx.u(A).active, false, "systemd skipped it: restore is still up");
+  assert.equal(w.store.registry.agent(A).state, "provisioned", "the run state waits for the resume");
+  await w.close();
+});
+
+test("then the REAL resume: resumeRestored passes after the activation and lowers restore; validated only after the publish, it refuses lease_raised until the next renewal activates", async () => {
+  const resume = (w, live, started) => resumeRestored(A, live.gen, live.lease_id, live.lg, {
+    restoreState: (id) => readRestore("agent", id, { dir: w.restoreDir })?.state, dir: w.leaseDir, fenceDir: w.fenceDir,
+    leaseFenceDir: join(w.fenceDir, "lease"), clock: w.clock, cgroupOf: () => resumeCgroup(A),
+    sys: { ...w.lsys, selfCgroup: () => resumeCgroup(A), start: async (unit) => { started.push(unit); } },
+  });
+  for (const early of [true, false]) {
+    const w = await world();
+    const req = await asked(w);
+    raiseFence("restore", A, { dir: w.fenceDir });
+    restoreRecord(w, A, early ? "validated" : "published");
+    await w.sup.submit({ kind: "lease-response", authority: "host", agent: A, bytes: w.respond(req) });
+    const started = [];
+    if (!early) {
+      // Validated only after the lease was published: lease is still up, so the resume refuses and changes nothing.
+      restoreRecord(w, A, "validated");
+      const refused = await resume(w, await w.machine.live(A), started);
+      assert.deepEqual([refused.resumed, refused.reason], [false, "lease_raised"]);
+      assert.deepEqual(fenceCauses(A, { dir: w.fenceDir }), ["lease", "restore"]);
+      // The next renewal finds lease up and starts it: the helper lowers lease (restore still holds the unit).
+      w.advance(RENEW_MS);
+      await w.fire("renew");
+      assert.deepEqual(fenceCauses(A, { dir: w.fenceDir }), ["restore"]);
+    }
+    const live = await w.machine.live(A);
+    const resumed = await resume(w, live, started);
+    assert.equal(resumed.resumed, true, JSON.stringify(resumed));
+    assert.deepEqual(fenceCauses(A, { dir: w.fenceDir }), []);
+    assert.equal(started.length, 1, "the resume queued the start");
+    await w.close();
+  }
+});
+
+test("restore up without a validated record, or with another fence, or the agent stopped or failed to start: the helper never runs", async () => {
+  for (const [state, extra] of [["published", null], ["failed", null], ["not_fitting", null], [null, null], ["garbage", null],
+    ["validated", "agent"], ["validated", "all"], ["validated", "backup"], ["validated", "stopped"], ["validated", "start_failed"]]) {
+    const w = await world();
+    const req = await asked(w);
+    raiseFence("restore", A, { dir: w.fenceDir });
+    if (state === "garbage") writeFileSync(join(w.restoreDir, `agent-${A}.json`), "{not json");
+    else if (state !== null) restoreRecord(w, A, state);
+    if (extra === "agent" || extra === "backup") raiseFence(extra, A, { dir: w.fenceDir });
+    if (extra === "all") raiseFence("all", null, { dir: w.fenceDir });
+    if (extra === "stopped") w.store.registry.setState(A, "stopped");
+    if (extra === "start_failed") w.store.registry.setStartFailed(A, "unit_failed");
+    const r = await w.sup.submit({ kind: "lease-response", authority: "host", agent: A, bytes: w.respond(req) });
+    const what = `${state}/${extra}`;
+    assert.equal(r.status, "accepted", what);
+    assert.equal(r.started, false, what);
+    assert.equal(w.helperRuns.length, 0, what);
+    assert.equal(w.leaseUp(A), true, what);
+    assert.equal(w.fx.u(A).active, false, what);
+    await w.close();
+  }
+});
+
+// ---- a paused agent's resume: the thaw under the activation lock
+
+/** A running agent with a live lease, then paused (frozen). */
+async function paused(w) {
+  await granted(w, [A]);
+  await w.fire("renew");
+  assert.equal(w.fx.u(A).active, true);
+  assert.equal((await w.sup.submit({ kind: "pause", authority: "person", agent: A })).status, "paused");
+  assert.equal(w.fx.u(A).frozen, true);
+  w.helperRuns.length = 0;
+}
+
+test("a paused agent's resume with its live lease: thawed by the thaw helper, in its scope, outside the fence lock", async () => {
+  const w = await world();
+  await paused(w);
+  const r = await w.sup.submit({ kind: "resume", authority: "person", agent: A });
+  assert.deepEqual(r, { status: "resumed", started: true, thawed: true });
+  assert.deepEqual(w.helperRuns.map((h) => [h.cmd, h.underFenceLock, h.slice]), [["lease-thaw", false, `--slice=${agentSlice(A)}`]]);
+  assert.equal(w.fx.u(A).frozen, false);
+  assert.equal(w.store.registry.agent(A).state, "running");
+  assert.deepEqual(w.helperRuns[0].result, { thawed: true, reason: null }, "the helper itself thawed it, under the lock");
+  await w.close();
+});
+
+test("a paused agent's resume once the effective end has passed but before the timer fired: refused, nothing changes, a renewal is asked for", async () => {
+  const w = await world();
+  await paused(w);
+  w.send = async () => null;
+  const exp = w.record(A).rec.expiry_tick;
+  w.advance(exp - MARGIN_MS - 10 - w.b); // bootNow = the effective end exactly; the lease timer hasn't run
+  const r = await w.sup.submit({ kind: "resume", authority: "person", agent: A });
+  assert.deepEqual(r, { status: "refused", reason: "no_lease", started: false });
+  assert.equal(w.helperRuns.length, 0);
+  assert.equal(w.fx.u(A).frozen, true, "not thawed");
+  assert.equal(w.store.registry.agent(A).state, "paused");
+  assert.ok(w.pending.some((h) => h.ms === 0), "a renewal is due now");
+  await w.close();
+});
+
+test("an expiry at the thaw seam wins: the thaw helper's checks under the lock refuse, and the agent is contained with its own fence", async () => {
+  const w = await world();
+  await paused(w);
+  // The watchdog commits (tombstone at the lease's lg) just as the thaw helper starts.
+  w.helperHook = (agent, cmd) => { if (cmd === "lease-thaw") writeFileSync(join(w.leaseDir, `${agent}.spent`), `${w.record(agent).rec.lg}\n`); };
+  const r = await w.sup.submit({ kind: "resume", authority: "person", agent: A });
+  assert.equal(r.status, "failed");
+  assert.equal(r.reason, "lease");
+  assert.equal(w.helperRuns[0].result.reason, "spent");
+  assert.equal(w.fx.u(A).active, false, "contained: stopped");
+  assert.ok(fenceCauses(A, { dir: w.fenceDir }).includes("agent"), "its own fence: a person resumes it again");
+  assert.ok(!w.fx.log.some((l) => l[0] === "thaw"));
+  await w.close();
+});
+
+test("a raised lease can't be bypassed by a resume: refused before anything changes; the thaw helper refuses lease up on its own too", async () => {
+  const w = await world();
+  await paused(w);
+  raiseFence("lease", A, { dir: w.fenceDir });
+  const r = await w.sup.submit({ kind: "resume", authority: "person", agent: A });
+  assert.deepEqual(r, { status: "refused", reason: "lease_raised", started: false });
+  assert.equal(w.helperRuns.length, 0);
+  assert.equal(w.fx.u(A).frozen, true);
+  // The helper itself, with a live published lease but lease up: refuses.
+  const rec = w.record(A).rec;
+  const hsys = { ...w.lsys, selfCgroup: () => `/sagebrush.slice/sagebrush-agents.slice/${agentSlice(A)}/${thawScope(A)}`, thaw: async () => { throw new Error("must not thaw"); } };
+  assert.deepEqual(await leaseThaw(A, rec.lease_id, rec.lg, { dir: w.leaseDir, fenceDir: join(w.fenceDir, "lease"), sys: hsys, clock: w.clock }), { thawed: false, reason: "lease_raised" });
+  // Outside its scope, or for another lease: refused.
+  assert.equal((await leaseThaw(A, rec.lease_id, rec.lg, { dir: w.leaseDir, fenceDir: join(w.fenceDir, "lease"), sys: { ...hsys, selfCgroup: () => "/" }, clock: w.clock })).reason, "outside_slice");
+  assert.equal((await leaseThaw(A, "other", rec.lg, { dir: w.leaseDir, fenceDir: join(w.fenceDir, "lease"), sys: hsys, clock: w.clock })).reason, "not_published");
+  await w.close();
 });
 
 test("a helper that refuses: not started, lease still up; the executor never starts the unit itself", async () => {

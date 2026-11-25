@@ -343,6 +343,25 @@ def check_transfer_for_host(pair, host):
     return {"first": True}
 
 
+# ---- the old host's fence acknowledgement (r2.4 §3.7.4)
+
+def verify_fence_ack(data: bytes, ctx):
+    """§3.7.4, the envelope's check (see lib/fleet/core/verify.mjs). ctx: { aud, fleet, cert }."""
+    def resolve_key(signer, t, body):
+        if t != "sb.agent-fence-ack.v1":
+            refuse("bad_form", "another type")
+        body_validator("agent-fence-ack")(body)
+        cert = ctx["cert"]
+        if signer["kind"] != "host" or signer["id"] != cert["body"]["host"] or body["host"] != signer["id"]:
+            refuse("bad_signature")
+        if signer["key"] != key_id("ed25519", cert["sign_raw"]):
+            refuse("bad_signature", "not the certified host key")
+        return cert["sign_raw"]
+
+    env = open_envelope(data, {"aud": ctx["aud"], "fleet": ctx["fleet"], "resolve_key": resolve_key})
+    return {"body": env["body"], "hash": sha256b64(env["signed"])}
+
+
 # ---- execution-lease renewal (r2.5 §3.8)
 
 def verify_lease_request(data: bytes, ctx):

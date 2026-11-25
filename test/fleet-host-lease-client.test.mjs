@@ -188,6 +188,53 @@ test("the deadline is absolute: a body that stalls after its headers, and a fetc
   assert.equal(deafBody.counts.timeout, 1);
 });
 
+test("a response that arrives AFTER the deadline is released unread: its body cancelled, no reader left on it", { timeout: 10000 }, async () => {
+  let resolveFetch, cancelled = 0;
+  const d = deps({ sendMs: 20, fetch: () => new Promise((r) => { resolveFetch = r; }) });
+  assert.equal(await d.send(enc("x")), null);
+  assert.equal(d.counts.timeout, 1);
+  const stream = new ReadableStream({ pull() {}, cancel() { cancelled++; } });
+  resolveFetch(new Response(stream, { status: 200 }));
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(cancelled, 1, "the late body was cancelled");
+  assert.equal(stream.locked, false, "no abandoned reader holds it");
+  assert.equal(d.counts.ok, 0);
+});
+
+test("a busy event loop can't stretch the deadline: an answer available only after it is refused, on the monotonic clock", async () => {
+  // The fetch blocks the loop past the deadline, so the timer can't fire before its answer resolves.
+  const busy = deps({ sendMs: 10, fetch: async () => { const end = performance.now() + 60; while (performance.now() < end) { /* busy */ } return new Response(enc("{}"), { status: 200 }); } });
+  assert.equal(await busy.send(enc("x")), null);
+  assert.equal(busy.counts.timeout, 1);
+  assert.equal(busy.counts.ok, 0);
+  // ... and its body is released unread: checked right after the fetch, before any reader is opened on it.
+  let cancelled = 0;
+  const stream = new ReadableStream({ pull() {}, cancel() { cancelled++; } });
+  const busyBody = deps({ sendMs: 10, fetch: async () => { const end = performance.now() + 60; while (performance.now() < end) { /* busy */ } return new Response(stream, { status: 200 }); } });
+  assert.equal(await busyBody.send(enc("x")), null);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(cancelled, 1);
+  assert.equal(stream.locked, false, "never read: no reader was opened on it");
+  // The same check with an injected monotonic clock: past the deadline at acceptance is a timeout, at any status.
+  let t = 0;
+  const late = deps({ sendMs: 1000, mono: () => t, fetch: async () => { t = 1000; return new Response(enc("{}"), { status: 200 }); } });
+  assert.equal(await late.send(enc("x")), null);
+  assert.equal(late.counts.timeout, 1);
+  t = 0;
+  const inTime = deps({ sendMs: 1000, mono: () => t, fetch: async () => { t = 999; return new Response(enc("{}"), { status: 200 }); } });
+  assert.deepEqual(await inTime.send(enc("x")), enc("{}"));
+  // A response in time whose BODY ends at the deadline: refused at acceptance; 1 ms before it: accepted.
+  // (highWaterMark 0: the stream pulls only when the body is read, not when it is made)
+  const slowBody = (end) => () => new Response(new ReadableStream({ pull(c) { t = end; c.enqueue(enc("{}")); c.close(); } }, { highWaterMark: 0 }), { status: 200 });
+  t = 0;
+  const atEnd = deps({ sendMs: 1000, mono: () => t, fetch: async () => slowBody(1000)() });
+  assert.equal(await atEnd.send(enc("x")), null);
+  assert.equal(atEnd.counts.timeout, 1);
+  t = 0;
+  const justIn = deps({ sendMs: 1000, mono: () => t, fetch: async () => slowBody(999)() });
+  assert.deepEqual(await justIn.send(enc("x")), enc("{}"));
+});
+
 test("device_unknown (the service's chain ahead of the host's): a chain sync is asked for, coalesced, and the lease still refused", { timeout: 10000 }, async () => {
   // The host pinned the chain before its last entry; the service signs at its own head, past the host's.
   const behind = await core.replayChain(E.chain.slice(0, -1).map(enc), base);

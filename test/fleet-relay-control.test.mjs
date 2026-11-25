@@ -154,11 +154,13 @@ test("the feed's answer: a cursor ahead of since, each identity once per list, a
 test("the admit request: closed per kind, canonical, at most 128 KiB; the epochs target exact", async () => {
   const req = (v) => code(() => parseAdmitRequest(enc(canonText(v, REQUEST_MAX))));
   const host = { v: 1, kind: "host", target: "/t", sig: "v1 x" };
-  const app = { v: 1, kind: "app", target: "/t", record: "AAAA", request: id22(), cookie: "abc" };
+  const app = { v: 1, kind: "app", target: "/t", record: "AAAA", request: id22(), token: `rt1.${"A".repeat(43)}` };
   const commit = { v: 1, kind: "commit", target: COMMIT_ROUTE, sig: "v1 x", body: "e30" };
   for (const v of [host, app, commit]) assert.equal(await req(v), "ok", v.kind);
-  for (const [why, v] of [["a host request with a record", { ...host, record: "AAAA" }], ["an app request without its cookie", { ...app, cookie: undefined }],
-    ["a commit at another target", { ...commit, target: "/other" }], ["a cookie with a space", { ...app, cookie: "a b" }], ["a cookie over 4,096", { ...app, cookie: "a".repeat(4097) }],
+  for (const [why, v] of [["a host request with a record", { ...host, record: "AAAA" }], ["an app request without its relay token", { ...app, token: undefined }],
+    ["a commit at another target", { ...commit, target: "/other" }], ["a token of another version", { ...app, token: `rt2.${"A".repeat(43)}` }],
+    ["a token with a non-zero pad bit", { ...app, token: `rt1.${"A".repeat(42)}B` }], ["a token one character too long", { ...app, token: `rt1.${"A".repeat(44)}` }],
+    ["a cookie in place of the token", { ...app, token: undefined, cookie: "abc" }],
     ["a record over 87,252", { ...app, record: "A".repeat(RECORD_HEADER_MAX + 1) }], ["a record that isn't base64url", { ...app, record: "a+b" }],
     ["another kind", { ...host, kind: "other" }], ["another version", { ...host, v: 2 }], ["a commit body over 1,024 bytes", { ...commit, body: "A".repeat(1367) }],
     ["a target over 512", { ...host, target: "/".repeat(513) }], ["an app request id out of form", { ...app, request: "x" }]])

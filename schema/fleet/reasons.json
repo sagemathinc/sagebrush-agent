@@ -129,6 +129,12 @@
       "meaning": "the sign-in is more than 5 minutes old, for a change of the fleet's shape"
     },
     {
+      "name": "unauthenticated",
+      "owner": "service",
+      "status": 401,
+      "meaning": "no live account session, or a relay token that is missing, unknown, used or expired (one code, no hint which)"
+    },
+    {
       "name": "rate",
       "owner": "service",
       "status": 429,

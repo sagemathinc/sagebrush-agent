@@ -46,8 +46,8 @@ const fields = (role, t, over = {}) => ({ role, fleet: t.fleet, session: t.sessi
 /** Open a WebSocket as `role`; resolves { ws } or { status }. */
 function open(r, role, t, { over = {}, headers = {}, nonce = rid(), request = rid() } = {}) {
   const roleHeaders = role === "host" ? { "sagebrush-sig": `host=${t.host};gen=${over.host_gen ?? 1};nonce=${nonce}` }
-    : { "sagebrush-browser-record": t.host, "sagebrush-request": request, cookie: `theme=dark; __Host-sb_session=${t.account}; other=1` };
-  const ws = new WebSocket(`ws://127.0.0.1:${r.port}${openTarget(fields(role, t, over))}`, { headers: { ...roleHeaders, ...headers }, perMessageDeflate: false });
+    : { "sagebrush-browser-record": t.host, "sagebrush-request": request, "sagebrush-relay-token": r.worker.issueToken(t.account) };
+  const ws = new WebSocket(`ws://127.0.0.1:${r.port}${openTarget(fields(role, t, over))}`, { headers: Object.fromEntries(Object.entries({ ...roleHeaders, ...headers }).filter(([, v]) => v !== undefined)), perMessageDeflate: false });
   r.live.add(ws);
   return new Promise((resolve) => {
     ws.on("open", () => resolve({ ws, nonce, request }));
@@ -97,19 +97,27 @@ test("ingress refusals happen before any control-plane call: the query, the role
       ["a bad request id", { headers: { "sagebrush-request": "short" } }],
     ];
     for (const [what, o] of bad) {
-      const ws = new WebSocket(`ws://127.0.0.1:${r.port}${o.url ?? target}`, { headers: { "sagebrush-browser-record": t.host, "sagebrush-request": rid(), cookie: "__Host-sb_session=x", ...o.headers } });
+      const ws = new WebSocket(`ws://127.0.0.1:${r.port}${o.url ?? target}`, { headers: { "sagebrush-browser-record": t.host, "sagebrush-request": rid(), "sagebrush-relay-token": r.worker.issueToken("x"), ...o.headers } });
       r.live.add(ws);
       const status = await new Promise((res) => { ws.on("unexpected-response", (_q, s) => { res(s.statusCode); s.resume(); }); ws.on("error", () => res("error")); });
       assert.equal(status, 400, what);
     }
     const big = await open(r, "app", t, { headers: { "x-pad": "a".repeat(98_304) } });
     assert.equal(big.status, 431, "the header block over 98,304 bytes");
-    assert.equal((await open(r, "app", t, { headers: { cookie: "theme=dark" } })).status, 403, "no session cookie");
-    assert.equal((await open(r, "app", t, { headers: { cookie: "__Host-sb_session=a; __Host-sb_session=b" } })).status, 403, "the session cookie twice");
+    // (the relay token, A1 §3: no token, or one out of its exact form, is 401 before any control-plane call; a session
+    //  cookie is never read on this route, so one without a token is refused the same)
+    assert.equal((await open(r, "app", t, { headers: { "sagebrush-relay-token": undefined } })).status, 401, "no relay token");
+    assert.equal((await open(r, "app", t, { headers: { "sagebrush-relay-token": undefined, cookie: `__Host-sb_session=${t.account}` } })).status, 401, "a session cookie, no token");
+    for (const bad of [`rt2.${"A".repeat(43)}`, `rt1.${"A".repeat(42)}B`, `rt1.${"A".repeat(44)}`, "rt1."])
+      assert.equal((await open(r, "app", t, { headers: { "sagebrush-relay-token": bad } })).status, 401, `a token out of form: ${bad.slice(0, 6)}`);
     assert.equal(r.worker.calls.admit, 0, "no control-plane call for any of them");
     const atCap = await open(r, "app", t, { headers: { "sagebrush-browser-record": t.host + "A".repeat(RECORD_HEADER_MAX - t.host.length) } });
     assert.ok(atCap.ws, `a record of exactly 87,252 characters passes ingress (${atCap.status})`);
     assert.equal(r.worker.calls.admit, 1);
+    // (a token in form that the service never issued, or already took: the Worker's unauthenticated, 401)
+    const unknown = `rt1.${randomBytes(32).toString("base64url")}`;
+    assert.equal((await open(r, "app", t, { headers: { "sagebrush-relay-token": unknown } })).status, 401, "a token never issued");
+    assert.equal(r.worker.calls.admit, 2, "asked the Worker");
   } finally { await r.close(); }
 });
 
@@ -249,13 +257,14 @@ test("raw-frame ingress: sizes from the frame header before buffering, fragments
   } finally { await r3.close(); }
 });
 
-test("logs carry metadata only: no record, cookie, signature, nonce, request id or message bytes", async () => {
+test("logs carry metadata only: no record, relay token, signature, nonce, request id or message bytes", async () => {
   const r = await relay(), t = ids();
   try {
     const nonce = rid(), request = rid(), payload = "CANARY" + randomBytes(6).toString("hex");
     const record = t.host + "CANARYREC" + randomBytes(4).toString("hex");
     const h = await open(r, "host", t, { nonce });
-    const a = await open(r, "app", t, { request, headers: { "sagebrush-browser-record": record, cookie: `__Host-sb_session=${t.account}; s=CANARYCOOKIE` } });
+    const token = r.worker.issueToken(t.account);
+    const a = await open(r, "app", t, { request, headers: { "sagebrush-browser-record": record, "sagebrush-relay-token": token } });
     a.ws.send(Buffer.from(payload));
     await nextMessage(h.ws);
     assert.equal((await open(r, "host", t, { nonce })).status, 409);
@@ -263,7 +272,7 @@ test("logs carry metadata only: no record, cookie, signature, nonce, request id 
     await settle(20);
     assert.ok(r.log.length > 3);
     const logs = JSON.stringify(r.log);
-    for (const secret of [nonce, request, "CANARY", "sagebrush-sig", "host=", "__Host"]) assert.ok(!logs.includes(secret), secret.slice(0, 8));
+    for (const secret of [nonce, request, "CANARY", "sagebrush-sig", "host=", token, token.slice(4), "rt1."]) assert.ok(!logs.includes(secret), secret.slice(0, 8));
   } finally { await r.close(); }
 });
 

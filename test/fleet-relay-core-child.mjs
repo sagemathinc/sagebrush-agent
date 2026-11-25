@@ -18,7 +18,8 @@ const ctxOf = (c = {}) => ({
   hostKey: (h) => { if (h !== host) core.refuse("unknown_host"); return hostRaw; },
   currentGen: () => c.gen ?? 3,
   agentHasBrowser: (h, a) => a === agent && c.granted !== false,
-  accountFleets: () => c.fleets ?? [fleet],
+  consumeAppToken: (key) => corpus.tokens[key] ?? null,
+  sessionLive: (account, session) => account === corpus.account && session === corpus.account_session && !c.sessionDead,
   chainOf: () => chain,
 });
 

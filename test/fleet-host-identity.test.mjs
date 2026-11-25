@@ -4,7 +4,7 @@
 // injected stop (the real systemd/cgroup rows are the daemon's, L2c-2c).
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, lstatSync as lstatReal, rmdirSync as rmdirReal, statSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync as lstatReal, renameSync as renameReal, rmdirSync as rmdirReal, statSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
@@ -208,7 +208,7 @@ test("separation before every state: no keys or a pending reset with the identit
   assert.equal(readFileSync(join(target, "agent-x.json"), "utf8"), "record");
 });
 
-test("the reset never follows a link: a linked chain, identity or keys directory is removed itself, its target untouched", async () => {
+test("the reset never follows a link: a linked chain directory is removed itself; a linked identity or keys directory refuses the reset; the target is untouched either way", async () => {
   for (const which of ["chain", "identity"]) {
     const h = await host("cert");
     const target = join(h.root, "target");
@@ -216,17 +216,19 @@ test("the reset never follows a link: a linked chain, identity or keys directory
     writeFileSync(join(target, "keepme"), "x");
     for (const n of readdirSync(join(h.p.identity, "chain"))) unlinkSync(join(h.p.identity, "chain", n));
     rmdirReal(join(h.p.identity, "chain"));
-    if (which === "chain") symlinkSync(target, join(h.p.identity, "chain"));
-    else {
+    if (which === "chain") {
+      symlinkSync(target, join(h.p.identity, "chain"));
+      await resetIdentity(h.p, sysFake());
+      assert.equal(existsSync(join(h.p.identity, "chain")), false, "the link itself removed");
+    } else {
       for (const f of readdirSync(h.p.identity)) unlinkSync(join(h.p.identity, f));
       rmdirReal(h.p.identity);
       symlinkSync(target, h.p.identity);
+      await assert.rejects(resetIdentity(h.p, sysFake()), (e) => e.code === "bad_form");
     }
-    await resetIdentity(h.p, sysFake());
     assert.equal(readFileSync(join(target, "keepme"), "utf8"), "x", which);
-    assert.equal(existsSync(join(target, "keepme")), true, which);
   }
-  // A linked keys directory: removed itself; the target's files stay.
+  // A linked keys directory: the reset (and a RESETTING completion) refuses; the target's files stay.
   const h = await host("cert");
   const kt = join(h.root, "ktarget");
   mkdirSync(kt, { mode: 0o700 });
@@ -235,9 +237,26 @@ test("the reset never follows a link: a linked chain, identity or keys directory
   rmdirReal(h.p.keys);
   symlinkSync(kt, h.p.keys);
   writeFileSync(h.p.resetPending, "1\n");
-  await completeReset(h.p, sysFake());
+  await assert.rejects(completeReset(h.p, sysFake()), (e) => e.code === "bad_form");
   assert.equal(readFileSync(join(kt, "sign"), "utf8"), "x");
-  assert.equal(existsSync(h.p.keys), false);
+});
+
+test("the reset runs the layout check first: a linked ancestor of the keys or the identity refuses before the broker stop or any record, nothing deleted", async () => {
+  for (const which of ["var/lib/sagebrush-broker", "var/lib/sagebrush"]) {
+    const h = await host("cert");
+    const moved = join(h.root, "moved");
+    renameReal(join(h.root, which), moved);
+    symlinkSync(moved, join(h.root, which));
+    const watched = which.endsWith("broker") ? join(moved, "keys") : join(moved, "identity");
+    const before = readdirSync(watched).sort();
+    const s = sysFake();
+    await assert.rejects(resetIdentity(h.p, s), (e) => e.code === "bad_form", which);
+    assert.deepEqual(s.log, [], `${which}: no stop ran`);
+    assert.equal(existsSync(join(moved, "reset-pending")) || existsSync(h.p.resetPending), false, `${which}: nothing recorded`);
+    assert.deepEqual(readdirSync(watched).sort(), before, `${which}: nothing deleted`);
+    await assert.rejects(completeReset(h.p, sysFake()), (e) => e.code === "bad_form", which);
+    assert.deepEqual(readdirSync(watched).sort(), before);
+  }
 });
 
 test("the lock: created exactly 0600; a pre-existing lock that is a link, or of another mode, is refused before anything is read", async () => {

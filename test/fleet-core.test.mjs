@@ -157,6 +157,12 @@ test("envelope: the type and signer are in the signed bytes; signer kinds per ty
   assert.equal(code(() => seal("sb.host-grant.v1", { ...signer, kind: "host" }, body, host)), "bad_signature");
   assert.equal(code(() => seal("sb.grant-ack.v1", signer, body, dev)), "bad_signature");
   assert.equal(code(() => seal("sb.host-cert.v1", { ...signer, kind: "service" }, body, dev)), "bad_signature");
+  // (r2.5 §1.3, §1.7a) the lease key signs only execution leases, and only the lease key signs one
+  assert.equal(code(() => seal("sb.execution-lease.v1", { ...signer, kind: "service" }, body, dev)), "bad_signature");
+  assert.equal(code(() => seal("sb.execution-lease.v1", { ...signer, kind: "host" }, body, host)), "bad_signature");
+  assert.equal(code(() => seal("sb.agent-transfer-receipt.v1", { ...signer, kind: "lease" }, body, dev)), "bad_signature");
+  assert.equal(code(() => seal("sb.lease-request.v1", signer, body, dev)), "bad_signature");
+  assert.equal(code(() => seal("sb.execution-lease.v1", { ...signer, kind: "lease" }, body, dev)), "ok");
   // the same signature can't be moved to another type, signer or body
   const env = JSON.parse(new TextDecoder().decode(bytes));
   const swap = (e) => enc(canonText(e));
@@ -175,5 +181,5 @@ test("envelope: the type and signer are in the signed bytes; signer kinds per ty
   const withSig2 = swap({ ...JSON.parse(new TextDecoder().decode(addish)), sig2: env.sig });
   assert.equal(code(() => open(addish, ctx)), "ok");
   assert.equal(code(() => open(withSig2, ctx)), "bad_form");
-  assert.equal(Object.keys(TYPES).length, 16);
+  assert.equal(Object.keys(TYPES).length, 18);
 });

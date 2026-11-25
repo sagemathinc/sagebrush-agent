@@ -52,6 +52,7 @@ class ChainState:
     service_keys: tuple = ()
     policy: dict = field(default_factory=lambda: {"require_native_for_widening": False})
     hashes: tuple = ()
+    lease_keys: tuple = ()  # (r2.5 §1.7a)
 
 
 def raw_key(k) -> bytes:
@@ -109,6 +110,7 @@ def apply(state: ChainState | None, data: bytes, ctx):
     devices = dict(state.devices) if state is not None else {}
     recovery = state.recovery if state is not None else None
     service_keys = list(state.service_keys) if state is not None else []
+    lease_keys = list(state.lease_keys) if state is not None else []
     policy = state.policy if state is not None else {"require_native_for_widening": False}
 
     def enroll(dev):
@@ -124,6 +126,16 @@ def apply(state: ChainState | None, data: bytes, ctx):
         if recovery is not None and recovery.key_id == kid:
             refuse("bad_form", "the same recovery key")
         recovery = Recovery(raw, kid)
+
+    def pinned(k, what):
+        # (a service or lease key: an id unique across both lists, and key material never shared between them, §1.7a)
+        raw = raw_key(k)
+        if not is_id(k.get("id")) or any(x.id == k["id"] for x in service_keys + lease_keys):
+            refuse("bad_form", f"a {what} key id twice")
+        other = lease_keys if what == "service" else service_keys
+        if any(x.raw == raw for x in other):
+            refuse("bad_form", f"a {what} key that is also a {'lease' if what == 'service' else 'service'} key")
+        return ServiceKey(k["id"], raw, key_id("ed25519", raw), seq)
 
     def device_signer():
         if signer["kind"] != "device":
@@ -167,11 +179,12 @@ def apply(state: ChainState | None, data: bytes, ctx):
         set_recovery(body["recovery_key"])
     elif op == "service-key":
         device_signer()
-        sk = body["service_key"]
-        raw = raw_key(sk)
-        if not is_id(sk.get("id")) or any(k.id == sk["id"] for k in service_keys):
-            refuse("bad_form", "a service key id twice")
-        service_keys.append(ServiceKey(sk["id"], raw, key_id("ed25519", raw), seq))
+        service_keys.append(pinned(body["service_key"], "service"))
+    elif op == "lease-key":
+        # (r2.5 §1.7a, SEC's Q4: only a native device pins or rotates the lease key)
+        device_signer()
+        need_native()
+        lease_keys.append(pinned(body["lease_key"], "lease"))
     elif op == "policy":
         device_signer()
         if not body["policy"]["require_native_for_widening"]:
@@ -183,7 +196,7 @@ def apply(state: ChainState | None, data: bytes, ctx):
     head = sha256b64(env["signed"])
     hashes = (state.hashes if state is not None else ()) + (head,)
     nxt = ChainState(ctx["fleet"] if state is None else state.fleet, ctx["aud"] if state is None else state.aud, seq, head,
-                     devices, recovery, tuple(service_keys), policy, hashes)
+                     devices, recovery, tuple(service_keys), policy, hashes, tuple(lease_keys))
     return nxt, {"op": op, "seq": seq, "signer": signer, "body": body, "regrants": regrants}
 
 
@@ -222,12 +235,21 @@ def require_tier(state: ChainState, device: Device, widening: bool):
 
 def service_key_at(state: ChainState, signer, chain_seq) -> bytes:
     """The service key in force at chain_seq (§1.7): the latest service-key entry at or before it."""
-    if signer["kind"] != "service":
+    return _key_at(state, state.service_keys, "service", signer, chain_seq)
+
+
+def lease_key_at(state: ChainState, signer, chain_seq) -> bytes:
+    """The lease key in force at chain_seq (r2.5 §1.7a): the same rule over the lease-key entries alone."""
+    return _key_at(state, state.lease_keys, "lease", signer, chain_seq)
+
+
+def _key_at(state: ChainState, keys, kind, signer, chain_seq) -> bytes:
+    if signer["kind"] != kind:
         refuse("bad_signature")
     if not _safe_int(chain_seq) or chain_seq < 0 or chain_seq > state.seq:
         refuse("device_unknown", "fetch the chain first")
     k = None
-    for s in state.service_keys:
+    for s in keys:
         if s.seq <= chain_seq:
             k = s
     if k is None or k.id != signer["id"] or k.key_id != signer["key"]:

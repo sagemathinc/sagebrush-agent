@@ -11,7 +11,7 @@ import { b64, hostFingerprint, keyFromSeed, replayChain, seal, sha256b64 } from 
 import { handleChainRead } from "../lib/fleet/core/chain-service.mjs";
 import { parseSig } from "../lib/fleet/request.mjs";
 import { classify, firstBoot, hostPaths } from "../lib/fleet/host/identity.mjs";
-import { ChainSync, buildCandidate, chainAdopter } from "../lib/fleet/host/chain-sync.mjs";
+import { ChainSync, SYNC_EVERY_MS, boundedGet, buildCandidate, chainAdopter } from "../lib/fleet/host/chain-sync.mjs";
 import { Supervisor } from "../lib/fleet/host/executor.mjs";
 import { HostStore } from "../lib/fleet/host/host-store.mjs";
 import { fenced } from "../lib/fleet/host/fence.mjs";
@@ -23,7 +23,8 @@ const N = keyFromSeed(Buffer.from(F.keys["device-native"].seed, "hex"));
 const N2 = keyFromSeed(Buffer.from(F.keys["device-native-2"].seed, "hex"));
 const HONEST = F.objects.chain.map(enc); // seq 0..5
 const LEASED = F.leases.chain.map(enc); // the same 0..5, then 6..8 (lease keys and a policy)
-const UID = process.getuid();
+// process.getuid doesn't exist off POSIX; there every test here is skipped (host-linux-only), so UID is never used.
+const UID = process.getuid?.() ?? -1;
 const tmp = () => mkdtempSync(join(tmpdir(), "sb-sync-"));
 /** A host root with the package's /var/lib/sagebrush (0755; the test's uid stands for root). */
 const hostRoot = () => { const r = tmp(); mkdirSync(join(r, "var/lib/sagebrush"), { recursive: true, mode: 0o755 }); return r; };
@@ -58,7 +59,7 @@ async function pairedHost() {
 }
 
 /** The service: the REAL chain read handler over `serverChain`, its ctx in memory; records each request's gen. */
-function service(h, serverChain, { head } = {}) {
+function service(h, serverChain, { head, per } = {}) {
   const calls = [];
   const sctx = {
     aud: AUD, now: NOW,
@@ -66,7 +67,7 @@ function service(h, serverChain, { head } = {}) {
     currentGen: async () => 9,
     bucket: async () => true,
     nonces: { spend: async () => true },
-    chain: { page: async (_f, after, max) => ({ head: head ?? serverChain.length - 1, entries: serverChain.slice(after + 1, after + 1 + max).map((bytes, i) => ({ seq: after + 1 + i, bytes: Buffer.from(bytes).toString() })) }) },
+    chain: { page: async (_f, after, max) => ({ head: head ?? serverChain.length - 1, entries: serverChain.slice(after + 1, after + 1 + (per ?? max)).map((bytes, i) => ({ seq: after + 1 + i, bytes: Buffer.from(bytes).toString() })) }) },
   };
   const fetch = async (url, init) => {
     const u = new URL(url);
@@ -155,6 +156,75 @@ test("one sync at a time: two calls share one fetch; a refused adoption changes 
   const n = syncFor(g, service(g, LEASED).fetch, { submit: async () => ({ status: "refused", reason: "revoked" }) });
   assert.equal((await n.sync.sync()).status, "not_adopted");
   assert.equal(n.sync.snapshot().seq, 5);
+});
+
+test("pages until current: a service serving one entry a page is followed to its head, each page adopted in turn", async () => {
+  const h = await pairedHost();
+  const svc = service(h, LEASED, { per: 1 });
+  const { sync, commits } = syncFor(h, svc.fetch);
+  assert.equal((await sync.sync()).status, "current");
+  assert.deepEqual(svc.calls.map((c) => c.target), ["after=5", "after=6", "after=7"].map((q) => `/api/fleet/v1/host/chain?${q}`));
+  assert.deepEqual(commits.map((c) => c.fromSeq), [6, 7, 8]);
+  assert.equal(sync.snapshot().seq, 8);
+});
+
+test("the transport: a redirect, a non-200, an oversize body, a stalled fetch and a late arrival are each refused by class; nothing adopted", async () => {
+  const ok = () => new Response(new Uint8Array(10), { status: 200 });
+  const cases = [
+    ["redirect", async () => new Response(null, { status: 302, headers: { location: "https://elsewhere/" } }), {}],
+    ["redirect", async () => { throw new TypeError("fetch failed", { cause: new Error("unexpected redirect") }); }, {}],
+    ["status", async () => new Response("no", { status: 503 }), {}],
+    ["oversize", async () => new Response(new ReadableStream({ pull(c) { c.enqueue(new Uint8Array(65536)); } }, { highWaterMark: 0 }), { status: 200 }), { max: 100000 }],
+    ["timeout", () => new Promise(() => {}), { ms: 50 }],
+    ["network", async () => { throw new TypeError("fetch failed"); }, {}],
+  ];
+  for (const [cls, f, o] of cases) assert.deepEqual(await boundedGet(f, "https://x/", {}, { max: 1000, ms: 2000, ...o }), { cls }, cls);
+  // A late arrival on the monotonic clock: past the deadline when the response comes, whatever the timer did.
+  let t = 0;
+  assert.deepEqual(await boundedGet(async () => { t = 5000; return ok(); }, "https://x/", {}, { max: 1000, ms: 2000, mono: () => t }), { cls: "timeout" });
+  assert.equal((await boundedGet(async () => ok(), "https://x/", {}, { max: 1000, ms: 2000 })).bytes.length, 10);
+  // Through the sync: counted by class, the snapshot unchanged.
+  const h = await pairedHost();
+  const { sync, commits } = syncFor(h, async () => new Response("no", { status: 500 }));
+  assert.equal((await sync.sync()).status, "failed");
+  assert.equal(sync.counts.status, 1);
+  assert.equal(commits.length, 0);
+  assert.equal(sync.snapshot().seq, 5);
+});
+
+test("the sync's form: an https origin only; the snapshot only moves forward; the hourly schedule", async () => {
+  const h = await pairedHost();
+  const base = { snapshot: h.chain, aud: AUD, fleet: FLEET, host: HOST, signer: h.keys.sign, gen: () => 1, submit: async () => ({}) };
+  for (const origin of ["http://dev.sagebrush.space", "https://u:p@dev.sagebrush.space", "https://dev.sagebrush.space/x", "https://dev.sagebrush.space/?q"]) {
+    assert.throws(() => new ChainSync({ ...base, origin }), (e) => e.code === "bad_form", origin);
+  }
+  const set = [];
+  const s = new ChainSync({ ...base, origin: "https://dev.sagebrush.space", fetch: async () => new Response("no", { status: 500 }),
+    timers: { set: (ms, fn) => { set.push(ms); return { fn }; }, clear: () => {} } });
+  assert.throws(() => s.swap(h.chain), (e) => e.code === "bad_form");
+  assert.throws(() => s.swap({ ...h.chain, seq: 4 }), (e) => e.code === "bad_form");
+  s.swap({ ...h.chain, seq: 6 });
+  assert.equal(s.snapshot().seq, 6);
+  // start: one sync now, then every SYNC_EVERY_MS.
+  let fire;
+  const t = new ChainSync({ ...base, origin: "https://dev.sagebrush.space", fetch: async () => new Response("no", { status: 500 }),
+    timers: { set: (ms, fn) => { set.push(ms); fire = fn; return {}; }, clear: () => {} } });
+  set.length = 0;
+  t.start();
+  assert.deepEqual(set, [0]);
+  fire();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(set, [0, SYNC_EVERY_MS]);
+  assert.equal(t.counts.status, 1);
+});
+
+test("the adopter's writes: the revoked marker makes every later start REVOKED; entries that don't end at the pin are refused", async () => {
+  const h = await pairedHost();
+  const a = chainAdopter({ paths: h.p, certBytes: h.certBytes, keys: h.keys, pin: h.pin, sync: null, rootUid: UID, grantValidAt: async () => true });
+  assert.throws(() => a.commit({ state: { seq: 7, head: "x" }, entries: [LEASED[6]], fromSeq: 6 }), (e) => e.code === "bad_form");
+  assert.equal((await classify(h.p, { machineId: machine, brokerUid: UID, rootUid: UID })).chain.seq, 5, "nothing written");
+  a.markRevoked();
+  assert.equal((await classify(h.p, { machineId: machine, brokerUid: UID, rootUid: UID })).state, "REVOKED");
 });
 
 test("the adopter: a candidate that removes the certificate's signing device ends the certificate; the lease-key extension doesn't", async () => {

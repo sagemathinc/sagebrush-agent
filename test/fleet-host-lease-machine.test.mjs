@@ -5,7 +5,7 @@
 // lease key. The rows that need the real systemd (§5 "without the supervisor", T2a-T2g, suspend) are listed at the end,
 // deferred to the qualification VM.
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
@@ -1254,4 +1254,65 @@ test("the restore resume's helper wait is RESUME_HELPER_MS (10 s) by default, in
     run: async (argv, o) => { seen = o.ms; return { code: 0, stdout: '{"resumed":true,"reason":null}' }; },
   });
   assert.equal(seen, RESUME_HELPER_MS);
+});
+
+// ---- the suspend gate (lease-on r1.5 §6.2): requests and responses are bound to the gate's generation
+
+const gateWrite = (w, sleep, reopen) => {
+  for (const [name, text] of [["sleep", sleep], ["reopen", reopen]]) {
+    const f = join(w.leaseDir, name);
+    rmSync(f, { force: true });
+    if (text !== null) writeFileSync(f, text, { mode: 0o644 });
+  }
+};
+const S = (gen, phase = "post") => JSON.stringify({ gen, phase, pre_ok: true, pre_at: 0 });
+const R = (gen) => JSON.stringify({ gen });
+
+test("the gate: no request while it is closed, and the renewal keeps its schedule; the record carries the gate's generation", async () => {
+  const w = await world();
+  await granted(w, [A]);
+  gateWrite(w, S(1, "pre"), null); // a PRE ran (sleep without reopen: closed)
+  await w.fire("renew");
+  assert.equal(w.sent.length, 0, "no request while the gate is closed");
+  assert.equal(w.record(A).state, "missing");
+  assert.ok(w.pending.some((h) => h.ms === RENEW_MS), "the next renewal is scheduled");
+  gateWrite(w, S(1), R(1)); // post, then the supervisor's reopen
+  w.advance(RENEW_MS);
+  await w.fire("renew");
+  assert.equal(w.sent.length, 1);
+  assert.equal(w.record(A).rec.sg, 1, "published under the generation the request was made in");
+  assert.equal(w.fx.u(A).active, true);
+  await w.close();
+});
+
+test("the gate: a response to a request made before a suspend is ignored after it (`suspended`), counted, and its request consumed", async () => {
+  const w = await world();
+  await granted(w, [A]);
+  let held = null;
+  w.send = async (bytes) => { held = bytes; return null; }; // the response is delayed
+  await w.fire("renew");
+  assert.ok(held, "a request went out at generation 0");
+  delete w.send;
+  gateWrite(w, S(1), R(1)); // a suspend and its reopen happened meanwhile: open at 1
+  const r = await w.sup.submit({ kind: "lease-response", authority: "host", agent: A, bytes: await w.respond(held) });
+  assert.deepEqual(r, { status: "ignored", reason: "suspended" });
+  assert.equal(w.machine.counts.suspended, 1);
+  assert.equal(w.machine.outstanding(A), null, "a response counts at most once");
+  assert.equal(w.record(A).state, "missing", "nothing published");
+  assert.equal(w.fx.u(A).active, false);
+  // a request made AFTER the reopen succeeds (the positive control)
+  w.advance(RENEW_MS);
+  await w.fire("renew");
+  assert.equal(w.record(A).rec.sg, 1);
+  assert.equal(w.fx.u(A).active, true);
+  await w.close();
+});
+
+test("the gate: with no gate files at all the gate is open at 0, so a real host before any suspend behaves as before", async () => {
+  const w = await world();
+  await granted(w, [A]);
+  await w.fire("renew");
+  assert.equal(w.record(A).rec.sg, 0);
+  assert.equal(w.fx.u(A).active, true);
+  await w.close();
 });

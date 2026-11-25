@@ -26,7 +26,7 @@ function world({ boot = 1_000_000, timer = { active: "active", sub: "waiting", n
 
 test("liveLease: the published record when liveCheck passes, with gen a number; null otherwise", async () => {
   const w = world();
-  const rec = { lease_id: "L1", lg: 4, expiry_tick: 1_000_000 + 600_000, gen: 7 };
+  const rec = { lease_id: "L1", lg: 4, expiry_tick: 1_000_000 + 600_000, gen: 7, sg: 0 };
   assert.equal(await liveLease(A, w.opts), null, "no record");
   w.publish(rec);
   const live = await liveLease(A, w.opts);
@@ -42,7 +42,7 @@ test("liveLease: the published record when liveCheck passes, with gen a number; 
 });
 
 test("liveLease: null at and past the effective end (expiry_tick - 30 s), without a waiting timer, or for a malformed record", async () => {
-  const rec = (expiry) => ({ lease_id: "L1", lg: 4, expiry_tick: expiry, gen: 7 });
+  const rec = (expiry) => ({ lease_id: "L1", lg: 4, expiry_tick: expiry, gen: 7, sg: 0 });
   // bootNow adds /proc/uptime's 10 ms resolution: now = boot + 10.
   const at = (boot, expiry) => { const w = world({ boot }); w.publish(rec(expiry)); return liveLease(A, w.opts); };
   assert.notEqual(await at(1_000_000, 1_000_000 + 10 + MARGIN_MS + 1), null, "1 ms before the effective end");
@@ -57,7 +57,7 @@ test("liveLease: null at and past the effective end (expiry_tick - 30 s), withou
   w.publish(rec(9e12));
   delete w.timers[watchdogTimer(A, 4)];
   assert.equal(await liveLease(A, w.opts), null, "the timer can't be read");
-  for (const bad of [{ lease_id: "L1", lg: 4, expiry_tick: 9e12 }, { lease_id: "L1", lg: 4, expiry_tick: 9e12, gen: 0 }, "{not json"]) {
+  for (const bad of [{ lease_id: "L1", lg: 4, expiry_tick: 9e12 }, { lease_id: "L1", lg: 4, expiry_tick: 9e12, gen: 0, sg: 0 }, "{not json"]) {
     const v = world();
     v.publish(rec(9e12));
     writeFileSync(join(v.dir, A), typeof bad === "string" ? bad : JSON.stringify(bad));

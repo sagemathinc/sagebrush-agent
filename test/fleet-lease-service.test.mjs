@@ -271,3 +271,29 @@ test("a refused request never reaches the host as a lease: the answer is unsigne
   const r = await w.send(q.bytes);
   await assert.rejects(() => w.hostAccepts(r, other), (e) => e instanceof FleetError && e.code === "not_granted");
 });
+
+test("the service clock is sampled twice: the window check and its refusal agree, and the grant clock is the issue-time sample", async () => {
+  const w = await world();
+  // (a clock that moves on every read, as a stepping provider could)
+  const reads = [];
+  // (defined on the ctx itself: spreading a getter into an object would read it once)
+  const moving = (start, step) => { let t = start; return Object.defineProperty(w.ctx(), "now", { get() { const v = t; t += step; reads.push(v); return v; } }); };
+  const q = w.request(w.hostA, { at_ms: NOW + LEASE_SKEW_MS + 1 });
+  const r = await w.send(q.bytes, moving(NOW, 1000));
+  assert.deepEqual(JSON.parse(text(r.body)), { error: "clock_skew", service_time_ms: NOW, skew_ms: LEASE_SKEW_MS + 1 }, "one sample for the comparison and both fields");
+  assert.equal(reads.length, 1);
+  reads.length = 0;
+  let seen = null;
+  const c = moving(NOW, 1000);
+  const inner = c.leases.issue;
+  c.leases = { issue: (d) => { seen = d.now; return inner(d); } };
+  const q2 = w.request();
+  await w.hostAccepts(await w.send(q2.bytes, c), q2);
+  assert.equal(reads.length, 2, "read exactly twice");
+  assert.equal(seen, reads[1], "the decision gets the second sample");
+  assert.equal(w.st.records.get(`${w.agent}/${w.hostA}`).expires_at, reads[1] + LEASE_TTL_MS);
+  // (a clock that isn't a finite safe integer fails closed: nothing decided, nothing signed)
+  const issues = w.st.issues;
+  for (const bad of [NaN, Infinity, -1, 1.5]) assert.equal((await w.send(w.request().bytes, w.ctx({ now: bad }))).status, 500, String(bad));
+  assert.equal(w.st.issues, issues);
+});

@@ -112,6 +112,8 @@ test("a grant giving any agent the claude-subscription right is refused whole; t
 const fresh = () => join(mkdtempSync(join(tmpdir(), "sb-grant-")), "state");
 const okIntent = () => { const log = []; const f = async (r) => { log.push(r); }; f.log = log; return f; };
 const stateFile = (root) => join(root, "grant", "state.json");
+/** begin's records input: these grants list no agents. */
+const E = { entries: {}, hash: sha256b64(Buffer.from("the signed bytes")) };
 const stateOnDisk = (root) => JSON.parse(readFileSync(stateFile(root), "utf8"));
 /** Open the host store and return its grant view, with close() closing the store. */
 const GrantState = { open: async (root, opts) => { const h = await HostStore.open(root, opts); const g = h.grants; g.close = () => h.close(); g.store = h; return g; } };
@@ -122,10 +124,10 @@ test("begin: the intent first; then grant bytes; then ONE atomic state commit; s
   const s = await GrantState.open(dir);
   const { bytes, digest } = g(1);
   const intent = okIntent();
-  await s.begin(1, bytes, digest, ["broker-gen", "start:a"], intent);
+  await s.begin(1, bytes, digest, ["broker-gen", "start:a"], intent, E);
   assert.equal(intent.log.length, 1);
   assert.equal(intent.log[0].gen, 1);
-  assert.deepEqual(stateOnDisk(dir), { v: 1, gen: 1, digest, phase: "applying", plan: [{ step: "broker-gen", done: false }, { step: "start:a", done: false }], ack: null, proof: {} });
+  assert.deepEqual(stateOnDisk(dir), { v: 2, gen: 1, digest, hash: E.hash, phase: "applying", plan: [{ step: "broker-gen", done: false }, { step: "start:a", done: false }], ack: null, proof: {}, records: {} });
   assert.deepEqual(s.steps(), ["broker-gen", "start:a"]);
   assert.equal(s.ack, null);
   s.done(0);
@@ -148,7 +150,7 @@ test("a failed intent changes nothing: no highwater, no grant file, N not accept
   const dir = fresh();
   const s = await GrantState.open(dir);
   const { bytes, digest } = g(1);
-  await rejects(s.begin(1, bytes, digest, ["x"], async () => { throw new FleetError("audit_unavailable"); }), "audit_unavailable");
+  await rejects(s.begin(1, bytes, digest, ["x"], async () => { throw new FleetError("audit_unavailable"); }, E), "audit_unavailable");
   assert.equal(s.highwater.gen, 0);
   assert.deepEqual(readdirSync(join(dir, "grant", "grants")), []);
   assert.equal(s.reconcileIntent(1), "failed_no_effect");
@@ -158,16 +160,16 @@ test("a failed intent changes nothing: no highwater, no grant file, N not accept
 test("the generation rule: lower or equal-but-different refused; byte-identical is a re-apply with no effects", async () => {
   const s = await GrantState.open(fresh());
   const g2 = g(2);
-  await s.begin(2, g2.bytes, g2.digest, ["a"], okIntent());
+  await s.begin(2, g2.bytes, g2.digest, ["a"], okIntent(), E);
   s.done(0); s.finish({ narrowed: false, restarted: [] });
   assert.deepEqual(s.admit(2, g2.digest), { reapply: true });
   refused(() => s.admit(2, g(2, { at_ms: 1001 }).digest), "stale_generation");
   refused(() => s.admit(1, g(1).digest), "stale_generation");
   assert.deepEqual(s.admit(3, "x"), { reapply: false });
-  await rejects(s.begin(2, g2.bytes, g2.digest, ["a"], okIntent()), "bad_form");
-  await rejects(s.begin(1, g(1).bytes, g(1).digest, ["a"], okIntent()), "stale_generation");
-  await rejects(s.begin(3, g(3).bytes, "not-the-digest", ["a"], okIntent()), "bad_form");
-  await rejects(s.begin(3, g(3).bytes, g(3, { at_ms: 1002 }).digest, ["a"], okIntent()), "bad_form"); // well-formed, but of other bytes
+  await rejects(s.begin(2, g2.bytes, g2.digest, ["a"], okIntent(), E), "bad_form");
+  await rejects(s.begin(1, g(1).bytes, g(1).digest, ["a"], okIntent(), E), "stale_generation");
+  await rejects(s.begin(3, g(3).bytes, "not-the-digest", ["a"], okIntent(), E), "bad_form");
+  await rejects(s.begin(3, g(3).bytes, g(3, { at_ms: 1002 }).digest, ["a"], okIntent(), E), "bad_form"); // well-formed, but of other bytes
   assert.equal(s.highwater.gen, 2);
   await s.close();
 });
@@ -178,15 +180,15 @@ test("highwater only increases: the tests review's sequence (gen 2 intent held, 
   let release;
   const held = new Promise((r) => { release = r; });
   const g2 = g(2), g3 = g(3);
-  const p2 = s.begin(2, g2.bytes, g2.digest, ["a"], async () => { await held; });
-  await rejects(s.begin(3, g3.bytes, g3.digest, ["a"], okIntent()), "in_progress"); // admission is serialized
+  const p2 = s.begin(2, g2.bytes, g2.digest, ["a"], async () => { await held; }, E);
+  await rejects(s.begin(3, g3.bytes, g3.digest, ["a"], okIntent(), E), "in_progress"); // admission is serialized
   release();
   await p2;
   assert.equal(stateOnDisk(dir).gen, 2);
   s.done(0); s.finish({ narrowed: false, restarted: [] });
-  await s.begin(3, g3.bytes, g3.digest, ["a"], okIntent());
+  await s.begin(3, g3.bytes, g3.digest, ["a"], okIntent(), E);
   assert.equal(stateOnDisk(dir).gen, 3);
-  await rejects(s.begin(2, g2.bytes, g2.digest, ["a"], okIntent()), "stale_generation"); // a stale release never lowers it
+  await rejects(s.begin(2, g2.bytes, g2.digest, ["a"], okIntent(), E), "stale_generation"); // a stale release never lowers it
   assert.equal(stateOnDisk(dir).gen, 3);
   await s.close();
 });
@@ -195,15 +197,15 @@ test("supersede: a held applying(N) is replaced by N+1 only when asked; the gene
   const dir = fresh();
   const s = await GrantState.open(dir);
   const g1 = g(1), g2 = g(2), g3 = g(3);
-  await s.begin(1, g1.bytes, g1.digest, ["broker-gen", "map"], okIntent());
-  await rejects(s.begin(2, g2.bytes, g2.digest, ["map"], okIntent()), "in_progress");
-  await rejects(s.begin(1, g1.bytes, g1.digest, ["map"], okIntent(), { supersede: true }), "bad_form"); // a re-apply has no effects
-  await s.begin(2, g2.bytes, g2.digest, ["map"], okIntent(), { supersede: true });
+  await s.begin(1, g1.bytes, g1.digest, ["broker-gen", "map"], okIntent(), E);
+  await rejects(s.begin(2, g2.bytes, g2.digest, ["map"], okIntent(), E), "in_progress");
+  await rejects(s.begin(1, g1.bytes, g1.digest, ["map"], okIntent(), { supersede: true, ...E }), "bad_form"); // a re-apply has no effects
+  await s.begin(2, g2.bytes, g2.digest, ["map"], okIntent(), { supersede: true, ...E });
   assert.deepEqual(s.pending(), { phase: "applying", gen: 2, remaining: [0] });
   assert.deepEqual(s.steps(), ["map"]);
-  await rejects(s.begin(2, g3.bytes, g3.digest, ["map"], okIntent(), { supersede: true }), "stale_generation");
+  await rejects(s.begin(2, g3.bytes, g3.digest, ["map"], okIntent(), { supersede: true, ...E }), "stale_generation");
   s.done(0); s.finish({ narrowed: false, restarted: [] });
-  await s.begin(3, g3.bytes, g3.digest, ["map"], okIntent(), { supersede: true }); // nothing to supersede: an ordinary begin
+  await s.begin(3, g3.bytes, g3.digest, ["map"], okIntent(), { supersede: true, ...E }); // nothing to supersede: an ordinary begin
   assert.equal(s.highwater.gen, 3);
   await s.close();
 });
@@ -211,9 +213,9 @@ test("supersede: a held applying(N) is replaced by N+1 only when asked; the gene
 test("a new generation can't begin while another is applying", async () => {
   const s = await GrantState.open(fresh());
   const g1 = g(1), g2 = g(2);
-  await s.begin(1, g1.bytes, g1.digest, ["a"], okIntent());
+  await s.begin(1, g1.bytes, g1.digest, ["a"], okIntent(), E);
   const intent = okIntent();
-  await rejects(s.begin(2, g2.bytes, g2.digest, ["a"], intent), "in_progress");
+  await rejects(s.begin(2, g2.bytes, g2.digest, ["a"], intent, E), "in_progress");
   assert.equal(intent.log.length, 0); // refused before any intent is written
   await s.close();
 });
@@ -222,7 +224,7 @@ test("AU07: an intent whose state commit never happened reconciles failed_no_eff
   const s = await GrantState.open(fresh());
   assert.equal(s.reconcileIntent(1), "failed_no_effect");
   const g1 = g(1);
-  await s.begin(1, g1.bytes, g1.digest, ["a"], okIntent());
+  await s.begin(1, g1.bytes, g1.digest, ["a"], okIntent(), E);
   assert.equal(s.reconcileIntent(1), "accepted");
   await s.close();
 });
@@ -249,7 +251,7 @@ for (const step of ["open", "write", "fsync", "rename", "dirfsync"]) {
     // exclusive create): the failure hits the state commit.
     const s = await GrantState.open(dir, { io: failAt(step, step === "rename" ? 2 : 3) });
     const g1 = g(1);
-    await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a", "b"], okIntent()), /ENOSPC/);
+    await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a", "b"], okIntent(), E), /ENOSPC/);
     assert.equal(s.poisoned, true);
     refused(() => s.pending(), "outcome_unknown");
     s.reload();
@@ -265,21 +267,21 @@ for (const step of ["open", "write", "fsync", "rename", "dirfsync"]) {
     const dir = fresh();
     const s = await GrantState.open(dir, { io: failAt(step, 2) });
     const g1 = g(1);
-    await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a"], okIntent()), /ENOSPC/);
+    await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a"], okIntent(), E), /ENOSPC/);
     assert.equal(s.poisoned, false);
     assert.deepEqual(s.pending(), { phase: "applied", gen: 0, remaining: [] });
-    assert.deepEqual(stateOnDisk(dir), { v: 1, gen: 0, digest: null, phase: "applied", plan: [], ack: null, proof: {} });
+    assert.deepEqual(stateOnDisk(dir), { v: 2, gen: 0, digest: null, hash: null, phase: "applied", plan: [], ack: null, proof: {}, records: {} });
     assert.deepEqual(readdirSync(join(dir, "grant", "grants")), []); // no partial file left to block a retry
     await s.close();
     const again = await GrantState.open(dir);
-    await again.begin(1, g1.bytes, g1.digest, ["a"], okIntent());
+    await again.begin(1, g1.bytes, g1.digest, ["a"], okIntent(), E);
     assert.deepEqual([...again.currentBytes()], [...g1.bytes]);
     await again.close();
   });
 
   test(`a failure at ${step} while marking a step done: poisoned; the step stays pending after reload`, async () => {
     const dir = fresh();
-    { const s = await GrantState.open(dir); const g1 = g(1); await s.begin(1, g1.bytes, g1.digest, ["a", "b"], okIntent()); await s.close(); }
+    { const s = await GrantState.open(dir); const g1 = g(1); await s.begin(1, g1.bytes, g1.digest, ["a", "b"], okIntent(), E); await s.close(); }
     const s = await GrantState.open(dir, { io: failAt(step) });
     assert.throws(() => s.done(0), /ENOSPC/);
     refused(() => s.pending(), "outcome_unknown");
@@ -296,7 +298,7 @@ test("one host store: registry and grant state open together; commit both; crash
   const a = newId();
   h.registry.addAgent(a, 1); h.registry.setState(a, "running");
   const g1 = g(1);
-  await h.grants.begin(1, g1.bytes, g1.digest, ["start:a"], okIntent());
+  await h.grants.begin(1, g1.bytes, g1.digest, ["start:a"], okIntent(), E);
   await rejects(HostStore.open(dir), "in_progress");   // a second supervisor
   // "Crash": a new process opens after this one is gone (simulated by closing without finishing the plan).
   await h.close();
@@ -313,7 +315,7 @@ test("a held intent across lock loss: the begin's commit refuses; highwater is u
   let release;
   const held = new Promise((r) => { release = r; });
   const g1 = g(1);
-  const p = s.begin(1, g1.bytes, g1.digest, ["a"], async () => { await held; });
+  const p = s.begin(1, g1.bytes, g1.digest, ["a"], async () => { await held; }, E);
   const { execFileSync } = await import("node:child_process");
   for (const pid of String(execFileSync("pgrep", ["-f", join(dir, ".lock")])).trim().split("\n").filter(Boolean)) {
     try { process.kill(Number(pid), "SIGKILL"); } catch {}
@@ -329,29 +331,31 @@ test("anything but the exact closed state is refused at load and left as found",
   const d43 = "A".repeat(43);
   const variants = [
     "{",
-    { v: 1, gen: 7, digest: null, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {} },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: "false" }] , ack: null, proof: {} },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: "yes" }] , ack: null, proof: {} },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: 12, done: false }] , ack: null, proof: {} },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "a", done: false, extra: 1 }] , ack: null, proof: {} },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [{ step: "", done: false }] , ack: null, proof: {} },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [{ step: "a", done: true }] , ack: { narrowed: false, restarted: [] }, proof: {} },
-    { v: 1, gen: 0, digest: null, phase: "applying", plan: [] , ack: null, proof: {} },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], extra: 1 , ack: { narrowed: false, restarted: [] }, proof: {} },
-    { v: 1, gen: 1, digest: "short", phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {} },
-    { v: 2, gen: 1, digest: d43, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {} },
-    { v: 1, gen: -1, digest: null, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {} },
-    { v: 1, gen: 1, digest: d43, phase: "done", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {} },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [] },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: null, proof: {} },
-    { v: 1, gen: 1, digest: d43, phase: "applying", plan: [], ack: { narrowed: false, restarted: [] }, proof: {} },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: "no", restarted: [] }, proof: {} },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: ["x"] }, proof: {} },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [], extra: 1 }, proof: {} },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] } },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: [] },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: { x: "not_empty" } },
-    { v: 1, gen: 1, digest: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: { abcdefghijklmnopqrstuvwxya: "maybe" } },
+    { v: 2, gen: 7, digest: null, hash: d43, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applying", plan: [{ step: "a", done: "false" }] , ack: null, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applying", plan: [{ step: "a", done: "yes" }] , ack: null, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applying", plan: [{ step: 12, done: false }] , ack: null, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applying", plan: [{ step: "a", done: false, extra: 1 }] , ack: null, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applying", plan: [{ step: "", done: false }] , ack: null, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [{ step: "a", done: true }] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 0, digest: null, hash: null, phase: "applying", plan: [] , ack: null, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], extra: 1 , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: "short", hash: d43, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: null, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: "short", phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {} },
+    { v: 2, gen: -1, digest: null, hash: null, phase: "applied", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "done", plan: [] , ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [] },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: null, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applying", plan: [], ack: { narrowed: false, restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: { narrowed: "no", restarted: [] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: ["x"] }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [], extra: 1 }, proof: {}, records: {} },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] } },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: [] },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: { x: "not_empty" } },
+    { v: 2, gen: 1, digest: d43, hash: d43, phase: "applied", plan: [], ack: { narrowed: false, restarted: [] }, proof: { abcdefghijklmnopqrstuvwxya: "maybe" } },
   ];
   for (const v of variants) {
     const dir = fresh();
@@ -369,13 +373,13 @@ test("the tests review's interleaving: a stale begin across lock loss can't touc
   let release;
   const held = new Promise((r) => { release = r; });
   const A = g(1, { at_ms: 1001 }), B = g(1, { at_ms: 1002 });
-  const p = old.begin(1, A.bytes, A.digest, ["a"], async () => { await held; });
+  const p = old.begin(1, A.bytes, A.digest, ["a"], async () => { await held; }, E);
   const { execFileSync } = await import("node:child_process");
   for (const pid of String(execFileSync("pgrep", ["-f", join(dir, ".lock")])).trim().split("\n").filter(Boolean)) { try { process.kill(Number(pid), "SIGKILL"); } catch {} }
   let rep;
   for (let i = 0; i < 50 && !rep; i++) { try { rep = await GrantState.open(dir); } catch { await new Promise((r) => setTimeout(r, 100)); } }
   assert.ok(rep, "a replacement opened");
-  await rep.begin(1, B.bytes, B.digest, ["a"], okIntent());
+  await rep.begin(1, B.bytes, B.digest, ["a"], okIntent(), E);
   rep.done(0); rep.finish({ narrowed: false, restarted: [] });
   release();
   await rejects(p, "outcome_unknown");
@@ -392,7 +396,7 @@ test("accepted bytes that don't match their digest are refused, not returned", a
   const dir = fresh();
   const s = await GrantState.open(dir);
   const g1 = g(1);
-  await s.begin(1, g1.bytes, g1.digest, ["a"], okIntent());
+  await s.begin(1, g1.bytes, g1.digest, ["a"], okIntent(), E);
   writeFileSync(join(dir, "grant", "grants", `1-${g1.digest}`), "tampered");
   refused(() => s.currentBytes(), "outcome_unknown");
   await s.close();
@@ -403,10 +407,10 @@ test("grant bytes are created exclusively: an existing different file under the 
   const s = await GrantState.open(dir);
   const g1 = g(1);
   writeFileSync(join(dir, "grant", "grants", `1-${g1.digest}`), "something else");
-  await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a"], okIntent()), /different file/);
+  await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a"], okIntent(), E), /different file/);
   assert.equal(stateOnDisk(dir).gen, 0);
   writeFileSync(join(dir, "grant", "grants", `1-${g1.digest}`), Buffer.from(g1.bytes));
-  await s.begin(1, g1.bytes, g1.digest, ["a"], okIntent()); // the same bytes already there: accepted
+  await s.begin(1, g1.bytes, g1.digest, ["a"], okIntent(), E); // the same bytes already there: accepted
   assert.deepEqual([...s.currentBytes()], [...g1.bytes]);
   await s.close();
 });
@@ -431,7 +435,7 @@ test("crash-retry: the same bytes already present are fsynced (file and director
     },
   };
   const s = await GrantState.open(dir, { io });
-  await s.begin(1, g1.bytes, g1.digest, ["a"], okIntent());
+  await s.begin(1, g1.bytes, g1.digest, ["a"], okIntent(), E);
   assert.equal(fileSyncedBeforeState, true, "the existing blob was fsynced before state.json was renamed in");
   assert.equal(dirSyncedBeforeState, true, "grants/ was fsynced before state.json was renamed in");
   assert.deepEqual([...s.currentBytes()], [...g1.bytes]);
@@ -451,7 +455,7 @@ test("crash-retry: if fsyncing the existing blob fails, the state is not accepte
     fsync: (fd) => { if (fds.get(fd) === path) throw Object.assign(new Error("EIO"), { code: "EIO" }); return realIo.fsync(fd); },
   };
   const s = await GrantState.open(dir, { io });
-  await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a"], okIntent()), /EIO/);
+  await assert.rejects(s.begin(1, g1.bytes, g1.digest, ["a"], okIntent(), E), /EIO/);
   assert.equal(stateOnDisk(dir).gen, 0);
   await s.close();
 });
@@ -462,7 +466,7 @@ test("pending proofs: durable, host-level; finish refuses while any is pending; 
   const A = "abcdefghijklmnopqrstuvwxya", B = "bbbbbbbbbbbbbbbbbbbbbbbbbe";
   for (const [id, why] of [["x", "not_empty"], [A, "maybe"]]) refused(() => s.markProof(id, why), "bad_form");
   const { bytes, digest } = g(1);
-  await s.begin(1, bytes, digest, ["map"], okIntent());
+  await s.begin(1, bytes, digest, ["map"], okIntent(), E);
   s.markProof(A); s.markProof(B); s.markProof(A);
   assert.deepEqual(s.pendingProofs(), [A, B].sort());
   s.done(0);

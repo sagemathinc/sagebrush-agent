@@ -1,0 +1,337 @@
+// Host restore e2e §1, §2, §5: the exclusion with backup, an open restore, the person's begin with its continuation
+// after a crash at every durable effect, and close with its one commit point. Real temporary directories and the real
+// flock; the store's listing, the host store's copy and its import are fakes that record what they were given.
+import assert from "node:assert/strict";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "./host-linux-only.mjs";
+import { FleetError, newId } from "../lib/fleet/index.mjs";
+import { lockFile } from "../lib/fleet/host/store.mjs";
+import { newRecord, newRestoreRun, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
+import { PLAN, closePlan, newPlan, readPlan, replanSet, updatePlan } from "../lib/fleet/host/restore-plan.mjs";
+import { ABANDON, BEGIN, CLOSED, HOSTSTORE_COPY, REQUESTS, begin, close, closeBlockers, readBegin, restoreOpen, withExclusion } from "../lib/fleet/host/restore-begin.mjs";
+
+const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
+const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
+const UID = process.getuid();
+const hex = (c) => c.repeat(64);
+const RUN = newRestoreRun(1795500000000, () => Buffer.alloc(6)), RUN2 = newRestoreRun(1795600000000, () => Buffer.alloc(6, 1));
+const SNAP = hex("1");
+
+/** A manifest of one live agent, one deleted agent's archive and one tag, as chooseManifest returns it. */
+function chosenOf({ sha256 = hex("2"), snapshot = SNAP } = {}) {
+  const a = newId(), d = newId(), t = newId();
+  const manifest = { host: "old-host", time: "2026-11-24T03:10:00.000Z", hoststore: hex("3"), registry: { hash: hex("4") },
+    sets: [{ kind: "agent", id: a, snapshot: hex("5"), tree: hex("6") }, { kind: "archive", id: d, snapshot: hex("7"), tree: hex("8") },
+      { kind: "tag", id: t, snapshot: hex("9"), tree: hex("a") }] };
+  return { chosen: { manifest, snapshot, sha256 }, a, d, t };
+}
+
+/** A host: a private lock directory, a restore directory, and fakes that record every outside effect. */
+function host(over = {}) {
+  const root = mkdtempSync(join(tmpdir(), "sb-begin-"));
+  chmodSync(root, 0o700);
+  const dir = join(root, "restore"), lockDir = join(root, "lib");
+  mkdirSync(lockDir, { mode: 0o700 });
+  const m = chosenOf(over.choose);
+  const calls = [];
+  const deps = {
+    supervisorStopped: () => true, registryFresh: () => true, backupEnabled: () => false,
+    choose: async (snapshot) => { calls.push(["choose", snapshot]); return snapshot === m.chosen.snapshot ? m.chosen : { error: "not_found" }; },
+    newRun: () => RUN,
+    restoreHostStore: async (chosen, into) => { calls.push(["restoreHostStore", into]); writeFileSync(join(into, "registry.json"), "{}"); },
+    importHostStore: async ({ copy, plan, manifest }) => { calls.push(["importHostStore", copy, plan.sets, manifest.hoststore]); assert.ok(existsSync(join(copy, "registry.json")), "the copy is whole before the import"); },
+    ...over.deps,
+  };
+  const exclusion = { path: join(lockDir, "backup-restore.lock"), uid: UID, waitMs: 0 };
+  return { root, dir, lockDir, deps, calls, exclusion, m, run: () => begin(SNAP, deps, { dir, exclusion }) };
+}
+
+/** Everything begin leaves: begin.json, the plan, each request, as text (absent: null). */
+const state = (h) => {
+  const read = (p) => (existsSync(p) ? readFileSync(p, "utf8") : null);
+  const reqDir = join(h.dir, REQUESTS);
+  return { begin: read(join(h.dir, BEGIN)), plan: read(join(h.dir, PLAN)),
+    requests: existsSync(reqDir) ? Object.fromEntries(readdirSync(reqDir).sort().map((k) => [k, read(join(reqDir, k))])) : null };
+};
+
+test("begin: begin.json first, then the plan, the host store's copy and import, one request per set, then done", async () => {
+  const h = host();
+  const r = await h.run();
+  assert.deepEqual(r.run, RUN);
+  const s = state(h);
+  assert.deepEqual(JSON.parse(s.begin), { v: 1, snapshot: SNAP, manifest_sha256: hex("2"), run: RUN, state: "done" });
+  assert.deepEqual(JSON.parse(s.plan), newPlan(h.m.chosen, RUN));
+  assert.deepEqual(Object.keys(s.requests), [`agent-${h.m.a}`, `archive-${h.m.d}`, `tag-${h.m.t}`].sort());
+  for (const v of Object.values(s.requests)) assert.equal(v, JSON.stringify({ run: RUN }) + "\n");
+  assert.deepEqual(h.calls.map((c) => c[0]), ["choose", "restoreHostStore", "importHostStore"]);
+  assert.equal(h.calls[1][1], join(h.dir, HOSTSTORE_COPY, RUN));
+  // done: any later begin refuses, writing nothing.
+  await rejects(h.run(), "in_progress");
+  assert.deepEqual(state(h), s);
+});
+
+test("begin's refusals write nothing: the supervisor running, a plan here, a registry that isn't fresh, backup enabled, an unusable manifest", async () => {
+  for (const [label, over, code] of [
+    ["supervisor", { supervisorStopped: () => false }, "in_progress"],
+    ["registry", { registryFresh: () => false }, "not_granted"],
+    ["backup", { backupEnabled: () => true }, "in_progress"],
+    ["manifest", { choose: async () => ({ error: "check_failed" }) }, "not_granted"],
+  ]) {
+    const h = host({ deps: over });
+    await rejects(h.run(), code);
+    assert.deepEqual(state(h), { begin: null, plan: null, requests: null }, label);
+  }
+  // A plan already here, with no begin.json: refused, the plan untouched.
+  const h = host();
+  mkdirSync(h.dir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(h.dir, PLAN), JSON.stringify(newPlan(h.m.chosen, RUN2)) + "\n");
+  const before = state(h);
+  await rejects(h.run(), "in_progress");
+  assert.deepEqual(state(h), before);
+});
+
+test("begin's continuation: a crash after each durable effect, each request included, ends in the exact uncrashed state", async () => {
+  const ref = host();
+  await ref.run();
+  const want = state(ref);
+  const keys = Object.keys(want.requests);
+  // Each crash point, as the durable state it leaves: begin.json only; + the plan; + the copy; + 0..n-1 requests.
+  const points = [
+    ["after begin.json", { plan: false, requests: 0 }],
+    ["after the plan", { plan: true, requests: 0 }],
+    ...keys.map((_, i) => [`after ${i} request(s)`, { plan: true, requests: i }]),
+    ["after every request, before done", { plan: true, requests: keys.length }],
+  ];
+  for (const [label, at] of points) {
+    const h = host();
+    h.m.chosen = ref.m.chosen; Object.assign(h.m, { a: ref.m.a, d: ref.m.d, t: ref.m.t });
+    mkdirSync(h.dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(h.dir, BEGIN), JSON.stringify({ v: 1, snapshot: SNAP, manifest_sha256: hex("2"), run: RUN, state: "begun" }) + "\n");
+    if (at.plan) writeFileSync(join(h.dir, PLAN), want.plan);
+    mkdirSync(join(h.dir, REQUESTS), { recursive: true, mode: 0o700 });
+    for (const k of keys.slice(0, at.requests)) writeFileSync(join(h.dir, REQUESTS, k), want.requests[k]);
+    // A partial copy left by the crash is discarded first, never imported as it is.
+    mkdirSync(join(h.dir, HOSTSTORE_COPY, RUN), { recursive: true });
+    writeFileSync(join(h.dir, HOSTSTORE_COPY, RUN, "partial"), "x");
+    // The continuation uses the RECORDED run, never a new one.
+    h.deps.newRun = () => RUN2;
+    await h.run();
+    assert.deepEqual(state(h), want, label);
+    assert.ok(!existsSync(join(h.dir, HOSTSTORE_COPY, RUN, "partial")), `${label}: the partial copy was discarded`);
+    assert.deepEqual(h.calls.map((c) => c[0]), ["choose", "restoreHostStore", "importHostStore"], label);
+  }
+});
+
+test("begin's continuation is bound exactly: another snapshot, a changed store, a foreign plan, a running supervisor each refuse, writing nothing", async () => {
+  const setup = (over) => {
+    const h = host(over);
+    mkdirSync(h.dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(h.dir, BEGIN), JSON.stringify({ v: 1, snapshot: SNAP, manifest_sha256: hex("2"), run: RUN, state: "begun" }) + "\n");
+    return h;
+  };
+  // Another snapshot than the one that began.
+  let h = setup();
+  let before = state(h);
+  await rejects(begin(hex("e"), h.deps, { dir: h.dir, exclusion: h.exclusion }), "not_granted");
+  assert.deepEqual(state(h), before);
+  // The store's manifest for that snapshot no longer hashes to the recorded sha256.
+  h = setup({ choose: { sha256: hex("f") } });
+  before = state(h);
+  await rejects(h.run(), "not_granted");
+  assert.deepEqual(state(h), before, "no plan rebuilt from a changed manifest");
+  // A plan of another run (or another manifest) already here.
+  h = setup();
+  writeFileSync(join(h.dir, PLAN), JSON.stringify(newPlan(h.m.chosen, RUN2)) + "\n");
+  before = state(h);
+  await rejects(h.run(), "not_granted");
+  assert.deepEqual(state(h), before);
+  // The supervisor running.
+  h = setup({ deps: { supervisorStopped: () => false } });
+  before = state(h);
+  await rejects(h.run(), "in_progress");
+  assert.deepEqual(state(h), before);
+  // A set's request already there with another run: never replaced.
+  h = setup();
+  writeFileSync(join(h.dir, PLAN), JSON.stringify(newPlan(h.m.chosen, RUN)) + "\n");
+  mkdirSync(join(h.dir, REQUESTS), { recursive: true });
+  writeFileSync(join(h.dir, REQUESTS, `agent-${h.m.a}`), JSON.stringify({ run: RUN2 }) + "\n");
+  await rejects(h.run(), "not_granted");
+  assert.equal(readFileSync(join(h.dir, REQUESTS, `agent-${h.m.a}`), "utf8"), JSON.stringify({ run: RUN2 }) + "\n");
+  assert.equal(JSON.parse(readFileSync(join(h.dir, BEGIN), "utf8")).state, "begun", "not done");
+  // A malformed begin.json is never a continuation.
+  h = setup();
+  writeFileSync(join(h.dir, BEGIN), "{");
+  await rejects(h.run(), "bad_form");
+  // The control: with the UNCONDITIONAL new-begin refusals (a plan here, a non-fresh registry), the crash rows above
+  // could never complete; here the plan is there and the registry not fresh, and the exact continuation completes.
+  h = setup({ deps: { registryFresh: () => false } });
+  writeFileSync(join(h.dir, PLAN), JSON.stringify(newPlan(h.m.chosen, RUN)) + "\n");
+  await h.run();
+  assert.equal(JSON.parse(state(h).begin).state, "done");
+});
+
+test("an open restore: begin.json AND (no plan, or a plan not closed); unreadable or malformed counts as open", () => {
+  const dir = join(mkdtempSync(join(tmpdir(), "sb-open-")), "restore");
+  mkdirSync(dir, { recursive: true });
+  const { chosen } = chosenOf();
+  const b = JSON.stringify({ v: 1, snapshot: SNAP, manifest_sha256: hex("2"), run: RUN, state: "begun" }) + "\n";
+  const plan = JSON.stringify(newPlan(chosen, RUN)) + "\n";
+  const set = (beginText, planText) => {
+    for (const [n, t] of [[BEGIN, beginText], [PLAN, planText]]) { rmSync(join(dir, n), { force: true, recursive: true }); if (t !== null) writeFileSync(join(dir, n), t); }
+  };
+  const cases = [
+    ["nothing", null, null, false],
+    ["a plan alone (no begin.json)", null, plan, false],
+    ["begin.json, no plan (a half-begun restore)", b, null, true],
+    ["begin.json, an open plan", b, plan, true],
+    ["begin.json, a malformed plan", b, "{", true],
+    ["a malformed begin.json", "{", plan, true],
+  ];
+  for (const [label, bt, pt, want] of cases) { set(bt, pt); assert.equal(restoreOpen({ dir }), want, label); }
+  set(b, plan);
+  closePlan(1, { dir });
+  assert.equal(restoreOpen({ dir }), false, "closed");
+  // A begin.json that is a directory or a link: unreadable, open.
+  rmSync(join(dir, BEGIN)); mkdirSync(join(dir, BEGIN));
+  assert.equal(restoreOpen({ dir }), true);
+  rmSync(join(dir, BEGIN), { recursive: true }); symlinkSync(join(dir, PLAN), join(dir, BEGIN));
+  assert.equal(restoreOpen({ dir }), true);
+});
+
+test("the exclusion: a held lock refuses begin and close (busy) before anything is read or written; an untrusted lock file refuses", async () => {
+  const h = host();
+  await withExclusion(async () => {}, h.exclusion); // the lock file, created private (as every holder does)
+  const held = await lockFile(h.exclusion.path); // another holder: a backup run
+  try {
+    await rejects(h.run(), "in_progress");
+    assert.deepEqual(state(h), { begin: null, plan: null, requests: null });
+    assert.equal(h.calls.length, 0, "nothing was asked of the store");
+    await rejects(close({ now: () => 1 }, { dir: h.dir, exclusion: h.exclusion }), "in_progress");
+  } finally { await held.release(); }
+  await h.run(); // free again: it begins
+  // The lock file: a private regular file in a private directory, else refused before it is tried.
+  for (const [label, prep] of [
+    ["group-readable file", (p) => { writeFileSync(p, ""); chmodSync(p, 0o640); }],
+    ["a link", (p) => symlinkSync("/etc/hostname", p)],
+    ["a directory", (p) => mkdirSync(p)],
+  ]) {
+    const x = host();
+    prep(x.exclusion.path);
+    await rejects(withExclusion(async () => assert.fail("ran"), x.exclusion), "not_granted");
+    assert.ok(label);
+  }
+  const y = host();
+  chmodSync(y.lockDir, 0o777);
+  await rejects(withExclusion(async () => assert.fail("ran"), y.exclusion), "not_granted");
+  // Created 0600 when missing.
+  const z = host();
+  await withExclusion(async () => {}, z.exclusion);
+  assert.equal(statSync(z.exclusion.path).mode & 0o777, 0o600);
+});
+
+/** Records for the restored host's sets, each in `states[kind]`. */
+function records(h, states) {
+  const ident = (ino) => ({ dev: "1", ino, uid: 70000, gid: 70000, mode: 0o700, projid: 70000 });
+  const reach = (kind, id, target) => {
+    let r = newRecord({ kind, id, run: RUN, snapshot: SNAP });
+    if (target === "staging") return r;
+    if (target === "abandoned") return step(r, "abandoned");
+    const cls = { agent: ["home", "sessions"], archive: ["archive"], tag: ["tag"] }[kind];
+    const dest = Object.fromEntries(cls.map((c, i) => [c, ident(String(10 + i))]));
+    r = step(r, "bind", { dest });
+    for (const c of cls) r = step(r, "digest", { cls: c, sha256: hex("d") });
+    for (const s of ["staged", "filling", "published", "files_validated"]) r = step(r, s, { dest });
+    if (target === "files_validated") return r;
+    if (r.imports !== null) for (const which of ["config", "context"]) for (const phase of ["pending", "done"]) r = step(r, "import", { which, phase, sha256: hex("c") });
+    return step(r, "validated");
+  };
+  for (const [kind, id] of [["agent", h.m.a], ["archive", h.m.d], ["tag", h.m.t]]) writeRecord(reach(kind, id, states[kind]), { dir: h.dir });
+}
+
+test("close: every set terminal-for-close, per kind; anything else refuses, naming each set; nothing is written", async () => {
+  const h = host();
+  await h.run();
+  const raised = new Set([h.m.a]);
+  const restoreRaised = (id) => raised.has(id);
+  const attempt = () => close({ now: () => 7, restoreRaised }, { dir: h.dir, exclusion: h.exclusion });
+  // No records yet: each set named.
+  await assert.rejects(attempt(), (e) => e.code === "not_granted" && /agent-.*: none/.test(e.message) && /archive-.*: none/.test(e.message));
+  // The agent validated but not resumed (its restore fence still up): refused.
+  records(h, { agent: "validated", archive: "validated", tag: "validated" });
+  await assert.rejects(attempt(), (e) => e.code === "not_granted" && /validated, not resumed/.test(e.message));
+  assert.ok(!Object.hasOwn(readPlan({ dir: h.dir }), "closed"), "still open");
+  // An archive files_validated (not validated), a tag stepping: refused.
+  raised.delete(h.m.a);
+  records(h, { agent: "validated", archive: "files_validated", tag: "staging" });
+  await assert.rejects(attempt(), (e) => e.code === "not_granted" && /archive-.*: files_validated/.test(e.message) && /tag-.*: staging/.test(e.message));
+  // An abandon intent whose record isn't abandoned yet: refused (the cleanup isn't proven).
+  records(h, { agent: "validated", archive: "validated", tag: "staging" });
+  mkdirSync(join(h.dir, ABANDON), { recursive: true });
+  writeFileSync(join(h.dir, ABANDON, `tag-${h.m.t}.json`), "{}");
+  assert.deepEqual(closeBlockers(readPlan({ dir: h.dir }), { dir: h.dir, restoreRaised }), [`tag-${h.m.t}: abandoning`]);
+  await rejects(attempt(), "not_granted");
+  // Abandoned: closes. Requests and the host store's copy are removed; restoreOpen is false; the archive is read-only.
+  records(h, { agent: "validated", archive: "validated", tag: "abandoned" });
+  assert.deepEqual(await attempt(), { closed: 7 });
+  assert.equal(restoreOpen({ dir: h.dir }), false);
+  assert.ok(!existsSync(join(h.dir, REQUESTS)) && !existsSync(join(h.dir, HOSTSTORE_COPY)));
+  const into = join(h.dir, CLOSED, RUN);
+  const archived = readdirSync(into).sort();
+  assert.ok(archived.includes(PLAN) && archived.includes(BEGIN) && archived.includes(`tag-${h.m.t}.json`) && archived.includes(`tag-${h.m.t}.abandon.json`));
+  for (const f of archived) assert.equal(statSync(join(into, f)).mode & 0o777, 0o400, f);
+  assert.deepEqual(readFileSync(join(into, PLAN)), readFileSync(join(h.dir, PLAN)));
+  // Closing again: the same, nothing changed.
+  assert.deepEqual(await attempt(), { closed: 7 });
+  // A closed restore is never re-planned.
+  const p = readPlan({ dir: h.dir });
+  const { closed: _c, ...open } = p;
+  refused(() => updatePlan(replanSet(open, "agent", h.m.a, RUN2), { dir: h.dir }), "not_granted");
+});
+
+test("close: a crash after the commit, and after each archived file, is finished by closing again; before the commit the restore stays open", async () => {
+  const h = host();
+  await h.run();
+  records(h, { agent: "validated", archive: "abandoned", tag: "validated" });
+  const restoreRaised = () => false;
+  // Before the commit (a refusal), nothing is closed.
+  await rejects(close({ now: () => 7, restoreRaised: () => true }, { dir: h.dir, exclusion: h.exclusion }), "not_granted");
+  assert.equal(restoreOpen({ dir: h.dir }), true);
+  // The commit, then a crash: simulated by an archived file planted with other bytes, so close stops after its commit.
+  const into = join(h.dir, CLOSED, RUN);
+  mkdirSync(into, { recursive: true });
+  writeFileSync(join(into, `agent-${h.m.a}.json`), "other");
+  await rejects(close({ now: () => 7, restoreRaised }, { dir: h.dir, exclusion: h.exclusion }), "not_granted");
+  assert.equal(restoreOpen({ dir: h.dir }), false, "the commit is durable: the restore is closed");
+  assert.ok(existsSync(join(h.dir, REQUESTS)), "the cleanup didn't run yet");
+  rmSync(join(into, `agent-${h.m.a}.json`));
+  // Closing again finishes it, with the SAME close time (the commit isn't redone).
+  assert.deepEqual(await close({ now: () => 99, restoreRaised }, { dir: h.dir, exclusion: h.exclusion }), { closed: 7 });
+  assert.ok(!existsSync(join(h.dir, REQUESTS)));
+  assert.deepEqual(readFileSync(join(into, `agent-${h.m.a}.json`)), readFileSync(join(h.dir, `agent-${h.m.a}.json`)));
+});
+
+test("close refuses a restore whose begin hasn't finished, and a host with no restore", async () => {
+  const h = host();
+  await rejects(close({ now: () => 1 }, { dir: h.dir, exclusion: h.exclusion }), "not_found");
+  await h.run();
+  const b = readBegin({ dir: h.dir });
+  writeFileSync(join(h.dir, BEGIN), JSON.stringify({ ...b, state: "begun" }) + "\n");
+  await rejects(close({ now: () => 1, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion }), "in_progress");
+});
+
+test("closePlan: the one commit point, durable and idempotent; a closed plan's shape", () => {
+  const dir = join(mkdtempSync(join(tmpdir(), "sb-close-")), "restore");
+  mkdirSync(dir, { recursive: true });
+  refused(() => closePlan(1, { dir }), "not_found");
+  writeFileSync(join(dir, PLAN), JSON.stringify(newPlan(chosenOf().chosen, RUN)) + "\n");
+  refused(() => closePlan(-1, { dir }), "bad_form");
+  const p = closePlan(5, { dir });
+  assert.deepEqual(p.closed, { at: 5 });
+  assert.deepEqual(closePlan(9, { dir }).closed, { at: 5 }, "closed once: the first time stays");
+  for (const closed of [{}, { at: "5" }, { at: 5, x: 1 }, null]) {
+    writeFileSync(join(dir, PLAN), JSON.stringify({ ...p, closed }) + "\n");
+    refused(() => readPlan({ dir }), "bad_form");
+  }
+});

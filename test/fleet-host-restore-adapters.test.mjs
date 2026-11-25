@@ -7,10 +7,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
-import { EXPECT_DIR, archiveLimits, restoreAdapters } from "../lib/fleet/host/restore-adapters.mjs";
+import { ARCHIVE_ROOTS, EXPECT_DIR, archiveLimits, restoreAdapters } from "../lib/fleet/host/restore-adapters.mjs";
 import { RESTORE_STAGING, VALIDATE_DIR, fenceFiles } from "../lib/fleet/host/names.mjs";
 import { newRestoreRun } from "../lib/fleet/host/restore-record.mjs";
-import { needOf } from "../lib/fleet/host/restore-space.mjs";
+import { fileBlocks, needOf } from "../lib/fleet/host/restore-space.mjs";
 import { uidEmpty } from "../lib/fleet/host/uid-proof.mjs";
 
 const LAUNCHER = "/usr/lib/sagebrush/sagebrush-agent-launch";
@@ -24,7 +24,7 @@ const obj = (over = {}) => ({ type: "dir", mode: 0o700, uid: 70001, gid: 70001, 
 const inspectOut = (over = {}) => ({ epoch: EPOCH, fsid: FSID, dir: obj({ uid: 0, gid: 0, mode: 0o755, ino: 99 }),
   entries: { home: obj({ ino: 101 }), sessions: obj({ ino: 102 }), "var-tmp": obj({ ino: 103 }) }, ...over });
 const identified = (o = obj({ uid: 0, gid: 0, mode: 0o755, ino: 200 })) => ({ epoch: EPOCH, fsid: FSID, object: o });
-const USAGE = { block_size: 4096, blocks_upper: 10, inodes: 6, peak_blocks_upper: 14, peak_inodes: 9 };
+const USAGE = { block_size: 4096, blocks_upper: 10, inodes: 6, peak_blocks_upper: 14, peak_inodes: 9, listing_bytes_upper: 9000 };
 
 /**
  * A world: a temporary root, a restored registry (two live members of one tag, one deleted agent), the provisioned
@@ -148,8 +148,15 @@ test("archives: provisioned by restore under exactly the measured need; identifi
   // The limit: needOf's project bounds for the class (4 KiB blocks, inodes at the larger phase) plus the config
   // archive's own directory, in setquota's units.
   const n = needOf([USAGE]).project;
-  assert.deepEqual(archiveLimits(USAGE), { kib: (n.blocks + 1) * 4, inodes: n.inodesMax + 1 });
-  assert.deepEqual(archiveLimits(USAGE), { kib: (Math.max(10 + 3, 14 + 2) + 1) * 4, inodes: Math.max(6 + 4, 9 + 3) + 1 });
+  assert.deepEqual(ARCHIVE_ROOTS, { inodes: 2, blocks: 2 }, "the archive root and the config archive's root");
+  assert.deepEqual(archiveLimits(USAGE), { kib: (n.blocks + 2) * 4, inodes: n.inodesMax + 2 });
+  assert.deepEqual(archiveLimits(USAGE), { kib: (Math.max(10 + 3, 14 + 2) + fileBlocks(9000) + 2) * 4, inodes: Math.max(6 + 5, 9 + 4) + 2 });
+  // An EMPTY archive (the binary's usage of an empty class: the root directory's bound, its 34-byte list): every
+  // project inode that coexists is counted: the archive root, the config root, the attempt, data, the class leaf,
+  // the digest list and the marker, 7.
+  const emptyClass = { block_size: 4096, blocks_upper: 4, inodes: 0, peak_blocks_upper: 8, peak_inodes: 0, listing_bytes_upper: 34 };
+  assert.equal(archiveLimits(emptyClass).inodes, 7);
+  assert.equal(archiveLimits(emptyClass).kib, (Math.max(4 + 3, 8 + 2) + fileBlocks(34) + 2) * 4);
   assert.throws(() => archiveLimits({ ...USAGE, block_size: 1024 }), (e) => e.code === "bad_form");
   const w = world();
   await w.ad.provisionArchive(w.ids.dead);

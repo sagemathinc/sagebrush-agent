@@ -219,9 +219,10 @@ test("usage: the request's and the result's closed shapes", () => {
   for (const r of [{ op: "usage" }, { op: "usage", snapshot: "latest" }, { op: "usage", snapshot: S, path: "/abs" }, { op: "usage", snapshot: S, path: "a/../b" },
     { op: "usage", snapshot: S, path: "" }, { op: "usage", snapshot: S, exact: true }]) refused(() => checkRequest(r), "bad_form");
   const ok = (v) => parseResult(JSON.stringify({ ok: true, ...v }) + "\n", 0, null, "", "usage");
-  const good = { snapshot: S, entries: 306, inodes: 305, blocks_upper: 262_903, peak_inodes: 308, peak_blocks_upper: 262_920, block_size: 4096 };
+  const good = { snapshot: S, entries: 306, inodes: 305, blocks_upper: 262_903, peak_inodes: 308, peak_blocks_upper: 262_920, block_size: 4096, listing_bytes_upper: 40_000 };
   assert.deepEqual(ok(good), { ok: true, value: good, stderr: "" });
-  for (const bad of [{ ...good, inodes: 307 }, { ...good, peak_inodes: 304 }, { ...good, peak_blocks_upper: 262_902 }, { ...good, block_size: 1024 }, { ...good, entries: -1 }, { ...good, blocks_upper: 1.5 }, { ...good, extra: 1 }, { ...good, snapshot: "x" }]) {
+  const { listing_bytes_upper: _l, ...noList } = good;
+  for (const bad of [noList, { ...good, listing_bytes_upper: -1 }, { ...good, listing_bytes_upper: 1.5 }, { ...good, inodes: 307 }, { ...good, peak_inodes: 304 }, { ...good, peak_blocks_upper: 262_902 }, { ...good, block_size: 1024 }, { ...good, entries: -1 }, { ...good, blocks_upper: 1.5 }, { ...good, extra: 1 }, { ...good, snapshot: "x" }]) {
     assert.equal(ok(bad).code, "bad_result", JSON.stringify(bad));
   }
   assert.ok(CODES.includes("usage_failed"));

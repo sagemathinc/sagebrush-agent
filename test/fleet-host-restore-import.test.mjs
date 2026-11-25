@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
+import { refuse } from "../lib/fleet/bytes.mjs";
 import { HostStore } from "../lib/fleet/host/host-store.mjs";
 import { fenced, lowerFence } from "../lib/fleet/host/fence.mjs";
 import { fenceFiles } from "../lib/fleet/host/names.mjs";
@@ -28,7 +29,7 @@ const RUN = "20261124T030000Z-abcdefgh", RRUN = newRestoreRun(1795500000000, () 
 const tmp = () => mkdtempSync(join(tmpdir(), "sb-import-"));
 
 /** An old host's registry: two live agents (one with a start failure), a tombstone, a tag; and its manifest and plan. */
-function fixture() {
+function fixture({ dead2 = null } = {}) {
   const [a, b, dead, t] = [newId(), newId(), newId(), newId()];
   const registry = {
     v: 1, next_uid: 70007, next_gid: 80002, // the counters are kept exactly, whatever the highest uid
@@ -36,10 +37,11 @@ function fixture() {
       [a]: { uid: 70000, state: "running", life: 3, gen: 7, tags: [t], start_failed: "unit_failed" },
       [b]: { uid: 70003, state: "stopped", life: 1, gen: 7, tags: [], start_failed: null },
       [dead]: { uid: 70004, state: "deleted", life: 2, gen: 5, tags: [], start_failed: null },
+      ...(dead2 ? { [dead2]: { uid: 70005, state: "deleted", life: 1, gen: 2, tags: [], start_failed: null } } : {}),
     },
     tags: { [t]: { gid: 80001 } },
   };
-  const sets = [{ kind: "agent", id: a }, { kind: "agent", id: b }, { kind: "archive", id: dead }, { kind: "tag", id: t }]
+  const sets = [{ kind: "agent", id: a }, { kind: "agent", id: b }, { kind: "archive", id: dead }, ...(dead2 ? [{ kind: "archive", id: dead2 }] : []), { kind: "tag", id: t }]
     .map((s) => ({ ...s, snapshot: hex(), tree: hex(), unrestorable: { count: 0, paths: [] } }));
   const manifest = buildManifest({ host: "old-host", run: RUN, time: "2026-11-24T03:10:00.000Z", registry, sets, config: { [a]: hex(), [b]: hex() }, hoststore: hex() });
   const plan = newPlan({ manifest, snapshot: hex(), sha256: sha256(canonical(manifest) + "\n") }, RRUN);
@@ -485,4 +487,76 @@ test("a parent fsync that fails after the rename: the identical retry flushes th
   // A failure of that flush is still an error, never "present".
   const failAgain = spyIo((op, p) => op === "fsync" && p === join(dst, "a"));
   assert.throws(() => copyReadOnly(src, dst, { io: failAgain.io }), /injected fsync/);
+});
+
+test("the caller's lock guard runs before every effect: lost at any check, nothing after it is done", async () => {
+  const { registry, manifest, plan } = fixture();
+  // A whole import, recording what is on disk at each guard call.
+  const seen = (h) => JSON.stringify({
+    fences: existsSync(join(h.fenceDir, "restore")) ? readdirSync(join(h.fenceDir, "restore")).sort() : [],
+    registry: h.store.registry.ids(),
+    deprovision: existsSync(join(h.root, "deprovision", "deprovision.json")) ? readFileSync(join(h.root, "deprovision", "deprovision.json"), "utf8") : null,
+    provenance: existsSync(join(h.restoreDir, "provenance", "grant")),
+    audit: existsSync(join(h.root, "audit")) ? readdirSync(join(h.root, "audit")).filter((x) => x.startsWith("restored-")) : [],
+  });
+  const full = await host();
+  const at = [];
+  try {
+    await importHostStore({ copy: copyOf(registry), store: full.store, root: full.root, plan, manifest, restoreDir: full.restoreDir, fenceDir: full.fenceDir, guard: () => at.push(seen(full)) });
+  } finally { await full.store.close(); }
+  assert.ok(at.length >= 6, `${at.length} guard checks`);
+  // Lost at check k: refused there, and the disk is exactly as it was at that check in the whole run.
+  for (let k = 0; k < at.length; k++) {
+    const h = await host();
+    let n = 0;
+    try {
+      await rejects(importHostStore({ copy: copyOf(registry), store: h.store, root: h.root, plan, manifest, restoreDir: h.restoreDir, fenceDir: h.fenceDir,
+        guard: () => { if (n++ === k) refuse("outcome_unknown", "lost"); } }), "outcome_unknown");
+      assert.equal(seen(h), at[k], `lost at check ${k}: nothing after it`);
+    } finally { await h.store.close(); }
+  }
+});
+
+test("the guard at each effect boundary, fixed independently of the import's own checks: a lock lost after one effect stops the next", async () => {
+  const { a, b, dead, registry, manifest, plan } = fixture({ dead2: newId() });
+  const dead2 = Object.keys(registry.agents).find((id) => id !== dead && registry.agents[id].state === "deleted");
+  const [live1, live2] = [a, b].sort(), [dead1, deadB] = [dead, dead2].sort();
+  const disk = (h) => {
+    const dep = existsSync(join(h.root, "deprovision", "deprovision.json")) ? readFileSync(join(h.root, "deprovision", "deprovision.json"), "utf8") : "";
+    return {
+      fences: existsSync(join(h.fenceDir, "restore")) ? readdirSync(join(h.fenceDir, "restore")).sort() : [],
+      done: [dead1, deadB].filter((id) => dep.includes(id)),
+      registry: h.store.registry.ids().length,
+      provenance: existsSync(join(h.restoreDir, "provenance", "grant")),
+      audit: existsSync(join(h.root, "audit")) ? readdirSync(join(h.root, "audit")).filter((x) => x.startsWith("restored-")).length : 0,
+    };
+  };
+  const none = { fences: [], done: [], registry: 0, provenance: false, audit: 0 };
+  // Each boundary: the lock is reported lost once the disk shows the effect before it (a fixed condition on the disk,
+  // never a count of the import's own checks), and the disk must then be exactly the effects up to it: the next one,
+  // whose guard this boundary needs, never happens.
+  const rows = [
+    ["before the first fence", () => true, none],
+    ["between the fences", (d) => d.fences.length >= 1, { ...none, fences: [live1] }],
+    ["after the fences, before the first deprovision record", (d) => d.fences.length >= 2, { ...none, fences: [live1, live2] }],
+    ["between the deprovision records", (d) => d.done.length >= 1, { ...none, fences: [live1, live2], done: [dead1] }],
+    ["after the deprovision records, before the registry", (d) => d.done.length >= 2, { ...none, fences: [live1, live2], done: [dead1, deadB] }],
+    ["after the registry, before the provenance", (d) => d.registry > 0, { ...none, fences: [live1, live2], done: [dead1, deadB], registry: 4 }],
+    ["after the provenance, before the audit", (d) => d.provenance, { fences: [live1, live2], done: [dead1, deadB], registry: 4, provenance: true, audit: 0 }],
+  ];
+  for (const [label, lost, want] of rows) {
+    const h = await host();
+    try {
+      await rejects(importHostStore({ copy: copyOf(registry), store: h.store, root: h.root, plan, manifest, restoreDir: h.restoreDir, fenceDir: h.fenceDir,
+        guard: () => { if (lost(disk(h))) refuse("outcome_unknown", "lost"); } }), "outcome_unknown");
+      assert.deepEqual(disk(h), want, label);
+    } finally { await h.store.close(); }
+  }
+  // Without the grant, the audit's guard stands right after the registry.
+  const h = await host();
+  try {
+    await rejects(importHostStore({ copy: copyOf(registry, { entries: ["registry", "audit"] }), store: h.store, root: h.root, plan, manifest, restoreDir: h.restoreDir, fenceDir: h.fenceDir,
+      guard: () => { if (disk(h).registry > 0) refuse("outcome_unknown", "lost"); } }), "outcome_unknown");
+    assert.deepEqual(disk(h), { fences: [live1, live2], done: [dead1, deadB], registry: 4, provenance: false, audit: 0 });
+  } finally { await h.store.close(); }
 });

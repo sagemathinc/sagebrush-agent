@@ -2034,3 +2034,131 @@ test("provision holds the tag folders of the agent's CURRENT registry tags too, 
   await w.release();
   await s.close();
 });
+
+const waitFor = async (cond, ms = 3000) => { const end = Date.now() + ms; while (!(await cond())) { if (Date.now() > end) return false; await new Promise((r) => setTimeout(r, 10)); } return true; };
+/** A worker for A's own set, started now: "busy" (it found the set held) or "filled" (it took the set and filled). */
+const lateWorker = async (R) => {
+  const filled = [];
+  try {
+    await runWorker("agent", A, R.run, { filler: () => async () => { filled.push(1); return { state: "validated" }; } }, { dir: R.dir, uid: process.getuid() });
+  } catch (e) { if (e.code === "in_progress" && filled.length === 0) return "busy"; throw e; }
+  return filled.length ? "filled" : "none";
+};
+
+test("an effect abandoned past its deadline keeps the agent's sets held until it ACTUALLY settles: a late worker can't take the set meanwhile (purge, provision)", async () => {
+  for (const which of ["purge", "provision"]) {
+    const R = openRestore([`agent-${A}`]);
+    let settle;
+    const fx = fakeFx();
+    const hang = () => new Promise((r) => { settle = r; }); // ignores its abort signal: it settles only when told
+    if (which === "purge") fx.purge = async () => { await hang(); return { status: "purged" }; };
+    else fx.provision = async (id) => { if (id === A) await hang(); };
+    const deadlines = which === "purge" ? { deprovision: 30, grace: 20 } : { provision: 30, grace: 20 };
+    const { sup, close } = await setup({ fx, restoreWorker: R.restoreWorker, deadlines });
+    let r;
+    if (which === "purge") {
+      await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+      await sup.submit({ kind: "delete", authority: "person", agent: A });
+      r = await sup.submit({ kind: "purge", authority: "local", agent: A });
+      assert.deepEqual([r.status, r.reason, r.settled], ["pending", "step_deadline", false], which);
+    } else {
+      r = await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+      assert.equal(r.status, "failed", which);
+    }
+    assert.equal(sup.unsettled, 1, `${which}: abandoned, not settled`);
+    assert.equal(await R.probe("agent", A), "held", `${which}: still held while the effect may act`);
+    assert.equal(await lateWorker(R), "busy", `${which}: the late worker finds the set held`);
+    // The effect settles: the hold goes with it.
+    settle();
+    assert.ok(await waitFor(async () => sup.unsettled === 0 && (await R.probe("agent", A)) === "free"), `${which}: released once settled`);
+    await sup.close();
+    await close();
+  }
+});
+
+test("a restore hold's release never holds up the supervisor's close; it is started once, finishes in the background, and its failure is absorbed", async () => {
+  // A holder whose release hangs until lifted.
+  let releases = 0, lift, armed = false;
+  const gate = new Promise((r) => { lift = r; });
+  const restoreWorker = { hold: async () => ({ release: () => { releases++; return armed ? gate : Promise.resolve(); } }), dispatch: async () => ({ dispatched: null }) };
+  const { sup, close } = await setup({ restoreWorker });
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  await sup.submit({ kind: "delete", authority: "person", agent: A });
+  releases = 0;
+  armed = true; // the purge's release hangs
+  const purge = sup.submit({ kind: "purge", authority: "local", agent: A }).then((v) => ["ok", v], (e) => ["rejected", e?.message]);
+  await waitFor(async () => releases === 1);
+  const t0 = Date.now();
+  const closed = await Promise.race([sup.close().then(() => "closed"), new Promise((r) => setTimeout(() => r("stuck"), 200))]);
+  assert.equal(closed, "closed", "close is bounded while a release hangs");
+  assert.ok(Date.now() - t0 < 200);
+  const [how] = await purge;
+  assert.equal(how, "rejected", "the op ends where it is, as at a crash");
+  lift();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(releases, 1, "started exactly once");
+  await close();
+  // A release that rejects: absorbed; the op's result stands and the queue goes on.
+  const bad = { hold: async () => ({ release: async () => { throw new Error("helper gone"); } }), dispatch: async () => ({ dispatched: null }) };
+  const s2 = await setup({ restoreWorker: bad });
+  await s2.sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  await s2.sup.submit({ kind: "delete", authority: "person", agent: A });
+  assert.deepEqual(await s2.sup.submit({ kind: "purge", authority: "local", agent: A }), { status: "purged" });
+  assert.deepEqual(await s2.sup.submit({ kind: "requalify", authority: "local", agent: A }), { status: "requalified", rebound: ["home"] });
+  await s2.sup.close();
+  await s2.close();
+});
+
+test("both together, with real locks: an abandoned purge's hold outlives a bounded close, and is released once the effect settles", async () => {
+  const R = openRestore([`agent-${A}`]);
+  let settle;
+  const fx = fakeFx();
+  fx.purge = async () => { await new Promise((r) => { settle = r; }); return { status: "purged" }; };
+  const { sup, close } = await setup({ fx, restoreWorker: R.restoreWorker, deadlines: { deprovision: 30, grace: 20 } });
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  await sup.submit({ kind: "delete", authority: "person", agent: A });
+  const r = await sup.submit({ kind: "purge", authority: "local", agent: A });
+  assert.deepEqual([r.reason, r.settled], ["step_deadline", false]);
+  const closed = await Promise.race([sup.close().then(() => "closed"), new Promise((x) => setTimeout(() => x("stuck"), 200))]);
+  assert.equal(closed, "closed", "close is bounded with an abandoned effect and its hold outstanding");
+  assert.equal(await R.probe("agent", A), "held", "closed, but the effect may still act: the set stays held");
+  assert.equal(await lateWorker(R), "busy");
+  settle();
+  assert.ok(await waitFor(async () => (await R.probe("agent", A)) === "free"), "released once the effect settles");
+  await close();
+});
+
+test("positive controls: an effect that settles in time releases at once; a prompt release lets close finish", async () => {
+  const R = openRestore([`agent-${A}`]);
+  const { sup, close } = await setup({ restoreWorker: R.restoreWorker });
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  await sup.submit({ kind: "delete", authority: "person", agent: A });
+  assert.deepEqual(await sup.submit({ kind: "purge", authority: "local", agent: A }), { status: "purged" });
+  assert.equal(sup.unsettled, 0);
+  assert.equal(await R.probe("agent", A), "free", "released before the op returned");
+  assert.equal(await lateWorker(R), "filled", "a worker then takes the set");
+  await sup.close();
+  await close();
+});
+
+test("the recovery's deprovision lane keeps its hold through an abandoned pass too, until that pass settles", async () => {
+  const R = openRestore([`agent-${A}`]);
+  let settle = null;
+  const fx = fakeFx();
+  const { sup, close } = await setup({ fx, restoreWorker: R.restoreWorker, deadlines: { deprovision: 30, grace: 20 } });
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  fx.dpResult = () => ({ status: "pending", step: "accounts", reason: "uid still in use" });
+  await sup.submit({ kind: "delete", authority: "person", agent: A }); // left pending: the lane's to finish
+  fx.dpResult = null;
+  const orig = fx.deprovision;
+  fx.deprovision = async (...a) => { await new Promise((r) => { settle = r; }); return orig(...a); };
+  await sup.recover();
+  assert.notEqual(settle, null, "the lane ran its pass");
+  assert.equal(sup.unsettled, 1, "abandoned past its deadline");
+  assert.equal(await R.probe("agent", A), "held");
+  assert.equal(await lateWorker(R), "busy");
+  settle();
+  assert.ok(await waitFor(async () => sup.unsettled === 0 && (await R.probe("agent", A)) === "free"), "released once settled");
+  await sup.close();
+  await close();
+});

@@ -342,15 +342,21 @@ test("the nonce: a repeat is replay with nothing served; at the prune's edge it 
 test("rate limits: per source before authentication, per host after it; an unauthenticated flood never spends a host's budget", async () => {
   const w = world();
   for (let i = 0; i < CHAIN_RATE_HOST.limit; i++) assert.equal((await w.send(w.sig())).status, 200, `request ${i + 1}`);
+  const spends = w.st.spends, pages = w.st.pages;
   const r = await w.send(w.sig());
-  assert.deepEqual([r.status, errorOf(r)], [429, "rate"]);
+  assert.equal(r.status, 429);
+  assert.deepEqual(JSON.parse(text(r.body)), { error: "rate", retry_after_s: CHAIN_RATE_HOST.windowMs / 1000 }, "the host's branch carries retry_after_s");
+  assert.ok(Number.isSafeInteger(JSON.parse(text(r.body)).retry_after_s) && JSON.parse(text(r.body)).retry_after_s > 0);
+  assert.deepEqual([w.st.spends, w.st.pages], [spends, pages], "no nonce spent and no page read");
   const w2 = world();
   for (let i = 0; i < 20; i++) await w2.send(w2.sig(w2.hostA, { signer: w2.keys[w2.hostB] }));
   assert.equal(w2.st.counts.get(`chain-host:${w2.hostA}`) ?? 0, 0, "forged requests never reach the host's bucket");
   w2.st.counts.set("chain-src:198.51.100.7", CHAIN_RATE_SOURCE.limit);
   const s = await w2.send(w2.sig());
-  assert.deepEqual([s.status, errorOf(s)], [429, "rate"]);
-  assert.equal(w2.st.spends, 0);
+  assert.equal(s.status, 429);
+  assert.deepEqual(JSON.parse(text(s.body)), { error: "rate", retry_after_s: CHAIN_RATE_SOURCE.windowMs / 1000 }, "the source's branch carries retry_after_s");
+  assert.ok(Number.isSafeInteger(JSON.parse(text(s.body)).retry_after_s) && JSON.parse(text(s.body)).retry_after_s > 0);
+  assert.equal(w2.st.spends + w2.st.pages, 0, "no nonce spent and no page read");
 });
 
 test("store faults: a gap, a page past its head or a page that can't fit is 500; a failed nonce or page read is 503; nothing served", async () => {
@@ -378,6 +384,56 @@ test("store faults: a gap, a page past its head or a page that can't fit is 500;
   const pages = w.st.pages;
   assert.equal((await w.send(w.sig())).status, 503);
   assert.equal(w.st.pages, pages, "no page read without a spent nonce");
+});
+
+test("the order: the audience and the window are checked on the one clock sample before the host's authority is read", async () => {
+  const w = world();
+  const calls = [];
+  const watched = (over = {}) => w.ctx({
+    host: async (h) => { calls.push("host"); return w.st.hosts.get(h) ?? null; },
+    currentGen: async (_f, h) => { calls.push("currentGen"); return w.st.gens.get(h); },
+    ...over,
+  });
+  const throwing = { currentGen: async () => { calls.push("currentGen"); throw new Error("the store failed"); }, host: async () => { calls.push("host"); throw new Error("the store failed"); } };
+  for (const d of [SKEW + 1, -SKEW - 1]) {
+    calls.length = 0;
+    const r = await w.send(w.sig(w.hostA, { ts: NOW + d }), watched(throwing));
+    assert.deepEqual([r.status, errorOf(r), calls], [401, "clock_skew", []], `ts ${d}: refused before any authority read, whatever the store would do`);
+  }
+  calls.length = 0;
+  const aud = await w.send(w.sig(), watched({ ...throwing, aud: "https://elsewhere.example" }));
+  assert.deepEqual([aud.status, errorOf(aud), calls], [401, "bad_audience", []], "a service audience that isn't ours");
+  // (in the window, the reads happen in order; a store fault is a bare 500 with nothing spent, never a refusal)
+  calls.length = 0;
+  assert.equal((await w.send(w.sig(), watched())).status, 200);
+  assert.deepEqual(calls, ["host", "currentGen"]);
+  const spends = w.st.spends;
+  for (const over of [{ host: throwing.host }, { currentGen: throwing.currentGen }]) {
+    const r = await w.send(w.sig(), watched(over));
+    assert.deepEqual([r.status, r.body.length], [500, 0]);
+  }
+  assert.equal(w.st.spends, spends, "a store fault spends no nonce");
+});
+
+test("a stored entry over SIGNED_MAX UTF-8 bytes is a store fault: 500 with nothing served, at the exact boundary", async () => {
+  const w = world();
+  const cases = [
+    ["ASCII", "a".repeat(SIGNED_MAX), "a".repeat(SIGNED_MAX + 1)],
+    ["two-byte", "é".repeat(SIGNED_MAX / 2), "é".repeat(SIGNED_MAX / 2) + "a"],
+    ["four-byte", "𝄞".repeat(SIGNED_MAX / 4), "𝄞".repeat(SIGNED_MAX / 4) + "a"],
+  ];
+  for (const [what, fits, over] of cases) {
+    assert.deepEqual([enc(fits).length, enc(over).length], [SIGNED_MAX, SIGNED_MAX + 1], what);
+    w.st.entries.set(w.fleetA, [fits]);
+    const r = await w.send(w.sig());
+    assert.equal(r.status, 200, `${what}: exactly SIGNED_MAX is served`);
+    assert.equal(text(parseChainPage(r.body, -1).entries[0]), fits);
+    for (const entries of [[over], [fits, over]]) {
+      w.st.entries.set(w.fleetA, entries);
+      const bad = await w.send(w.sig());
+      assert.deepEqual([bad.status, bad.body.length], [500, 0], `${what}: one byte over, entry ${entries.length}`);
+    }
+  }
 });
 
 test("transport: another route, method or scheme is refused before anything is read or written", async () => {

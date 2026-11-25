@@ -313,7 +313,7 @@ test("row 8: no result or refusal is replayed before the first authenticated rac
   assert.deepEqual((await Promise.all(out)).map((o) => o.outcome), ["result", "not_run"]);
 });
 
-// ---- takeover (r4.2 §7: astra2's rows 1-4; row 5 is a mutant)
+// ---- takeover (r4.2 §7: the tests review's rows 1-4; row 5 is a mutant)
 
 test("takeover 1: a command after pause reaches no execution, and is not run", async () => {
   const s = sessions();

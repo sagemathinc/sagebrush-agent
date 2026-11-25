@@ -49,7 +49,7 @@ test("the pinned inputs and the program: every file has its pinned hash, and the
   const c = (a) => flat.filter((r) => r.action.startsWith(a)).length;
   // (the counts the freeze's reviewers reproduced: 318 locations)
   assert.deepEqual([flat.length, c("map"), c("drop"), c("keep"), c("recurse")], [318, 101, 65, 43, 109]);
-  // (both of astra4's draft-4 findings are explicit drop rows)
+  // (both of the security review's draft-4 findings are explicit drop rows)
   assert.ok(flat.some((r) => r.owner === "Runtime.executionContextDestroyed event" && r.path === "executionContextUniqueId" && r.action === "drop"));
   assert.ok(flat.some((r) => r.owner === "Runtime.executionContextCreated event" && r.path === "context.auxData" && r.action === "drop"));
 });

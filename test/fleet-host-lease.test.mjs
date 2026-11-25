@@ -123,7 +123,7 @@ test("arming: an absolute OnBootSec timer, AccuracySec=1s, running lease-expire 
 
 test("armWatchdog: verified only when active, waiting, and elapsing at or before m*; else lease_unverified", async () => {
   const e = env(), c = fakeClock();
-  const rec = { lease_id: "L1", lg: 1, expiry_tick: c.boot() + 600_000 };
+  const rec = { lease_id: "L1", lg: 1, expiry_tick: c.boot() + 600_000, gen: 3 };
   const ok = await armWatchdog(A, rec, { sys: fakeSys(e), clock: c });
   assert.equal(ok.timer, watchdogTimer(A, 1));
   await rejects(armWatchdog(A, rec, { sys: fakeSys(e, { armFails: true }), clock: c }), "lease_unverified");
@@ -132,13 +132,13 @@ test("armWatchdog: verified only when active, waiting, and elapsing at or before
   await rejects(armWatchdog(A, rec, { sys: fakeSys(e, { readBack: () => 0 }), clock: c }), "lease_unverified");
   // a deadline already inside the margin: refused before anything is armed
   const late = fakeSys(e);
-  await rejects(armWatchdog(A, { ...rec, expiry_tick: c.boot() + MARGIN_MS }, { sys: late, clock: c }), "lease_unverified");
+  await rejects(armWatchdog(A, { ...rec, expiry_tick: c.boot() + MARGIN_MS, gen: 3 }, { sys: late, clock: c }), "lease_unverified");
   assert.deepEqual(late.calls, []);
 });
 
 test("publish (re-arm step 2) and SEC H1: nothing is published once now >= expiry_tick - 30 s, or for a spent or elapsed timer", async () => {
   const e = env(), c = fakeClock(), sys = fakeSys(e);
-  const rec = { lease_id: "L1", lg: 2, expiry_tick: c.boot() + 600_000 };
+  const rec = { lease_id: "L1", lg: 2, expiry_tick: c.boot() + 600_000, gen: 3 };
   await armWatchdog(A, rec, { sys, clock: c });
   const o = { dir: e.dir, sys, clock: c };
   // inside the margin but before the signed expiry: treated as expired
@@ -161,14 +161,49 @@ test("publish (re-arm step 2) and SEC H1: nothing is published once now >= expir
   assert.equal(statSync(join(e.dir, A)).mode & 0o777, 0o644);
 });
 
+test("the record's gen (execution lease r3.12): written, read back as a number, required, and refused out of range", () => {
+  const e = env();
+  const rec = { lease_id: "L1", lg: 5, expiry_tick: 100000, gen: 7 };
+  writeRecord(A, rec, { dir: e.dir });
+  assert.equal(readFileSync(join(e.dir, A), "utf8"), '{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":7}');
+  const got = readRecord(A, { dir: e.dir });
+  assert.deepEqual(got, { state: "ok", rec });
+  assert.equal(typeof got.rec.gen, "number", "a number: the restore-resume helper compares it with ===");
+  for (const gen of [undefined, 0, -1, 1.5, "7", 2 ** 53, null]) {
+    assert.throws(() => writeRecord(A, { ...rec, gen }, { dir: e.dir }), (x) => x.code === "bad_form", String(gen));
+    writeFileSync(join(e.dir, A), JSON.stringify(gen === undefined ? { lease_id: "L1", lg: 5, expiry_tick: 100000 } : { ...rec, gen }));
+    assert.deepEqual(readRecord(A, { dir: e.dir }), { state: "bad" }, `read ${String(gen)}`);
+  }
+  for (const gen of [1, 2 ** 53 - 1]) {
+    writeRecord(A, { ...rec, gen }, { dir: e.dir });
+    assert.equal(readRecord(A, { dir: e.dir }).rec.gen, gen);
+  }
+});
+
+test("the helper activates alike whatever the record's gen", async () => {
+  for (const gen of [1, 7]) {
+    const e = env(), c = fakeClock(), locks = fakeLocks(), sys = fakeSys(e, { locks });
+    const rec = { lease_id: "L", lg: 1, expiry_tick: c.boot() + 600_000, gen };
+    await armWatchdog(A, rec, { sys, clock: c });
+    assert.equal(await publish(A, rec, { dir: e.dir, sys, clock: c }), true);
+    raiseFence("lease", A, { dir: join(e.fenceDir, "..") });
+    const r = await leaseActivate(A, "L", 1, { dir: e.dir, fenceDir: e.fenceDir, sys, clock: c, lock: locks.lock });
+    assert.deepEqual(r, { activated: true, reason: null, lowered: true }, `gen ${gen}`);
+  }
+});
+
 test("the watchdog is a no-op only for a strictly newer lg: same, older, missing and unreadable records all act", async () => {
   for (const [label, setup, acts] of [
-    ["newer", (e) => writeRecord(A, { lease_id: "L", lg: 6, expiry_tick: 1 }, { dir: e.dir }), false],
-    ["same", (e) => writeRecord(A, { lease_id: "L", lg: 5, expiry_tick: 1 }, { dir: e.dir }), true],
-    ["older", (e) => writeRecord(A, { lease_id: "L", lg: 4, expiry_tick: 1 }, { dir: e.dir }), true],
+    ["newer", (e) => writeRecord(A, { lease_id: "L", lg: 6, expiry_tick: 1, gen: 3 }, { dir: e.dir }), false],
+    ["same", (e) => writeRecord(A, { lease_id: "L", lg: 5, expiry_tick: 1, gen: 3 }, { dir: e.dir }), true],
+    ["older", (e) => writeRecord(A, { lease_id: "L", lg: 4, expiry_tick: 1, gen: 3 }, { dir: e.dir }), true],
     ["missing", () => {}, true],
     ["unreadable", (e) => { mkdirSync(e.dir, { recursive: true }); writeFileSync(join(e.dir, A), "{not json"); }, true],
-    ["malformed", (e) => { mkdirSync(e.dir, { recursive: true }); writeFileSync(join(e.dir, A), JSON.stringify({ lease_id: "L", lg: 9, expiry_tick: 1, x: 1 })); }, true],
+    ["malformed", (e) => { mkdirSync(e.dir, { recursive: true }); writeFileSync(join(e.dir, A), JSON.stringify({ lease_id: "L", lg: 9, expiry_tick: 1, gen: 3, x: 1 })); }, true],
+    // r3.12: gen changes nothing here; the old three-key shape is malformed, so the watchdog acts on it.
+    ["newer, another gen", (e) => writeRecord(A, { lease_id: "L", lg: 6, expiry_tick: 1, gen: 7 }, { dir: e.dir }), false],
+    ["same, another gen", (e) => writeRecord(A, { lease_id: "L", lg: 5, expiry_tick: 1, gen: 9 }, { dir: e.dir }), true],
+    ["the old shape, newer lg", (e) => { mkdirSync(e.dir, { recursive: true }); writeFileSync(join(e.dir, A), JSON.stringify({ lease_id: "L", lg: 9, expiry_tick: 1 })); }, true],
   ]) {
     const e = env(), locks = fakeLocks(), sys = fakeSys(e, { locks });
     setup(e);
@@ -235,8 +270,8 @@ test("a watchdog never kills outside the slice, never by pid: a busy lock held O
 
 test("a record renewed while the watchdog waited for the lock: it is stale after all and stops nothing", async () => {
   const e = env(), locks = fakeLocks(), sys = fakeSys(e, { locks });
-  writeRecord(A, { lease_id: "L", lg: 3, expiry_tick: 1 }, { dir: e.dir });
-  const lock = async (p, o) => { writeRecord(A, { lease_id: "M", lg: 4, expiry_tick: 2 }, { dir: e.dir }); return locks.lock(p, o); };
+  writeRecord(A, { lease_id: "L", lg: 3, expiry_tick: 1, gen: 3 }, { dir: e.dir });
+  const lock = async (p, o) => { writeRecord(A, { lease_id: "M", lg: 4, expiry_tick: 2, gen: 3 }, { dir: e.dir }); return locks.lock(p, o); };
   const r = await leaseExpire(A, "L", 3, { ...opts(e, sys, locks), lock });
   assert.equal(r.acted, false);
   assert.equal(existsSync(e.fence), false);
@@ -270,7 +305,7 @@ test("an absent slice is proven empty; an unreadable one is never", async () => 
 function activated(e, c, lg = 1, more = {}) {
   const locks = fakeLocks(), sys = fakeSys(e, { locks, ...more });
   return { locks, sys, run: async () => {
-    const rec = { lease_id: "L", lg, expiry_tick: c.boot() + 600_000 };
+    const rec = { lease_id: "L", lg, expiry_tick: c.boot() + 600_000, gen: 3 };
     await armWatchdog(A, rec, { sys, clock: c });
     assert.equal(await publish(A, rec, { dir: e.dir, sys, clock: c }), true);
     raiseFence("lease", A, { dir: join(e.fenceDir, "..") });
@@ -293,7 +328,9 @@ test("the helper refuses, changing nothing: outside the slice, busy, unpublished
   const cases = [
     ["outside_slice", (k) => { k.sys.self = "/system.slice/x.service"; }],
     ["busy", async (k, e) => { await k.locks.lock(join(e.dir, `${A}.lock`), {}); }],
-    ["not_published", (k, e) => writeRecord(A, { lease_id: "OTHER", lg: 1, expiry_tick: 9e12 }, { dir: e.dir })],
+    ["not_published", (k, e) => writeRecord(A, { lease_id: "OTHER", lg: 1, expiry_tick: 9e12, gen: 3 }, { dir: e.dir })],
+    // r3.12: the same lease in the old three-key shape is malformed, so it isn't published either
+    ["not_published", (k, e) => writeFileSync(join(e.dir, A), JSON.stringify({ lease_id: "L", lg: 1, expiry_tick: 9e12 }))],
     ["spent", (k, e) => writeFileSync(join(e.dir, `${A}.spent`), "1\n")],
     ["timer_not_waiting", (k) => { k.sys.timers[watchdogTimer(A, 1)].sub = "elapsed"; }],
     ["expired", (k, e, c) => c.advance(600_000 - MARGIN_MS)],
@@ -338,9 +375,9 @@ test("a watchdog at every activation seam: no lease fence ends lowered after a w
 test("T2d: arm, then both watchdogs fire before publication; publication 10 s before the signed expiry finds the lg spent", async () => {
   for (const first of [true, false]) {
     const e = env(), c = fakeClock(), locks = fakeLocks(), sys = fakeSys(e, { locks });
-    if (!first) { const old = { lease_id: "O", lg: 1, expiry_tick: c.boot() + 60_000 }; await armWatchdog(A, old, { sys, clock: c }); await publish(A, old, { dir: e.dir, sys, clock: c }); }
+    if (!first) { const old = { lease_id: "O", lg: 1, expiry_tick: c.boot() + 60_000, gen: 3 }; await armWatchdog(A, old, { sys, clock: c }); await publish(A, old, { dir: e.dir, sys, clock: c }); }
     const lg = first ? 1 : 2;
-    const rec = { lease_id: "N", lg, expiry_tick: c.boot() + 120_000 };
+    const rec = { lease_id: "N", lg, expiry_tick: c.boot() + 120_000, gen: 3 };
     await armWatchdog(A, rec, { sys, clock: c });
     // the supervisor is stopped here; both timers fire
     if (!first) await leaseExpire(A, "O", 1, opts(e, sys, locks));
@@ -411,7 +448,7 @@ test("a watchdog that had to kill the slice for the lock completes its stop even
   mkdirSync(e.dir, { recursive: true });
   await locks.holdInSlice(join(e.dir, `${A}.lock`), true);
   const kill = sys.kill;
-  sys.kill = (d) => { kill(d); writeRecord(A, { lease_id: "M", lg: 9, expiry_tick: 2 }, { dir: e.dir }); };
+  sys.kill = (d) => { kill(d); writeRecord(A, { lease_id: "M", lg: 9, expiry_tick: 2, gen: 3 }, { dir: e.dir }); };
   const r = await leaseExpire(A, "L", 3, opts(e, sys, locks));
   assert.equal(r.acted, true);
   assert.equal(r.proven, true);

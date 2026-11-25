@@ -1,5 +1,5 @@
 {
- "about": "The execution lease's runtime files, read by both lease.mjs (js) and the launcher's lease-check (rust). A tombstone's value, or null when refused; a record accepted or not. Rust is never more lenient than JS: where they differ (16-digit tombstones are never written by lease.mjs; 5.0 and duplicate keys are never written by its JSON.stringify), Rust refuses, which fails closed.",
+ "about": "The execution lease's runtime files, read by both lease.mjs (js) and the launcher's lease-check (rust). A tombstone's value, or null when refused; a record accepted or not. Rust is never more lenient than JS: where they differ (16-digit tombstones are never written by lease.mjs; 5.0 and duplicate keys, lg's or gen's, are never written by its JSON.stringify), Rust refuses, which fails closed.",
  "tombstones": [
   {
    "text": "0\n",
@@ -59,52 +59,107 @@
  ],
  "records": [
   {
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":3}",
+   "js": true,
+   "rust": true
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":9007199254740991,\"expiry_tick\":9007199254740991,\"gen\":3}",
+   "js": true,
+   "rust": true
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":9007199254740992,\"expiry_tick\":1,\"gen\":3}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":0,\"expiry_tick\":1,\"gen\":3}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":-1,\"gen\":3}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":1,\"x\":1,\"gen\":3}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"lg\":5,\"expiry_tick\":1,\"gen\":3}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"a b\",\"lg\":5,\"expiry_tick\":1,\"gen\":3}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":5.0,\"expiry_tick\":1,\"gen\":3}",
+   "js": true,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":1,\"lg\":2,\"expiry_tick\":1,\"gen\":3}",
+   "js": true,
+   "rust": false
+  },
+  {
    "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000}",
+   "js": false,
+   "rust": false
+  },
+  {
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":1}",
    "js": true,
    "rust": true
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":9007199254740991,\"expiry_tick\":9007199254740991}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":9007199254740991}",
    "js": true,
    "rust": true
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":9007199254740992,\"expiry_tick\":1}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":0}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":0,\"expiry_tick\":1}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":9007199254740992}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":-1}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":\"3\"}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":1,\"x\":1}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":1.5}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"lg\":5,\"expiry_tick\":1}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":-1}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"a b\",\"lg\":5,\"expiry_tick\":1}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":null}",
    "js": false,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":5.0,\"expiry_tick\":1}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":3.0}",
    "js": true,
    "rust": false
   },
   {
-   "text": "{\"lease_id\":\"L1\",\"lg\":1,\"lg\":2,\"expiry_tick\":1}",
+   "text": "{\"lease_id\":\"L1\",\"lg\":5,\"expiry_tick\":100000,\"gen\":2,\"gen\":3}",
    "js": true,
    "rust": false
   }

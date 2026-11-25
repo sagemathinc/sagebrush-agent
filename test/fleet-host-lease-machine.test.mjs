@@ -981,7 +981,7 @@ const resumeOp = (w) => ({
         const [id, gen, leaseId, lg] = argv.slice(at + 1);
         const r = await resumeRestored(id, Number(gen), leaseId, Number(lg), {
           restoreState: (x) => readRestore("agent", x, { dir: w.restoreDir })?.state, dir: w.leaseDir, fenceDir: w.fenceDir,
-          leaseFenceDir: join(w.fenceDir, "lease"), clock: w.clock, cgroupOf: () => resumeCgroup(id),
+          leaseFenceDir: join(w.fenceDir, "lease"), clock: w.clock, cgroupOf: () => resumeCgroup(id), barrier: w.helperBarrier,
           sys: { ...w.lsys, selfCgroup: () => resumeCgroup(id), start: w.helperStart ?? (async () => {
             w.fx.log.push(["resume-start", id]);
             if (!w.fx.u(id).masked && !fenced(id, { dir: w.fenceDir })) w.fx.u(id).active = true;
@@ -1385,5 +1385,48 @@ test("C7' (iii): a reopen queued behind an in-flight resume-restored starts only
   await resume;
   assert.deepEqual((await reopen).status, "reopened");
   assert.deepEqual(order, ["resume-start", "resume-end", "reopen"]);
+  await w.close();
+});
+
+test("C7' (iii), the REAL helper held at after_checks: a queued reopen does nothing until the resume op's result, then contains the agent", async () => {
+  const w = await world({ resumeOp, sleepOpts: reopenSeams });
+  await restored(w);
+  const old = w.machine.current(A);
+  let release, atChecks = false;
+  const held = new Promise((r) => { release = r; });
+  w.helperBarrier = async (n) => { if (n === "after_checks") { atChecks = true; await held; } };
+  const order = [];
+  let atResult;
+  const resume = resumeRestoredOp(w).then((r) => {
+    order.push("resume");
+    atResult = { causes: fenceCauses(A, { dir: w.fenceDir }), calls: [...w.sleepSys.calls], reopen: existsSync(join(w.leaseDir, "reopen")) };
+    return r;
+  });
+  // the helper's locks are real flocks: a real-time wait, bounded
+  for (const end = Date.now() + 5000; !atChecks && Date.now() < end;) await new Promise((r) => setTimeout(r, 5));
+  assert.ok(atChecks, "the helper is held at after_checks");
+  gateWrite(w, S(1), null); // the hook's post for generation 1
+  const reopen = w.sup.submit({ kind: "sleep-reopen", authority: "host" }).then((r) => { order.push("reopen"); return r; });
+  await new Promise((r) => setTimeout(r, 200)); // the reopen's chance to run, were it not queued behind the resume
+  // Nothing of the reopen before the resume op's result: no containment, kill, freeze, mask, void or reopen write.
+  assert.deepEqual(w.sleepSys.calls, []);
+  assert.equal(existsSync(join(w.leaseDir, "reopen")), false);
+  assert.equal(w.leaseUp(A), false, "lease not raised");
+  assert.deepEqual(w.machine.current(A), old, "not voided");
+  assert.deepEqual(fenceCauses(A, { dir: w.fenceDir }), ["restore"]);
+  assert.deepEqual(order, []);
+  release();
+  const r = await resume;
+  assert.equal(r.status, "resumed");
+  assert.deepEqual(atResult, { causes: [], calls: [], reopen: false }, "at the op's result: restore lowered, nothing of the reopen yet");
+  assert.deepEqual(await reopen, { status: "reopened", gen: 1 });
+  assert.deepEqual(order, ["resume", "reopen"]);
+  // Then the reopen contains it: voided, `lease` raised, the record spent, killed, thawed after the proof, acknowledged.
+  assert.equal(w.machine.current(A), null);
+  assert.deepEqual(fenceCauses(A, { dir: w.fenceDir }), ["lease"]);
+  assert.ok(readTombstone(A, { dir: w.leaseDir }) >= old.lg);
+  assert.ok(w.sleepSys.calls.includes("kill"));
+  assert.equal(w.sleepSys.freeze, "0");
+  assert.equal(readFileSync(join(w.leaseDir, "reopen"), "utf8"), R(1));
   await w.close();
 });

@@ -1052,7 +1052,9 @@ test("a thaw that doesn't settle stops the resume there: contained with a fence,
   const { sup, store, fenceDir, close } = await setup({ fx, deadlines: { freeze: 20, grace: 20 } });
   await sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
   await sup.submit({ kind: "pause", authority: "service", agent: A });
-  fx.thaw = async () => lateBy(150); // ignores its abort
+  // (the thaw settles only when this test says so, never by a timer: the resume's own time under load can't race it)
+  let settle;
+  fx.thaw = () => new Promise((res) => { settle = res; }); // ignores its abort
   fx.log.length = 0;
   const r = await sup.submit({ kind: "resume", authority: "person", agent: A });
   assert.deepEqual([r.status, r.settled, r.fenced], ["failed", false, true]);
@@ -1060,7 +1062,9 @@ test("a thaw that doesn't settle stops the resume there: contained with a fence,
   assert.deepEqual([store.registry.agent(A).state, fx.units[A].active, existsSync(join(fenceDir, A))], ["stopped", false, true]);
   // Until it settles, an authority-giving effect is refused even inside an emergency's own sequence.
   assert.equal(sup.unsettled, 1);
-  await new Promise((res) => setTimeout(res, 200));
+  settle();
+  // (settled: the count falls to 0, polled within a bound rather than after a fixed sleep)
+  for (const t0 = Date.now(); sup.unsettled !== 0 && Date.now() - t0 < 5000;) await new Promise((res) => setTimeout(res, 10));
   assert.equal(sup.unsettled, 0);
   await close();
 });

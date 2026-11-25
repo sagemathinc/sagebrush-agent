@@ -2,7 +2,7 @@
 // after a crash at every durable effect, and close with its one commit point. Real temporary directories and the real
 // flock; the store's listing, the host store's copy and its import are fakes that record what they were given.
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
@@ -10,7 +10,7 @@ import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { lockFile } from "../lib/fleet/host/store.mjs";
 import { newRecord, newRestoreRun, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 import { PLAN, closePlan, newPlan, readPlan, replanSet, updatePlan } from "../lib/fleet/host/restore-plan.mjs";
-import { ABANDON, BEGIN, CLOSED, HOSTSTORE_COPY, REQUESTS, begin, close, closeBlockers, readBegin, restoreOpen, withExclusion } from "../lib/fleet/host/restore-begin.mjs";
+import { ABANDON, BEGIN, CLOSED, HOSTSTORE_COPY, REQUESTS, begin, close, closeBlockers, readBegin, removeBeneath, restoreOpen, withExclusion } from "../lib/fleet/host/restore-begin.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
@@ -474,6 +474,89 @@ test("close: a holder killed before the commit leaves the restore open; after it
     assert.ok(existsSync(join(h.dir, REQUESTS)), `${step}: the requests weren't removed`);
     if (step !== "close:archived") assert.ok(!existsSync(join(h.dir, CLOSED, RUN, PLAN)), `${step}: nothing archived`);
     // Close again (the locks fresh): it finishes, with the first close time when it had committed.
+    assert.deepEqual(await close({ now: () => 9, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID }), { closed: committed ? 7 : 9 });
+  }
+});
+
+// ---- SEC r2 narrowing: a replaced nested entry, and lock loss inside the copy and the import ------------------------
+
+test("removeBeneath walks by handle: a nested directory replaced by a link before its open, or moved away after it, never reaches the outside", async () => {
+  const mk = () => {
+    const root = mkdtempSync(join(tmpdir(), "sb-rm-"));
+    chmodSync(root, 0o700);
+    const top = join(root, "top"), ext = join(root, "outside");
+    mkdirSync(join(top, "run", "sub", "deeper"), { recursive: true });
+    writeFileSync(join(top, "run", "sub", "deeper", "f"), "ours");
+    // entries named like the outside's, so a walk that re-resolved the name would reach (and remove) the outside's
+    for (const n of ["a", "g", "keep", "z"]) writeFileSync(join(top, "run", "sub", n), "ours");
+    mkdirSync(ext); writeFileSync(join(ext, "keep"), "outside bytes");
+    chmodSync(join(top, "run", "sub"), 0o777); // a level someone else could write: made private through its handle first
+    const intact = () => readFileSync(join(ext, "keep"), "utf8") === "outside bytes" && readdirSync(ext).join() === "keep";
+    return { root, top, ext, intact };
+  };
+  // Replaced between its lstat and its open: refused, the outside untouched.
+  let t = mk();
+  let swapped = false;
+  const before = (here, name) => {
+    if (name === "sub" && !swapped) { swapped = true; renameSync(join(here, "sub"), join(t.root, "moved")); symlinkSync(t.ext, join(here, "sub")); }
+  };
+  assert.throws(() => removeBeneath(t.top, "run", { uid: UID, onEntry: before }), (e) => e.code === "not_granted");
+  assert.ok(swapped && t.intact(), "the outside is untouched");
+  // Moved away and replaced by a link AFTER it was opened (while its entries are removed): the walk stays on the
+  // opened directory; the outside is untouched, and the link left at the name is never followed.
+  t = mk();
+  swapped = false;
+  // At the FIRST entry of sub visited (sub already opened and listed), so every later entry would be re-resolved by a
+  // pathname walk through the link: "keep" among them.
+  const during = (here, name) => {
+    if (["a", "deeper", "g", "keep", "z"].includes(name) && !swapped) {
+      swapped = true;
+      renameSync(join(t.top, "run", "sub"), join(t.root, "moved"));
+      symlinkSync(t.ext, join(t.top, "run", "sub"));
+    }
+  };
+  assert.throws(() => removeBeneath(t.top, "run", { uid: UID, onEntry: during }));
+  assert.ok(swapped && t.intact(), "the outside is untouched");
+  assert.deepEqual(readdirSync(join(t.root, "moved")), [], "the opened directory itself was emptied");
+  assert.equal(statSync(join(t.root, "moved")).mode & 0o777, 0o700, "the writable level was made private through its handle before its entries were read");
+  // No race: the whole tree goes, the writable level included.
+  t = mk();
+  removeBeneath(t.top, "run", { uid: UID });
+  assert.deepEqual(readdirSync(t.top), []);
+  assert.ok(t.intact());
+});
+
+test("a lock lost INSIDE the host store's copy or import (the real holder killed mid-step): the step's next effect never happens", async () => {
+  for (const [which, inside] of [["exclusion", "restoreHostStore"], ["exclusion", "importHostStore"], ["restore", "restoreHostStore"], ["restore", "importHostStore"]]) {
+    const effects = [];
+    const h = host();
+    const path = which === "exclusion" ? h.exclusion.path : join(h.dir, ".lock");
+    // A step with three effects, each behind the guard it is given, the holder killed after the first.
+    const step = async (guard) => {
+      for (let i = 0; i < 3; i++) {
+        guard();
+        effects.push(i);
+        if (i === 0) { killHolder(path); await settle(); }
+      }
+    };
+    h.deps[inside] = inside === "restoreHostStore"
+      ? async (chosen, into, { guard }) => { await step(guard); writeFileSync(join(into, "registry.json"), "{}"); }
+      : async ({ guard }) => { await step(guard); };
+    await rejects(h.run(), "outcome_unknown");
+    assert.deepEqual(effects, [0], `${which} lost inside ${inside}: only the first effect`);
+    assert.notEqual(JSON.parse(state(h).begin).state, "done");
+  }
+});
+
+test("close: the RESTORE lock's holder killed at each step, as the exclusion's: the same stop, and close again finishes", async () => {
+  for (const [step, committed] of [["close:locked", false], ["close:checked", false], ["close:committed", true], ["close:archived", true]]) {
+    const h = host();
+    await h.run();
+    records(h, { agent: "validated", archive: "validated", tag: "validated" });
+    const onStep = async (name) => { if (name === step) { killHolder(join(h.dir, ".lock")); await settle(); } };
+    await rejects(close({ now: () => 7, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID, onStep }), "outcome_unknown");
+    assert.equal(restoreOpen({ dir: h.dir }), !committed, step);
+    assert.ok(existsSync(join(h.dir, REQUESTS)), `${step}: the requests weren't removed`);
     assert.deepEqual(await close({ now: () => 9, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID }), { closed: committed ? 7 : 9 });
   }
 });

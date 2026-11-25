@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
+import { refuse } from "../lib/fleet/bytes.mjs";
 import { HostStore } from "../lib/fleet/host/host-store.mjs";
 import { fenced, lowerFence } from "../lib/fleet/host/fence.mjs";
 import { fenceFiles } from "../lib/fleet/host/names.mjs";
@@ -485,4 +486,32 @@ test("a parent fsync that fails after the rename: the identical retry flushes th
   // A failure of that flush is still an error, never "present".
   const failAgain = spyIo((op, p) => op === "fsync" && p === join(dst, "a"));
   assert.throws(() => copyReadOnly(src, dst, { io: failAgain.io }), /injected fsync/);
+});
+
+test("the caller's lock guard runs before every effect: lost at any check, nothing after it is done", async () => {
+  const { registry, manifest, plan } = fixture();
+  // A whole import, recording what is on disk at each guard call.
+  const seen = (h) => JSON.stringify({
+    fences: existsSync(join(h.fenceDir, "restore")) ? readdirSync(join(h.fenceDir, "restore")).sort() : [],
+    registry: h.store.registry.ids(),
+    deprovision: existsSync(join(h.root, "deprovision", "deprovision.json")) ? readFileSync(join(h.root, "deprovision", "deprovision.json"), "utf8") : null,
+    provenance: existsSync(join(h.restoreDir, "provenance", "grant")),
+    audit: existsSync(join(h.root, "audit")) ? readdirSync(join(h.root, "audit")).filter((x) => x.startsWith("restored-")) : [],
+  });
+  const full = await host();
+  const at = [];
+  try {
+    await importHostStore({ copy: copyOf(registry), store: full.store, root: full.root, plan, manifest, restoreDir: full.restoreDir, fenceDir: full.fenceDir, guard: () => at.push(seen(full)) });
+  } finally { await full.store.close(); }
+  assert.ok(at.length >= 6, `${at.length} guard checks`);
+  // Lost at check k: refused there, and the disk is exactly as it was at that check in the whole run.
+  for (let k = 0; k < at.length; k++) {
+    const h = await host();
+    let n = 0;
+    try {
+      await rejects(importHostStore({ copy: copyOf(registry), store: h.store, root: h.root, plan, manifest, restoreDir: h.restoreDir, fenceDir: h.fenceDir,
+        guard: () => { if (n++ === k) refuse("outcome_unknown", "lost"); } }), "outcome_unknown");
+      assert.equal(seen(h), at[k], `lost at check ${k}: nothing after it`);
+    } finally { await h.store.close(); }
+  }
 });

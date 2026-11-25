@@ -136,6 +136,7 @@ test("CI's comparison accepts exactly the three machine-dependent tails, and not
     ["two Unlisted sections", head + unlisted + unlisted],
     ["text after the Unlisted section", head + unlisted + "x\n"],
     ["two empty lines", head + "\n\n"],
+    ["the last Ungrouped line without its newline", head.slice(0, -1)],
   ]) assert.ok(run(t).length > 0, what);
 });
 
@@ -149,7 +150,7 @@ test("the check command itself: a changed or absent Unlisted section passes, a n
   const cli = (text) => spawnSync(process.execPath, [fileURLToPath(new URL("../scripts/seccomp-policy.mjs", import.meta.url)), "check", write("filter", text), u, v], { encoding: "utf8" });
   try {
     for (const t of [filterText, head, head + unlisted]) assert.equal(cli(t).status, 0, cli(t).stderr);
-    for (const t of [head.replace("    accept4\n", "    accept5\n"), head.replace("#   arc_gettls\n", ""), head + unlisted.replace("host_only_call", "host only")]) {
+    for (const t of [head.replace("    accept4\n", "    accept5\n"), head.replace("#   arc_gettls\n", ""), head + unlisted.replace("host_only_call", "host only"), head.slice(0, -1)]) {
       const r = cli(t);
       assert.equal(r.status, 1);
       assert.match(r.stderr, /seccomp policy: /);

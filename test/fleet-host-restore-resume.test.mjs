@@ -115,7 +115,8 @@ function supervisor(over = {}) {
     checkTransferForHost: (v, h) => { log.push(["check", v, h === host]); return { first: false }; },
     verifyCtx: { fleet: "F" },
     host,
-    liveLease: (a) => { log.push(["live", a]); return { gen: 5, lease_id: "L", lg: 1 }; },
+    // async, as the real one is
+    liveLease: async (a) => { log.push(["live", a]); return { gen: 5, lease_id: "L", lg: 1, expiry_tick: 9 }; },
     run: async (argv, o) => { log.push(["run", argv, o.ms]); return { code: 0, stdout: '{"resumed":true,"reason":null,"lowered":true}\n' }; },
     node: "/n", main: "/m",
     ...over,
@@ -200,6 +201,8 @@ test("the supervisor refuses, launching nothing: each condition in its order, wi
     ["waiting_for_lease", { liveLease: () => null }],
     ["waiting_for_lease", { liveLease: undefined }],
     ["not_this_lease", { liveLease: () => ({ gen: 4, lease_id: "L", lg: 1 }) }],
+    ["waiting_for_lease", { liveLease: async () => null }],
+    ["not_this_lease", { liveLease: async () => ({ gen: 4, lease_id: "L", lg: 1, expiry_tick: 9 }) }],
     ["not_this_lease", { host: { entryGen: () => null, recordTransfer: () => {} } }],
     ["not_this_lease", { host: { entryGen: () => { throw new Error("x"); }, recordTransfer: () => {} } }],
   ];

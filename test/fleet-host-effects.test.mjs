@@ -389,6 +389,14 @@ test("mask counts only if systemd reports the unit masked; unmask only if it loa
   await setup().fx.unmask(A, 1000);
 });
 
+test("systemdVersion runs exactly `systemctl --version` within its deadline; a non-zero exit is a failure", async () => {
+  const ok = setup({ over: { "--version": () => ({ code: 0, stdout: "systemd 255 (255.4-1ubuntu8.19)\n+PAM\n" }) } });
+  assert.equal(await ok.fx.systemdVersion(1000), "systemd 255 (255.4-1ubuntu8.19)\n+PAM\n");
+  assert.deepEqual(ok.calls, [["systemctl", "--version"]]);
+  const bad = setup({ over: { "--version": () => ({ code: 1, stdout: "systemd 255 (255.4-1ubuntu8.19)\n" }) } });
+  await assert.rejects(bad.fx.systemdVersion(1000), host);
+});
+
 test("writeUnit installs below the runtime mask, and refuses while an agent unit file sits in a load path above it", async () => {
   assert.equal(UNIT_DIR, "/usr/local/lib/systemd/system");
   for (const d of UNIT_DIRS_ABOVE_MASK) {

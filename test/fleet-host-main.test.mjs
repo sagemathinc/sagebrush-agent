@@ -593,6 +593,20 @@ test("REAL executor: SIGTERM while recovery's owned start effect never settles (
   assert.equal((await run2).code, 0);
 });
 
+test("REAL executor: once closed, no effect starts, even where an op swallows a failed effect and goes on (a stop-all closed inside its fenced stop masks nothing after)", async () => {
+  const seed = await seededStore();
+  const store = await HostStore.open(seed.root);
+  const { fx, calls } = unitFx();
+  let closing = null;
+  const sup = new Supervisor({ store, fx, verify: fakeVerify, bodyOf: fakeBodyOf, fenceDir: seed.fenceDir, deadlines: { grace: 200 },
+    barrier: async (n) => { if (n === "after_fence_write" && !closing) closing = sup.close(); } });
+  const before = calls.length;
+  await sup.submit({ kind: "stop-all", authority: "person" }).catch(() => {});
+  await closing;
+  assert.deepEqual(calls.slice(before), [], `no effect after the close: ${calls.slice(before).join(",")}`);
+  await store.close();
+});
+
 test("REAL executor: SIGTERM during a held initial sync: nothing runs, the close is immediate, exit 0", async () => {
   const { id } = await paired();
   const { fx } = unitFx();

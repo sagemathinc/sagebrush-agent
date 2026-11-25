@@ -161,6 +161,15 @@ test("the supervisor: a pair new here is recorded durably before anything is lau
     assert.equal(r.resumed, false);
     assert.ok(!t.kinds().includes("recordTransfer") && !t.kinds().includes("run"), JSON.stringify(r));
   }
+  // A malformed live lease or tag list: the helper's argv fails its checks BEFORE the record, so nothing is recorded
+  // and nothing launched.
+  for (const over of [{ tagsOf: () => ["nope"] }, { tagsOf: () => [T1, T1] }, { tagsOf: () => null }, { tagsOf: undefined },
+    { liveLease: () => ({ gen: 5, lease_id: "a b", lg: 1 }) }, { liveLease: () => ({ gen: 5, lease_id: "L", lg: "1" }) },
+    { liveLease: () => ({ gen: 5, lease_id: "L" }) }, { liveLease: () => ({ gen: 5, lease_id: "L", lg: 0 }) }]) {
+    const t = supervisor({ checkTransferForHost: () => ({ first: true }), ...over });
+    await assert.rejects(requestResume(A, t.opts), (e) => e.code === "bad_form", JSON.stringify(Object.keys(over)));
+    assert.ok(!t.kinds().includes("recordTransfer") && !t.kinds().includes("run"), JSON.stringify(Object.keys(over)));
+  }
   // A recording that fails launches nothing.
   const f = supervisor({ checkTransferForHost: () => ({ first: true }) });
   f.host.recordTransfer = () => { throw new Error("EIO"); };
@@ -185,6 +194,9 @@ test("the supervisor refuses, launching nothing: each condition in its order, wi
     ["receipt", { checkTransferForHost: fe("stale_generation") }, "stale_generation"],
     ["receipt", { checkTransferForHost: fe("replay") }, "replay"],
     ["receipt", { checkTransferForHost: () => ({}) }, "bad_form"],
+    // a valid pair for ANOTHER agent authorizes nothing here (the transfer's or the receipt's agent)
+    ["receipt", { verifyTransferReceipt: () => ({ transfer: { agent: newId() }, receipt: { agent: A, gen: 5, nonce: "N" }, transferHash: "H" }) }, "not_granted"],
+    ["receipt", { verifyTransferReceipt: () => ({ transfer: { agent: A }, receipt: { agent: newId(), gen: 5, nonce: "N" }, transferHash: "H" }) }, "not_granted"],
     ["waiting_for_lease", { liveLease: () => null }],
     ["waiting_for_lease", { liveLease: undefined }],
     ["not_this_lease", { liveLease: () => ({ gen: 4, lease_id: "L", lg: 1 }) }],
@@ -365,6 +377,15 @@ test("the supervisor with the REAL verifiers (the shared vectors): accepted once
   assert.deepEqual(await requestResume(t.agent, opts(honest)), { resumed: true, reason: null });
   assert.equal(recorded.length, 1);
   assert.equal(runs.length, 2);
+  // The honest pair, but a resume requested for ANOTHER agent: refused, nothing recorded or launched.
+  const other = newId();
+  const fresh = { ...opts(honest) };
+  const recBefore = recorded.length, runsBefore = runs.length;
+  delete accepted[t.agent]; // (as if not yet accepted: a swapped request must not accept it either)
+  assert.deepEqual(await requestResume(other, fresh), { resumed: false, reason: "receipt", code: "not_granted" });
+  assert.equal(recorded.length, recBefore);
+  assert.equal(runs.length, runsBefore);
+  accepted[t.agent] = recorded[0][1];
   // Refusing vectors: the verifier's own codes, nothing recorded or launched.
   for (const [name, code, st] of [["a receipt for another audience", "bad_audience"], ["the old key at the new key's chain_seq", "bad_signature"],
     ["the receipt's gen differs, both signatures valid", "bad_form"], ["a transfer whose signer was removed at the pinned head", "device_removed", removed]]) {

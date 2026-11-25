@@ -367,6 +367,21 @@ export async function build() {
     { name: "ttl_ms one past its bound", bytes: lease({ ttl_ms: 600_001 }), expect: "bad_form" },
   ].map((c) => ({ ...c, outstanding: c.outstanding === undefined ? outstanding : c.outstanding }));
 
+  // ---- 9. the old host's fence acknowledgement (r2.4 §3.7.4): the envelope's check, by the host's certified key
+  const fbody = (extra = {}) => ({ fleet, aud: AUD, agent, host, gen: 3, transfer: b64(new Uint8Array(32).fill(11)), boot_id: BOOT, proven_empty: true, at_ms: NOW, ...extra });
+  const fb = fbody();
+  const fence_acks = [
+    { name: "an acknowledgement", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fb, H)), expect: "ok", hash: sha256b64(signedBytes("sb.agent-fence-ack.v1", hs, fb)) },
+    { name: "signed by a device", bytes: rawSeal("sb.agent-fence-ack.v1", signer(N, nId), fb, N), expect: "bad_signature" },
+    { name: "another host key under this host's id", bytes: txt(seal("sb.agent-fence-ack.v1", { ...hs, key: H2.key }, fb, H2)), expect: "bad_signature" },
+    { name: "this host's signature under another key id", bytes: rawSeal("sb.agent-fence-ack.v1", { ...hs, key: H2.key }, fb, H), expect: "bad_signature" },
+    { name: "a body naming another host", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ host: id(57) }), H)), expect: "bad_signature" },
+    { name: "proven_empty false", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ proven_empty: false }), H)), expect: "bad_form" },
+    { name: "another fleet", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ fleet: id(58) }), H)), expect: "bad_form" },
+    { name: "another audience", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ aud: "https://sagebrush.space" }), H)), expect: "bad_audience" },
+    { name: "an extra field", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ reason: "x" }), H)), expect: "bad_form" },
+  ];
+
   return {
     $comment: "Shared fleet-protocol vectors (agent-autonomous-schemas.md r2.5 §9, §3.7.5, §3.8.3). Built by test/make-fleet-fixtures.mjs; every implementation must agree with every case. Mock data only: no real key, device or host.",
     freeze: FREEZE.sha256,
@@ -375,6 +390,7 @@ export async function build() {
     chain: { entries_note: "envelope texts, in order", cases: chain },
     service_keys: { chain: honest, cases: service_keys },
     lease_keys: { chain: leased, chain_cases: lease_chain, cases: lease_keys },
+    fence_acks: { chain: honest, host_cert: cert, cases: fence_acks },
     leases: { chain: leased, host_cert: cert, host: host, host_key: certBody.fingerprint, requests: lease_requests, leases },
     objects: { chain: honest, host_cert: cert, grants, grant_acks, host_ops, approvals, envelopes },
     transfers: { chain: honest, chain_removed: removedChain, receipts: transfer_receipts, hosts: transfer_hosts },

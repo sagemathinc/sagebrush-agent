@@ -6,6 +6,7 @@
 // real §4b digest list beside the class and reports its hash; tree-digest lists the real destination; validation
 // compares the two, so a published set settles as validated, and every tamper of the tree, the list or the reports fails.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -808,10 +809,14 @@ test("permanent list or report faults are a durable failed; an interruption stay
   const list = (w, id, cls) => join(attemptDir(w, id, cls), "data", "digests.json");
   const report = (w, id, cls) => join(w.dir, `agent-${id}.${cls}.fill.json`);
   const rows = {
-    "the list replaced by a directory": (w, id) => { rmSync(list(w, id, "home")); mkdirSync(list(w, id, "home")); },
+    "the list replaced by a directory": (w, id) => { rmSync(list(w, id, "home")); mkdirSync(list(w, id, "home")); writeFileSync(join(list(w, id, "home"), "x"), "{}"); },
     "the list replaced by a link": (w, id) => { const p = list(w, id, "home"); renameSync(p, p + ".x"); symlinkSync(p + ".x", p); },
     "a report that isn't JSON": (w, id) => writeFileSync(report(w, id, "sessions"), "{"),
     "a report of another shape": (w, id) => writeFileSync(report(w, id, "home"), '{"v":1}\n'),
+    // (not empty: an empty directory has size 0 on some filesystems, and would fail as malformed JSON anyway)
+    "a report replaced by a directory": (w, id) => { rmSync(report(w, id, "home")); mkdirSync(report(w, id, "home")); writeFileSync(join(report(w, id, "home"), "x"), "{}"); },
+    "a report replaced by a link": (w, id) => { const p = report(w, id, "sessions"); renameSync(p, p + ".x"); symlinkSync(p + ".x", p); },
+    "a report replaced by a FIFO": (w, id) => { rmSync(report(w, id, "home")); execFileSync("mkfifo", [report(w, id, "home")]); },
     "a report replaced by another attempt's": (w, id) => { const x = JSON.parse(readFileSync(report(w, id, "home"), "utf8")); writeFileSync(report(w, id, "home"), JSON.stringify({ ...x, attempt: 2 }) + "\n"); },
   };
   for (const [what, f] of Object.entries(rows)) {
@@ -835,6 +840,16 @@ test("permanent list or report faults are a durable failed; an interruption stay
   await assert.rejects(w.fill("agent", id, planOf("agent", id)), /EIO/);
   assert.equal(readRecord("agent", id, { dir: w.dir }).state, "published");
   assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "validated");
+  // The same for the report: unreadable for a moment (EACCES) is no verdict.
+  if (process.getuid?.() !== 0) {
+    const id3 = newId();
+    let q = null;
+    const w3 = world("agent", { stopped: async () => { if (q === null) { q = join(w3.dir, `agent-${id3}.home.fill.json`); chmodSync(q, 0); } return true; } });
+    await assert.rejects(w3.fill("agent", id3, planOf("agent", id3)), (e) => e.code === "EACCES");
+    assert.equal(readRecord("agent", id3, { dir: w3.dir }).state, "published");
+    chmodSync(q, 0o600);
+    assert.equal((await w3.fill("agent", id3, planOf("agent", id3))).state, "validated");
+  }
   // A read of the list that fails for another reason than its form (here EACCES, standing in for an I/O error) is
   // the same: thrown, still published, validated once it reads.
   if (process.getuid?.() !== 0) {

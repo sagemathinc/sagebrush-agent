@@ -550,6 +550,9 @@ fn stage_inner<O: RestoreOps, R: Runner<O::H>>(o: &mut O, r: &mut R, a: &StageAr
             let (q, s, now) = (o.quota(&att, a.projid), o.space(&att), o.now());
             Err(limit_error(classify(q, s, now)))
         }
+        // A2 r3.8.3: the binary's own §4b bounds (entries, a path, the listing) are permanent: 64 `limit`, no marker,
+        // never the retried 75. Its JSON is relayed as for any other failure.
+        Some(Reply::Failed(code)) if code == "limit" => Ok(Done { out: stdout, result: Err(err(Fail::Usage, "limit")) }),
         Some(Reply::Failed(_)) => Ok(Done { out: stdout, result: Err(err(Fail::Partial, "the restore failed")) }),
         Some(Reply::Ok(snap, ..)) if snap != a.snapshot => Err(err(Fail::Partial, "the restored snapshot isn't the requested one")),
         Some(Reply::Ok(_, _, digests)) => {
@@ -1838,6 +1841,25 @@ mod tests {
         let x = fill_expect(&mut f, "home");
         fill_home(&mut f, &fill_args("home", x)).unwrap();
         assert_eq!((f.nodes[&p].id.ino, f.files[&p].clone()), before, "the list stays, the same inode and bytes");
+    }
+
+    #[test]
+    fn the_binary_s_limit_is_a_permanent_64_and_other_failures_keep_their_codes() {
+        // A2 r3.8.3: `limit` is 64 with no syncfs and no marker; the binary's line is relayed.
+        let mut f = host();
+        let d = restore_stage(&mut f, &mut exited(failed("limit")), &stage_args("home"));
+        assert_eq!(rcode(&d), 64);
+        assert_eq!(d.result.unwrap_err().msg, "limit");
+        assert_eq!(d.out, failed("limit"), "the binary's JSON is relayed");
+        assert_eq!(f.count("syncfs"), 0);
+        assert!(!f.log.iter().any(|l| l.starts_with("marker ")));
+        // Another unknown code stays 75; no_space stays §3.1's (77 with the filesystem full and the project under).
+        let mut f = host();
+        assert_eq!(rcode(&restore_stage(&mut f, &mut exited(failed("other")), &stage_args("home"))), 75);
+        let mut f = host();
+        f.quota = Some(q(2 << 20, GIB_BLOCKS, 5, 100));
+        f.space = (0, 9);
+        assert_eq!(rcode(&restore_stage(&mut f, &mut exited(failed("no_space")), &stage_args("home"))), 77);
     }
 
     #[test]

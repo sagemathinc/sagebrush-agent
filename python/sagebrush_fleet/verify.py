@@ -9,8 +9,8 @@ from __future__ import annotations
 import math
 import re
 
-from .chain import device_key, require_tier, service_key_at
-from .core import b64, canon_text, check_public_key, concat, enc, refuse, sha256, sha256b64, unb64
+from .chain import device_key, lease_key_at, require_tier, service_key_at
+from .core import b64, canon_text, check_public_key, concat, enc, key_id, refuse, sha256, sha256b64, unb64
 from .envelope import body_validator, open_envelope
 
 B32 = "abcdefghijklmnopqrstuvwxyz234567"
@@ -341,3 +341,45 @@ def check_transfer_for_host(pair, host):
     if seen is not None and seen != pair["transfer_hash"]:
         refuse("replay", "this nonce named another transfer here")
     return {"first": True}
+
+
+# ---- execution-lease renewal (r2.5 §3.8)
+
+def verify_lease_request(data: bytes, ctx):
+    """§3.8.1, the service's check: form, fleet, aud and the certified host key's signature. ctx: { aud, fleet, cert }."""
+    def resolve_key(signer, t, body):
+        if t != "sb.lease-request.v1":
+            refuse("bad_form", "another type")
+        body_validator("lease-request")(body)
+        cert = ctx["cert"]
+        if signer["kind"] != "host" or signer["id"] != cert["body"]["host"] or body["host"] != signer["id"]:
+            refuse("bad_signature")
+        if signer["key"] != key_id("ed25519", cert["sign_raw"]):
+            refuse("bad_signature", "not the certified host key")
+        return cert["sign_raw"]
+
+    env = open_envelope(data, {"aud": ctx["aud"], "fleet": ctx["fleet"], "resolve_key": resolve_key})
+    return {"body": env["body"], "hash": sha256b64(env["signed"])}
+
+
+ECHOED = ("request", "agent", "gen", "nonce", "boot_id")
+
+
+def verify_execution_lease(data: bytes, ctx):
+    """§3.8.2, the host's check (see lib/fleet/core/verify.mjs). ctx: { aud, fleet, chain, host, host_key, outstanding }."""
+    def resolve_key(signer, t, body):
+        if t != "sb.execution-lease.v1":
+            refuse("bad_form", "another type")
+        body_validator("execution-lease")(body)
+        return lease_key_at(ctx["chain"], signer, body.get("chain_seq"))
+
+    env = open_envelope(data, {"aud": ctx["aud"], "fleet": ctx["fleet"], "resolve_key": resolve_key})
+    lease, o = env["body"], ctx.get("outstanding")
+    if lease["host"] != ctx["host"] or lease["host_key"] != ctx["host_key"]:
+        refuse("not_granted", "a lease for another host")
+    if not o:
+        refuse("not_granted", "no request outstanding")
+    for k in ECHOED:
+        if lease[k] != o[k]:
+            refuse("not_granted", f"the lease's {k} isn't the outstanding request's")
+    return {"body": lease, "hash": sha256b64(env["signed"])}

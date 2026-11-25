@@ -313,6 +313,60 @@ export async function build() {
     { name: "the nonce seen for this same transfer", pair: pair0, host: rec({ nonces: { [nonceT]: T0.hash } }), expect: "ok", first: true },
   ];
 
+  // ---- 8. execution-lease renewal (r2.5 §3.8.3), on the leased chain (§1.7a's keys), with the objects' host
+  const hs = { kind: "host", id: host, alg: "ed25519", key: H.key };
+  // (an envelope seal() refuses to make, for a signer kind the type doesn't accept)
+  const rawSeal = (type, s, b, k) => txt(enc(canonText({ v: 1, type, signer: s, body: b, sig: b64(k.sign(signedBytes(type, s, b))) })));
+  const BOOT = "0f6c2b5e-8d3a-4c1e-9b7f-2a4d6e8f0a1c";
+  const lNonce = b64(new Uint8Array(16).fill(9));
+  const reqBody = (extra = {}) => ({ fleet, aud: AUD, agent, host, gen: 3, nonce: lNonce, boot_id: BOOT, at_ms: NOW, ...extra });
+  const rq = reqBody();
+  const reqBytes = txt(seal("sb.lease-request.v1", hs, rq, H));
+  const reqHash = sha256b64(signedBytes("sb.lease-request.v1", hs, rq));
+  const H2 = keyFromSeed(seed(50));
+  const lease_requests = [
+    { name: "a request", bytes: reqBytes, expect: "ok", hash: reqHash },
+    { name: "signed by a device", bytes: rawSeal("sb.lease-request.v1", signer(N, nId), rq, N), expect: "bad_signature" },
+    { name: "signed by another host key under this host's id", bytes: txt(seal("sb.lease-request.v1", { ...hs, key: H2.key }, rq, H2)), expect: "bad_signature" },
+    { name: "the certified key id with another key's signature", bytes: txt(seal("sb.lease-request.v1", hs, rq, H2)), expect: "bad_signature" },
+    { name: "this host's signature under another key id", bytes: rawSeal("sb.lease-request.v1", { ...hs, key: H2.key }, rq, H), expect: "bad_signature" },
+    { name: "a body naming another host, signed by this one", bytes: txt(seal("sb.lease-request.v1", hs, reqBody({ host: id(51) }), H)), expect: "bad_signature" },
+    { name: "for another host id", bytes: txt(seal("sb.lease-request.v1", { ...hs, id: id(51) }, reqBody({ host: id(51) }), H)), expect: "bad_signature" },
+    { name: "another fleet", bytes: txt(seal("sb.lease-request.v1", hs, reqBody({ fleet: id(52) }), H)), expect: "bad_form" },
+    { name: "another audience", bytes: txt(seal("sb.lease-request.v1", hs, reqBody({ aud: "https://sagebrush.space" }), H)), expect: "bad_audience" },
+    { name: "gen 0", bytes: txt(seal("sb.lease-request.v1", hs, reqBody({ gen: 0 }), H)), expect: "bad_form" },
+    { name: "an extra field", bytes: txt(seal("sb.lease-request.v1", hs, reqBody({ ttl_ms: 1 }), H)), expect: "bad_form" },
+  ];
+  const ls = (k, lid, kind = "lease") => ({ kind, id: lid, alg: "ed25519", key: k.key });
+  const leaseBody = (extra = {}) => ({ fleet, aud: AUD, agent, host, host_key: certBody.fingerprint, gen: 3, lease_id: id(53), ttl_ms: 600_000,
+    nonce: lNonce, boot_id: BOOT, request: reqHash, chain_seq: l2Seq, ...extra });
+  const lease = (extra, k = L2, s = ls(L2, l2Id)) => txt(seal("sb.execution-lease.v1", s, leaseBody(extra), k));
+  const outstanding = { request: reqHash, agent, gen: 3, nonce: lNonce, boot_id: BOOT };
+  const envelopeHash = sha256b64(enc(reqBytes));
+  const leases = [
+    { name: "a lease", bytes: lease({}), expect: "ok" },
+    { name: "a lease under the old key, signed before the rotation", bytes: lease({ chain_seq: l1Seq + 1 }, L1, ls(L1, l1Id)), expect: "ok" },
+    { name: "ttl_ms at its bound", bytes: lease({ ttl_ms: 600_000 }), expect: "ok" },
+    { name: "the old key at the rotation's seq", bytes: lease({}, L1, ls(L1, l1Id)), expect: "bad_signature" },
+    { name: "chain_seq past the pinned head", bytes: lease({ chain_seq: l2Seq + 1 }), expect: "device_unknown" },
+    { name: "signed by the service key", bytes: txt(seal("sb.execution-lease.v1", { kind: "lease", id: s2Id, alg: "ed25519", key: S2.key }, leaseBody(), S2)), expect: "bad_signature" },
+    { name: "signer kind service", bytes: rawSeal("sb.execution-lease.v1", ls(L2, l2Id, "service"), leaseBody(), L2), expect: "bad_signature" },
+    { name: "signer kind host", bytes: rawSeal("sb.execution-lease.v1", hs, leaseBody(), H), expect: "bad_signature" },
+    { name: "another fleet", bytes: lease({ fleet: id(54) }), expect: "bad_form" },
+    { name: "another audience", bytes: lease({ aud: "https://sagebrush.space" }), expect: "bad_audience" },
+    { name: "another host", bytes: lease({ host: id(55) }), expect: "not_granted" },
+    { name: "another host key", bytes: lease({ host_key: b64(new Uint8Array(32).fill(7)) }), expect: "not_granted" },
+    { name: "another request", bytes: lease({ request: b64(new Uint8Array(32).fill(8)) }), expect: "not_granted" },
+    { name: "the request's envelope hash, not its signed bytes'", bytes: lease({ request: envelopeHash }), expect: "not_granted" },
+    { name: "another agent", bytes: lease({ agent: id(56) }), expect: "not_granted" },
+    { name: "another gen", bytes: lease({ gen: 4 }), expect: "not_granted" },
+    { name: "another nonce", bytes: lease({ nonce: b64(new Uint8Array(16).fill(10)) }), expect: "not_granted" },
+    { name: "another boot", bytes: lease({ boot_id: "1f6c2b5e-8d3a-4c1e-9b7f-2a4d6e8f0a1c" }), expect: "not_granted" },
+    { name: "no request outstanding", bytes: lease({}), outstanding: null, expect: "not_granted" },
+    { name: "ttl_ms 0", bytes: lease({ ttl_ms: 0 }), expect: "bad_form" },
+    { name: "ttl_ms one past its bound", bytes: lease({ ttl_ms: 600_001 }), expect: "bad_form" },
+  ].map((c) => ({ ...c, outstanding: c.outstanding === undefined ? outstanding : c.outstanding }));
+
   return {
     $comment: "Shared fleet-protocol vectors (agent-autonomous-schemas.md r2.5 §9, §3.7.5, §3.8.3). Built by test/make-fleet-fixtures.mjs; every implementation must agree with every case. Mock data only: no real key, device or host.",
     freeze: FREEZE.sha256,
@@ -321,6 +375,7 @@ export async function build() {
     chain: { entries_note: "envelope texts, in order", cases: chain },
     service_keys: { chain: honest, cases: service_keys },
     lease_keys: { chain: leased, chain_cases: lease_chain, cases: lease_keys },
+    leases: { chain: leased, host_cert: cert, host: host, host_key: certBody.fingerprint, requests: lease_requests, leases },
     objects: { chain: honest, host_cert: cert, grants, grant_acks, host_ops, approvals, envelopes },
     transfers: { chain: honest, chain_removed: removedChain, receipts: transfer_receipts, hosts: transfer_hosts },
   };

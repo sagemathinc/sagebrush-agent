@@ -403,3 +403,19 @@ test("the lock holder dies and the commit runs before Node sees the exit: the OS
   refused(() => r.setState(a, "running"), "outcome_unknown");
   assert.equal(disk(dir).agents[a].state, "provisioned");
 });
+
+test("a grant generation of 0 is a restored live agent's (no grant on this host yet); a revoked or deleted agent always has its own", async () => {
+  const { checkRegistry } = await import("../lib/fleet/host/registry.mjs");
+  const reg = (state, gen) => ({ v: 1, next_uid: UID_RANGE[0] + 1, next_gid: GID_RANGE[0], agents: { [newId()]: { uid: UID_RANGE[0], state, life: 0, gen, tags: [], start_failed: null } }, tags: {} });
+  for (const s of ["provisioned", "running", "paused", "stopped"]) assert.equal(checkRegistry(reg(s, 0)), true, s);
+  for (const s of ["revoked", "deleted"]) refused(() => checkRegistry(reg(s, 0)), "bad_form");
+  for (const s of ["revoked", "deleted", "running"]) assert.equal(checkRegistry(reg(s, 1)), true, s);
+  refused(() => checkRegistry(reg("running", -1)), "bad_form");
+  // and a grant update never sets 0
+  const r = await Registry.open(fresh());
+  const a = newId();
+  r.addAgent(a, 3);
+  refused(() => r.setGrant(a, 0, []), "bad_form");
+  refused(() => r.addAgent(newId(), 0), "bad_form");
+  r.close();
+});

@@ -132,6 +132,52 @@ export async function build() {
     { name: "past the pinned head", chain_seq: s2Seq + 1, signer: sv(s2Id, S2), expect: "device_unknown" },
   ];
 
+  // ---- 5b. lease keys (r2.5 §1.7a): native devices only, never a service key's material or id, half-open as §1.7.
+  // A chain of its own (the honest chain plus three entries), built without moving the honest chain's seq or head.
+  const L1 = key("lease-1", seed(40)), L2 = key("lease-2", seed(41));
+  const l1Id = id(40), l2Id = id(41);
+  Object.assign(ids, { lease_1: l1Id, lease_2: l2Id });
+  const saved = { seq, head, n: entries.length };
+  const lk = (by, byId, lid, k) => seal("sb.device-chain.v1", signer(by, byId), body("lease-key", { lease_key: { id: lid, alg: "ed25519", key: b64(k.raw) } }), by);
+  const sk = (lid, k) => next(N, nId, "service-key", { service_key: { id: lid, alg: "ed25519", key: b64(k.raw) } });
+  const lease_chain = [
+    // (on the honest chain, before any lease key)
+    { name: "a browser device pins the first lease key", entries: honest, append: txt(lk(B, bId, id(42), keyFromSeed(seed(42)))), expect: "device_tier" },
+    { name: "a native device pins the first lease key", entries: honest, append: txt(lk(N, nId, id(42), keyFromSeed(seed(42)))), expect: "ok" },
+  ];
+  push(lk(N, nId, l1Id, L1));
+  const l1Seq = seq - 1;
+  push(seal("sb.device-chain.v1", signer(N, nId), body("policy", { policy: { require_native_for_widening: true } }), N));
+  push(lk(N2, n2Id, l2Id, L2));
+  const l2Seq = seq - 1;
+  const leased = [...entries];
+  lease_chain.push(
+    { name: "the leased chain replays", entries: leased, expect: "ok" },
+    { name: "a browser device rotates a native-pinned lease key", entries: leased, append: txt(lk(B, bId, id(43), keyFromSeed(seed(43)))), expect: "device_tier" },
+    { name: "a native device rotates the lease key", entries: leased, append: txt(lk(N, nId, id(43), keyFromSeed(seed(43)))), expect: "ok" },
+    { name: "the recovery key signs a lease-key entry", entries: leased, append: txt(seal("sb.device-chain.v1", { kind: "recovery", id: fleet, alg: "ed25519", key: R2.key }, body("lease-key", { lease_key: { id: id(43), alg: "ed25519", key: b64(keyFromSeed(seed(43)).raw) } }), R2)), expect: "device_unknown" },
+    { name: "a lease key that is a pinned service key", entries: leased, append: txt(lk(N, nId, id(44), S1)), expect: "bad_form" },
+    { name: "a service key that is a pinned lease key", entries: leased, append: sk(id(45), L1), expect: "bad_form" },
+    { name: "a lease key under a service key's id", entries: leased, append: txt(lk(N, nId, s1Id, keyFromSeed(seed(46)))), expect: "bad_form" },
+    { name: "a service key under a lease key's id", entries: leased, append: sk(l1Id, keyFromSeed(seed(47))), expect: "bad_form" },
+    { name: "a lease key id twice", entries: leased, append: txt(lk(N, nId, l2Id, keyFromSeed(seed(48)))), expect: "bad_form" },
+  );
+  const lv = (lid, k, kind = "lease") => ({ kind, id: lid, alg: "ed25519", key: k.key });
+  const lease_keys = [
+    { name: "key 1 inside its interval", lookup: "lease", chain_seq: l1Seq + 1, signer: lv(l1Id, L1), expect: "ok" },
+    { name: "key 2 after the rotation", lookup: "lease", chain_seq: l2Seq, signer: lv(l2Id, L2), expect: "ok" },
+    { name: "an old lease after the rotation", lookup: "lease", chain_seq: l1Seq, signer: lv(l1Id, L1), expect: "ok" },
+    { name: "the old key past its replacement", lookup: "lease", chain_seq: l2Seq, signer: lv(l1Id, L1), expect: "bad_signature" },
+    { name: "before any lease key", lookup: "lease", chain_seq: l1Seq - 1, signer: lv(l1Id, L1), expect: "bad_signature" },
+    { name: "past the pinned head", lookup: "lease", chain_seq: l2Seq + 1, signer: lv(l2Id, L2), expect: "device_unknown" },
+    { name: "signer kind service naming the lease key", lookup: "lease", chain_seq: l2Seq, signer: lv(l2Id, L2, "service"), expect: "bad_signature" },
+    { name: "signer kind lease naming the service key", lookup: "lease", chain_seq: l2Seq, signer: lv(s2Id, S2), expect: "bad_signature" },
+    { name: "the lease lookup before any lease key, naming the service key then in force", lookup: "lease", chain_seq: l1Seq - 1, signer: lv(s2Id, S2), expect: "bad_signature" },
+    { name: "the service lookup never sees a lease key", lookup: "service", chain_seq: l2Seq, signer: lv(l2Id, L2, "service"), expect: "bad_signature" },
+    { name: "the service key stays in force beside the lease keys", lookup: "service", chain_seq: l2Seq, signer: lv(s2Id, S2, "service"), expect: "ok" },
+  ];
+  entries.length = saved.n; seq = saved.seq; head = saved.head;
+
   // ---- 6. envelopes and objects outside the chain (§1.3, §3, §4), against the honest chain
   const encRaw = new Uint8Array(32).fill(9);
   const certBody = { fleet, aud: AUD, chain_seq: headAt.seq, host, sign_key: b64(H.raw), enc_key: b64(encRaw), fingerprint: b64(await hostFingerprint(host, H.raw, encRaw)), name: "lab-box", at_ms: NOW };
@@ -268,12 +314,13 @@ export async function build() {
   ];
 
   return {
-    $comment: "Shared fleet-protocol vectors (agent-autonomous-schemas.md r2.4 §9, §3.7.5). Built by test/make-fleet-fixtures.mjs; every implementation must agree with every case. Mock data only: no real key, device or host.",
+    $comment: "Shared fleet-protocol vectors (agent-autonomous-schemas.md r2.5 §9, §3.7.5, §3.8.3). Built by test/make-fleet-fixtures.mjs; every implementation must agree with every case. Mock data only: no real key, device or host.",
     freeze: FREEZE.sha256,
     aud: AUD, now_ms: NOW, ids, keys,
     canonical, base64url, ids_cases: idCases, ed25519,
     chain: { entries_note: "envelope texts, in order", cases: chain },
     service_keys: { chain: honest, cases: service_keys },
+    lease_keys: { chain: leased, chain_cases: lease_chain, cases: lease_keys },
     objects: { chain: honest, host_cert: cert, grants, grant_acks, host_ops, approvals, envelopes },
     transfers: { chain: honest, chain_removed: removedChain, receipts: transfer_receipts, hosts: transfer_hosts },
   };

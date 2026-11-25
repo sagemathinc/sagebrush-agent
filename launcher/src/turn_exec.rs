@@ -74,8 +74,10 @@ pub const START: &[u8] = b"{\"k\":\"start\"}";
 /// The outcome of `run`: Ok(()) only after a successful exec (in the fake); otherwise the error to report and exit
 /// with. Its record, when one is possible, has already been written.
 pub fn run<O: TurnOps, P: ProcOps>(o: &mut O, p: &mut P, argv: &[String]) -> Result<()> {
-    // §1, first: both inherited descriptors close on exec; an invalid status pipe (or go pipe) can prove nothing.
-    if p.cloexec(STATUS).is_err() || !p.status_fd_ok(STATUS).unwrap_or(false) || p.cloexec(GO).is_err() {
+    // §1, first: both inherited descriptors close on exec, fd 3 then fd 4, both always attempted, before anything else
+    // touches either. Only then is fd 3 checked: an invalid status pipe (or go pipe) can prove nothing.
+    let (cloexec_status, cloexec_go) = (p.cloexec(STATUS), p.cloexec(GO));
+    if cloexec_status.is_err() || cloexec_go.is_err() || !p.status_fd_ok(STATUS).unwrap_or(false) {
         return Err(err(Fail::Contract, "the status or go descriptor isn't valid"));
     }
     if p.close_from(5).is_err() {
@@ -646,7 +648,7 @@ mod tests {
         assert_eq!(code(&r), 0, "{r:?} {:?}", p.log);
         assert_eq!(record(&p), None, "no failure record");
         // §1 first, then the go byte, then the steps.
-        assert_eq!(p.log[..7], ["cloexec3", "status_fd_ok", "cloexec4", "close_from5", "write", "read_go", "close4"]);
+        assert_eq!(p.log[..7], ["cloexec3", "cloexec4", "status_fd_ok", "close_from5", "write", "read_go", "close4"]);
         assert!(f.log.iter().any(|l| l == &format!("setns {UNIT}")), "steps 2-7 ran");
         // 10, r4.7's order: bounding and ambient while root, then the ids, then the clear and the verification.
         let pos = |n: &str| p.log.iter().position(|l| l == n).unwrap_or_else(|| panic!("{n}: {:?}", p.log));
@@ -675,6 +677,7 @@ mod tests {
             spoil(&mut p);
             let r = run(&mut f, &mut p, &argv());
             assert_eq!(code(&r), 65, "{what}");
+            assert_eq!(p.log[..2], ["cloexec3", "cloexec4"], "{what}: both close-on-exec attempts come first, always");
             assert!(p.status.is_empty(), "{what}: nothing written, not even start");
             assert!(!p.seen("read_go") && !p.seen("close_from5"), "{what}");
             assert!(f.log.is_empty(), "{what}: nothing of the turn");
@@ -880,6 +883,12 @@ mod tests {
             assert!(p.unix_stream(a.as_raw_fd()).unwrap(), "an AF_UNIX stream socket");
             assert!(!p.unix_stream(w.as_raw_fd()).unwrap(), "a pipe isn't");
             assert!(!p.status_fd_ok(a.as_raw_fd()).unwrap(), "a socket isn't a status pipe");
+            // Write-only, but a regular file: not a pipe.
+            let path = std::env::temp_dir().join(format!("sbl-wo-{}", std::process::id()));
+            let wo = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&path).unwrap();
+            assert!(!p.status_fd_ok(wo.as_raw_fd()).unwrap(), "a write-only file isn't a status pipe");
+            drop(wo);
+            std::fs::remove_file(&path).unwrap();
             assert!(p.status_fd_ok(1_000_000).is_err() && p.cloexec(1_000_000).is_err(), "an invalid descriptor");
             p.cloexec(w.as_raw_fd()).unwrap();
             // One record, read back whole.
@@ -888,6 +897,31 @@ mod tests {
             let mut buf = [0u8; 64];
             assert_eq!(p.read(r.as_raw_fd(), &mut buf).unwrap(), rec.len());
             assert_eq!(&buf[..rec.len()], &rec[..]);
+        }
+
+        #[test]
+        fn only_an_af_unix_stream_socket_is_a_stream_socket() {
+            use std::os::unix::net::UnixDatagram;
+            let mut p = RealProc::default();
+            let (a, _b) = UnixStream::pair().unwrap();
+            assert!(p.unix_stream(a.as_raw_fd()).unwrap(), "AF_UNIX SOCK_STREAM");
+            let (d, _e) = UnixDatagram::pair().unwrap();
+            assert!(!p.unix_stream(d.as_raw_fd()).unwrap(), "AF_UNIX SOCK_DGRAM: the type differs");
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            assert!(!p.unix_stream(tcp.as_raw_fd()).unwrap(), "AF_INET SOCK_STREAM: the domain differs");
+            let (r, _w) = sys::pipe().unwrap();
+            assert!(!p.unix_stream(r.as_raw_fd()).unwrap(), "not a socket at all");
+        }
+
+        #[test]
+        fn cloexec_really_sets_the_flag_on_an_inheritable_descriptor() {
+            // dup gives a descriptor WITHOUT FD_CLOEXEC (as an inherited fd 3 or 4 arrives); cloexec must set it.
+            let (_r, w) = sys::pipe().unwrap();
+            let fd = sys::dup_inheritable(&w).unwrap();
+            assert_eq!(sys::fd_flags(fd).unwrap() & libc::FD_CLOEXEC, 0, "inheritable before");
+            RealProc::default().cloexec(fd).unwrap();
+            assert_eq!(sys::fd_flags(fd).unwrap() & libc::FD_CLOEXEC, libc::FD_CLOEXEC, "close-on-exec after");
+            sys::close_raw(fd).unwrap();
         }
 
         #[test]

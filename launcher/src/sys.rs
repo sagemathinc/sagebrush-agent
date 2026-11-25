@@ -1120,3 +1120,19 @@ pub fn getgroups() -> io::Result<Vec<u32>> {
     v.truncate(n as usize);
     Ok(v)
 }
+
+/// fcntl(fd, F_GETFD): a descriptor's flags (tests only: they read back FD_CLOEXEC).
+#[cfg(test)]
+pub fn fd_flags(fd: libc::c_int) -> io::Result<libc::c_int> {
+    // SAFETY: plain integer arguments; an invalid fd is EBADF.
+    let r = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if r < 0 { Err(last()) } else { Ok(r) }
+}
+
+/// dup(fd): a new, inheritable descriptor (no FD_CLOEXEC), the lowest free number (tests only).
+#[cfg(test)]
+pub fn dup_inheritable(from: &OwnedFd) -> io::Result<libc::c_int> {
+    // SAFETY: `from` is open; dup takes a plain integer and returns a new descriptor or -1.
+    let r = unsafe { libc::dup(from.as_raw_fd()) };
+    if r < 0 { Err(last()) } else { Ok(r) }
+}

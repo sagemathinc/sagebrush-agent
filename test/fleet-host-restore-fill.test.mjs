@@ -835,6 +835,17 @@ test("permanent list or report faults are a durable failed; an interruption stay
   await assert.rejects(w.fill("agent", id, planOf("agent", id)), /EIO/);
   assert.equal(readRecord("agent", id, { dir: w.dir }).state, "published");
   assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "validated");
+  // A read of the list that fails for another reason than its form (here EACCES, standing in for an I/O error) is
+  // the same: thrown, still published, validated once it reads.
+  if (process.getuid?.() !== 0) {
+    const id2 = newId();
+    let p = null;
+    const w2 = world("agent", { stopped: async () => { if (p === null) { p = join(attemptDir(w2, id2, "home"), "data", "digests.json"); chmodSync(p, 0); } return true; } });
+    await assert.rejects(w2.fill("agent", id2, planOf("agent", id2)), (e) => e.code === "EACCES");
+    assert.equal(readRecord("agent", id2, { dir: w2.dir }).state, "published");
+    chmodSync(p, 0o600);
+    assert.equal((await w2.fill("agent", id2, planOf("agent", id2))).state, "validated");
+  }
 });
 
 test("names through the whole restore: a literal %, bytes that aren't UTF-8, UTF-8 and nested names, in raw order", async () => {

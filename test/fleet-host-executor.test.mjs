@@ -1233,7 +1233,7 @@ test("after any effect goes unsettled, the running operation does no authority-g
 });
 
 test("SEC H3-new: a grant is verified again after the previous application finishes, and after its intent; never carried", async () => {
-  // astra4b's probe: N+1 verifies; N's remaining work then flips N+1 to expired; N+1 must not be accepted.
+  // the security review's probe: N+1 verifies; N's remaining work then flips N+1 to expired; N+1 must not be accepted.
   for (const where of ["redo", "intent"]) {
     const fx = fakeFx();
     let g2valid = true, failMap = true;
@@ -1380,7 +1380,7 @@ for (const state of STATES) {
   }
 }
 
-test("SEC r4 (astra4b): a person's delete while the proof is pending doesn't let the same grant finish", async () => {
+test("SEC r4: a person's delete while the proof is pending doesn't let the same grant finish", async () => {
   const fx = fakeFx();
   fx.start = async (id) => { fx.u(id).active = true; throw new FleetError("unit_failed", "exited"); };
   fx.sys.stop = () => { throw new Error("stop failed"); };
@@ -1549,7 +1549,7 @@ for (const [name, op] of OPS) {
   });
 }
 
-test("TESTS r6 (astra2): a person's stop or delete that can't prove the cgroup empty marks the proof; the same grant isn't re-acknowledged", async () => {
+test("TESTS r6: a person's stop or delete that can't prove the cgroup empty marks the proof; the same grant isn't re-acknowledged", async () => {
   for (const kind of ["stop", "delete"]) {
     const fx = fakeFx();
     const { sup, store, close } = await setup({ fx });
@@ -1663,7 +1663,7 @@ async function pendingA({ via = "stop", fx = fakeFx() } = {}) {
   return { ...s, fx, root, fenceDir, stuck, snapshot };
 }
 
-test("SEC r8 (astra4b): a pending, paused, frozen agent: a person's resume is refused before any fence, state or thaw", async () => {
+test("SEC r8: a pending, paused, frozen agent: a person's resume is refused before any fence, state or thaw", async () => {
   const p = await pendingA({ via: "pause" });
   assert.equal(p.store.registry.agent(A).state, "paused");
   const before = p.snapshot();

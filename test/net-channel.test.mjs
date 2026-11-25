@@ -45,7 +45,7 @@ function fixture() {
  * The relay and host in one: each connection is checked, answered as the responder at its resume_n, and attached to
  * one broker session. `opens` records what each open carried; `sockets` the server's side of each.
  */
-async function host(fx, { brokerOpts = {} } = {}) {
+async function host(fx, { brokerOpts = {}, payload = null } = {}) {
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 0, perMessageDeflate: false });
   await new Promise((r) => wss.once("listening", r));
   const events = [];
@@ -62,7 +62,8 @@ async function host(fx, { brokerOpts = {} } = {}) {
       if (!link) {
         const m1 = R.readMessage1(bytes);
         assert.deepEqual(Buffer.from(m1.payload), fx.record, "message 1 carries the record");
-        const m2 = R.writeMessage2(new Uint8Array(0));
+        // (message 2's payload is the accepted counters, as the host's acceptance writes it)
+        const m2 = R.writeMessage2(payload ? payload(f) : canonBytes({ host_gen: fx.body.host_gen, browser_gen: fx.body.browser_gen, resume_n: f.resume_n }));
         socket.send(m2.message, { binary: true });
         link = broker.attach({ cipher: { send: m2.send, receive: m2.receive }, sink: wsSink(socket) });
         h.links.push(link);
@@ -451,4 +452,22 @@ test("closed while the transport is being opened: the socket it resolves to is t
     assert.deepEqual(states, [], "close() is quiet");
     assert.equal(c.socket, null);
   } finally { c.close(); await h.close(); }
+});
+
+test("a message 2 that isn't this attempt's (another counter, another shape) ends the session; it is never a lost attempt", async () => {
+  for (const [what, payload] of [
+    ["another resume_n", (f) => canonBytes({ host_gen: 1, browser_gen: 2, resume_n: f.resume_n + 1 })],
+    ["a refusal naming another counter", (f) => canonBytes({ refused: "resume_n", host_gen: 1, browser_gen: 2, resume_n: f.resume_n + 5 })],
+    ["an empty payload", () => new Uint8Array(0)],
+  ]) {
+    const fx = fixture(), h = await host(fx, { payload });
+    const { c, states } = channel(fx, h);
+    try {
+      await until(() => states.some((s) => s.startsWith("ended")) || h.opens.length > 1, 3000, `ended or a retry (${what})`);
+      assert.equal(h.opens.length, 1, `no retry (${what})`);
+      assert.deepEqual(states, ["ended:message 2 isn't this attempt's"], what);
+      await tick(60);
+      assert.equal(h.opens.length, 1, `no retry (${what})`);
+    } finally { c.close(); await h.close(); }
+  }
 });

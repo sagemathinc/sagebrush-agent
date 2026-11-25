@@ -34,6 +34,10 @@ import { pairOrigin, readPairLine } from "../lib/pair-stdin.mjs";
 import { stdioOutput } from "../lib/stdout-thread.mjs";
 import { baseUrlSet, claudeBinary, claudeMode, claudeSignedIn, claudeVersionProblem, cliCreateServer, cliDeleteSession, cliQuery, sdkGuard, SETUP_TEXT } from "../lib/claude-cli.mjs";
 
+// `sagebrush-agent host run | reset-identity`: the host daemon's root commands (lib/fleet/host/host-main.mjs). Handed
+// over as the FIRST statement, before any of the chat agent's own (its base-URL refusal, its arguments, Claude's mode).
+if (process.argv[2] === "host") process.exit(await (await import("../lib/fleet/host/host-main.mjs")).main(process.argv.slice(3)));
+
 
 // (r2 §6: Claude is never pointed at another endpoint from here; refused before anything starts)
 const baseUrls = baseUrlSet();

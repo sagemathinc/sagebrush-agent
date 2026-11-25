@@ -2,7 +2,7 @@
 // audit. One queue, emergencies first; the plan's steps in order with durable progress; narrowing; agent-side and
 // host-side failures; expiry; the lifecycle ops and who may submit them; recovery; and a crash at every barrier.
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
@@ -13,6 +13,11 @@ import { HostStore } from "../lib/fleet/host/host-store.mjs";
 import { planGrant, parseStep } from "../lib/fleet/host/plan.mjs";
 import { STATES } from "../lib/fleet/host/registry.mjs";
 import { STEPS } from "../lib/fleet/host/deprovision-record.mjs";
+import { lockFile } from "../lib/fleet/host/store.mjs";
+import { createPlan } from "../lib/fleet/host/restore-plan.mjs";
+import { newRestoreRun } from "../lib/fleet/host/restore-record.mjs";
+import { BEGIN, writeRequest } from "../lib/fleet/host/restore-begin.mjs";
+import { holdSets, runWorker, setLockPath } from "../lib/fleet/host/restore-worker.mjs";
 
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
 const tmp = (n) => join(mkdtempSync(join(tmpdir(), "sb-exec-")), n);
@@ -1905,7 +1910,7 @@ test("restore-dispatch: the host's op only, with a restore seam; owned under its
   await none.close();
   const calls = [];
   let answer = { dispatched: `agent-${A}` };
-  const restoreWorker = { busy: async () => false, dispatch: async (ms, signal) => { calls.push([ms, signal instanceof AbortSignal]); return answer; } };
+  const restoreWorker = { hold: async () => ({ release: async () => {} }), dispatch: async (ms, signal) => { calls.push([ms, signal instanceof AbortSignal]); return answer; } };
   const { sup, fx, close } = await setup({ restoreWorker });
   for (const authority of ["person", "service", "local"]) await rejects(sup.submit({ kind: "restore-dispatch", authority }), "not_granted");
   assert.deepEqual(await sup.submit({ kind: "restore-dispatch", authority: "host" }), { status: "dispatched", dispatched: `agent-${A}` });
@@ -1917,53 +1922,115 @@ test("restore-dispatch: the host's op only, with a restore seam; owned under its
   restoreWorker.dispatch = async () => { throw new FleetError("preflight_missing", "systemd-run"); };
   assert.deepEqual(await sup.submit({ kind: "restore-dispatch", authority: "host" }), { status: "failed", reason: "preflight_missing", settled: true });
   await close();
-  const slow = { busy: async () => false, dispatch: (ms, signal) => new Promise((r, j) => signal.addEventListener("abort", () => j(new Error("aborted")))) };
+  const slow = { hold: async () => ({ release: async () => {} }), dispatch: (ms, signal) => new Promise((r, j) => signal.addEventListener("abort", () => j(new Error("aborted")))) };
   const late = await setup({ restoreWorker: slow, deadlines: { "restore-dispatch": 20 } });
   assert.deepEqual(await late.sup.submit({ kind: "restore-dispatch", authority: "host" }), { status: "failed", reason: "step_deadline", settled: true });
   await late.close();
 });
 
-test("a live restore worker for one of an agent's sets: delete, purge and requalify are refused with no effect; free again, they run", async () => {
-  let busy = true;
-  const asked = [];
-  const restoreWorker = { busy: async (agent, tags) => { asked.push([agent, tags]); return busy; }, dispatch: async () => ({ dispatched: null }) };
-  const { sup, store, fx, close } = await setup({ restoreWorker });
-  busy = false;
+/**
+ * An open restore on a real temporary directory whose plan has `keys` (each with its request), and the executor's
+ * restore seam over it with REAL set locks (holdSets). `probe(kind, id)` asks whether a worker could take a set now:
+ * "held" when its lock is held by someone else, "free" otherwise.
+ */
+function openRestore(keys) {
+  const dir = join(mkdtempSync(join(tmpdir(), "sb-exec-restore-")), "restore");
+  mkdirSync(dir, { mode: 0o700 });
+  const run = newRestoreRun(1795500000000, () => Buffer.alloc(6));
+  writeFileSync(join(dir, BEGIN), JSON.stringify({ v: 1, snapshot: "1".repeat(64), manifest_sha256: "2".repeat(64), run, state: "done" }) + "\n", { mode: 0o600 });
+  createPlan({ v: 1, host: "old", manifest: "1".repeat(64), sha256: "2".repeat(64), hoststore: "3".repeat(64),
+    sets: Object.fromEntries(keys.map((k) => [k, { run, snapshot: "1".repeat(64), tree: "4".repeat(64) }])) }, { dir });
+  for (const k of keys) writeRequest(k, run, { dir, uid: process.getuid() });
+  const holds = [];
+  const restoreWorker = {
+    hold: async (agent, tags) => { holds.push([agent, [...tags].sort()]); return holdSets(agent, tags, { dir }); },
+    dispatch: async () => ({ dispatched: null, why: "idle" }),
+  };
+  const probe = async (kind, id) => {
+    try { const l = await lockFile(setLockPath(dir, kind, id), { waitMs: 0 }); await l.release(); return "free"; } catch (e) { if (e.code === "in_progress") return "held"; throw e; }
+  };
+  return { dir, run, restoreWorker, probe, holds };
+}
+
+test("a dispatch that returned before its worker took the set: the next delete, purge, requalify and provision HOLD the set through their effects, so that worker can't start", async () => {
+  const R = openRestore([`agent-${A}`, `archive-${A}`, `tag-${T}`, `agent-${B}`]);
+  const seen = [];
+  const fx = fakeFx();
+  // At each lifecycle effect: the sets are held, and a worker started now (the dispatched one, late) exits busy.
+  const during = (what) => async (...a) => {
+    for (const [kind, id] of [["agent", A], ["archive", A], ["tag", T]]) seen.push([what, kind, await R.probe(kind, id)]);
+    const filled = [];
+    await rejects(runWorker("agent", A, R.run, { filler: () => async () => { filled.push(1); return { state: "validated" }; } }, { dir: R.dir, uid: process.getuid() }), "in_progress");
+    seen.push([what, "worker filled", filled.length]);
+    return a;
+  };
+  for (const k of ["deprovision", "purge", "requalify", "provision"]) { const orig = fx[k]; fx[k] = async (...a) => { if (a[0] === A) await during(k)(); return orig(...a); }; }
+  const { sup, close } = await setup({ fx, restoreWorker: R.restoreWorker });
   await sup.submit({ kind: "grant", bytes: grant(1, [entry(A, { tags: [T] }), entry(B)]) });
-  busy = true;
-  fx.log.length = 0;
-  asked.length = 0;
-  assert.deepEqual(await sup.submit({ kind: "delete", authority: "person", agent: A }), { status: "refused", reason: "restore_running" });
-  assert.deepEqual(asked, [[A, [T]]], "the agent and its registry tags");
-  assert.equal(store.registry.agent(A).state, "running", "not deleted");
-  assert.deepEqual(fx.log, [], "no effect");
-  busy = false;
+  // The dispatch "started" A's worker (accepted by systemd) and returned; the worker hasn't taken its lock yet.
+  assert.deepEqual(await sup.submit({ kind: "restore-dispatch", authority: "host" }), { status: "idle", dispatched: null, why: "idle" });
   await sup.submit({ kind: "delete", authority: "person", agent: A });
-  assert.equal(store.registry.agent(A).state, "deleted");
-  busy = true;
-  fx.log.length = 0;
-  for (const kind of ["purge", "requalify"]) {
-    assert.deepEqual(await sup.submit({ kind, authority: "local", agent: A }), { status: "refused", reason: "restore_running" }, kind);
-  }
-  assert.deepEqual(fx.log.filter((l) => l[0] === "purge" || l[0] === "requalify"), []);
-  busy = false;
-  assert.deepEqual(await sup.submit({ kind: "purge", authority: "local", agent: A }), { status: "purged" });
+  await sup.submit({ kind: "requalify", authority: "local", agent: A });
+  await sup.submit({ kind: "purge", authority: "local", agent: A });
+  const want = (what) => [[what, "agent", "held"], [what, "archive", "held"], [what, "tag", "held"], [what, "worker filled", 0]];
+  // Each of A's effects ran exactly once, with all three of A's sets held and the late worker refused.
+  for (const what of ["provision", "deprovision", "requalify", "purge"]) assert.deepEqual(seen.filter((x) => x[0] === what), want(what), what);
+  // Released after each op: the sets are free again.
+  for (const [kind, id] of [["agent", A], ["archive", A], ["tag", T]]) assert.equal(await R.probe(kind, id), "free", kind);
+  // Each op asked for the agent's sets with its tags.
+  assert.ok(R.holds.some(([a, t]) => a === A && t.length === 1 && t[0] === T));
   await close();
 });
 
-test("a live restore worker for one of an agent's sets: its provision step is refused before any effect, and redone once it ends", async () => {
-  let busy = (agent) => agent === B;
-  const asked = [];
-  const restoreWorker = { busy: async (agent, tags) => { asked.push([agent, tags]); return busy(agent); }, dispatch: async () => ({ dispatched: null }) };
-  const { sup, store, fx, close } = await setup({ restoreWorker });
-  const r = await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B, { tags: [T] })]) });
-  assert.deepEqual(r, { status: "failed", gen: 1, step: `provision:${B}`, reason: "in_progress", settled: true }, "host-side, the application left to redo");
-  assert.ok(!fx.log.some((l) => l[0] === "provision" && l[1] === B), "B never provisioned");
-  assert.equal(store.registry.agent(B), null, "B not added to the registry either");
-  assert.ok(asked.some(([agent, tags]) => agent === B && tags.length === 1 && tags[0] === T), "asked with the grant's tags");
-  busy = () => false;
-  const again = await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B, { tags: [T] })]) });
-  assert.equal(again.status, "reapplied", "the same grant redoes the unfinished application");
-  assert.ok(fx.log.some((l) => l[0] === "provision" && l[1] === B));
+test("a worker that already holds one of an agent's sets: delete, purge, requalify and provision are refused with NO effect; the deprovision lane waits", async () => {
+  const R = openRestore([`agent-${A}`, `tag-${T}`, `agent-${B}`]);
+  const { sup, store, fx, close } = await setup({ restoreWorker: R.restoreWorker });
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A, { tags: [T] })]) });
+  // The worker of A's tag folder holds its lock.
+  let w = await lockFile(setLockPath(R.dir, "tag", T), { waitMs: 0 });
+  fx.log.length = 0;
+  assert.deepEqual(await sup.submit({ kind: "delete", authority: "person", agent: A }), { status: "refused", reason: "restore_running" });
+  assert.deepEqual([store.registry.agent(A).state, fx.log], ["running", []], "not deleted, nothing stopped or masked");
+  await w.release();
+  // Deleted, with its deprovision left pending; then a worker holds A's own set: purge, requalify and the recovery's
+  // deprovision lane don't run.
+  fx.dpResult = () => ({ status: "pending", step: "accounts", reason: "uid still in use" });
+  await sup.submit({ kind: "delete", authority: "person", agent: A });
+  w = await lockFile(setLockPath(R.dir, "agent", A), { waitMs: 0 });
+  fx.log.length = 0;
+  for (const kind of ["purge", "requalify"]) assert.deepEqual(await sup.submit({ kind, authority: "local", agent: A }), { status: "refused", reason: "restore_running" }, kind);
+  fx.dpResult = null;
+  await sup.recover();
+  assert.deepEqual(fx.log.filter((l) => ["purge", "requalify", "deprovision"].includes(l[0])), [], "no host command, no deprovision pass");
+  assert.notEqual(store.deprovision.record(A)?.done, true);
+  await w.release();
+  await sup.recover();
+  assert.equal(store.deprovision.record(A).done, true, "the lane runs once the set is free");
+  // Provision: B's set held, so B's provision step is refused before any effect.
+  w = await lockFile(setLockPath(R.dir, "agent", B), { waitMs: 0 });
+  fx.log.length = 0;
+  const r = await sup.submit({ kind: "grant", bytes: grant(2, [entry(B)]) });
+  assert.deepEqual([r.status, r.step, r.reason], ["failed", `provision:${B}`, "in_progress"]);
+  assert.ok(!fx.log.some((l) => l[0] === "provision" && l[1] === B));
+  assert.equal(store.registry.agent(B), null, "not added either");
+  await w.release();
   await close();
+});
+
+test("provision holds the tag folders of the agent's CURRENT registry tags too, not only the grant's", async () => {
+  // The registry can know the agent by the time its provision step runs (a redo after the agent was added), with tags
+  // the incoming grant doesn't list: those tag folders are held too. Here the registry learns B, with tag T, between
+  // the plan and B's provision step.
+  const R = openRestore([`agent-${B}`, `tag-${T}`]);
+  let store;
+  const barrier = async (name) => { if (name === "after_broker_gen" && store.registry.agent(B) === null) { store.registry.addTag(T); store.registry.addAgent(B, 1, [T]); } };
+  const s = await setup({ restoreWorker: R.restoreWorker, barrier });
+  store = s.store;
+  const w = await lockFile(setLockPath(R.dir, "tag", T), { waitMs: 0 });
+  const r = await s.sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) }); // B listed without T
+  assert.deepEqual([r.status, r.step, r.reason], ["failed", `provision:${B}`, "in_progress"]);
+  assert.deepEqual(R.holds.filter(([a]) => a === B), [[B, [T]]], "asked with the registry's tag, though the grant lists none");
+  assert.ok(!s.fx.log.some((l) => l[0] === "provision" && l[1] === B));
+  await w.release();
+  await s.close();
 });

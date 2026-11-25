@@ -15,7 +15,7 @@ import { createPlan, closePlan } from "../lib/fleet/host/restore-plan.mjs";
 import { newRecord, newRestoreRun, readRecord, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 import { ABANDON, BEGIN, writeRequest } from "../lib/fleet/host/restore-begin.mjs";
 import {
-  WORKER_SLICE, admitBind, agentBusy, dispatchOnce, readIntent, runWorker, setLockPath, stopWorker, workerArgv, workerLive, workerScope,
+  WORKER_SLICE, admitBind, dispatchOnce, holdSets, readIntent, runWorker, setLockPath, stopWorker, workerArgv, workerLive, workerScope,
 } from "../lib/fleet/host/restore-worker.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
@@ -27,6 +27,8 @@ const SNAP = hex("1");
 const settle = () => new Promise((r) => setTimeout(r, 200));
 const OBJ = { type: "dir", mode: 0o700, uid: 70000, gid: 70000, dev: [8, 1], ino: 4242, gen: 1, mnt_id: 7, projid: 70000, inherit: true };
 const PROV = { uid: 70000, gid: 70000, mode: 0o700, projid: 70000 };
+/** OBJ's identity in the record's form: what the provisioning recorded for it. */
+const EXACT = { dev: String(8 * 2 ** 20 + 1), ino: "4242", ...PROV };
 
 /** A restore directory: begin.json (`state`), the plan of `sets` (key → run), each set's request (unless `noRequest`). */
 function host({ sets, state = "done", noRequest = [], closed = false } = {}) {
@@ -52,7 +54,7 @@ function filler(body = async () => ({ state: "validated" })) {
   return { calls, get hooks() { return hooks; }, filler: (h) => { hooks = h; return async (kind, id, plan, opts) => { calls.push([kind, id]); return body(h, kind, id, plan, opts); }; } };
 }
 const deps = (f, over = {}) => ({
-  filler: f.filler, identifyDest: async () => ({ object: OBJ }), provisioned: async () => PROV, isEmpty: async () => true, ...over,
+  filler: f.filler, identifyDest: async () => ({ object: OBJ }), provisioned: async () => EXACT, isEmpty: async () => true, ...over,
 });
 const bound = (kind, id, run = RUN, dest = { dev: String(8 * 2 ** 20 + 1), ino: "4242", ...PROV }) => {
   const r = newRecord({ kind, id, run, snapshot: SNAP });
@@ -194,28 +196,59 @@ test("a bound destination must still be exactly its identity: any field changed 
   }
 });
 
-test("admission at the bind: the provisioned identity, empty, for every class; anything else is refused", async () => {
+test("admission at the bind: EXACTLY the provisioned object (every identity field), empty, for every class; anything else is refused", async () => {
   const id = newId();
   const r = newRecord({ kind: "agent", id, run: RUN, snapshot: SNAP });
   const dest = { home: { dev: "1", ino: "2", ...PROV }, sessions: { dev: "1", ino: "3", ...PROV } };
   const ids = { home: { object: OBJ }, sessions: { object: OBJ } };
-  await admitBind(r, ids, dest, { provisioned: async () => PROV, isEmpty: async () => true });
-  for (const k of ["uid", "gid", "mode", "projid"]) {
-    await rejects(admitBind(r, ids, { ...dest, sessions: { ...dest.sessions, [k]: 1 } }, { provisioned: async () => PROV, isEmpty: async () => true }), "not_granted");
+  const provisioned = async (k, i, cls) => ({ ...dest[cls] });
+  await admitBind(r, ids, dest, { provisioned, isEmpty: async () => true });
+  // Each field changed alone, in either class: device and inode (another directory with the same owner and mode),
+  // owner, group, mode, project.
+  for (const cls of ["home", "sessions"]) {
+    for (const [k, v] of [["dev", "9"], ["ino", "99"], ["uid", 1], ["gid", 1], ["mode", 0o755], ["projid", 1]]) {
+      await rejects(admitBind(r, ids, { ...dest, [cls]: { ...dest[cls], [k]: v } }, { provisioned, isEmpty: async () => true }), "not_granted");
+    }
   }
+  // The trusted identity must be whole: missing, or missing any field, refuses.
   await rejects(admitBind(r, ids, dest, { provisioned: async () => null, isEmpty: async () => true }), "not_granted");
+  for (const k of ["dev", "ino", "uid", "gid", "mode", "projid"]) {
+    await rejects(admitBind(r, ids, dest, { provisioned: async (kk, i, cls) => { const x = { ...dest[cls] }; delete x[k]; return x; }, isEmpty: async () => true }), "not_granted");
+  }
   const asked = [];
-  await rejects(admitBind(r, ids, dest, { provisioned: async () => PROV, isEmpty: async (k, i, cls, x) => { asked.push([cls, x]); return cls !== "sessions"; } }), "not_granted");
+  await rejects(admitBind(r, ids, dest, { provisioned, isEmpty: async (k, i, cls, x) => { asked.push([cls, x]); return cls !== "sessions"; } }), "not_granted");
   assert.deepEqual(asked, [["home", ids.home], ["sessions", ids.sessions]], "each class's own identified object");
   // A truthy non-true answer isn't empty.
-  await rejects(admitBind(r, ids, dest, { provisioned: async () => PROV, isEmpty: async () => "yes" }), "not_granted");
+  await rejects(admitBind(r, ids, dest, { provisioned, isEmpty: async () => "yes" }), "not_granted");
+});
+
+test("through the real fill driver: the destination replaced by another EMPTY directory with the same owner, mode and project fails before any bind or launch", async () => {
+  for (const kind of ["agent", "archive"]) {
+    const id = newId(), key = `${kind}-${id}`;
+    const h = host({ sets: { [key]: RUN } });
+    const launched = [], touched = [];
+    const never = (what) => async () => { touched.push(what); throw new Error(`${what} must not run`); };
+    const { restoreFiller } = await import("../lib/fleet/host/restore-fill.mjs");
+    const real = (hooks) => restoreFiller({
+      launch: async (args) => { launched.push(args); throw new Error("no launch"); },
+      mount: "/srv/sagebrush", root: join(h.base, "staging"), dir: h.dir,
+      // Identified now: another inode than the provisioned one, every other field the same.
+      identifyDest: async () => ({ object: { ...OBJ, ino: OBJ.ino + 1 } }),
+      expectOf: never("expectOf"), projidOf: () => 70000, cleanDest: never("cleanDest"), discardStaging: never("discardStaging"),
+      stopped: never("stopped"), unrestorableOf: () => [], removeCopies: never("removeCopies"), ...hooks,
+    });
+    await rejects(runWorker(kind, id, RUN, { ...deps(filler()), filler: real }, { dir: h.dir, uid: UID }), "not_granted");
+    const r = readRecord(kind, id, { dir: h.dir });
+    assert.deepEqual([r.state, r.dest, r.attempt], ["staging", null, 1], `${kind}: nothing bound`);
+    assert.deepEqual([launched, touched], [[], []], `${kind}: nothing launched, cleaned or discarded`);
+  }
 });
 
 test("the worker's hooks: admission through the provisioned deps; the veto reads the intent now", async () => {
   const id = newId(), key = `archive-${id}`;
   const h = host({ sets: { [key]: RUN } });
   const r = newRecord({ kind: "archive", id, run: RUN, snapshot: SNAP });
-  const dest = { archive: { dev: "1", ino: "2", ...PROV } };
+  const dest = { archive: EXACT };
   const got = [];
   const f = filler(async (hooks) => {
     await hooks.admit(r, { archive: { object: OBJ } }, dest);
@@ -306,20 +339,48 @@ test("dispatch: only a begun, open restore with the gate open; one worker per ho
   assert.equal(out.dispatched, keys[1], "no request: skipped");
 });
 
-test("agentBusy: an agent's own set, its archive or a tag set it belongs to with a live worker", async () => {
-  const a = newId(), t = newId();
-  const h = host({ sets: { [`agent-${a}`]: RUN } });
-  const opts = { dir: h.dir, tagsOf: () => [t] };
-  assert.equal(await agentBusy(a, opts), false);
+test("holdSets: every lock of an agent's sets in an OPEN plan, held until released; refused, holding none, while any is held", async () => {
+  const a = newId(), t = newId(), other = newId();
+  const keys = { agent: `agent-${a}`, archive: `archive-${a}`, tag: `tag-${t}` };
+  const h = host({ sets: { [keys.agent]: RUN, [keys.archive]: RUN, [keys.tag]: RUN, [`agent-${other}`]: RUN } });
+  const free = async (kind, id) => { const l = await lockFile(setLockPath(h.dir, kind, id), { waitMs: 0 }); await l.release(); };
+  const held = await holdSets(a, [t], { dir: h.dir });
   for (const [kind, id] of [["agent", a], ["archive", a], ["tag", t]]) {
-    const held = await lockFile(setLockPath(h.dir, kind, id));
-    assert.equal(await agentBusy(a, opts), true, kind);
-    await held.release();
-    assert.equal(await agentBusy(a, opts), false, `${kind} released`);
+    await rejects(lockFile(setLockPath(h.dir, kind, id), { waitMs: 0 }), "in_progress");
+    // A worker for that set can't start: it exits busy, filling nothing.
+    const f = filler();
+    await rejects(runWorker(kind, id, RUN, deps(f), { dir: h.dir, uid: UID }), "in_progress");
+    assert.deepEqual(f.calls, [], `${kind}: nothing filled`);
   }
-  await rejects(agentBusy("nope", opts), "bad_form");
-  // No restore directory at all: nothing is busy.
-  assert.equal(await agentBusy(a, { dir: join(h.base, "missing") }), false);
+  await free("agent", other); // another agent's set isn't held
+  await held.release();
+  for (const [kind, id] of [["agent", a], ["archive", a], ["tag", t]]) await free(kind, id);
+  // Any one held by a worker: null, and none of the others stays held.
+  for (const [kind, id] of [["agent", a], ["archive", a], ["tag", t]]) {
+    const w = await lockFile(setLockPath(h.dir, kind, id), { waitMs: 0 });
+    assert.equal(await holdSets(a, [t], { dir: h.dir }), null, kind);
+    await w.release();
+    for (const [k2, i2] of [["agent", a], ["archive", a], ["tag", t]]) await free(k2, i2);
+  }
+  // A tag the caller names (the current or the incoming ones) is held; one it doesn't name isn't.
+  const w = await lockFile(setLockPath(h.dir, "tag", t), { waitMs: 0 });
+  const without = await holdSets(a, [], { dir: h.dir });
+  assert.notEqual(without, null);
+  await without.release();
+  assert.equal(await holdSets(a, [t, t], { dir: h.dir }), null);
+  await w.release();
+  await rejects(holdSets("nope", [], { dir: h.dir }), "bad_form");
+  // No restore here, or a closed one: nothing to hold (and no lock file made).
+  const none = await holdSets(a, [t], { dir: join(h.base, "missing") });
+  await none.release();
+  const c = host({ sets: { [keys.agent]: RUN }, closed: true });
+  const nc = await holdSets(a, [t], { dir: c.dir });
+  await nc.release();
+  assert.equal(existsSync(setLockPath(c.dir, "agent", a)), false);
+  // An unreadable plan: refused, as held (fail closed).
+  const u = host({ sets: { [keys.agent]: RUN } });
+  writeFileSync(join(u.dir, "plan.json"), "{");
+  assert.equal(await holdSets(a, [t], { dir: u.dir }), null);
 });
 
 test("stopWorker: kills the scope, then proves it gone, bounded", async () => {

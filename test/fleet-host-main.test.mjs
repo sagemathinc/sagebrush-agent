@@ -509,11 +509,12 @@ function unitFx({ hold = () => false, fenceDir } = {}) {
   const step = (name, f) => (...a) => { calls.push(name); return hold(name) ? never : f(...a); };
   const fx = {
     appendIntent: step("appendIntent", async () => {}), openIntents: step("openIntents", async () => []), audit: () => {},
-    brokerGen: step("brokerGen", async () => {}), brokerRevoke: async () => {}, publishMap: step("publishMap", async () => {}), sendAck: async () => {},
+    brokerGen: step("brokerGen", async () => {}), brokerRevoke: async () => {}, publishMap: step("publishMap", async () => {}), sendAck: step("sendAck", async () => {}),
     stopUnit: step("stopUnit", async (id) => { u(id).active = false; }), procCount: async (id) => (u(id).active ? 1 : 0),
     mask: step("mask", async (id) => { u(id).masked = true; }), unmask: step("unmask", async (id) => { u(id).masked = false; }),
     provision: step("provision", async () => {}), writeUnit: step("writeUnit", async () => {}), daemonReload: step("daemonReload", async () => {}),
-    systemdVersion: async () => GOOD, isActive: async (id) => u(id).active,
+    systemdVersion: async () => GOOD, isActive: step("isActive", async (id) => u(id).active),
+    freeze: step("freeze", async () => { throw new Error("the freeze failed"); }), thaw: step("thaw", async () => {}),
     start: step("start", async (id) => { if (!u(id).masked) u(id).active = true; }),
     sys: { stop: (unit) => { for (const s of Object.values(units)) s.active = false; void unit; }, jobs: () => [], cancel: () => {}, rootUnits: () => [],
       activeAgentUnits: () => Object.entries(units).filter(([, x]) => x.active).map(([id]) => `sagebrush-agent-${id}.service`), procCount: () => Object.values(units).filter((x) => x.active).length },
@@ -605,6 +606,77 @@ test("REAL executor: once closed, no effect starts, even where an op swallows a 
   await closing;
   assert.deepEqual(calls.slice(before), [], `no effect after the close: ${calls.slice(before).join(",")}`);
   await store.close();
+});
+
+test("REAL executor: a close while a grant's final ack read (isActive) is held ends the apply there, before applied; the next recovery finishes it and sends the ack", async () => {
+  const root = join(tmp(), "state"), fenceDir = join(tmp(), "fence");
+  const store = await HostStore.open(root);
+  let held = true;
+  const { fx, calls } = unitFx({ hold: (n) => n === "isActive" && held });
+  const sup = new Supervisor({ store, fx, verify: fakeVerify, bodyOf: fakeBodyOf, fenceDir, deadlines: { grace: 200 } });
+  await sup.recover();
+  const applying = sup.submit({ kind: "grant", bytes: grantOf(1, [AGENT]) });
+  await waitFor(() => calls.includes("isActive"));
+  await within(sup.close(), 5000);
+  await assert.rejects(applying, /closing/, "the op ends at the crash point, never resolving applied");
+  assert.ok(!calls.includes("sendAck"), "no ack");
+  assert.equal(store.grants.pending().phase, "applying", "not applied");
+  await store.close();
+  held = false;
+  const store2 = await HostStore.open(root);
+  const next = unitFx();
+  const sup2 = new Supervisor({ store: store2, fx: next.fx, verify: fakeVerify, bodyOf: fakeBodyOf, fenceDir });
+  await sup2.recover();
+  assert.equal(store2.grants.pending().phase, "applied", "recovery finished the apply");
+  assert.ok(next.calls.includes("sendAck"), "and sent the ack");
+  await sup2.close();
+  await store2.close();
+});
+
+test("REAL executor: a close while the grant's ack send is held ends the op after applied (as a crash there); a byte-identical re-apply sends the ack", async () => {
+  const root = join(tmp(), "state"), fenceDir = join(tmp(), "fence");
+  const store = await HostStore.open(root);
+  const { fx, calls } = unitFx({ hold: (n) => n === "sendAck" });
+  const sup = new Supervisor({ store, fx, verify: fakeVerify, bodyOf: fakeBodyOf, fenceDir, deadlines: { grace: 200 } });
+  await sup.recover();
+  const applying = sup.submit({ kind: "grant", bytes: grantOf(1, [AGENT]) });
+  await waitFor(() => calls.includes("sendAck"));
+  await within(sup.close(), 5000);
+  await assert.rejects(applying, /closing/, "the op ends with Closing, not a resolved 'applied'");
+  assert.equal(store.grants.pending().phase, "applied");
+  await store.close();
+  const store2 = await HostStore.open(root);
+  const next = unitFx();
+  const sup2 = new Supervisor({ store: store2, fx: next.fx, verify: fakeVerify, bodyOf: fakeBodyOf, fenceDir });
+  await sup2.recover();
+  const again = await sup2.submit({ kind: "grant", bytes: grantOf(1, [AGENT]) });
+  assert.equal(again.status, "reapplied", JSON.stringify(again));
+  assert.ok(next.calls.includes("sendAck"), "the re-apply sends the ack");
+  await sup2.close();
+  await store2.close();
+});
+
+test("REAL executor: a close during a contain's or a stop's mask ends the op (mask's fallback never swallows it)", async () => {
+  // A person's stop of the seeded agent, its mask held: the close ends the op with Closing, not a resolved stop.
+  const seed = await seededStore();
+  const store = await HostStore.open(seed.root);
+  const { fx, calls } = unitFx({ hold: (n) => n === "mask" });
+  const sup = new Supervisor({ store, fx, verify: fakeVerify, bodyOf: fakeBodyOf, fenceDir: seed.fenceDir, deadlines: { grace: 200 } });
+  const stopping = sup.submit({ kind: "stop", authority: "person", agent: AGENT });
+  await waitFor(() => calls.includes("mask"));
+  await within(sup.close(), 5000);
+  await assert.rejects(stopping, /closing/);
+  await store.close();
+  // A pause whose freeze fails is contained (the contain's mask): that mask held, the close ends the op too.
+  const seed2 = await seededStore();
+  const store2 = await HostStore.open(seed2.root);
+  const p = unitFx({ hold: (n) => n === "mask" });
+  const sup2 = new Supervisor({ store: store2, fx: p.fx, verify: fakeVerify, bodyOf: fakeBodyOf, fenceDir: seed2.fenceDir, deadlines: { grace: 200 } });
+  const pausing = sup2.submit({ kind: "pause", authority: "person", agent: AGENT });
+  await waitFor(() => p.calls.includes("freeze") && p.calls.includes("mask"));
+  await within(sup2.close(), 5000);
+  await assert.rejects(pausing, /closing/);
+  await store2.close();
 });
 
 test("REAL executor: SIGTERM during a held initial sync: nothing runs, the close is immediate, exit 0", async () => {

@@ -3,9 +3,10 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, utimesSync, writeFileSync, lstatSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
+import { profileForbiddenRoots } from "../lib/fleet/host/profile-life.mjs";
 import { FIXED_FORBIDDEN, backupSources, checkExcludes, checkForbidden, realOrSelf, unchanged, walkSources, within } from "../lib/fleet/host/backup-sources.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
@@ -52,6 +53,20 @@ test("forbidden roots: refused when one is at or beneath a source, or a source i
   checkForbidden([`${SRV}/agents/x/homeX`], [`${SRV}/agents/x/home`], { real: (p) => p }); // a sibling with a shared prefix is fine
   for (const bad of ["rel", "/a/../b", "/a/", "/a//b", "/"]) refused(() => checkForbidden([bad], [], { real: (p) => p }), "bad_form");
   assert.ok(within("/a/b", "/a") && within("/a", "/a") && !within("/ab", "/a"));
+});
+
+test("the profiles root is profile-life.mjs's own: every root it names is forbidden, so no harness sign-in is ever backed up", () => {
+  const roots = profileForbiddenRoots();
+  assert.ok(roots.length >= 1 && Object.isFrozen(roots) && Object.isFrozen(FIXED_FORBIDDEN));
+  assert.deepEqual(FIXED_FORBIDDEN.slice(0, roots.length), [...roots], "the profile roots lead the fixed list, as profile-life.mjs gives them");
+  for (const r of roots) {
+    refused(() => checkForbidden([r], FIXED_FORBIDDEN, { real: (p) => p }), "not_granted");
+    refused(() => checkForbidden([`${r}/p1/.claude`], FIXED_FORBIDDEN, { real: (p) => p }), "not_granted"); // a sign-in beneath it
+    refused(() => checkForbidden([dirname(r)], FIXED_FORBIDDEN, { real: (p) => p }), "not_granted"); // a source holding it
+  }
+  // (and a run's whole allowlist stays clear of it, as given)
+  const { reg } = registry();
+  checkForbidden(backupSources(reg).flatMap((x) => x.sources), FIXED_FORBIDDEN, { real: (p) => p });
 });
 
 test("forbidden roots are checked as resolved too: a symlink can't bring one into a source", () => {

@@ -350,7 +350,7 @@ test("the initial sync gates serving: nothing is served until it completes, fail
   }
 });
 
-test("a chain-adopt that ends the certificate: host_ended after its stop; during the initial sync, before serving", async () => {
+test("a chain-adopt that ends the certificate: host_ended only once it returns proven, then drained; during the initial sync, before serving", async () => {
   const { id } = await paired();
   const h = harness({ id, supervisor: () => ({}) });
   const run = hostRun(h.d);
@@ -359,11 +359,64 @@ test("a chain-adopt that ends the certificate: host_ended after its stop; during
   await h.made.sync.submit({ kind: "chain-adopt", authority: "host" });
   const r = await run;
   assert.deepEqual([r.code, refusal(h.lines)], [3, ["host_ended"]]);
-  assert.ok(!h.log.includes("close"), "no drain: the adoption's own stop already ran");
-  const g = harness({ id, supervisor: (_x) => ({ revoked: true }) });
-  assert.equal((await hostRun(g.d)).code, 3);
+  assert.ok(h.log.includes("close"), "drained before the exit");
+  // During the initial sync: the adoption proves within it; nothing is served, and the ending is host_ended.
+  let finishSync;
+  const g = harness({ id, sync: new Promise((res) => { finishSync = res; }), sleep: (ms) => (ms === INITIAL_SYNC_MS ? new Promise(() => {}) : Promise.resolve()) });
+  const run2 = hostRun(g.d);
+  await until(() => g.log.includes("sync"));
+  g.made.sup.submit = async () => { g.made.sup.revoked = true; return { status: "revoked", proven: true }; };
+  await g.made.sync.submit({ kind: "chain-adopt", authority: "host" });
+  finishSync({ status: "current" });
+  assert.equal((await run2).code, 3);
   assert.deepEqual(refusal(g.lines), ["host_ended"]);
-  assert.ok(!g.log.includes("inputs"));
+  assert.ok(!g.log.includes("inputs") && !g.lines.some((l) => l.serving));
+});
+
+test("crossed: the initial sync's deadline while an adoption has revoked the host and is still proving its stop: no ending, nothing served, the lock held; then the proof (host_ended) or SIGTERM (unproven, 3)", async () => {
+  const { id } = await paired();
+  for (const how of ["proves", "sigterm"]) {
+    let deadline, finish;
+    const h = harness({ id, sync: new Promise(() => {}), sleep: (ms) => (ms === INITIAL_SYNC_MS ? new Promise((r) => { deadline = r; }) : Promise.resolve()) });
+    const run = hostRun(h.d);
+    await until(() => h.log.includes("sync"));
+    h.made.sup.submit = (op) => (op.kind === "chain-adopt" ? new Promise((r) => { h.made.sup.revoked = true; finish = r; }) : Promise.resolve({}));
+    h.made.sup.close = async () => { h.log.push("close"); finish?.({ status: "revoked", proven: false }); };
+    const adoption = h.made.sync.submit({ kind: "chain-adopt", authority: "host" });
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+    deadline();
+    for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r));
+    assert.deepEqual(refusal(h.lines), [], `${how}: no ending at the deadline`);
+    assert.ok(!h.log.includes("release") && !h.log.includes("inputs") && !h.lines.some((l) => l.serving), `${how}: the lock held, nothing served`);
+    assert.ok(!h.log.includes(`syncStart:${3_600_000}`), "no timer for a revoked host");
+    if (how === "proves") {
+      finish({ status: "revoked", proven: true });
+      const r = await run;
+      assert.deepEqual([r.code, refusal(h.lines)], [3, ["host_ended"]]);
+    } else {
+      h.term();
+      const r = await run;
+      assert.deepEqual([r.code, r.refused], [3, null]);
+      assert.deepEqual(h.lines.slice(-1), [{ v: 1, containment: "unproven" }]);
+    }
+    assert.ok(h.log.includes("close"), `${how}: drained`);
+    await adoption;
+  }
+});
+
+test("crossed: SIGTERM during a held initial sync, or a held recovery, reaches the drain at once (not after the sync's deadline)", async () => {
+  const { id } = await paired();
+  for (const where of ["sync", "recover"]) {
+    const h = harness({ id, sync: new Promise(() => {}), sleep: (ms) => (ms === INITIAL_SYNC_MS ? new Promise(() => {}) : Promise.resolve()),
+      supervisor: (_x, ev) => (where === "recover" ? { recover: () => { ev("recover"); return new Promise(() => {}); } } : {}) });
+    const run = hostRun(h.d);
+    await until(() => h.log.includes(where));
+    h.term();
+    const r = await Promise.race([run, new Promise((res) => setTimeout(() => res("held"), 2000))]);
+    assert.notEqual(r, "held", `${where}: SIGTERM must not wait for the sync's deadline`);
+    assert.equal(r.code, 0, where);
+    assert.ok(h.log.includes("close") && h.log.includes("syncStop") && !h.log.includes("inputs"), where);
+  }
 });
 
 test("SIGTERM while an adoption that ended the certificate is still proving its stop: the close ends it uncommitted; the unproven line, exit 3", async () => {
@@ -614,13 +667,24 @@ test("an idle daemon stays up until SIGTERM: the real wait holds the process ope
 
 // ---- the bin's hand-over (§1)
 
-test("the bin hands `host` over before the chat agent's own statements: with ANTHROPIC_BASE_URL set and a chat-agent argument", () => {
+test("the bin hands `host` over before ANY chat-agent module is loaded: with ANTHROPIC_BASE_URL set, a chat-agent argument, and a hook that fails on the chat graph", () => {
   const bin = new URL("../bin/sagebrush-agent.mjs", import.meta.url).pathname;
   const env = { ...process.env, ANTHROPIC_BASE_URL: "http://127.0.0.1:9" };
   const a = spawnSync(process.execPath, [bin, "host", "--port", "1"], { env, encoding: "utf8", timeout: 30_000 });
   assert.equal(a.status, 2);
   assert.match(a.stderr, /^usage: sagebrush-agent host run \| reset-identity$/m);
   assert.doesNotMatch(a.stderr, /ANTHROPIC_BASE_URL|unknown argument/);
+  // The control: a resolve hook that fails the moment any chat-agent module (or its ws or zod) is even resolved. Host
+  // mode never trips it; the chat agent does at once.
+  const hook = `data:text/javascript,${encodeURIComponent('export async function resolve(s, c, n) { if (/sagebrush-agent-chat|(^|\\/)(server|stdio|pair-stdin|stdout-thread|claude-cli)\\.mjs$|^(ws|zod)$/.test(s)) throw new Error("CHAT GRAPH: " + s); return n(s, c); }')}`;
+  const reg = `data:text/javascript,${encodeURIComponent(`import { register } from "node:module"; register(${JSON.stringify(hook)});`)}`;
+  const h1 = spawnSync(process.execPath, ["--import", reg, bin, "host", "--port", "1"], { env, encoding: "utf8", timeout: 30_000 });
+  assert.equal(h1.status, 2, h1.stderr);
+  assert.match(h1.stderr, /^usage: sagebrush-agent host run \| reset-identity$/m);
+  assert.doesNotMatch(h1.stderr, /CHAT GRAPH/);
+  const c1 = spawnSync(process.execPath, ["--import", reg, bin, "--help"], { env, encoding: "utf8", timeout: 30_000 });
+  assert.notEqual(c1.status, 0);
+  assert.match(c1.stderr, /CHAT GRAPH: \.\/sagebrush-agent-chat\.mjs/, "the control trips for the chat agent");
   if (UID !== 0) {
     const b = spawnSync(process.execPath, [bin, "host", "run"], { env, encoding: "utf8", timeout: 30_000 });
     assert.equal(b.status, 3);

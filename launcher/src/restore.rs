@@ -2233,7 +2233,8 @@ mod tests {
         let root = f.root().unwrap();
         let class = f.dir_from_root(&root, &format!("srv/sagebrush/.restore/{RUN}/{}/home", owner())).unwrap();
         let (ax, _) = crate::tree::child(&mut f, &class, "1", MNT).unwrap().unwrap();
-        let owners: Vec<String> = std::iter::once(0).chain(70001..70004).map(|u: u32| u.to_string()).collect();
+        // A1 r2.9 §5b: beneath .restore, owners exactly [0], whatever the refused entries' owners.
+        let owners: Vec<String> = vec!["0".to_string()];
         let ex = expect_file(&mut f, "rm.json", format!("{{\"epoch\":{{\"boot_id\":\"{BOOT}\",\"mnt_id\":{MNT}}},\"fsid\":\"0000abcd00001234\",\"root\":{},\"owners\":[{}]}}", obj_json(&ax), owners.join(",")));
         assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 0);
         assert!(!f.nodes.contains_key(&attempt_path("home")));
@@ -2333,8 +2334,8 @@ mod tests {
         let root = f.root().unwrap();
         let class = f.dir_from_root(&root, &format!("srv/sagebrush/.restore/{RUN}/{}/home", owner())).unwrap();
         let (x, _) = crate::tree::child(&mut f, &class, "1", MNT).unwrap().unwrap();
-        let owners: Vec<String> = std::iter::once(0).chain(70001..70065).map(|u: u32| u.to_string()).collect();
-        assert_eq!(owners.len(), 65);
+        // A1 r2.9 §5b: owners exactly [0]; the refused entries (another agent's) are removed with the rest.
+        let owners: Vec<String> = vec!["0".to_string()];
         let ex = expect_file(&mut f, "rm.json", format!("{{\"epoch\":{{\"boot_id\":\"{BOOT}\",\"mnt_id\":{MNT}}},\"fsid\":\"0000abcd00001234\",\"root\":{},\"owners\":[{}]}}", obj_json(&x), owners.join(",")));
         // remove-tree refuses a FIFO (A1 §5): drop it from this staging.
         f.nodes.remove(&format!("{att}/data/home/fifo"));
@@ -2355,5 +2356,113 @@ mod tests {
             assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 73, "{uid} {mode:o}");
             assert!(f.nodes.contains_key(&att), "nothing removed");
         }
+    }
+
+    // ---- A1 r2.9 §5b: removing a staging attempt, whatever its restored entries' owners and its state
+
+    /// A staged home attempt, its FIFO dropped, and the expect for removing it (owners [0], built after `spoil`).
+    fn attempt_with(spoil: fn(&mut Fake, &str)) -> (Fake, String, String) {
+        let (mut f, src) = staged("home");
+        f.nodes.remove(&format!("{src}/fifo"));
+        let att = attempt_path("home");
+        spoil(&mut f, &att);
+        let root = f.root().unwrap();
+        let class = f.dir_from_root(&root, &format!("srv/sagebrush/.restore/{RUN}/{}/home", owner())).unwrap();
+        let (x, _) = crate::tree::child(&mut f, &class, "1", MNT).unwrap().unwrap();
+        let ex = expect_file(&mut f, "rm.json", format!("{{\"epoch\":{{\"boot_id\":\"{BOOT}\",\"mnt_id\":{MNT}}},\"fsid\":\"0000abcd00001234\",\"root\":{},\"owners\":[0]}}", obj_json(&x)));
+        (f, att, ex)
+    }
+
+    fn leaf_of(f: &Fake, att: &str) -> String {
+        f.nodes.keys().find(|k| k.starts_with(&format!("{att}/data/")) && f.nodes[*k].id.mode & crate::tree::S_IFMT == S_IFDIR && k[att.len() + 6..].find('/').is_none()).cloned().unwrap()
+    }
+
+    #[test]
+    fn a_staging_attempt_is_removed_whatever_its_entries_owners() {
+        let (mut f, att, ex) = attempt_with(|f, att| {
+            let leaf = f.nodes.keys().find(|k| k.starts_with(&format!("{att}/data/")) && !k.ends_with("digests.json") && k[att.len() + 6..].find('/').is_none()).cloned().unwrap();
+            // Another agent's, an unknown uid's and root's entries, at several depths below the class leaf.
+            f.add(&format!("{leaf}/u"), S_IFDIR | 0o755, 99999, 99999);
+            f.add(&format!("{leaf}/u/deep"), S_IFDIR | 0o700, 12345, 12345);
+            f.add(&format!("{leaf}/u/deep/x"), S_IFREG | 0o600, 70002, 70002);
+            f.add(&format!("{leaf}/r"), S_IFREG | 0o600, 0, 0);
+            f.node(&leaf).id.uid = 77777; // the leaf's own metadata isn't checked
+        });
+        assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 0);
+        assert!(!f.nodes.contains_key(&att));
+    }
+
+    #[test]
+    fn every_state_a_stage_or_a_removal_leaves_is_removed() {
+        let states: Vec<(&str, fn(&mut Fake, &str))> = vec![
+            ("staged and marked", |_, _| {}),
+            ("the marker only (a removal killed after data)", |f, att| { f.nodes.retain(|k, _| !k.starts_with(&format!("{att}/data"))); }),
+            ("empty (killed before data's mkdir)", |f, att| { f.nodes.retain(|k, _| !k.starts_with(&format!("{att}/"))); }),
+            ("data only (killed before the leaf)", |f, att| { f.nodes.retain(|k, _| !k.starts_with(&format!("{att}/data/")) && !k.ends_with(".complete")); }),
+            ("a list mid-write", |f, att| { f.nodes.remove(&format!("{att}/data/digests.json")); f.nodes.remove(&format!("{att}/.complete")); f.add(&format!("{att}/data/.digests.json.tmp-4242"), S_IFREG | 0o600, 0, 0); }),
+            ("a partial leaf, no list", |f, att| { f.nodes.remove(&format!("{att}/data/digests.json")); f.nodes.remove(&format!("{att}/.complete")); }),
+        ];
+        for (what, spoil) in states {
+            let (mut f, att, ex) = attempt_with(spoil);
+            assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 0, "{what}");
+            assert!(!f.nodes.contains_key(&att), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_staging_removal_fails_at_each_seam_and_converges_on_retry() {
+        let (f0, _, _) = attempt_with(|_, _| {});
+        let n = f0.nodes.keys().filter(|k| k.starts_with(&attempt_path("home"))).count();
+        for at in 1..=n {
+            let (mut f, att, ex) = attempt_with(|_, _| {});
+            f.errno_at = Some(("unlink", at, libc::EIO));
+            let want = if at == 1 { 73 } else { 75 };
+            assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), want, "unlink {at}");
+            assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 0, "retry after unlink {at}");
+            assert!(!f.nodes.contains_key(&att));
+        }
+        let (mut f, att, ex) = attempt_with(|_, _| {});
+        f.fail = Some("fsync");
+        assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 75);
+        f.fail = None;
+        assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 0);
+        assert!(!f.nodes.contains_key(&att));
+    }
+
+    #[test]
+    fn a_staging_attempt_outside_the_closed_shape_is_refused_with_zero_unlinks() {
+        let rows: Vec<(&str, fn(&mut Fake, &str))> = vec![
+            ("the attempt 0750", |f, att| f.node(att).id.mode = S_IFDIR | 0o750),
+            ("data not root's", |f, att| f.node(&format!("{att}/data")).id.uid = UID),
+            ("data 0755", |f, att| f.node(&format!("{att}/data")).id.mode = S_IFDIR | 0o755),
+            ("two directories in data", |f, att| f.add(&format!("{att}/data/second"), S_IFDIR | 0o700, 0, 0)),
+            ("digests.json not root's", |f, att| f.node(&format!("{att}/data/digests.json")).id.uid = UID),
+            ("digests.json group-readable", |f, att| f.node(&format!("{att}/data/digests.json")).id.mode = S_IFREG | 0o640),
+            ("digests.json setuid", |f, att| f.node(&format!("{att}/data/digests.json")).id.mode = S_IFREG | 0o4600),
+            ("digests.json with two links", |f, att| f.node(&format!("{att}/data/digests.json")).id.nlink = 2),
+            ("a marker of 65 bytes", |f, att| f.node(&format!("{att}/.complete")).id.size = 65),
+            ("a marker not root's", |f, att| f.node(&format!("{att}/.complete")).id.uid = UID),
+            ("a temporary list with another name", |f, att| f.add(&format!("{att}/data/.digests.json.tmp-x1"), S_IFREG | 0o600, 0, 0)),
+            ("a temporary list with no number", |f, att| f.add(&format!("{att}/data/.digests.json.tmp-"), S_IFREG | 0o600, 0, 0)),
+            ("two temporary lists", |f, att| { f.add(&format!("{att}/data/.digests.json.tmp-1"), S_IFREG | 0o600, 0, 0); f.add(&format!("{att}/data/.digests.json.tmp-2"), S_IFREG | 0o600, 0, 0); }),
+            ("an extra name in the attempt", |f, att| f.add(&format!("{att}/junk"), S_IFREG | 0o600, 0, 0)),
+            ("a symlink in the attempt", |f, att| f.add(&format!("{att}/data2"), crate::tree::S_IFLNK | 0o777, 0, 0)),
+            ("an extra file in data", |f, att| f.add(&format!("{att}/data/notes"), S_IFREG | 0o600, 0, 0)),
+            ("a FIFO in data", |f, att| f.add(&format!("{att}/data/p"), 0o010000 | 0o600, 0, 0)),
+            ("a FIFO below the leaf", |f, att| { let l = leaf_of(f, att); f.add(&format!("{l}/p"), 0o010000 | 0o600, UID, UID); }),
+            ("a bind below the leaf", |f, att| { let l = leaf_of(f, att); f.add(&format!("{l}/m"), S_IFDIR | 0o700, UID, UID); f.node(&format!("{l}/m")).id.mnt_id = MNT + 1; }),
+        ];
+        for (what, spoil) in rows {
+            let (mut f, att, ex) = attempt_with(spoil);
+            assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 73, "{what}");
+            assert_eq!(f.count("unlink"), 0, "{what}");
+            assert!(f.nodes.contains_key(&att), "{what}");
+        }
+        // owners other than [0]: 65, nothing opened below the anchor.
+        let (mut f, _, ex) = attempt_with(|_, _| {});
+        let other = String::from_utf8(f.files[&ex[1..]].clone()).unwrap().replace("\"owners\":[0]", &format!("\"owners\":[0,{UID}]"));
+        let ex2 = expect_file(&mut f, "rm2.json", other);
+        assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex2)), 65);
+        assert_eq!(f.count("unlink"), 0);
     }
 }

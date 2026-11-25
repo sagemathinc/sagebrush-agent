@@ -125,7 +125,8 @@ fn a1(cmd: &str, rest: &[String]) -> err::Result<()> {
     let out = match cmd {
         "identify" => {
             let v = args::flags(rest, &["anchor", "name"])?;
-            if !tree::anchor_name_ok(v[0], v[1]) {
+            // A1 r2.7: a tag folder is a read-only row, for identify only.
+            if !tree::anchor_name_ok(v[0], v[1]) && !(v[0] == tree::TAGS && args::is_id(v[1])) {
                 return Err(err(Fail::Usage, "bad arguments"));
             }
             guard()?;
@@ -176,12 +177,29 @@ fn a1(cmd: &str, rest: &[String]) -> err::Result<()> {
             String::new()
         }
         _ => {
-            let v = args::flags(rest, &["anchor", "name", "expect"])?;
-            if !tree::anchor_name_ok(v[0], v[1]) || args::rel(v[2]).is_none() {
+            // `--contents` takes no value (A1 r2.6 §5a): it empties a restore destination and keeps it.
+            let contents = rest.iter().filter(|a| *a == "--contents").count();
+            if contents > 1 {
                 return Err(err(Fail::Usage, "bad arguments"));
             }
-            guard()?;
-            tree::remove_tree(&mut o, v[0], v[1], v[2])?;
+            let kept: Vec<String> = rest.iter().filter(|a| *a != "--contents").cloned().collect();
+            let v = args::flags(&kept, &["anchor", "name", "expect"])?;
+            if args::rel(v[2]).is_none() {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            if contents == 1 {
+                if !tree::contents_ok(v[0], v[1]) {
+                    return Err(err(Fail::Usage, "bad arguments"));
+                }
+                guard()?;
+                tree::remove_contents(&mut o, v[0], v[1], v[2])?;
+            } else {
+                if !tree::anchor_name_ok(v[0], v[1]) {
+                    return Err(err(Fail::Usage, "bad arguments"));
+                }
+                guard()?;
+                tree::remove_tree(&mut o, v[0], v[1], v[2])?;
+            }
             String::new()
         }
     };

@@ -9,7 +9,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFile
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
-import { b64, hostFingerprint, keyFromSeed, replayChain, seal } from "../lib/fleet/index.mjs";
+import { b64, hostFingerprint, keyFromSeed, replayChain, seal, sha256b64 } from "../lib/fleet/index.mjs";
 import { classify, firstBoot, hostPaths } from "../lib/fleet/host/identity.mjs";
 import { ADAPTERS, CONFIG_MAX, CONTAIN_RETRY_MS, INITIAL_SYNC_MS, LEASE_QUALIFIED, brokerAccount, hostResetIdentity, hostRun, readHostConfig, realContainSys, supervisorUnit } from "../lib/fleet/host/host-main.mjs";
 import { QUALIFIED_MAJOR } from "../lib/fleet/host/host-preflight.mjs";
@@ -492,6 +492,118 @@ test("the executor's drain: the running op reaches its end, a queued one never s
   await assert.rejects(sup.submit({ kind: "stop-all", authority: "person" }), (e) => e.code === "in_progress");
   await assert.rejects(sup.recover(), (e) => e.code === "in_progress");
   await store.close();
+});
+
+// ---- the REAL executor under hostRun (SEC/TESTS H3): only the store's contents, the effects and grant verification
+//      are fakes; the close must end recovery's direct awaits and owned effects within the unit's 30 s stop
+
+const AGENT = F.ids.agent;
+const grantOf = (gen, agents) => Buffer.from(JSON.stringify({ gen, agents: agents.map((agent) => ({ agent, tags: [], config: { x: 1 } })) }));
+const fakeVerify = (bytes) => { const body = JSON.parse(String(bytes)); return { body, digest: sha256b64(bytes), hash: sha256b64(Buffer.concat([Buffer.from("s"), bytes])) }; };
+const fakeBodyOf = (bytes) => JSON.parse(String(bytes));
+/** Fake effects over fake units; `hold(name)` makes that effect never settle (and ignore its abort); `calls` logs each. */
+function unitFx({ hold = () => false, fenceDir } = {}) {
+  const units = {}, calls = [];
+  const u = (id) => (units[id] ??= { active: false, masked: false });
+  const never = new Promise(() => {});
+  const step = (name, f) => (...a) => { calls.push(name); return hold(name) ? never : f(...a); };
+  const fx = {
+    appendIntent: step("appendIntent", async () => {}), openIntents: step("openIntents", async () => []), audit: () => {},
+    brokerGen: step("brokerGen", async () => {}), brokerRevoke: async () => {}, publishMap: step("publishMap", async () => {}), sendAck: async () => {},
+    stopUnit: step("stopUnit", async (id) => { u(id).active = false; }), procCount: async (id) => (u(id).active ? 1 : 0),
+    mask: step("mask", async (id) => { u(id).masked = true; }), unmask: step("unmask", async (id) => { u(id).masked = false; }),
+    provision: step("provision", async () => {}), writeUnit: step("writeUnit", async () => {}), daemonReload: step("daemonReload", async () => {}),
+    systemdVersion: async () => GOOD, isActive: async (id) => u(id).active,
+    start: step("start", async (id) => { if (!u(id).masked) u(id).active = true; }),
+    sys: { stop: (unit) => { for (const s of Object.values(units)) s.active = false; void unit; }, jobs: () => [], cancel: () => {}, rootUnits: () => [],
+      activeAgentUnits: () => Object.entries(units).filter(([, x]) => x.active).map(([id]) => `sagebrush-agent-${id}.service`), procCount: () => Object.values(units).filter((x) => x.active).length },
+  };
+  void fenceDir;
+  return { fx, calls, u };
+}
+/** A host store where AGENT is running under grant 1 (applied by a real executor, then closed as at a stop). */
+async function seededStore() {
+  const root = join(tmp(), "state"), fenceDir = join(tmp(), "fence");
+  const store = await HostStore.open(root);
+  const { fx } = unitFx();
+  const sup = new Supervisor({ store, fx, verify: fakeVerify, bodyOf: fakeBodyOf, fenceDir });
+  await sup.recover();
+  assert.equal((await sup.submit({ kind: "grant", bytes: grantOf(1, [AGENT]) })).status, "applied");
+  await sup.close();
+  await store.close();
+  return { root, fenceDir };
+}
+/** hostRun over the REAL Supervisor and a real store at `root`. */
+function realHarness(id, { root, fenceDir, fx, sync } = {}) {
+  const h = harness({ id, ...(sync ? { sync, sleep: (ms) => (ms === INITIAL_SYNC_MS ? new Promise(() => {}) : Promise.resolve()) } : {}) });
+  let store = null;
+  h.d.openStore = async () => { store = await HostStore.open(root ?? join(tmp(), "state")); const close = store.close.bind(store); store.close = async () => { h.log.push("storeClose"); return close(); }; return store; };
+  h.d.effects = () => fx;
+  h.d.makeSupervisor = (o) => { const sup = new Supervisor({ ...o, verify: fakeVerify, bodyOf: fakeBodyOf, fenceDir: fenceDir ?? join(tmp(), "fence"), deadlines: { grace: 200 } }); h.made.sup = sup; return sup; };
+  return h;
+}
+const within = (p, ms) => Promise.race([p, new Promise((r) => setTimeout(() => r("HELD"), ms))]);
+/** Wait (on the clock: real store I/O) until `fn()` holds, at most `ms`. */
+async function waitFor(fn, ms = 5000) { const t0 = Date.now(); while (!fn() && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 10)); assert.ok(fn(), "never reached"); }
+
+test("REAL executor: SIGTERM while recovery's direct await (openIntents) never settles: the close ends it, the store and the lock are released within the bound", async () => {
+  const { id } = await paired();
+  const { fx, calls } = unitFx({ hold: (n) => n === "openIntents" });
+  const h = realHarness(id, { fx });
+  const run = hostRun(h.d);
+  await waitFor(() => calls.includes("openIntents"));
+  const t0 = Date.now();
+  h.term();
+  const r = await within(run, 5000);
+  assert.notEqual(r, "HELD", "hostRun held by the running recovery");
+  assert.equal(r.code, 0);
+  assert.ok(Date.now() - t0 < 5000);
+  assert.ok(h.log.includes("storeClose") && h.log.includes("release"), "store closed, lock released");
+  assert.deepEqual(calls, ["openIntents"], "no effect after the close");
+});
+
+test("REAL executor: SIGTERM while recovery's owned start effect never settles (and ignores its abort): aborted within the grace; no later effect; the agent keeps its state with a pending proof; the next start proves it down before starting it", async () => {
+  const { id } = await paired();
+  const seed = await seededStore();
+  const { fx, calls } = unitFx({ hold: (n) => n === "start" });
+  const h = realHarness(id, { ...seed, fx });
+  const run = hostRun(h.d);
+  await waitFor(() => calls.includes("start"));
+  const before = calls.length;
+  h.term();
+  const r = await within(run, 5000);
+  assert.notEqual(r, "HELD", "hostRun held by the owned effect");
+  assert.equal(r.code, 0);
+  assert.ok(h.log.includes("storeClose") && h.log.includes("release"));
+  for (let i = 0; i < 20; i++) await new Promise((res) => setImmediate(res));
+  assert.equal(calls.length, before, "no effect after the close (narrowing or widening)");
+  // Fail closed: the cut-off start's agent is durably pending a proof, and still `running` (never turned `stopped`).
+  const store = await HostStore.open(seed.root);
+  assert.ok(store.grants.pendingProofs().includes(AGENT), "pending proof");
+  assert.equal(store.registry.agent(AGENT).state, "running");
+  await store.close();
+  // The next start: recovery proves it down (mask, stop) before it starts it again.
+  const next = unitFx();
+  const g = realHarness(id, { ...seed, fx: next.fx });
+  const run2 = hostRun(g.d);
+  await waitFor(() => g.log.includes("inputs"));
+  const firstStart = next.calls.indexOf("start"), firstMask = next.calls.indexOf("mask");
+  assert.ok(firstMask >= 0 && (firstStart === -1 || firstMask < firstStart), `proven down first: ${next.calls.join(",")}`);
+  g.term();
+  assert.equal((await run2).code, 0);
+});
+
+test("REAL executor: SIGTERM during a held initial sync: nothing runs, the close is immediate, exit 0", async () => {
+  const { id } = await paired();
+  const { fx } = unitFx();
+  const h = realHarness(id, { fx, sync: new Promise(() => {}) });
+  const run = hostRun(h.d);
+  await waitFor(() => h.log.includes("sync"));
+  h.term();
+  const r = await within(run, 2000);
+  assert.notEqual(r, "HELD");
+  assert.equal(r.code, 0);
+  assert.ok(h.log.includes("storeClose") && h.log.includes("release"));
 });
 
 // ---- the reset command (§3)

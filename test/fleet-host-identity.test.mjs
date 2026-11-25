@@ -17,7 +17,9 @@ const AUD = F.aud, FLEET = F.ids.fleet, HOST = F.ids.host;
 const N = keyFromSeed(Buffer.from(F.keys["device-native"].seed, "hex"));
 const ENTRIES = F.objects.chain.map(enc);
 const UID = process.getuid();
-const tmp = () => mkdtempSync(join(tmpdir(), "sb-ident-"));
+// A host root with the package's /var/lib/sagebrush (0755, the test's own uid standing for root): nothing creates it.
+const tmp = () => { const r = mkdtempSync(join(tmpdir(), "sb-ident-")); mkdirSync(join(r, "var/lib/sagebrush"), { recursive: true, mode: 0o755 }); return r; };
+const R = { rootUid: UID };
 const machineA = () => "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", machineB = () => "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
 const opts = (root, machine = machineA) => ({ machineId: machine, brokerUid: UID, rootUid: UID });
 
@@ -181,6 +183,7 @@ test("separation (§2) first: the identity under the validation or staging root,
   const root2 = tmp(), p2 = hostPaths(root2);
   firstBoot(p2, { machineId: machineA, brokerUid: UID });
   mkdirSync(join(root2, "elsewhere"), { recursive: true });
+  rmdirReal(join(root2, "var/lib/sagebrush"));
   symlinkSync(join(root2, "elsewhere"), join(root2, "var/lib/sagebrush"));
   assert.equal((await classify(p2, opts(root2))).state, "BROKEN");
 });
@@ -189,7 +192,7 @@ test("separation before every state: no keys or a pending reset with the identit
   // No keys, /var/lib/sagebrush a link into the homes' root (the identity directory isn't there yet).
   const root = tmp(), p = hostPaths(root);
   mkdirSync(join(root, "srv/sagebrush"), { recursive: true });
-  mkdirSync(join(root, "var/lib"), { recursive: true });
+  rmdirReal(join(root, "var/lib/sagebrush"));
   symlinkSync(join(root, "srv/sagebrush"), join(root, "var/lib/sagebrush"));
   assert.equal((await classify(p, opts(root))).state, "BROKEN", "not NO_KEYS: no first boot follows");
   assert.equal(existsSync(p.keys), false, "no keys generated");
@@ -218,13 +221,13 @@ test("the reset never follows a link: a linked chain directory is removed itself
     rmdirReal(join(h.p.identity, "chain"));
     if (which === "chain") {
       symlinkSync(target, join(h.p.identity, "chain"));
-      await resetIdentity(h.p, sysFake());
+      await resetIdentity(h.p, sysFake(), R);
       assert.equal(existsSync(join(h.p.identity, "chain")), false, "the link itself removed");
     } else {
       for (const f of readdirSync(h.p.identity)) unlinkSync(join(h.p.identity, f));
       rmdirReal(h.p.identity);
       symlinkSync(target, h.p.identity);
-      await assert.rejects(resetIdentity(h.p, sysFake()), (e) => e.code === "bad_form");
+      await assert.rejects(resetIdentity(h.p, sysFake(), R), (e) => e.code === "bad_form");
     }
     assert.equal(readFileSync(join(target, "keepme"), "utf8"), "x", which);
   }
@@ -237,7 +240,7 @@ test("the reset never follows a link: a linked chain directory is removed itself
   rmdirReal(h.p.keys);
   symlinkSync(kt, h.p.keys);
   writeFileSync(h.p.resetPending, "1\n");
-  await assert.rejects(completeReset(h.p, sysFake()), (e) => e.code === "bad_form");
+  await assert.rejects(completeReset(h.p, sysFake(), R), (e) => e.code === "bad_form");
   assert.equal(readFileSync(join(kt, "sign"), "utf8"), "x");
 });
 
@@ -250,11 +253,11 @@ test("the reset runs the layout check first: a linked ancestor of the keys or th
     const watched = which.endsWith("broker") ? join(moved, "keys") : join(moved, "identity");
     const before = readdirSync(watched).sort();
     const s = sysFake();
-    await assert.rejects(resetIdentity(h.p, s), (e) => e.code === "bad_form", which);
+    await assert.rejects(resetIdentity(h.p, s, R), (e) => e.code === "bad_form", which);
     assert.deepEqual(s.log, [], `${which}: no stop ran`);
     assert.equal(existsSync(join(moved, "reset-pending")) || existsSync(h.p.resetPending), false, `${which}: nothing recorded`);
     assert.deepEqual(readdirSync(watched).sort(), before, `${which}: nothing deleted`);
-    await assert.rejects(completeReset(h.p, sysFake()), (e) => e.code === "bad_form", which);
+    await assert.rejects(completeReset(h.p, sysFake(), R), (e) => e.code === "bad_form", which);
     assert.deepEqual(readdirSync(watched).sort(), before);
   }
 });
@@ -277,6 +280,62 @@ test("the lock: created exactly 0600; a pre-existing lock that is a link, or of 
   writeFileSync(p3.lock, "", { mode: 0o644 });
   chmodSync(p3.lock, 0o644);
   await assert.rejects(takeOwnership(p3, { rootUid: UID }), (e) => e.code === "bad_form");
+});
+
+/** An fs whose fstat reports another owner for any descriptor opened on `path`. */
+async function ownerFs(path) {
+  const realFs = await import("node:fs");
+  const fds = new Set();
+  return { ...realFs,
+    openSync: (q, ...r) => { const fd = realFs.openSync(q, ...r); if (String(q) === path) fds.add(fd); return fd; },
+    closeSync: (fd) => { fds.delete(fd); realFs.closeSync(fd); },
+    fstatSync: (fd, ...r) => { const st = realFs.fstatSync(fd, ...r); return fds.has(fd) ? Object.assign(Object.create(Object.getPrototypeOf(st)), st, { uid: UID + 1 }) : st; } };
+}
+
+test("the parents: the lock's and the record's directory, or any ancestor, writable by group or other, of another owner, linked or missing refuses before any lock, stop or record; nothing created", async () => {
+  for (const which of ["0777", "0775", "ancestor 0777", "owner", "linked", "missing"]) {
+    const h = await host("cert");
+    const parent = join(h.root, "var/lib/sagebrush");
+    writeFileSync(h.p.resetPending, "1\n", { mode: 0o600 }); // a pending reset: RESETTING, were the parent fine
+    let fsx;
+    if (which === "0777") chmodSync(parent, 0o777);
+    if (which === "0775") chmodSync(parent, 0o775);
+    if (which === "ancestor 0777") chmodSync(join(h.root, "var"), 0o777);
+    if (which === "owner") fsx = await ownerFs(parent);
+    if (which === "linked") { renameReal(parent, join(h.root, "moved")); symlinkSync(join(h.root, "moved"), parent); }
+    if (which === "missing") { unlinkSync(h.p.resetPending); for (const n of readdirSync(join(h.p.identity, "chain"))) unlinkSync(join(h.p.identity, "chain", n)); rmdirReal(join(h.p.identity, "chain")); for (const f of readdirSync(h.p.identity)) unlinkSync(join(h.p.identity, f)); rmdirReal(h.p.identity); rmdirReal(parent); }
+    const keys = readdirSync(h.p.keys).sort();
+    const o = fsx ? { fsx } : {};
+    await assert.rejects(takeOwnership(h.p, { rootUid: UID, ...o }), (e) => e.code === "bad_form", which);
+    assert.equal(existsSync(h.p.lock), false, `${which}: no lock file made`);
+    const c = await classify(h.p, { ...opts(), ...o });
+    assert.equal(c.state, "BROKEN", `${which}: not RESETTING or NO_KEYS`);
+    const s = sysFake();
+    await assert.rejects(resetIdentity(h.p, s, { ...R, ...o }), (e) => e.code === "bad_form", which);
+    await assert.rejects(completeReset(h.p, s, { ...R, ...o }), (e) => e.code === "bad_form", which);
+    assert.deepEqual(s.log, [], `${which}: no stop ran`);
+    assert.deepEqual(readdirSync(h.p.keys).sort(), keys, `${which}: nothing deleted`);
+    if (which === "missing") assert.equal(existsSync(parent), false, "a missing parent is never created");
+    else assert.equal(existsSync(h.p.resetPending), true, which);
+  }
+});
+
+test("the lock can't be split: replacing its pathname needs a parent someone besides root can write, and then the next owner refuses rather than locking a second file", async () => {
+  const h = await host("cert");
+  const parent = join(h.root, "var/lib/sagebrush");
+  const one = await takeOwnership(h.p, R);
+  // The parent as it must be: root's (here the test's uid), no group or other write, so only root can unlink the lock.
+  const st = statSync(parent);
+  assert.equal(st.uid, UID);
+  assert.equal(st.mode & 0o022, 0);
+  // A parent opened to others is the only way the held lock's name could be unlinked and a fresh file put there: the
+  // second owner refuses before creating or locking anything.
+  chmodSync(parent, 0o777);
+  unlinkSync(h.p.lock);
+  await assert.rejects(takeOwnership(h.p, R), (e) => e.code === "bad_form");
+  assert.equal(existsSync(h.p.lock), false, "no second lock file");
+  chmodSync(parent, 0o755);
+  await one.release();
 });
 
 test("owner and mode come from the descriptor read: a key swapped for a same-bytes 0644 copy between the look and the open is BROKEN; a linked keys ancestor is BROKEN", async () => {
@@ -442,7 +501,7 @@ test("the reset: broker proven gone BEFORE the record; then the record; then the
   const barrier = async (name) => {
     seen.push([name, existsSync(h.p.resetPending), existsSync(join(h.p.keys, "sign")), existsSync(join(h.p.keys, "enc")), existsSync(join(h.p.keys, "first-boot")), existsSync(join(h.p.identity, "pin"))]);
   };
-  const r = await resetIdentity(h.p, s, { barrier });
+  const r = await resetIdentity(h.p, s, { barrier, ...R });
   assert.deepEqual(r, { state: "NO_KEYS" });
   assert.deepEqual(s.log, ["stopBroker", "stopAll", "stopBroker"]);
   assert.deepEqual(seen, [
@@ -460,28 +519,28 @@ test("the reset: broker proven gone BEFORE the record; then the record; then the
 
 test("the reset's failures: a key holder surviving records nothing; a slice surviving keeps the record and deletes nothing", async () => {
   const h = await host("cert");
-  await assert.rejects(resetIdentity(h.p, sysFake({ broker: false })), (e) => e.code === "not_empty");
+  await assert.rejects(resetIdentity(h.p, sysFake({ broker: false }), R), (e) => e.code === "not_empty");
   assert.equal(existsSync(h.p.resetPending), false);
   assert.equal((await classify(h.p, opts())).state, "PAIRED", "before the record: the old identity, unchanged");
-  await assert.rejects(resetIdentity(h.p, sysFake({ agents: false })), (e) => e.code === "not_empty");
+  await assert.rejects(resetIdentity(h.p, sysFake({ agents: false }), R), (e) => e.code === "not_empty");
   assert.equal(existsSync(h.p.resetPending), true);
   assert.equal(existsSync(join(h.p.keys, "sign")), true, "nothing deleted");
   assert.equal((await classify(h.p, opts())).state, "RESETTING", "and the next start completes it, never PAIRED again");
-  await completeReset(h.p, sysFake());
+  await completeReset(h.p, sysFake(), R);
   assert.equal((await classify(h.p, opts())).state, "NO_KEYS");
 });
 
 test("a crash at each step after the record: the next start is RESETTING and completes; before it: unchanged and PAIRED", async () => {
   for (const at of ["after_broker", "after_record", "after_contain", "after_key_sign", "after_key_enc", "after_marker", "after_identity"]) {
     const h = await host("cert");
-    await assert.rejects(resetIdentity(h.p, sysFake(), { barrier: async (n) => { if (n === at) throw new Error("crash"); } }), /crash/);
+    await assert.rejects(resetIdentity(h.p, sysFake(), { ...R, barrier: async (n) => { if (n === at) throw new Error("crash"); } }), /crash/);
     const r = await classify(h.p, opts());
     if (at === "after_broker") {
       assert.equal(r.state, "PAIRED", "before the record: nothing changed");
       continue;
     }
     assert.equal(r.state, "RESETTING", at);
-    await completeReset(h.p, sysFake());
+    await completeReset(h.p, sysFake(), R);
     assert.equal((await classify(h.p, opts())).state, "NO_KEYS", at);
     // NO KEYS's first boot gives NEW keys.
     firstBoot(h.p, { machineId: machineA, brokerUid: UID });

@@ -198,6 +198,36 @@ test("the corpus: Node's face, the core on Node's backend and the core on WebCry
   }
 });
 
+test("the core takes the token before the record, with a store that takes: a bad record burns it, and of two at once one wins; on both backends", async () => {
+  const w = await world();
+  const all = corpus(w);
+  const valid = all.find((k) => k.why === "app: valid");
+  const tokenRows = (k) => { const key = createHash("sha256").update(k.headers["sagebrush-relay-token"], "utf8").digest("base64url"); return { [key]: all.tokens[key] }; };
+  const tampered = Buffer.from(valid.headers["sagebrush-browser-record"], "base64url");
+  tampered[tampered.length - 5] ^= 1;
+  const bad = { ...valid, headers: { ...valid.headers, "sagebrush-browser-record": tampered.toString("base64url") } };
+  // (each sequence its own rows: the bad record first, then the same token with the good one; and two at once)
+  const sequences = [{ cases: [bad, valid], tokens: tokenRows(valid) }, { cases: [valid, valid], tokens: tokenRows(valid), concurrent: true }];
+  const inProcess = [];
+  for (const q of sequences) {
+    const rows = new Map(Object.entries(q.tokens));
+    const ctx = { ...coreCtx(w, {}, {}), consumeAppToken: async (key) => { const r = rows.get(key) ?? null; rows.delete(key); return r; } };
+    const one = (k) => run(core, w, k, ctx).then((r) => r.code);
+    const codes = q.concurrent ? await Promise.all(q.cases.map(one)) : [await one(q.cases[0]), await one(q.cases[1])];
+    inProcess.push({ codes, left: rows.size });
+  }
+  const child = JSON.parse(execFileSync(process.execPath, [CHILD], {
+    input: JSON.stringify({ AUD, NOW, fleet: w.fleet, host: w.host, agent: w.agent, hostRaw: b64(w.H.raw), genesis: b64(w.genesis), cases: [], tokens: {}, sequences,
+      account: ACCOUNT, account_session: ACCOUNT_SESSION, control: CONTROL }),
+    encoding: "utf8", maxBuffer: 1 << 22,
+  })).sequences;
+  for (const [name, got] of [["Node's backend", inProcess], ["WebCrypto alone", child]]) {
+    assert.notEqual(got[0].codes[0], "ok", `${name}: the bad record is refused`);
+    assert.deepEqual([got[0].codes[1], got[0].left], ["unauthenticated", 0], `${name}: and its token is gone, so the good record after it finds nothing`);
+    assert.deepEqual([[...got[1].codes].sort(), got[1].left], [["ok", "unauthenticated"], 0], `${name}: two at once, exactly one admitted`);
+  }
+});
+
 // (one control-plane call, for the WebCrypto backend's MACs; the oracle is node:crypto's HMAC over the documented strings)
 const CONTROL = { key: b64(new Uint8Array(32).fill(3)), method: "POST", target: "/api/fleet/v1/relay/admit", body: b64(enc('{"v":1}')), ts: NOW, id: nonce() };
 

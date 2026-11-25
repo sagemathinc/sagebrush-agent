@@ -12,7 +12,7 @@ import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { buildManifest, canonical, sha256 } from "../lib/fleet/host/backup-manifest.mjs";
 import { PLAN, checkPlan, chooseManifest, createPlan, expectedOf, listManifests, newPlan, readPlan, replanSet, updatePlan, withRestoreLock } from "../lib/fleet/host/restore-plan.mjs";
 import { realIo } from "../lib/fleet/host/store.mjs";
-import { newRecord, newRestoreRun, restoreReady, retryRecord, runTime, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
+import { CLASSES, newRecord, newRestoreRun, restoreReady, retryRecord, runTime, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
@@ -180,6 +180,7 @@ test("the plan is restoreReady's authority: records of the plan's run and snapsh
   const agent = b.ids[0], tag = b.t;
   const rec = (kind, id, run, dest) => {
     let r = newRecord({ kind, id, run, snapshot: p.sets[`${kind}-${id}`].snapshot });
+    for (const cls of CLASSES[kind]) r = step(r, "digest", { cls, sha256: "d".repeat(64) });
     for (const s of ["staged", "filling", "published", "validated"]) r = step(r, s, { dest });
     return r;
   };

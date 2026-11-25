@@ -15,14 +15,14 @@ sys.path.insert(0, str(ROOT / "python"))
 
 from sagebrush_fleet import (  # noqa: E402
     FleetError, apply_chain_entry, canon_text, derive_key_pair, device_key, is_id, key_id, open_cap, open_envelope,
-    parse_canonical, replay, service_key_at, unb64, verify_approval, verify_grant, verify_grant_ack, verify_host_cert, verify_host_op,
+    parse_canonical, replay, service_key_at, lease_key_at, verify_lease_request, verify_execution_lease, unb64, verify_approval, verify_grant, verify_grant_ack, verify_host_cert, verify_host_op,
     verify_package, verify_strict, verify_transfer_receipt, check_transfer_for_host,
 )
 from sagebrush_fleet.hpke import Recipient, Sender, receive_export, send_export  # noqa: E402
 
 FIXTURES = ROOT / "test" / "fixtures"
 # (the JavaScript checker's case counts: a fixture file that loses cases fails here, not silently)
-COUNTS = {"fleet": 130, "hpke": 34}
+COUNTS = {"fleet": 185, "hpke": 34}
 
 
 def load(name):
@@ -89,6 +89,38 @@ class FleetFixtures(Cases):
         sk = replay([enc(x) for x in self.F["service_keys"]["chain"]], self.ctx)
         self.each("service_keys", ((c["name"], result(lambda: service_key_at(sk, c["signer"], c["chain_seq"])), c["expect"]) for c in self.F["service_keys"]["cases"]))
 
+    def test_lease_keys(self):
+        L = self.F["lease_keys"]
+
+        def run(c):
+            def go():
+                st = replay([enc(x) for x in c["entries"]], self.ctx)
+                if c.get("append"):
+                    apply_chain_entry(st, enc(c["append"]), self.ctx)
+            return result(go)
+
+        self.each("lease_chain", ((c["name"], run(c), c["expect"]) for c in L["chain_cases"]))
+        lk = replay([enc(x) for x in L["chain"]], self.ctx)
+        at = {"lease": lease_key_at, "service": service_key_at}
+        self.each("lease_keys", ((c["name"], result(lambda: at[c["lookup"]](lk, c["signer"], c["chain_seq"])), c["expect"]) for c in L["cases"]))
+
+    def test_leases(self):
+        E = self.F["leases"]
+        lc = replay([enc(x) for x in E["chain"]], self.ctx)
+        cert = verify_host_cert(enc(E["host_cert"]), {**self.ctx, "chain": lc})
+        rows = []
+        for c in E["requests"]:
+            got = {}
+
+            def go(c=c, got=got):
+                got["hash"] = verify_lease_request(enc(c["bytes"]), {**self.ctx, "cert": cert})["hash"]
+            rows.append((c["name"], result(go), c["expect"]))
+            if c.get("hash"):
+                rows.append((f"{c['name']}: its hash", got.get("hash"), c["hash"]))
+        self.each("lease_requests", rows)
+        ctx = {**self.ctx, "chain": lc, "host": E["host"], "host_key": E["host_key"]}
+        self.each("leases", ((c["name"], result(lambda c=c: verify_execution_lease(enc(c["bytes"]), {**ctx, "outstanding": c["outstanding"]})), c["expect"]) for c in E["leases"]))
+
     def objects(self):
         O = self.F["objects"]
         st = replay([enc(x) for x in O["chain"]], self.ctx)
@@ -151,7 +183,7 @@ class FleetFixtures(Cases):
 
     def test_zz_every_case_ran(self):
         """(named to run last in the class) the JavaScript checker's count of cases, all of them run here"""
-        groups = ["canonical", "base64url", "ids", "ed25519", "chain", "service_keys", "envelopes", "grants", "grant_acks", "host_ops", "approvals",
+        groups = ["canonical", "base64url", "ids", "ed25519", "chain", "service_keys", "lease_chain", "lease_keys", "lease_requests", "leases", "envelopes", "grants", "grant_acks", "host_ops", "approvals",
                   "transfer_receipts", "transfer_hosts"]
         missing = [g for g in groups if g not in Cases.ran]
         if missing:

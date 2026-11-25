@@ -19,10 +19,12 @@ const tmp = (n) => join(mkdtempSync(join(tmpdir(), "sb-exec-")), n);
 
 // ---- a grant is JSON here; `verify` stands in for the §3.2 check (tested in grant.mjs)
 const bytesOf = (body) => Buffer.from(JSON.stringify(body));
+/** The stand-in's signed-bytes hash: deliberately NOT the envelope digest, so a mix-up of the two fails. */
+const signedHash = (bytes) => sha256b64(Buffer.concat([Buffer.from("signed:"), bytes]));
 const verify = (bytes) => {
   const body = JSON.parse(String(bytes));
   if (body.expired) throw new FleetError("grant_expired", "expired");
-  return { body, digest: sha256b64(bytes) };
+  return { body, digest: sha256b64(bytes), hash: signedHash(bytes) };
 };
 const bodyOf = (bytes) => JSON.parse(String(bytes));
 const entry = (agent, { tags = [], x = 1 } = {}) => ({ agent, tags, config: { x } });
@@ -473,6 +475,25 @@ test("systemd preflight: a paused agent's late valid answer (a busy event loop) 
   fx.systemd = undefined;
   assert.equal((await sup.submit({ kind: "resume", authority: "person", agent: B })).reason, "qualify_required");
   assert.ok(!fx.log.some((l) => ["unmask", "start", "thaw"].includes(l[0])), JSON.stringify(fx.log));
+  await close();
+});
+
+test("the transfer records follow accepted grants' entries, not the plan: an expiry restart moves no entry_gen", async () => {
+  const { sup, store, close } = await setup();
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
+  const rec = (id) => store.grants.record(id);
+  assert.deepEqual([rec(A).entry_gen, rec(A).listed_since, rec(B).entry_gen], [1, 1, 1]);
+  await sup.submit({ kind: "expiry", authority: "host" });
+  // After expiry every listed agent is planned anew (its unit step moves the registry's gen), but only B's entry changed.
+  const r = await sup.submit({ kind: "grant", bytes: grant(2, [entry(A), entry(B, { x: 2 })]) });
+  assert.equal(r.status, "applied");
+  assert.deepEqual([store.registry.agent(A).gen, rec(A).entry_gen, rec(A).listed_since], [2, 1, 1]);
+  assert.deepEqual([rec(B).entry_gen, rec(B).listed_since], [2, 1]);
+  assert.equal(store.grants.hashAt(1), signedHash(grant(1, [entry(A), entry(B)])), "the signed-bytes hash, not the envelope digest");
+  assert.notEqual(store.grants.hashAt(1), sha256b64(grant(1, [entry(A), entry(B)])));
+  // A dropped: its records go with it
+  await sup.submit({ kind: "grant", bytes: grant(3, [entry(B, { x: 2 })]) });
+  assert.deepEqual([rec(A), rec(B).entry_gen, rec(B).listed_since], [null, 2, 1]);
   await close();
 });
 
@@ -1233,7 +1254,7 @@ test("after any effect goes unsettled, the running operation does no authority-g
 });
 
 test("SEC H3-new: a grant is verified again after the previous application finishes, and after its intent; never carried", async () => {
-  // astra4b's probe: N+1 verifies; N's remaining work then flips N+1 to expired; N+1 must not be accepted.
+  // the security review's probe: N+1 verifies; N's remaining work then flips N+1 to expired; N+1 must not be accepted.
   for (const where of ["redo", "intent"]) {
     const fx = fakeFx();
     let g2valid = true, failMap = true;
@@ -1380,7 +1401,7 @@ for (const state of STATES) {
   }
 }
 
-test("SEC r4 (astra4b): a person's delete while the proof is pending doesn't let the same grant finish", async () => {
+test("SEC r4: a person's delete while the proof is pending doesn't let the same grant finish", async () => {
   const fx = fakeFx();
   fx.start = async (id) => { fx.u(id).active = true; throw new FleetError("unit_failed", "exited"); };
   fx.sys.stop = () => { throw new Error("stop failed"); };
@@ -1549,7 +1570,7 @@ for (const [name, op] of OPS) {
   });
 }
 
-test("TESTS r6 (astra2): a person's stop or delete that can't prove the cgroup empty marks the proof; the same grant isn't re-acknowledged", async () => {
+test("TESTS r6: a person's stop or delete that can't prove the cgroup empty marks the proof; the same grant isn't re-acknowledged", async () => {
   for (const kind of ["stop", "delete"]) {
     const fx = fakeFx();
     const { sup, store, close } = await setup({ fx });
@@ -1663,7 +1684,7 @@ async function pendingA({ via = "stop", fx = fakeFx() } = {}) {
   return { ...s, fx, root, fenceDir, stuck, snapshot };
 }
 
-test("SEC r8 (astra4b): a pending, paused, frozen agent: a person's resume is refused before any fence, state or thaw", async () => {
+test("SEC r8: a pending, paused, frozen agent: a person's resume is refused before any fence, state or thaw", async () => {
   const p = await pendingA({ via: "pause" });
   assert.equal(p.store.registry.agent(A).state, "paused");
   const before = p.snapshot();

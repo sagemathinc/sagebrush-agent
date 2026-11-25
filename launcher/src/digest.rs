@@ -1020,4 +1020,52 @@ mod tests {
         assert!(!crate::tree::anchor_name_ok(VALIDATE, &format!("{RUN}/{}/x", owner())));
         assert!(!crate::tree::anchor_name_ok(VALIDATE, &format!("short/{}", owner())));
     }
+
+    /// The shared listing corpus (test/fixtures/listing-corpus.json, the restore validator's own fixture): each row's
+    /// raw bytes rendered by tree-digest must be its exact line, byte for byte (A2 r3.9 §7). The row marked invalid (a
+    /// symlink with an empty target, which no kernel lets the walker see) is the reader's to refuse: render doesn't
+    /// judge, so it isn't compared.
+    #[test]
+    fn the_shared_listing_corpus_renders_byte_for_byte() {
+        let raw = include_bytes!("../../test/fixtures/listing-corpus.json");
+        let v = crate::json::parse(raw).expect("the corpus parses");
+        let get = |o: &crate::json::Value, k: &str| -> Option<crate::json::Value> {
+            match o {
+                crate::json::Value::Obj(kv) => kv.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone()),
+                _ => None,
+            }
+        };
+        let hex = |s: &str| -> Vec<u8> { (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect() };
+        let rows = get(&v, "rows").unwrap();
+        let rows = rows.arr().unwrap();
+        assert_eq!(rows.len(), 20, "the corpus has its 20 rows");
+        let mut checked = 0;
+        for r in rows {
+            let s = |k: &str| get(r, k).and_then(|x| x.str().map(str::to_string));
+            let name = s("name").unwrap();
+            if get(r, "valid") == Some(crate::json::Value::Bool(false)) {
+                continue;
+            }
+            let ty = match s("type").unwrap().as_str() {
+                "file" => Ty::File,
+                "dir" => Ty::Dir,
+                "symlink" => Ty::Symlink,
+                t => panic!("{name}: type {t}"),
+            };
+            let sha = s("sha256").map(|h| <[u8; 32]>::try_from(hex(&h)).unwrap());
+            let e = Entry {
+                path: hex(&s("raw_path_hex").unwrap()),
+                unexpected: None,
+                ty,
+                size: get(r, "size").unwrap().int().unwrap(),
+                mode: get(r, "mode").unwrap().int().unwrap() as u16,
+                sha,
+                target: s("raw_target_hex").map(|h| hex(&h)),
+                copy: None,
+            };
+            assert_eq!(e.render(), format!("{}\n", s("line").unwrap()), "{name}");
+            checked += 1;
+        }
+        assert_eq!(checked, 19, "every valid row");
+    }
 }

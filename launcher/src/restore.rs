@@ -340,7 +340,7 @@ fn done(r: Result<()>) -> Done {
 
 /// A staging parent (`<run>`, `<owner>`, `<class>`): opened, or made 0700 when absent; root:root 0700 on the anchor's
 /// mount, else 73.
-fn staging_dir<O: RestoreOps>(o: &mut O, parent: &O::H, name: &str, mnt: u64, projid: u32) -> Result<O::H> {
+pub(crate) fn staging_dir<O: RestoreOps>(o: &mut O, parent: &O::H, name: &str, mnt: u64, projid: u32) -> Result<O::H> {
     if tchild(o, parent, name, mnt)?.is_none() {
         match o.mkdir(parent, name, 0o700) {
             Ok(()) => {
@@ -610,7 +610,7 @@ pub struct FillArgs<'a> {
     pub expect: &'a str,
 }
 
-fn dest_anchor(c: Class) -> &'static str {
+pub(crate) fn dest_anchor(c: Class) -> &'static str {
     match c {
         Class::Home | Class::Sessions => "/srv/sagebrush/agents",
         Class::Archive => "/srv/sagebrush/archive",

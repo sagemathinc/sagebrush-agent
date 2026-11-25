@@ -1732,3 +1732,19 @@ test("SEC r9: an agentless widening effect (here a healthy agent's resume, which
   assert.ok(!fx.log.some((l) => ["daemon-reload", "unit", "unmask", "start", "broker-gen", "map"].includes(l[0])));
   await close();
 });
+
+test("an agent never granted on this host (gen 0, a restored one before this host's first grant) never starts, even unfenced", async () => {
+  const fx = fakeFx();
+  const s = await setup({ fx });
+  const id = newId();
+  s.store.registry.importRestored({ v: 1, next_uid: 70001, next_gid: 80000, tags: {}, agents: { [id]: { uid: 70000, state: "running", life: 1, gen: 9, tags: [], start_failed: null } } });
+  assert.equal(s.store.registry.agent(id).gen, 0);
+  // this host's first grant lists another agent only; then a person's resume-all, which starts every running agent
+  const r = await s.sup.submit({ kind: "grant", bytes: grant(1, [entry(A)]) });
+  assert.equal(r.status, "applied");
+  const all = await s.sup.submit({ kind: "resume-all", authority: "person" });
+  assert.ok(!all.started.includes(id), "the restored agent isn't started");
+  assert.ok(!fx.log.some((l) => (l[0] === "start" || l[0] === "unmask") && l[1] === id), "no unmask, no start for it");
+  assert.deepEqual([s.store.registry.agent(id).state, s.store.registry.agent(id).gen], ["running", 0]);
+  await s.close();
+});

@@ -47,6 +47,7 @@ pub const ANCHORS: [(&str, &str); 10] = [
 pub fn anchor_name_ok(anchor: &str, name: &str) -> bool {
     ANCHORS.iter().any(|(a, suffix)| *a == anchor && name.strip_suffix(suffix).is_some_and(is_id))
         || (anchor == crate::restore::RESTORE && crate::restore::name_of(name).is_some())
+        || (anchor == crate::digest::VALIDATE && crate::digest::copy_name_ok(name))
 }
 
 /// How a child is opened beneath its parent (always with RESOLVE_NO_XDEV).
@@ -871,6 +872,8 @@ fn remove_tree_limited<O: Ops>(o: &mut O, anchor: &str, name: &str, expect_path:
     let (e_epoch, e_fsid, e_root) = (epoch_of(f[0])?, fsid_of(f[1])?, obj_of(f[2])?);
     // A2: an attempt beneath .restore may hold root and up to 64 tag members' files.
     let restore = anchor == crate::restore::RESTORE;
+    // A2 r3.7: beneath the validate anchor, `<run>/<owner>`: one staging parent, root-only copies.
+    let validate = anchor == crate::digest::VALIDATE;
     let max_owners = if restore { 65 } else { 4 };
     let owners = f[3].arr().filter(|a| !a.is_empty() && a.len() <= max_owners).ok_or(bad_expect())?.iter().map(u32_of).collect::<Result<Vec<u32>>>()?;
     let a = anchor_policy(o, &root, anchor)?;
@@ -884,10 +887,15 @@ fn remove_tree_limited<O: Ops>(o: &mut O, anchor: &str, name: &str, expect_path:
     }
     // A2: beneath .restore, the attempt's three staging parents first, each root:root 0700 on the anchor's mount; a
     // missing one means the attempt is already gone.
-    let (a, name) = if restore {
-        let parts = crate::restore::name_of(name).ok_or(err(Fail::Usage, "bad arguments"))?.parts();
+    let (a, name) = if restore || validate {
+        let parts: Vec<String> = if restore {
+            crate::restore::name_of(name).ok_or(err(Fail::Usage, "bad arguments"))?.parts().to_vec()
+        } else {
+            name.split('/').map(str::to_string).collect()
+        };
+        let staging = parts.len() - 1;
         let mut cur = a;
-        for part in &parts[..3] {
+        for part in &parts[..staging] {
             match child(o, &cur, part, epoch.mnt_id)? {
                 Some((x, Some(h))) if x.kind == Kind::Dir && x.uid == 0 && x.gid == 0 && x.mode == 0o700 => cur = h,
                 None => {
@@ -897,7 +905,7 @@ fn remove_tree_limited<O: Ops>(o: &mut O, anchor: &str, name: &str, expect_path:
                 _ => return Err(identity("a staging directory isn't root:root 0700")),
             }
         }
-        (cur, parts[3].clone())
+        (cur, parts[staging].clone())
     } else {
         (a, name.to_string())
     };
@@ -976,6 +984,7 @@ pub(crate) mod tests {
     /// A fake tree: paths relative to the root ("" is the root). A node whose mnt_id differs from its parent's is a
     /// mount: opening it with NO_XDEV fails EXDEV. Symlinks fail ELOOP. `hook` runs once, when op `.0` has been called
     /// `.1` times; `fail` makes one op fail.
+    #[derive(Clone)]
     pub(crate) struct Fake {
         pub(crate) nodes: BTreeMap<String, Node>,
         pub(crate) files: BTreeMap<String, Vec<u8>>,

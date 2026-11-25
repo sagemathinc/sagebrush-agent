@@ -949,3 +949,54 @@ pub fn clock_boottime() -> io::Result<(i64, i64)> {
     let ts = unsafe { ts.assume_init() };
     Ok((ts.tv_sec as i64, ts.tv_nsec as i64))
 }
+
+// ---- launcher contract amendment A5 (turn): the unit's namespaces, the user namespace, the idmapped mount.
+
+/// pidfd_send_signal(pidfd, 0, NULL, 0): Ok if the process the pidfd names is still alive (ESRCH once it's gone).
+pub fn pidfd_alive(pidfd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: `pidfd` is open; signal 0 delivers nothing; the info pointer is NULL as the call allows.
+    let r = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), 0, core::ptr::null::<libc::siginfo_t>(), 0 as libc::c_uint) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// setns(pidfd, nstype): join the namespaces `nstype` names, of the process the pidfd names (Linux 5.8+).
+pub fn setns(pidfd: &OwnedFd, nstype: libc::c_int) -> io::Result<()> {
+    // SAFETY: `pidfd` is open; `nstype` is a set of CLONE_NEW* constants.
+    let r = unsafe { libc::setns(pidfd.as_raw_fd(), nstype) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// unshare(CLONE_NEWUSER): only in the user-namespace child, which then waits to be reaped.
+pub fn unshare_user() -> io::Result<()> {
+    // SAFETY: a constant flag.
+    let r = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// openat(nsdir, name, O_RDONLY | O_CLOEXEC | O_NOCTTY): ONE namespace entry beneath an opened `/proc/<pid>/ns`
+/// handle. Those entries are magic links, which openat2's RESOLVE_BENEATH and RESOLVE_NO_SYMLINKS refuse by design,
+/// so this is the one plain openat: one fixed component, relative to a handle the caller opened with openat2 and
+/// checked, and the caller checks the result's namespace type (A5 r4.6 step 6).
+pub fn open_ns_entry(nsdir: &OwnedFd, name: &CStr) -> io::Result<OwnedFd> {
+    // SAFETY: `nsdir` is open; `name` is NUL-terminated; the flags are constants.
+    let fd = unsafe { libc::openat(nsdir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOCTTY) };
+    own(fd as libc::c_long)
+}
+
+/// ioctl(fd, NS_GET_NSTYPE): the CLONE_NEW* type of the namespace a namespace descriptor names.
+pub fn ns_type(fd: &OwnedFd) -> io::Result<libc::c_int> {
+    // SAFETY: `fd` is open; NS_GET_NSTYPE takes no argument and returns the type.
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), libc::NS_GET_NSTYPE) };
+    if r < 0 { Err(last()) } else { Ok(r) }
+}
+
+/// mount_setattr(clone, "", AT_EMPTY_PATH, { attr_set: MOUNT_ATTR_IDMAP, userns_fd }): idmap a detached clone.
+pub fn mount_setattr_idmap(clone: &OwnedFd, userns: &OwnedFd) -> io::Result<()> {
+    let attr = MountAttr { attr_set: libc::MOUNT_ATTR_IDMAP, attr_clr: 0, propagation: 0, userns_fd: userns.as_raw_fd() as u64 };
+    // SAFETY: `clone` is an open mount fd and `userns` an open user-namespace fd; `attr` lives across the call and
+    // its size is passed.
+    let r = unsafe {
+        libc::syscall(libc::SYS_mount_setattr, clone.as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH, &attr as *const MountAttr, core::mem::size_of::<MountAttr>())
+    };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}

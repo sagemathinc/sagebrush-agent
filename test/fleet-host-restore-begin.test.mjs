@@ -502,6 +502,24 @@ test("removeBeneath walks by handle: a nested directory replaced by a link befor
   };
   assert.throws(() => removeBeneath(t.top, "run", { uid: UID, onEntry: before }), (e) => e.code === "not_granted");
   assert.ok(swapped && t.intact(), "the outside is untouched");
+  // Replaced between its lstat and its open by a DIFFERENT REAL directory (no link: O_NOFOLLOW alone lets it through):
+  // the handle isn't the object looked at, so it is refused before that directory is re-owned, made private or emptied.
+  t = mk();
+  swapped = false;
+  const other = join(t.root, "other");
+  mkdirSync(join(other, "inner"), { recursive: true });
+  for (const n of ["a", "keep"]) writeFileSync(join(other, n), "theirs");
+  chmodSync(other, 0o755);
+  const swapReal = (here, name) => {
+    if (name === "sub" && !swapped) { swapped = true; renameSync(join(here, "sub"), join(t.root, "moved")); renameSync(other, join(here, "sub")); }
+  };
+  assert.throws(() => removeBeneath(t.top, "run", { uid: UID, onEntry: swapReal }), (e) => e.code === "not_granted");
+  const there = join(t.top, "run", "sub");
+  assert.ok(swapped, "swapped");
+  assert.deepEqual(readdirSync(there).sort(), ["a", "inner", "keep"], "its entries all kept");
+  assert.deepEqual(["a", "keep"].map((n) => readFileSync(join(there, n), "utf8")), ["theirs", "theirs"]);
+  assert.equal(statSync(there).mode & 0o777, 0o755, "its mode unchanged: not made private through a handle");
+  assert.equal(readdirSync(join(t.root, "moved")).length > 0, true, "the moved original isn't reached either");
   // Moved away and replaced by a link AFTER it was opened (while its entries are removed): the walk stays on the
   // opened directory; the outside is untouched, and the link left at the name is never followed.
   t = mk();

@@ -135,6 +135,16 @@ test("a restored agent never starts on its own: every live agent is restore-fenc
     await rejects(lowerFence("restore", a, "resume-agent", { dir: fenceDir, agentState: "running" }), "not_granted");
     await rejects(lowerFence("restore", a, "resume-restored", { dir: fenceDir, restoreState: "published" }), "not_granted");
     assert.equal(fenced(a, { dir: fenceDir }), true);
+    // A restored agent at gen 0 can be revoked or deleted before this host's first grant: its state and life move,
+    // its gen stays 0, and its restore fence stays up (the narrowing lowers nothing).
+    assert.equal(store.registry.agent(a).gen, 0);
+    const rv = store.registry.setState(a, "revoked", "revoke-caps");
+    assert.deepEqual([rv.state, rv.gen, rv.life], ["revoked", 0, registry.agents[a].life + 1]);
+    const dl = store.registry.setState(b, "deleted", "delete");
+    assert.deepEqual([dl.state, dl.gen], ["deleted", 0]);
+    assert.equal(store.deprovision.ensure(b, store.registry.agent(b)).gen, 0, "b's deprovision record binds gen 0");
+    assert.deepEqual([existsSync(join(fenceDir, "restore", a)), existsSync(join(fenceDir, "restore", b))], [true, true]);
+    assert.equal(store.registry.agent(dead).gen, registry.agents[dead].gen, "the agent deleted on the old host keeps its own gen");
   } finally { await store.close(); }
 });
 

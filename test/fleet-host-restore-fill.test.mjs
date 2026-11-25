@@ -12,7 +12,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
-import { FleetError, newId } from "../lib/fleet/index.mjs";
+import { FleetError, newId, refuse } from "../lib/fleet/index.mjs";
 import { EXIT, classPaths, destOf, fillExpect, outcomeOf, ownersOf, restoreFiller, writeExpectFile } from "../lib/fleet/host/restore-fill.mjs";
 import { realIo } from "../lib/fleet/host/store.mjs";
 import { MAX_ATTEMPTS, newRecord, newRestoreRun, ownerOf, readFillReport, readRecord, retryRecord, writeRecord } from "../lib/fleet/host/restore-record.mjs";
@@ -88,7 +88,7 @@ const planOf = (kind, id, run = RUN) => ({ v: 1, host: "old-host", manifest: hex
  */
 function world(kind, { script = () => 0, onCall = () => {}, failDiscards = 0, report = () => ({}), observe = (c, t) => t,
   stdout = (op, cls, t) => t, stopped = async () => true, unrestorable = () => [], beforeDigest = () => {}, seed = () => {},
-  listOf = (c, t) => t, identify = (c, o) => o, skipCopy = () => false, afterCopy = () => {} } = {}) {
+  listOf = (c, t) => t, identify = (c, o) => o, skipCopy = () => false, afterCopy = () => {}, hooks = {} } = {}) {
   const base = mkdtempSync(join(tmpdir(), "sb-fill-"));
   const stage = join(base, "staging"), dir = join(base, "restore");
   const dests = {};
@@ -157,7 +157,7 @@ function world(kind, { script = () => 0, onCall = () => {}, failDiscards = 0, re
   };
   const removeCopies = async (r) => { copiesRemoved.push(r.attempt); rmSync(join(base, "copies", r.run, ownerOf(r.kind, r.id)), { recursive: true, force: true }); };
   const fill = restoreFiller({ launch, mount: "/srv/sagebrush", identifyDest, expectOf, projidOf: () => 70000, cleanDest, discardStaging, dir, root: stage,
-    stopped, unrestorableOf: (k, id, cls) => unrestorable(cls), removeCopies, copies: join(base, "copies") });
+    stopped, unrestorableOf: (k, id, cls) => unrestorable(cls), removeCopies, copies: join(base, "copies"), ...hooks });
   return { fill, calls, cleaned, discarded, copiesRemoved, dests, dir, stage, base };
 }
 
@@ -360,6 +360,40 @@ test("a crash after filling is written: the next call never refills that attempt
   assert.deepEqual([tree(w.dests.home), tree(w.dests.sessions)], [DATA.home, DATA.sessions]);
   // The consumed attempt 1 is discarded, and so is attempt 2 once the set is validated.
   assert.deepEqual(readdirSync(join(w.stage, RUN, `a-${id}`, "home")), []);
+});
+
+test("the caller's admission at the bind: a refusal records no destination and launches nothing", async () => {
+  const id = newId();
+  const seen = [];
+  const w = world("agent", { hooks: { admit: async (r, ids, dest) => { seen.push([r.state, r.dest, Object.keys(ids), dest.home.ino]); refuse("not_granted", "not the provisioned destination"); } } });
+  await rejects(w.fill("agent", id, planOf("agent", id)), "not_granted");
+  assert.deepEqual(seen, [["staging", null, ["home", "sessions"], String(statSync(w.dests.home).ino)]], "asked once, with every class's identity, before the bind");
+  const r = readRecord("agent", id, { dir: w.dir });
+  assert.deepEqual([r.state, r.dest, r.attempt], ["staging", null, 1], "nothing bound");
+  assert.deepEqual(w.calls, [], "nothing launched");
+  assert.deepEqual([tree(w.dests.home), tree(w.dests.sessions)], [{}, {}]);
+});
+
+test("the caller's veto before an archive's or a tag folder's validated: the set stays files_validated, nothing published", async () => {
+  for (const kind of ["archive", "tag"]) {
+    const id = newId();
+    let vetoed = true;
+    const asked = [];
+    const w = world(kind, { hooks: { veto: async (r) => { asked.push(r.state); return vetoed; } } });
+    await rejects(w.fill(kind, id, planOf(kind, id)), "not_granted");
+    assert.deepEqual(asked, ["files_validated"], kind);
+    assert.equal(readRecord(kind, id, { dir: w.dir }).state, "files_validated", kind);
+    vetoed = false;
+    assert.equal((await w.fill(kind, id, planOf(kind, id))).state, "validated", `${kind}: without the intent it completes`);
+  }
+});
+
+test("an agent's files_validated is never vetoed here: its validated is its imports'", async () => {
+  const id = newId();
+  let asked = 0;
+  const w = world("agent", { hooks: { veto: async () => { asked += 1; return true; } } });
+  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "files_validated");
+  assert.equal(asked, 0);
 });
 
 test("refusals: a set not in the plan, a record of another restore, missing adapters, an aborted call", async () => {

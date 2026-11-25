@@ -89,11 +89,11 @@ function fakeFx(over = {}) {
   return Object.assign(fx, over);
 }
 
-async function setup({ fx = fakeFx(), root = tmp("state"), fenceDir = tmp("fence"), deadlines = {}, barrier } = {}) {
+async function setup({ fx = fakeFx(), root = tmp("state"), fenceDir = tmp("fence"), deadlines = {}, barrier, restoreWorker } = {}) {
   const store = await HostStore.open(root);
   fx.fenceDir = fenceDir;
   fx.store = store;
-  const sup = new Supervisor({ store, fx, verify, bodyOf, fenceDir, deadlines, barrier });
+  const sup = new Supervisor({ store, fx, verify, bodyOf, fenceDir, deadlines, barrier, ...(restoreWorker ? { restoreWorker } : {}) });
   return { sup, store, fx, root, fenceDir, close: () => store.close() };
 }
 
@@ -1895,4 +1895,75 @@ test("an agent never granted on this host (gen 0, a restored one before this hos
   assert.ok(!fx.log.some((l) => (l[0] === "start" || l[0] === "unmask") && l[1] === id), "no unmask, no start for it");
   assert.deepEqual([s.store.registry.agent(id).state, s.store.registry.agent(id).gen], ["running", 0]);
   await s.close();
+});
+
+// ---- the host restore's worker (host restore e2e §3)
+
+test("restore-dispatch: the host's op only, with a restore seam; owned under its deadline; a start audited, never awaited", async () => {
+  const none = await setup();
+  await rejects(none.sup.submit({ kind: "restore-dispatch", authority: "host" }), "bad_form");
+  await none.close();
+  const calls = [];
+  let answer = { dispatched: `agent-${A}` };
+  const restoreWorker = { busy: async () => false, dispatch: async (ms, signal) => { calls.push([ms, signal instanceof AbortSignal]); return answer; } };
+  const { sup, fx, close } = await setup({ restoreWorker });
+  for (const authority of ["person", "service", "local"]) await rejects(sup.submit({ kind: "restore-dispatch", authority }), "not_granted");
+  assert.deepEqual(await sup.submit({ kind: "restore-dispatch", authority: "host" }), { status: "dispatched", dispatched: `agent-${A}` });
+  answer = { dispatched: null, why: "suspended" };
+  assert.deepEqual(await sup.submit({ kind: "restore-dispatch", authority: "host" }), { status: "idle", dispatched: null, why: "suspended" });
+  assert.deepEqual(calls, [[30000, true], [30000, true]]);
+  assert.deepEqual(fx.audits.filter((r) => r.kind === "restore.dispatch"), [{ kind: "restore.dispatch", set: `agent-${A}`, phase: "succeeded" }]);
+  // A dispatch that throws is a failed op, never a crash of the queue; one past its deadline is aborted.
+  restoreWorker.dispatch = async () => { throw new FleetError("preflight_missing", "systemd-run"); };
+  assert.deepEqual(await sup.submit({ kind: "restore-dispatch", authority: "host" }), { status: "failed", reason: "preflight_missing", settled: true });
+  await close();
+  const slow = { busy: async () => false, dispatch: (ms, signal) => new Promise((r, j) => signal.addEventListener("abort", () => j(new Error("aborted")))) };
+  const late = await setup({ restoreWorker: slow, deadlines: { "restore-dispatch": 20 } });
+  assert.deepEqual(await late.sup.submit({ kind: "restore-dispatch", authority: "host" }), { status: "failed", reason: "step_deadline", settled: true });
+  await late.close();
+});
+
+test("a live restore worker for one of an agent's sets: delete, purge and requalify are refused with no effect; free again, they run", async () => {
+  let busy = true;
+  const asked = [];
+  const restoreWorker = { busy: async (agent, tags) => { asked.push([agent, tags]); return busy; }, dispatch: async () => ({ dispatched: null }) };
+  const { sup, store, fx, close } = await setup({ restoreWorker });
+  busy = false;
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A, { tags: [T] }), entry(B)]) });
+  busy = true;
+  fx.log.length = 0;
+  asked.length = 0;
+  assert.deepEqual(await sup.submit({ kind: "delete", authority: "person", agent: A }), { status: "refused", reason: "restore_running" });
+  assert.deepEqual(asked, [[A, [T]]], "the agent and its registry tags");
+  assert.equal(store.registry.agent(A).state, "running", "not deleted");
+  assert.deepEqual(fx.log, [], "no effect");
+  busy = false;
+  await sup.submit({ kind: "delete", authority: "person", agent: A });
+  assert.equal(store.registry.agent(A).state, "deleted");
+  busy = true;
+  fx.log.length = 0;
+  for (const kind of ["purge", "requalify"]) {
+    assert.deepEqual(await sup.submit({ kind, authority: "local", agent: A }), { status: "refused", reason: "restore_running" }, kind);
+  }
+  assert.deepEqual(fx.log.filter((l) => l[0] === "purge" || l[0] === "requalify"), []);
+  busy = false;
+  assert.deepEqual(await sup.submit({ kind: "purge", authority: "local", agent: A }), { status: "purged" });
+  await close();
+});
+
+test("a live restore worker for one of an agent's sets: its provision step is refused before any effect, and redone once it ends", async () => {
+  let busy = (agent) => agent === B;
+  const asked = [];
+  const restoreWorker = { busy: async (agent, tags) => { asked.push([agent, tags]); return busy(agent); }, dispatch: async () => ({ dispatched: null }) };
+  const { sup, store, fx, close } = await setup({ restoreWorker });
+  const r = await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B, { tags: [T] })]) });
+  assert.deepEqual(r, { status: "failed", gen: 1, step: `provision:${B}`, reason: "in_progress", settled: true }, "host-side, the application left to redo");
+  assert.ok(!fx.log.some((l) => l[0] === "provision" && l[1] === B), "B never provisioned");
+  assert.equal(store.registry.agent(B), null, "B not added to the registry either");
+  assert.ok(asked.some(([agent, tags]) => agent === B && tags.length === 1 && tags[0] === T), "asked with the grant's tags");
+  busy = () => false;
+  const again = await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B, { tags: [T] })]) });
+  assert.equal(again.status, "reapplied", "the same grant redoes the unfinished application");
+  assert.ok(fx.log.some((l) => l[0] === "provision" && l[1] === B));
+  await close();
 });

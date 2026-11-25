@@ -29,6 +29,8 @@ pub const VALIDATE: &str = "/var/lib/sagebrush/validate";
 /// At most this many bytes copied in all (A2 r3.7).
 pub const MAX_COPY: u64 = 8 << 30;
 const CHUNK: usize = 1 << 20;
+/// A path's longest form, in raw bytes, relative to the class root (A2 §4b).
+pub const MAX_PATH: usize = 4096;
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 
 /// The operations `tree-digest` adds to restore's: names as raw bytes, and the copy-out's writes.
@@ -293,6 +295,9 @@ pub fn tree_digest_limited<O: DigestOps>(o: &mut O, a: &DigestArgs, lim: Limits)
         }
         for name in names {
             let path = join_raw(&base, &name);
+            if path.len() > MAX_PATH {
+                return Err(limit()); // §4b: at most 4096 raw bytes (TESTS H2 on 99b4b391)
+            }
             if entries.len() >= lim.objects {
                 return Err(limit());
             }
@@ -424,11 +429,18 @@ fn visit<O: DigestOps>(o: &mut O, dir: &O::H, name: &[u8], path: &[u8], mnt: u64
                 return Err(identity("a changed entry"));
             }
             e.size = again.size;
-            // A speculative sidecar copy is decided by name before the read; a main by its first bytes.
+            // A speculative sidecar copy is decided by name, BEFORE the read, so an empty sidecar is copied too (TESTS
+            // H1 on 99b4b391); a main by its first bytes.
             let side = copy.as_ref().and_then(|_| sidecar_of(path));
             let mut sum = Sha256::new();
             let mut off = 0u64;
             let mut out: Option<O::H> = None;
+            if let (Some((main, suf)), Some((c, _))) = (side, copy.as_mut()) {
+                let n = format!("t{}", c.next);
+                c.next += 1;
+                c.side.push((n.clone(), main.to_vec(), suf, idx));
+                out = Some(o.create_copy(&c.dir, &n).map_err(|x| if x.raw_os_error() == Some(libc::EEXIST) { identity("a copy name collides") } else { partial("a copy can't be made") })?);
+            }
             loop {
                 let chunk = o.pread(&h, CHUNK, off).map_err(|_| partial("a file can't be read"))?;
                 if chunk.is_empty() {
@@ -440,11 +452,6 @@ fn visit<O: DigestOps>(o: &mut O, dir: &O::H, name: &[u8], path: &[u8], mnt: u64
                             let n = format!("{}.db", h_of(path));
                             c.mains.push((path.to_vec(), n.clone()));
                             e.copy = Some(n.clone());
-                            Some(n)
-                        } else if let Some((main, suf)) = side {
-                            let n = format!("t{}", c.next);
-                            c.next += 1;
-                            c.side.push((n.clone(), main.to_vec(), suf, idx));
                             Some(n)
                         } else {
                             None
@@ -876,6 +883,58 @@ mod tests {
         assert!(f.log.iter().any(|l| l == &format!("fsync {cdir}")));
         // Nothing written outside the copy directory.
         assert!(!f.log.iter().any(|l| (l.starts_with("create ") || l.starts_with("rename ")) && !l.contains(&cdir)));
+    }
+
+    #[test]
+    fn an_empty_sidecar_of_a_main_is_copied_and_bound_too() {
+        // TESTS H1 on 99b4b391: a zero-byte db-wal or db-journal is copied (empty), fsynced and bound by its copy key;
+        // an absent one makes no copy; an empty orphan is listed without a copy.
+        for suf in ["-wal", "-journal"] {
+            let mut f = host();
+            put(&mut f, "db", 0o600, MAIN);
+            put(&mut f, &format!("db{suf}"), 0o600, b"");
+            put(&mut f, &format!("y{suf}"), 0o600, b"");
+            let x = expect(&mut f);
+            let out = tree_digest(&mut f, &args(&x, true)).unwrap();
+            let h = h_of(b"db");
+            let cdir = format!("{}/{RUN}/{}", VALIDATE.trim_start_matches('/'), owner());
+            assert_eq!(f.files[&format!("{cdir}/{h}.db{suf}")], b"", "{suf}");
+            assert!(f.log.iter().any(|l| l == &format!("fsync_file {cdir}/t0") || l == &format!("fsync_file {cdir}/t1")), "{suf}: fsynced");
+            assert!(out.contains(&format!("\"path\":\"db{suf}\",\"type\":\"file\",\"size\":0,\"mode\":384,\"sha256\":\"{}\",\"copy\":\"{h}.db{suf}\"", sha(b""))), "{suf}: {out}");
+            assert!(!out.lines().any(|l| l.contains(&format!("\"path\":\"y{suf}\"")) && l.contains("copy")), "{suf}: the orphan");
+            assert_eq!(f.children(&cdir).len(), 2, "{suf}: the main and its sidecar only");
+        }
+        // Absent: no sidecar copy at all.
+        let mut f = host();
+        put(&mut f, "db", 0o600, MAIN);
+        let x = expect(&mut f);
+        tree_digest(&mut f, &args(&x, true)).unwrap();
+        let cdir = format!("{}/{RUN}/{}", VALIDATE.trim_start_matches('/'), owner());
+        assert_eq!(f.children(&cdir).len(), 1);
+    }
+
+    #[test]
+    fn a_path_over_4096_raw_bytes_is_limit_with_nothing_printed() {
+        // TESTS H2 on 99b4b391: exactly 4096 bytes passes, 4097 is limit; depth is far below its own bound.
+        let comp = "c".repeat(240);
+        let build = |f: &mut Fake, last: usize| {
+            let mut rel = String::new();
+            for _ in 0..16 {
+                rel = if rel.is_empty() { comp.clone() } else { format!("{rel}/{comp}") };
+                dir(f, &rel, 0o700);
+            }
+            // 16 components of 240 and 15 slashes: 3855 bytes; then a file named to reach `last` bytes in all.
+            let name = "f".repeat(last - rel.len() - 1);
+            put(f, &format!("{rel}/{name}"), 0o600, b"x");
+        };
+        let mut f = host();
+        build(&mut f, MAX_PATH);
+        let x = expect(&mut f);
+        assert!(tree_digest(&mut f, &args(&x, false)).is_ok(), "exactly 4096");
+        let mut f = host();
+        build(&mut f, MAX_PATH + 1);
+        let x = expect(&mut f);
+        assert_eq!(code(tree_digest(&mut f, &args(&x, false))), 64, "4097");
     }
 
     #[test]

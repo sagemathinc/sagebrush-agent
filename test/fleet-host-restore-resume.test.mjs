@@ -14,7 +14,7 @@ import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { armWatchdog, leaseExpire, publish, raiseLeaseFence, readTombstone, watchdogTimer } from "../lib/fleet/host/lease.mjs";
 import { raiseFence } from "../lib/fleet/host/fence.mjs";
 import { REASONS, requestResume, resumeArgv, resumeCgroup, resumeRestored } from "../lib/fleet/host/restore-resume.mjs";
-import { readRecord } from "../lib/fleet/host/lease.mjs";
+import { writeRecord } from "../lib/fleet/host/lease.mjs";
 import { restoreResumeScope } from "../lib/fleet/host/names.mjs";
 
 const A = newId();
@@ -69,22 +69,23 @@ function fakeSys(e, { locks }) {
 
 /**
  * A host where agent A was restored and validated, its first lease (lease_id L, lg 1, entry_gen 5) armed and
- * published, `lease` down and `restore` up: the helper's world. The published record carries `gen` as lease part 2
- * will publish it (readLease adds it; lease.mjs's own readRecord doesn't know it yet). `over` replaces any option.
+ * published (the record carries its gen, as lease.mjs writes it), `lease` down and `restore` up: the helper's world,
+ * read through lease.mjs's own readRecord. `over` replaces any option.
  */
 async function world(over = {}) {
   const root = mkdtempSync(join(tmpdir(), "sb-resume-"));
   const e = { root, dir: join(root, "run"), fenceDir: join(root, "fence"), leaseFenceDir: join(root, "fence", "lease"), slice: join(root, "cg") };
   const c = fakeClock(), locks = fakeLocks(), sys = fakeSys(e, { locks });
-  const rec = { lease_id: "L", lg: 1, expiry_tick: c.boot() + 600_000 };
+  const rec = { lease_id: "L", lg: 1, expiry_tick: c.boot() + 600_000, gen: 5 };
   await armWatchdog(A, rec, { sys, clock: c });
   assert.equal(await publish(A, rec, { dir: e.dir, sys, clock: c }), true);
   raiseFence("restore", A, { dir: e.fenceDir });
-  const withGen = (g) => (a, o) => { const r = readRecord(a, o); return r.state === "ok" ? { state: "ok", rec: { ...r.rec, gen: g } } : r; };
+  /** Republish the same lease with another gen (the same lease_id, lg and expiry: only gen differs). */
+  const withGen = (g) => writeRecord(A, { ...rec, gen: g }, { dir: e.dir });
   const deps = {
     restoreState: () => "validated",
     dir: e.dir, fenceDir: e.fenceDir, leaseFenceDir: e.leaseFenceDir, sys, clock: c, lock: locks.lock,
-    readLease: withGen(5), cgroupOf: () => resumeCgroup(A), pid: 4242,
+    cgroupOf: () => resumeCgroup(A), pid: 4242,
     ...over,
   };
   const restoreUp = () => existsSync(join(e.fenceDir, "restore", A));
@@ -268,8 +269,8 @@ test("the helper refuses, lowering nothing and changing no fence", async () => {
     ["not_this_lease", () => ({}), { leaseId: "OTHER" }],
     ["not_this_lease", () => ({}), { lg: 2 }],
     ["not_this_lease", () => ({}), { gen: 6 }], // a newer entry_gen than the lease's
-    ["not_this_lease", (w) => ({ readLease: w.withGen(4) })],
-    ["not_this_lease", () => ({ readLease: readRecord })], // lease.mjs's record has no gen until part 2: fails closed
+    ["not_this_lease", (w) => { w.withGen(4); }], // the published lease is for another gen
+    ["no_record", (w) => { writeFileSync(join(w.e.dir, A), JSON.stringify({ lease_id: "L", lg: 1, expiry_tick: w.rec.expiry_tick })); }], // the old three-key record: refused
     ["lease_not_live", (w) => { writeFileSync(join(w.e.dir, `${A}.spent`), "1\n"); }],
     ["lease_not_live", (w) => { w.c.advance(600_000 - 30_000); }],
     ["lease_not_live", (w) => { w.sys.timers[watchdogTimer(A, 1)].sub = "elapsed"; }],

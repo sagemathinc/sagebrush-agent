@@ -142,16 +142,18 @@ fn read_trusted<O: LeaseOps>(o: &mut O, dir: &O::H, name: &str) -> Result<Option
     o.read(&h, MAX_FILE).map(Some).map_err(|_| pre("a lease file can't be read"))
 }
 
-/// The record's (lg, expiry_tick), if it has exactly the closed shape and ranges.
+/// The record's (lg, expiry_tick), if it has exactly the closed shape `{lease_id, lg, expiry_tick, gen}` and its
+/// ranges (A3 r3). `gen`, the lease's grant generation, is range-checked as part of the shape and never compared: it
+/// changes no outcome except through the shape (only the restore-resume helper compares it).
 pub(crate) fn parse_record(src: &[u8]) -> Option<(u64, u64)> {
     let v = json::parse_with(src, 64)?;
-    let f = v.exact(&["lease_id", "lg", "expiry_tick"])?;
+    let f = v.exact(&["lease_id", "lg", "expiry_tick", "gen"])?;
     let id = f[0].str()?;
     if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
         return None;
     }
-    let (lg, expiry) = (f[1].int()?, f[2].int()?);
-    if !(1..=MAX_SAFE).contains(&lg) || expiry > MAX_SAFE {
+    let (lg, expiry, gen) = (f[1].int()?, f[2].int()?, f[3].int()?);
+    if !(1..=MAX_SAFE).contains(&lg) || expiry > MAX_SAFE || !(1..=MAX_SAFE).contains(&gen) {
         return None;
     }
     Some((lg, expiry))
@@ -316,7 +318,7 @@ mod tests {
         for p in [top.clone(), top.join("run"), top.join("run/sagebrush"), lease.clone()] {
             fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        write(&lease.join(A), br#"{"lease_id":"L1","lg":5,"expiry_tick":100000}"#, 0o644);
+        write(&lease.join(A), br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":3}"#, 0o644);
         let me = uid_of(&top);
         (T { top, me, foreign: HashSet::new(), foreign_group: HashSet::new(), access: HashSet::new(), default: HashSet::new(), now: (1, 0), sleeps: 0, hook: None }, lease)
     }
@@ -370,26 +372,58 @@ mod tests {
     fn a_malformed_record_is_78_and_an_oversize_one_66() {
         for bad in [
             &br#"{"lease_id":"L1","lg":5}"#[..],
-            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"x":1}"#,
-            br#"{"lease_id":"","lg":5,"expiry_tick":100000}"#,
-            br#"{"lease_id":"a b","lg":5,"expiry_tick":100000}"#,
-            br#"{"lease_id":"L1","lg":0,"expiry_tick":100000}"#,
-            br#"{"lease_id":"L1","lg":9007199254740992,"expiry_tick":100000}"#,
-            br#"{"lease_id":"L1","lg":5,"expiry_tick":9007199254740992}"#,
-            br#"{"lease_id":"L1","lg":"5","expiry_tick":100000}"#,
-            br#"{"lease_id":"L1","lg":5,"expiry_tick":-1}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":3,"x":1}"#,
+            br#"{"lease_id":"","lg":5,"expiry_tick":100000,"gen":3}"#,
+            br#"{"lease_id":"a b","lg":5,"expiry_tick":100000,"gen":3}"#,
+            br#"{"lease_id":"L1","lg":0,"expiry_tick":100000,"gen":3}"#,
+            br#"{"lease_id":"L1","lg":9007199254740992,"expiry_tick":100000,"gen":3}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":9007199254740992,"gen":3}"#,
+            br#"{"lease_id":"L1","lg":"5","expiry_tick":100000,"gen":3}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":-1,"gen":3}"#,
             b"not json",
+            // gen (A3 r3): the old three-key shape, out of range, not an integer, duplicated
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":0}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":9007199254740992}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":"3"}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":-1}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":1.5}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":null}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":3,"gen":3}"#,
         ] {
             let (mut t, lease) = setup();
             write(&lease.join(A), bad, 0o644);
             assert_eq!(code(&mut t), 78, "{}", String::from_utf8_lossy(bad));
         }
-        let long = format!(r#"{{"lease_id":"{}","lg":5,"expiry_tick":100000}}"#, "x".repeat(65));
+        let long = format!(r#"{{"lease_id":"{}","lg":5,"expiry_tick":100000,"gen":3}}"#, "x".repeat(65));
         let (mut t, lease) = setup();
         write(&lease.join(A), long.as_bytes(), 0o644);
         assert_eq!(code(&mut t), 78, "a 65-character lease id");
         write(&lease.join(A), &vec![b' '; 5000], 0o644);
         assert_eq!(code(&mut t), 66, "oversize");
+    }
+
+    #[test]
+    fn the_records_gen_is_range_checked_and_never_changes_an_outcome() {
+        // Its bounds pass.
+        for g in ["1", "9007199254740991"] {
+            let (mut t, lease) = setup();
+            write(&lease.join(A), format!(r#"{{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":{g}}}"#).as_bytes(), 0o644);
+            assert_eq!(code(&mut t), 0, "gen {g}");
+        }
+        // The same record with each of two gens: the same outcome, passing, spent and expired alike.
+        for gen in [1u64, 7] {
+            let rec = format!(r#"{{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":{gen}}}"#);
+            let (mut t, lease) = setup();
+            write(&lease.join(A), rec.as_bytes(), 0o644);
+            assert_eq!(code(&mut t), 0, "passing, gen {gen}");
+            write(&lease.join(format!("{A}.spent")), b"5\n", 0o644);
+            assert_eq!(code(&mut t), 78, "spent, gen {gen}");
+            let (mut t, lease) = setup();
+            write(&lease.join(A), rec.as_bytes(), 0o644);
+            t.now = (70, 0); // 70 000 ms: past the effective end, 100 000 - 30 000
+            assert_eq!(code(&mut t), 78, "expired, gen {gen}");
+        }
     }
 
     #[test]

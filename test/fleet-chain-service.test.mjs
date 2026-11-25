@@ -8,7 +8,7 @@ import { b64, enc, newId, keyFromSeed, seal, sha256b64, signedBytes, hostFingerp
 import { signRequest } from "../lib/fleet/request.mjs";
 import { verifyExecutionLease } from "../lib/fleet/verify.mjs";
 import {
-  CHAIN_NONCE_KEEP_MS, CHAIN_PAGE_BYTES, CHAIN_PAGE_ENTRIES, CHAIN_RATE_HOST, CHAIN_RATE_SOURCE, CHAIN_ROUTE, chainTarget, handleChainRead, parseChainPage,
+  CHAIN_NONCE_KEEP_MS, CHAIN_PAGE_BYTES, CHAIN_PAGE_ENTRIES, CHAIN_RATE_HOST, CHAIN_RATE_SOURCE, CHAIN_ROUTE, chainPageBody, chainTarget, handleChainRead, parseChainPage,
   parseChainTarget,
 } from "../lib/fleet/core/chain-service.mjs";
 import { SIGNED_MAX } from "../lib/fleet/core/canonical.mjs";
@@ -487,4 +487,18 @@ test("with the lease route: a lease past the host's pin is device_unknown; after
   assert.notEqual(second.outstanding.nonce, first.outstanding.nonce);
   const v = await check(second, synced.state);
   assert.equal(v.body.chain_seq, 1);
+});
+
+test("chainPageBody is the route's own encoder: byte-identical to the handler's 200 body, and the same store faults", async () => {
+  const w = world();
+  const { entries } = await realChain(w.fleetA, 20);
+  w.st.entries.set(w.fleetA, entries);
+  for (const after of [-1, 0, 7, 19, 25]) {
+    const r = await w.send(w.sig(w.hostA, { after: after < 0 ? null : after }));
+    const page = { head: entries.length - 1, entries: entries.slice(after + 1, after + 1 + CHAIN_PAGE_ENTRIES).map((bytes, i) => ({ seq: after + 1 + i, bytes })) };
+    assert.deepEqual(chainPageBody(page, after), r.body, `after ${after}`);
+  }
+  assert.throws(() => chainPageBody({ head: 5, entries: [{ seq: 0, bytes: "a" }, { seq: 2, bytes: "c" }] }, -1));
+  assert.throws(() => chainPageBody({ head: 0, entries: [{ seq: 0, bytes: "a".repeat(SIGNED_MAX + 1) }] }, -1));
+  assert.throws(() => chainPageBody({ head: 5, entries: [] }, -1));
 });

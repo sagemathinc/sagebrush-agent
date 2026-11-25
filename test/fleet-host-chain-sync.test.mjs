@@ -253,7 +253,7 @@ const verify = (bytes) => { const body = JSON.parse(String(bytes)); return { bod
 const bodyOf = (bytes) => JSON.parse(String(bytes));
 
 /** The executor over fake units, with a fake chain seam recording its calls in `log`. */
-async function exec({ certValid = true, grantValid = true, stuck = () => null } = {}) {
+async function exec({ certValid = true, grantValid = true, stuck = () => null, retryMs = 5 } = {}) {
   const fenceDir = join(tmp(), "fence"), log = [], units = {};
   let proofs = 0; // (the all-slice proofs so far: `stuck(n)` makes the n-th read "nonempty" or "throw")
   const u = (id) => (units[id] ??= { active: false, masked: false });
@@ -287,7 +287,7 @@ async function exec({ certValid = true, grantValid = true, stuck = () => null } 
   };
   const store = await HostStore.open(join(tmp(), "state"));
   const holder = { barrier: null };
-  const sup = new Supervisor({ store, fx, verify, bodyOf, fenceDir, chain, deadlines: { "adopt-retry": 5 }, barrier: async (n, d) => { log.push(["barrier", n]); if (holder.barrier) await holder.barrier(n, d); } });
+  const sup = new Supervisor({ store, fx, verify, bodyOf, fenceDir, chain, deadlines: { "adopt-retry": retryMs }, barrier: async (n, d) => { log.push(["barrier", n]); if (holder.barrier) await holder.barrier(n, d); } });
   return { sup, store, log, units, u, fenceDir, holder };
 }
 const cand = { state: { seq: 6 }, entries: [new Uint8Array(1)], fromSeq: 6 };
@@ -396,6 +396,38 @@ test("close during an adoption's unproven stop: nothing committed, the adoption 
     assert.equal(await queued, "in_progress");
     await assert.rejects(adopt(x.sup), (e) => e.code === "in_progress");
   }
+});
+
+test("close: every caller observes the same drain; a close that lands during an attempt ends the retry without its wait", async () => {
+  // Two close() calls while an op is held: both resolve once it ends.
+  const x = await exec();
+  await x.sup.recover();
+  let release, reached;
+  const gate = new Promise((r) => { release = r; }), at = new Promise((r) => { reached = r; });
+  x.holder.barrier = async (n) => { if (n === "after_fence_write") { x.holder.barrier = null; reached(); await gate; } };
+  const running = x.sup.submit({ kind: "stop-all", authority: "person" });
+  await at;
+  const done = [];
+  const first = x.sup.close().then(() => done.push("first")), second = x.sup.close().then(() => done.push("second"));
+  release();
+  await running;
+  const bounded = (p) => Promise.race([p.then(() => true), new Promise((r) => setTimeout(() => r(false), 1000))]);
+  assert.deepEqual([await bounded(first), await bounded(second)], [true, true], "both close() callers observe the drain");
+  assert.deepEqual(done.sort(), ["first", "second"]);
+  await x.sup.close();
+  // Close during an unproven attempt (at its stop barrier, before the wait): the op ends at once, not after the retry
+  // interval (an hour here).
+  const y = await exec({ certValid: false, stuck: () => "nonempty", retryMs: 3_600_000 });
+  await y.sup.recover();
+  await y.sup.submit({ kind: "grant", bytes: grantBytes(1, [F.ids.agent]) });
+  let closing = null;
+  y.holder.barrier = async (n) => { if (n === "after_revoked_stop" && !closing) closing = y.sup.close(); };
+  const t0 = Date.now();
+  const r = await Promise.race([adopt(y.sup), new Promise((res) => setTimeout(() => res("waited"), 2000))]);
+  assert.notEqual(r, "waited");
+  assert.equal(r.proven, false);
+  assert.ok(Date.now() - t0 < 2000);
+  await closing;
 });
 
 test("the sync's lifetime: stop() while a scheduled sync is fetching arms nothing more; a restart's timers are its own", async () => {

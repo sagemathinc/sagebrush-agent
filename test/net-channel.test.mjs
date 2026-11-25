@@ -435,3 +435,20 @@ test("a relay that isn't the audience's makes no channel: no token is asked for 
   assert.equal(asked.length, 0, "no token asked for");
   assert.equal(opened.length, 0, "no socket");
 });
+
+test("closed while the transport is being opened: the socket it resolves to is terminated, and nothing follows", async () => {
+  const fx = fixture(), h = await host(fx);
+  let resolveOpen, opening = 0, terminated = 0, listened = 0;
+  const fake = { terminate() { terminated++; }, on() { listened++; }, send() { throw new Error("must not send"); } };
+  const { c, states } = channel(fx, h, { open: () => { opening++; return new Promise((r) => { resolveOpen = r; }); } });
+  try {
+    await until(() => opening === 1, 2000, "the open");
+    c.close();
+    resolveOpen(fake);
+    await tick(50);
+    assert.equal(terminated, 1, "the late socket is terminated");
+    assert.equal(listened, 0, "no handler is attached to it");
+    assert.deepEqual(states, [], "close() is quiet");
+    assert.equal(c.socket, null);
+  } finally { c.close(); await h.close(); }
+});

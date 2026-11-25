@@ -24,7 +24,7 @@ import { test } from "node:test";
 
 const ROOT = new URL("..", import.meta.url);
 // (per launch: until Chromium asks for the page; SAGEBRUSH_CHROME_ASK_MS shortens it for the relaunch controls)
-const ASK_MS = Number(process.env.SAGEBRUSH_CHROME_ASK_MS) > 0 ? Number(process.env.SAGEBRUSH_CHROME_ASK_MS) : 30_000;
+const ASK_MS = Number(process.env.SAGEBRUSH_CHROME_ASK_MS) > 0 ? Number(process.env.SAGEBRUSH_CHROME_ASK_MS) : 90_000;
 const LAUNCHES = 2; // (the first, and one relaunch after a launch that never asked)
 const RESULT_MS = 60_000; // (from the page's request: until the page reports)
 const SLOW_MS = 3000; // (a page asked for later than this, though the test passes, prints how Chromium started)
@@ -33,7 +33,9 @@ const RECOVERY_KNOWN = ["QIgcRL3kWMdpVNtbHP7lkw", "8f8Zi-ibteyHFwp-PnAVfGC6-_75J
 function findChrome() {
   if (process.env.SAGEBRUSH_CHROME) return process.env.SAGEBRUSH_CHROME;
   for (const dir of (process.env.PATH ?? "").split(delimiter))
-    for (const name of ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"])
+    // (Chrome first: on Ubuntu runners /usr/bin/chromium is the snap's wrapper, whose own start-up took 24 s under
+    // load, before Chromium printed anything; the runners also carry Google Chrome)
+    for (const name of ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser"])
       if (dir && existsSync(join(dir, name))) return join(dir, name);
   return null;
 }

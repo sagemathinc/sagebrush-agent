@@ -16,6 +16,7 @@ import { raiseFence } from "../lib/fleet/host/fence.mjs";
 import { REASONS, requestResume, resumeArgv, resumeCgroup, resumeRestored } from "../lib/fleet/host/restore-resume.mjs";
 import { writeRecord } from "../lib/fleet/host/lease.mjs";
 import { restoreResumeScope } from "../lib/fleet/host/names.mjs";
+import { liveLease } from "../lib/fleet/host/lease-live.mjs";
 
 const A = newId();
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
@@ -400,4 +401,37 @@ test("the supervisor with the REAL verifiers (the shared vectors): accepted once
   }
   assert.equal(recorded.length, 1);
   assert.equal(runs.length, 2);
+});
+
+test("the supervisor with the REAL liveLease: a published, live record for the current entry_gen resumes; anything else waits or refuses", async () => {
+  // The lease module's own reader over a real published record, with a fake systemd (the watchdog timer) and clock.
+  const real = ({ rec, timer = { active: "active", sub: "waiting", next: 9e15 }, spent = null }) => {
+    const dir = mkdtempSync(join(tmpdir(), "sb-resume-live-"));
+    const timers = {};
+    if (rec !== null) { writeRecord(A, rec, { dir }); timers[watchdogTimer(A, rec.lg)] = timer; }
+    if (spent !== null) writeFileSync(join(dir, `${A}.spent`), `${spent}\n`);
+    const sys = { timer: async (unit) => { if (!(unit in timers)) throw new Error("no such unit"); return timers[unit]; } };
+    const clock = { boot: () => 1_000_000, mono: () => 5_000_000_000 };
+    return (a) => liveLease(a, { dir, sys, clock });
+  };
+  const rec = (gen) => ({ lease_id: "L7", lg: 3, expiry_tick: 1_000_000 + 600_000, gen });
+  // Live, gen = entry_gen (5): the helper is launched with the record's lease_id, lg and gen.
+  const ok = supervisor({ liveLease: real({ rec: rec(5) }), checkTransferForHost: () => ({ first: true }) });
+  assert.deepEqual(await requestResume(A, ok.opts), { resumed: true, reason: null });
+  assert.deepEqual(ok.kinds().slice(-2), ["recordTransfer", "run"]);
+  const argv = ok.log.find((l) => l[0] === "run")[1];
+  assert.deepEqual(argv.slice(-5), [A, "5", "L7", "3", T1]);
+  // Anything else launches and records nothing.
+  const cases = [
+    ["not_this_lease", { rec: rec(4) }],
+    ["waiting_for_lease", { rec: null }],
+    ["waiting_for_lease", { rec: rec(5), spent: 3 }],
+    ["waiting_for_lease", { rec: rec(5), timer: { active: "active", sub: "elapsed", next: 9e15 } }],
+    ["waiting_for_lease", { rec: { ...rec(5), expiry_tick: 1_000_000 } }],
+  ];
+  for (const [reason, w] of cases) {
+    const s = supervisor({ liveLease: real(w), checkTransferForHost: () => ({ first: true }) });
+    assert.deepEqual(await requestResume(A, s.opts), { resumed: false, reason }, JSON.stringify(w));
+    assert.ok(!s.kinds().includes("recordTransfer") && !s.kinds().includes("run"), reason);
+  }
 });

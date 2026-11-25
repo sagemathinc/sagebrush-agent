@@ -168,7 +168,7 @@ pub fn request(snapshot: &str, path: &str) -> Result<Vec<u8>> {
 // ---- the operations A2 adds to A1's
 
 pub trait RestoreOps: Ops {
-    fn mkdir(&mut self, dir: &Self::H, name: &str, mode: u16) -> io::Result<()>;
+    fn mkdir(&mut self, dir: &Self::H, name: impl AsRef<[u8]>, mode: u16) -> io::Result<()>;
     fn set_project(&mut self, h: &Self::H, projid: u32) -> io::Result<()>;
     fn chown(&mut self, h: &Self::H, uid: u32, gid: u32) -> io::Result<()>;
     /// Every extended attribute's name.
@@ -629,8 +629,9 @@ struct Fill {
     dirs: u64,
     files: u64,
     symlinks: u64,
-    refused: Vec<(String, u32, u32, u64)>,
-    unexpected: Vec<(String, &'static str)>,
+    /// Raw relative paths (A2 r3.9): encoded with §4b's codec only in the report.
+    refused: Vec<(Vec<u8>, u32, u32, u64)>,
+    unexpected: Vec<(Vec<u8>, &'static str)>,
     truncated: bool,
 }
 
@@ -639,10 +640,10 @@ impl Fill {
     fn fail(&self, msg: &'static str) -> Error {
         if self.effects == 0 { identity(msg) } else { err(Fail::Partial, msg) }
     }
-    fn refuse(&mut self, path: String, uid: u32, gid: u32, entries: u64) {
+    fn refuse(&mut self, path: Vec<u8>, uid: u32, gid: u32, entries: u64) {
         if self.refused.len() < MAX_LIST { self.refused.push((path, uid, gid, entries)) } else { self.truncated = true }
     }
-    fn odd(&mut self, path: String, t: &'static str) {
+    fn odd(&mut self, path: Vec<u8>, t: &'static str) {
         if self.unexpected.len() < MAX_LIST { self.unexpected.push((path, t)) } else { self.truncated = true }
     }
 }
@@ -669,7 +670,7 @@ fn special_name(mode: u16) -> &'static str {
 
 /// An entry of a staging directory, identified without opening it for reading: (identity, its kind or None for a
 /// special). A symlink is identified by name.
-fn entry<O: RestoreOps>(o: &mut O, w: &Fill, dir: &O::H, name: &str) -> Result<(Ident, Option<Kind>)> {
+fn entry<O: RestoreOps>(o: &mut O, w: &Fill, dir: &O::H, name: &[u8]) -> Result<(Ident, Option<Kind>)> {
     let id = match o.at(dir, name, At::Path) {
         Ok(h) => o.ident(&h).map_err(|_| w.fail("an entry can't be identified"))?,
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
@@ -688,8 +689,10 @@ fn entry<O: RestoreOps>(o: &mut O, w: &Fill, dir: &O::H, name: &str) -> Result<(
     Ok((id, kind_of(&id)))
 }
 
-/// The dry pass (before any effect): bounds (2,000,000 objects, depth 256) and types only. Returns the count.
-fn scan<O: RestoreOps>(o: &mut O, w: &Fill, dir: &O::H, depth: usize, count: &mut usize) -> Result<()> {
+/// The dry pass (before any effect): bounds (2,000,000 objects, depth 256, and a relative path of at most 4096 raw
+/// bytes, A2 r3.9) and types only. `plen` is `dir`'s own relative path length in raw bytes (0 at the class root).
+/// Adds the entries it sees to `count`.
+fn scan<O: RestoreOps>(o: &mut O, w: &Fill, dir: &O::H, plen: usize, depth: usize, count: &mut usize) -> Result<()> {
     if depth > tree::MAX_DEPTH {
         return Err(w.fail("the staged class is too deep"));
     }
@@ -703,16 +706,27 @@ fn scan<O: RestoreOps>(o: &mut O, w: &Fill, dir: &O::H, depth: usize, count: &mu
             if *count > w.limit {
                 return Err(w.fail("the staged class is too large"));
             }
+            let len = if plen == 0 { name.len() } else { plen + 1 + name.len() };
+            if len > crate::digest::MAX_PATH {
+                return Err(w.fail("a staged path is too long"));
+            }
             if let (_, Some(Kind::Dir)) = entry(o, w, dir, &name)? {
                 let h = o.at(dir, &name, At::Dir).map_err(|_| w.fail("a staging directory can't be opened"))?;
-                scan(o, w, &h, depth + 1, count)?;
+                scan(o, w, &h, len, depth + 1, count)?;
             }
         }
     }
 }
 
-fn join(rel: &str, name: &str) -> String {
-    if rel.is_empty() { name.to_string() } else { format!("{rel}/{name}") }
+/// A relative path's raw bytes: `rel/name`, or `name` at the class root.
+fn join(rel: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(rel.len() + 1 + name.len());
+    if !rel.is_empty() {
+        p.extend_from_slice(rel);
+        p.push(b'/');
+    }
+    p.extend_from_slice(name);
+    p
 }
 
 /// The walk, top-down (A2 §4 step 5), for the staging directory `sname` beneath `sp` (identity `sid`) into `dst`.
@@ -720,7 +734,7 @@ fn join(rel: &str, name: &str) -> String {
 /// until a round finds nothing new (as A1's remove-tree pass 2): a listing may skip a name while names leave, never
 /// invent one. Only the names that stay in staging (refused, unexpected) are remembered between rounds.
 #[allow(clippy::too_many_arguments)]
-fn walk<O: RestoreOps>(o: &mut O, w: &mut Fill, sp: &O::H, sname: &str, sid: ((u32, u32), u64), dst: &O::H, rel: &str, depth: usize) -> Result<()> {
+fn walk<O: RestoreOps>(o: &mut O, w: &mut Fill, sp: &O::H, sname: &[u8], sid: ((u32, u32), u64), dst: &O::H, rel: &[u8], depth: usize) -> Result<()> {
     if depth > tree::MAX_DEPTH {
         return Err(w.fail("the staged class is too deep"));
     }
@@ -743,7 +757,7 @@ fn walk<O: RestoreOps>(o: &mut O, w: &mut Fill, sp: &O::H, sname: &str, sid: ((u
 }
 
 /// One round over a freshly opened staging directory: Ok(true) if it handled at least one new entry.
-fn walk_round<O: RestoreOps>(o: &mut O, w: &mut Fill, src: &O::H, dst: &O::H, rel: &str, depth: usize, kept: &mut std::collections::BTreeSet<String>) -> Result<bool> {
+fn walk_round<O: RestoreOps>(o: &mut O, w: &mut Fill, src: &O::H, dst: &O::H, rel: &[u8], depth: usize, kept: &mut std::collections::BTreeSet<Vec<u8>>) -> Result<bool> {
     let mut progress = false;
     loop {
         let names = o.batch(src).map_err(|_| w.fail("a staging directory can't be listed"))?;
@@ -763,11 +777,13 @@ fn walk_round<O: RestoreOps>(o: &mut O, w: &mut Fill, src: &O::H, dst: &O::H, re
                 continue;
             };
             if !(w.uids.contains(&id.uid) && id.gid == w.gid) {
-                // Not placed; a refused directory's whole subtree is neither walked nor placed, reported once.
-                let mut n = 0usize;
+                // Not placed; a refused directory's whole subtree is neither walked nor placed, reported once. Its
+                // `entries` counts the refused object itself plus, for a directory, everything beneath it (A2 r3.9):
+                // exactly the listing entries validation removes for it.
+                let mut n = 1usize;
                 if kind == Kind::Dir {
                     let h = o.at(src, &name, At::Dir).map_err(|_| w.fail("a staging directory can't be opened"))?;
-                    scan(o, w, &h, depth + 1, &mut n)?;
+                    scan(o, w, &h, p.len(), depth + 1, &mut n)?;
                 }
                 w.refuse(p, id.uid, id.gid, n as u64);
                 kept.insert(name);
@@ -831,12 +847,14 @@ fn walk_round<O: RestoreOps>(o: &mut O, w: &mut Fill, src: &O::H, dst: &O::H, re
 }
 
 fn fill_report(w: &Fill) -> String {
+    // Every path through §4b's codec, then its JSON form (A2 r3.9): one encoding for every path written.
+    let path = |p: &[u8]| json::quote(&crate::digest::encode(p));
     let refused: Vec<String> = w
         .refused
         .iter()
-        .map(|(p, u, g, n)| format!("{{\"path\":{},\"uid\":{u},\"gid\":{g},\"entries\":{n}}}", json::quote(p)))
+        .map(|(p, u, g, n)| format!("{{\"path\":{},\"uid\":{u},\"gid\":{g},\"entries\":{n}}}", path(p)))
         .collect();
-    let unexpected: Vec<String> = w.unexpected.iter().map(|(p, t)| format!("{{\"path\":{},\"type\":\"{t}\"}}", json::quote(p))).collect();
+    let unexpected: Vec<String> = w.unexpected.iter().map(|(p, t)| format!("{{\"path\":{},\"type\":\"{t}\"}}", path(p))).collect();
     format!(
         "{{\"placed\":{{\"dirs\":{},\"files\":{},\"symlinks\":{}}},\"refused\":[{}],\"unexpected\":[{}],\"truncated\":{}}}\n",
         w.dirs,
@@ -949,7 +967,7 @@ fn fill_limited<O: RestoreOps>(o: &mut O, a: &FillArgs, limit: usize) -> Result<
     let src = src.ok_or(identity("no such source"))?;
     // 5. The dry pass, then the walk on fresh handles.
     let mut count = 0usize;
-    scan(o, &w, &src, 1, &mut count)?;
+    scan(o, &w, &src, 0, 1, &mut count)?;
     let si = o.ident(&src).map_err(open_err)?;
     drop(src);
     let (parent_rel, leaf) = a.source.rsplit_once('/').ok_or(identity("no such source"))?;
@@ -959,7 +977,7 @@ fn fill_limited<O: RestoreOps>(o: &mut O, a: &FillArgs, limit: usize) -> Result<
         sp = Some(tchild(o, parent, part, mnt)?.and_then(|(_, h)| h).ok_or(identity("no such source"))?);
     }
     let sp = sp.ok_or(identity("no such source"))?;
-    walk(o, &mut w, &sp, leaf, (si.dev, si.ino), &dst, "", 1)?;
+    walk(o, &mut w, &sp, leaf.as_bytes(), (si.dev, si.ino), &dst, b"", 1)?;
     // The durability barrier: every written directory was synced bottom-up in the walk; then the destination and its
     // parent. Exit 0 only after the whole barrier.
     o.fsync(&dst).map_err(|_| err(Fail::Partial, "the destination can't be synced"))?;
@@ -990,8 +1008,8 @@ fn cs(s: &str) -> io::Result<CString> {
 }
 
 impl RestoreOps for tree::RealOps {
-    fn mkdir(&mut self, dir: &OwnedFd, name: &str, mode: u16) -> io::Result<()> {
-        sys::mkdirat(dir, &cs(name)?, mode as libc::mode_t)
+    fn mkdir(&mut self, dir: &OwnedFd, name: impl AsRef<[u8]>, mode: u16) -> io::Result<()> {
+        sys::mkdirat(dir, &tree::cb(name.as_ref())?, mode as libc::mode_t)
     }
     fn set_project(&mut self, h: &OwnedFd, projid: u32) -> io::Result<()> {
         sys::set_project(h, projid, true)
@@ -1099,9 +1117,9 @@ mod tests {
     const BIN: &str = "opt/sagebrush/1/bin/sagebrush-agent-backup";
 
     impl RestoreOps for Fake {
-        fn mkdir(&mut self, dir: &FH, name: &str, mode: u16) -> io::Result<()> {
+        fn mkdir(&mut self, dir: &FH, name: impl AsRef<[u8]>, mode: u16) -> io::Result<()> {
             self.tick("mkdir")?;
-            let p = join(&dir.p, name);
+            let p = join(&dir.p, &crate::tree::tests::key(name.as_ref()));
             if self.nodes.contains_key(&p) {
                 return Err(e(libc::EEXIST));
             }
@@ -1953,7 +1971,7 @@ mod tests {
         let out = fill_home(&mut f, &fill_args("home", x)).unwrap();
         assert_eq!(
             out,
-            "{\"placed\":{\"dirs\":1,\"files\":2,\"symlinks\":1},\"refused\":[{\"path\":\"other\",\"uid\":70002,\"gid\":70002,\"entries\":2},{\"path\":\"root.txt\",\"uid\":0,\"gid\":0,\"entries\":0}],\"unexpected\":[{\"path\":\"fifo\",\"type\":\"fifo\"}],\"truncated\":false}\n"
+            "{\"placed\":{\"dirs\":1,\"files\":2,\"symlinks\":1},\"refused\":[{\"path\":\"other\",\"uid\":70002,\"gid\":70002,\"entries\":3},{\"path\":\"root.txt\",\"uid\":0,\"gid\":0,\"entries\":1}],\"unexpected\":[{\"path\":\"fifo\",\"type\":\"fifo\"}],\"truncated\":false}\n"
         );
         let dest = format!("srv/sagebrush/agents/{A}/home");
         let a = &f.nodes[&format!("{dest}/a.txt")];
@@ -2142,6 +2160,143 @@ mod tests {
         assert!(out.contains("\"files\":2") && out.contains("\"path\":\"stranger\"") && out.contains("\"path\":\"own-group\""), "{out}");
         assert!(f.nodes.contains_key(&format!("{dest}/m1")) && f.nodes.contains_key(&format!("{dest}/m2")));
         assert!(!f.nodes.contains_key(&format!("{dest}/stranger")));
+    }
+
+    // ---- names that aren't UTF-8 (A2 r3.9, A1 r2.5)
+
+    /// `staged`'s class plus names that aren't UTF-8 (the fake keys names encoded: `%FF` is the byte 0xFF), all the
+    /// agent's: a file named 0xFF, a directory named 0xE2 0x82 (a truncated sequence) holding a file, and a symlink
+    /// named 0xC0 0x80 (an overlong encoding) whose target is `t`. The FIFO is dropped so remove-tree can follow.
+    fn staged_odd() -> (Fake, String) {
+        let (mut f, src) = staged("home");
+        f.nodes.remove(&format!("{src}/fifo"));
+        for (rel, mode) in [("%FF", S_IFREG | 0o600), ("%E2%82", S_IFDIR | 0o700), ("%E2%82/in", S_IFREG | 0o600), ("%C0%80", S_IFLNK | 0o777)] {
+            let p = format!("{src}/{rel}");
+            f.add(&p, mode, UID, UID);
+            f.node(&p).proj = UID;
+            f.node(&p).inherit = true;
+        }
+        f.files.insert(format!("{src}/%C0%80"), b"t".to_vec());
+        f.node(&format!("{src}/%C0%80")).id.size = 1;
+        (f, src)
+    }
+
+    #[test]
+    fn names_that_are_not_utf8_are_placed_listed_by_the_codec_and_their_attempt_removed() {
+        let (mut f, src) = staged_odd();
+        let x = fill_expect(&mut f, "home");
+        let out = fill_home(&mut f, &fill_args("home", x.clone())).unwrap();
+        assert!(out.starts_with("{\"placed\":{\"dirs\":2,\"files\":4,\"symlinks\":2}"), "{out}");
+        let dest = format!("srv/sagebrush/agents/{A}/home");
+        // Placed under their exact bytes: the fake finds a node only by the encoding of the bytes it is given.
+        for l in [format!("mkdir {dest}/%E2%82"), format!("rename {src}/%FF {dest}/%FF"), format!("rename {src}/%E2%82/in {dest}/%E2%82/in"), format!("rename {src}/%C0%80 {dest}/%C0%80")] {
+            assert!(f.log.contains(&l), "{l}: {:?}", f.log);
+        }
+        // tree-digest lists them through §4b's codec, exactly as the expected lines.
+        let o: &'static str = Box::leak(owner().into_boxed_str());
+        let listing = crate::digest::tree_digest(&mut f, &crate::digest::DigestArgs { mount: "/srv/sagebrush", owner: o, class: "home", expect: Box::leak(x.into_boxed_str()), copy_run: None }).unwrap();
+        let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        for line in [
+            "{\"path\":\"%C0%80\",\"type\":\"symlink\",\"size\":1,\"mode\":511,\"target\":\"t\"}".to_string(),
+            "{\"path\":\"%E2%82\",\"type\":\"dir\",\"size\":0,\"mode\":448}".to_string(),
+            format!("{{\"path\":\"%E2%82/in\",\"type\":\"file\",\"size\":0,\"mode\":384,\"sha256\":\"{empty}\"}}"),
+            format!("{{\"path\":\"%FF\",\"type\":\"file\",\"size\":0,\"mode\":384,\"sha256\":\"{empty}\"}}"),
+        ] {
+            assert!(listing.contains(&format!("\n{line}\n")), "{line}\n{listing}");
+        }
+        // Sorted by raw bytes: 0xC0 < 0xE2 < 0xFF, all after the ASCII names.
+        let at = |p: &str| listing.find(&format!("\"path\":\"{p}\"")).unwrap();
+        assert!(at("sub/b.txt") < at("%C0%80") && at("%C0%80") < at("%E2%82") && at("%E2%82/in") < at("%FF"));
+        // The consumed attempt, refused entries included, is removed.
+        let root = f.root().unwrap();
+        let class = f.dir_from_root(&root, &format!("srv/sagebrush/.restore/{RUN}/{}/home", owner())).unwrap();
+        let (ax, _) = crate::tree::child(&mut f, &class, "1", MNT).unwrap().unwrap();
+        let owners: Vec<String> = std::iter::once(0).chain(70001..70004).map(|u: u32| u.to_string()).collect();
+        let ex = expect_file(&mut f, "rm.json", format!("{{\"epoch\":{{\"boot_id\":\"{BOOT}\",\"mnt_id\":{MNT}}},\"fsid\":\"0000abcd00001234\",\"root\":{},\"owners\":[{}]}}", obj_json(&ax), owners.join(",")));
+        assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 0);
+        assert!(!f.nodes.contains_key(&attempt_path("home")));
+    }
+
+    #[test]
+    fn a_refused_entry_counts_itself_and_its_path_is_encoded() {
+        let (mut f, src) = staged("home");
+        // The raw name `x%` then 0xFF, foreign, holding two files; a raw-name neighbour `x%` 0xFF `y`, the agent's.
+        for (rel, mode, uid) in [("x%25%FF", S_IFDIR | 0o700, 70002), ("x%25%FF/p", S_IFREG | 0o600, 70002), ("x%25%FF/q", S_IFREG | 0o600, 70002), ("x%25%FFy", S_IFREG | 0o600, UID), ("empty", S_IFDIR | 0o700, 70002), ("sub/%FEz", S_IFREG | 0o600, 0), ("sub/fifo", 0o010000 | 0o600, UID)] {
+            let p = format!("{src}/{rel}");
+            f.add(&p, mode, uid, uid);
+            f.node(&p).proj = UID;
+            f.node(&p).inherit = true;
+        }
+        let x = fill_expect(&mut f, "home");
+        let out = fill_home(&mut f, &fill_args("home", x)).unwrap();
+        for want in [
+            "{\"path\":\"x%25%FF\",\"uid\":70002,\"gid\":70002,\"entries\":3}",
+            "{\"path\":\"empty\",\"uid\":70002,\"gid\":70002,\"entries\":1}",
+            "{\"path\":\"root.txt\",\"uid\":0,\"gid\":0,\"entries\":1}",
+            "{\"path\":\"other\",\"uid\":70002,\"gid\":70002,\"entries\":3}",
+            // Below the class root: the relative path, joined at '/' and encoded.
+            "{\"path\":\"sub/%FEz\",\"uid\":0,\"gid\":0,\"entries\":1}",
+            "{\"path\":\"sub/fifo\",\"type\":\"fifo\"}",
+        ] {
+            assert!(out.contains(want), "{want}\n{out}");
+        }
+        assert!(!out.contains("x%25%FFy"), "the neighbour is placed, not refused: {out}");
+        // The codec commutes with joining at '/' (A2 r3.9 §4b): the refused files' encoded paths are the reported path
+        // plus '/', and the neighbour's is not, though it shares the encoded prefix.
+        let e = crate::digest::encode;
+        assert_eq!(e(b"x%\xff/p"), format!("{}/{}", e(b"x%\xff"), e(b"p")));
+        assert!(e(b"x%\xff/q").starts_with("x%25%FF/") && !e(b"x%\xffy").starts_with("x%25%FF/") && e(b"x%\xffy").starts_with("x%25%FF"));
+        for (a, b) in [(&b"\xe2\x82"[..], &b"in"[..]), (b"\xc3", b"\xa9"), (b"a\xf0\x9f", b"\x98\x80z"), (b"%", b"%25")] {
+            let mut j = a.to_vec();
+            j.push(b'/');
+            j.extend_from_slice(b);
+            assert_eq!(e(&j), format!("{}/{}", e(a), e(b)), "{a:?} / {b:?}");
+        }
+    }
+
+    #[test]
+    fn a_staged_path_over_4096_raw_bytes_is_73_in_the_dry_pass_and_4096_is_placed() {
+        for (last, want) in [(254usize, 0), (255, 73)] {
+            let (mut f, src) = staged("home");
+            // 15 directories of 255 bytes and one of `last`, each beneath the previous, then a file `x`: the file's
+            // relative path is 15 * 255 + last + 16 separators and `x`: 4096 bytes with last = 254, 4097 with 255.
+            let mut p = src.clone();
+            let mut len = 0usize;
+            for i in 0..16 {
+                let n = if i == 15 { "d".repeat(last) } else { "d".repeat(255) };
+                p = format!("{p}/{n}");
+                len += n.len() + usize::from(i > 0);
+                f.add(&p, S_IFDIR | 0o700, UID, UID);
+                f.node(&p).proj = UID;
+                f.node(&p).inherit = true;
+            }
+            f.add(&format!("{p}/x"), S_IFREG | 0o600, UID, UID);
+            f.node(&format!("{p}/x")).proj = UID;
+            assert_eq!(len + 2, if last == 254 { 4096 } else { 4097 });
+            let x = fill_expect(&mut f, "home");
+            let r = fill_home(&mut f, &fill_args("home", x));
+            assert_eq!(code(r), want, "last {last}");
+            if want != 0 {
+                assert!(!f.log.iter().any(|l| l.starts_with(&format!("mkdir srv/sagebrush/agents/{A}")) || l.starts_with("rename ")), "zero effects");
+            }
+        }
+    }
+
+    #[test]
+    fn the_report_lists_exactly_1000_and_truncates_at_1001() {
+        for (n, truncated) in [(999usize, false), (1000, true)] {
+            // root.txt is already one refused entry: n more makes 1000 or 1001.
+            let (mut f, src) = staged("home");
+            f.nodes.remove(&format!("{src}/other"));
+            f.nodes.retain(|k, _| !k.starts_with(&format!("{src}/other/")));
+            for i in 0..n {
+                f.add(&format!("{src}/r{i:04}"), S_IFREG | 0o600, 0, 0);
+            }
+            let x = fill_expect(&mut f, "home");
+            let out = fill_home(&mut f, &fill_args("home", x)).unwrap();
+            assert_eq!(out.matches("\"entries\":").count(), 1000, "{n}");
+            assert!(out.ends_with(&format!("\"truncated\":{truncated}}}\n")), "{n}: {}", &out[out.len() - 40..]);
+        }
     }
 
     // ---- remove-tree beneath .restore (A2 §1)

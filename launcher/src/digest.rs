@@ -557,17 +557,17 @@ mod tests {
 
     impl DigestOps for Fake {
         fn names_raw(&mut self, dir: &FH) -> io::Result<Vec<Vec<u8>>> {
-            Ok(self.batch(dir)?.into_iter().map(String::into_bytes).collect())
+            self.batch(dir)
         }
         fn at_raw(&mut self, dir: &FH, name: &[u8], how: At) -> io::Result<FH> {
-            self.at(dir, std::str::from_utf8(name).map_err(|_| e(libc::EILSEQ))?, how)
+            self.at(dir, name, how)
         }
         fn ident_at_raw(&mut self, dir: &FH, name: &[u8]) -> io::Result<Ident> {
-            self.ident_at(dir, std::str::from_utf8(name).map_err(|_| e(libc::EILSEQ))?)
+            self.ident_at(dir, name)
         }
         fn link_at_raw(&mut self, dir: &FH, name: &[u8]) -> io::Result<FH> {
             self.tick("link_at")?;
-            let p = join(&dir.p, std::str::from_utf8(name).map_err(|_| e(libc::EILSEQ))?);
+            let p = join(&dir.p, &crate::tree::tests::key(name));
             if self.nodes.get(&p).ok_or(e(libc::ENOENT))?.id.mode & S_IFMT != S_IFLNK {
                 return Err(e(libc::ENOTDIR));
             }
@@ -695,7 +695,7 @@ mod tests {
         dir(&mut f, "a", 0o700);
         put(&mut f, "a/f", 0o644, b"hi");
         link(&mut f, "l", b"a/f");
-        put(&mut f, "%x", 0o600, b"");
+        put(&mut f, "%25x", 0o600, b""); // the raw name `%x` (the fake keys names encoded)
         dir(&mut f, "b", 0o2775); // setgid directory: reported as it is
         put(&mut f, "s", 0o4755, b"x"); // setuid file: reported as it is (TESTS M1, SEC S4)
         put(&mut f, ".hidden", 0o600, b"z");

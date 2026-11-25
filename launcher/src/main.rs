@@ -22,6 +22,7 @@ mod args;
 mod child;
 mod restore;
 mod contract;
+mod digest;
 mod err;
 mod exec;
 mod json;
@@ -29,8 +30,10 @@ mod landlock;
 mod lease;
 mod profile;
 mod secret;
+mod sha256;
 mod stage;
 mod tree;
+mod turn;
 #[allow(unsafe_code)]
 mod sys;
 
@@ -60,6 +63,12 @@ fn run() -> err::Result<()> {
             a1(cmd, rest)
         }
         // Launcher contract amendment A2 (backup restore): root only, outside any unit.
+        "tree-digest" => {
+            if !after.is_empty() {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            tree_digest(rest)
+        }
         "restore-stage" | "fill-home" => {
             if !after.is_empty() {
                 return Err(err(Fail::Usage, "bad arguments"));
@@ -164,6 +173,34 @@ fn a1(cmd: &str, rest: &[String]) -> err::Result<()> {
             String::new()
         }
     };
+    std::io::stdout().write_all(out.as_bytes()).map_err(|_| err(Fail::Internal, "internal error"))
+}
+
+/// A2 r3.8.1 §4a: `tree-digest --mount <m> --owner <o> --class <c> --expect <file> [--copy-sqlite --run <run>]`.
+fn tree_digest(rest: &[String]) -> err::Result<()> {
+    let bad = || err(Fail::Usage, "bad arguments");
+    let copies = rest.iter().filter(|a| *a == "--copy-sqlite").count();
+    if copies > 1 {
+        return Err(bad());
+    }
+    let kept: Vec<String> = rest.iter().filter(|a| *a != "--copy-sqlite").cloned().collect();
+    let (v, run) = if copies == 1 {
+        let v = args::flags(&kept, &["mount", "owner", "class", "expect", "run"])?;
+        let run = v[4];
+        (v, Some(run))
+    } else {
+        (args::flags(&kept, &["mount", "owner", "class", "expect"])?, None)
+    };
+    tree::parse_mount(v[0])?;
+    if args::rel(v[3]).is_none() {
+        return Err(bad());
+    }
+    if !sys::is_root() {
+        return Err(err(Fail::Preflight, "root only"));
+    }
+    sys::umask0();
+    let a = digest::DigestArgs { mount: v[0], owner: v[1], class: v[2], expect: v[3], copy_run: run };
+    let out = digest::tree_digest(&mut tree::RealOps, &a)?;
     std::io::stdout().write_all(out.as_bytes()).map_err(|_| err(Fail::Internal, "internal error"))
 }
 

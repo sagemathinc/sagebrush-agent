@@ -2,10 +2,16 @@
 # A qualified release's FRESH install (lease-on design r1.12 §2.5, §2.6), and a bound member of the lease
 # qualification:
 #
-#   scripts/release-install.sh <commit> <dest>        (as root, from a clone holding <commit>, systemd running)
+#   scripts/release-install.sh <commit> <dest> <launcher>   (as root, in a clone holding <commit>, systemd running)
 #   scripts/release-install.sh --verify <dest>         (read-only: the effective unit is exactly the installed one)
 #
 # SB_RELEASE_INSTALL_CUT=<step> (tests): stop with status 9 right after that step, as a crash there would.
+#
+# <launcher> is a launcher built beforehand, WITHOUT root (scripts/launcher-build.sh); its bytes must have exactly the
+# SHA-256 pinned in the reviewed tree at <commit> (lib/fleet/host/launcher.sha256). The root installer runs no
+# toolchain, build script or tool the caller chose: the commit is read through an isolated bare copy of the clone (no
+# config, hooks or local attributes, so no filter runs), and the launcher's bytes are verified against the pin before
+# anything on the host changes.
 #
 # It installs a release and the trust boundary that keeps release code from running as root unless the tree is
 # root's: the checker /usr/lib/sagebrush/release-trust (outside the release), the supervisor unit (ExecStartPre: the
@@ -13,20 +19,23 @@
 #
 # FRESH hosts only: any earlier sagebrush entrypoint, on disk or known to systemd, refuses with nothing touched.
 # Upgrade-in-place is a launch prerequisite (a later design), not done here. Steps (refusing at the first failure):
-#   0/1 (i)  read-only: <dest> absent; the absence probe; every destination and tool chain proven; what to create.
+#   0/1 (i)  read-only: <dest> absent; the absence probe; every destination and tool chain proven; what to create;
+#            the commit archived (isolated) and the launcher's bytes verified against its pin, staged under /run.
 #       (ii) create the missing directories, then prove every chain again.
 #   2  close: the closing drop-in (an unmet condition), daemon-reload, its loading verified.
-#   3  the release: git archive, the recipe's launcher, the dispatcher link, root's; the checker passes on it.
+#   3  the release: the staged archive, the staged launcher, the dispatcher link, root's; the checker passes on it.
 #   4  the checker, the unit and the shim, each atomically (exclusive temp, owner, mode, fsync, rename, dir fsync).
 #   5  daemon-reload.  6  the EFFECTIVE unit verified, still closed.  7  open: the drop-in removed, reload, verified.
 # A cut at any point leaves nothing startable: before step 4 there is no unit; from step 2 to 7 the unit is closed.
 set -eu
-ORIG_PATH=$PATH
 PATH=/usr/bin:/bin
 export PATH
 STAT=/usr/bin/stat
 FIND=/usr/bin/find
 READLINK=/usr/bin/readlink
+SHA256SUM=/usr/bin/sha256sum
+GIT=/usr/bin/git
+TAR=/usr/bin/tar
 SYSTEMCTL=/usr/bin/systemctl
 BUSCTL=/usr/bin/busctl
 ANALYZE=/usr/bin/systemd-analyze
@@ -42,19 +51,20 @@ SHIM=$SLEEPDIR/sagebrush-lease
 
 no() { printf 'release-install: %s\n' "$1" >&2; exit 1; }
 
-[ "$#" -eq 2 ] || no "usage: scripts/release-install.sh <commit> <dest> | --verify <dest>"
+case "$#:${1:-}" in 2:--verify) ;; 3:*) ;; *) no "usage: scripts/release-install.sh <commit> <dest> <launcher> | --verify <dest>" ;; esac
 COMMIT=$1
 DEST=$2
+LAUNCHER=${3:-}
 cut() { if [ "${SB_RELEASE_INSTALL_CUT:-}" = "$1" ]; then printf 'release-install: cut after step %s\n' "$1" >&2; exit 9; fi; }
 case "$DEST" in /*) ;; *) no "<dest> must be an absolute path" ;; esac
 case "$DEST" in *[!A-Za-z0-9/._-]*) no "<dest> has characters outside [A-Za-z0-9/._-]" ;; esac
 case "$DEST" in / | */ | *//* | */./* | */../* | */. | */..) no "<dest> isn't a normal path" ;; esac
 [ "$(id -u)" -eq 0 ] || no "run as root"
 VERIFY_ONLY=0
-if [ "$COMMIT" = --verify ]; then VERIFY_ONLY=1; else
-  REPO=$(pwd -P)
-  git -c safe.directory="$REPO" rev-parse --verify --quiet "$COMMIT^{commit}" >/dev/null || no "no such commit"
-fi
+[ "$COMMIT" = --verify ] && VERIFY_ONLY=1
+REPO=$(pwd -P)
+# git with nothing of the caller's: no system or global config, no HOME, an empty environment
+igit() { env -i PATH=/usr/bin:/bin HOME=/nonexistent GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null "$GIT" "$@"; }
 
 # ---- the proofs (the same rules as scripts/release-trust.sh) ----------------------------------------------------------
 word() { case "$1" in d) echo "a directory" ;; f) echo "a regular file" ;; *) echo "a link" ;; esac; }
@@ -106,7 +116,7 @@ empty_trace() {
   [ -z "$("$FIND" "$1" -mindepth 1 -print -quit)" ] || no "not empty (an earlier install?): $1"
 }
 prove_all() {
-  for t in /bin/sh "$STAT" "$FIND" "$READLINK" /usr/bin/node "$SYSTEMCTL" "$BUSCTL" "$ANALYZE"; do tool "$t"; done
+  for t in /bin/sh "$STAT" "$FIND" "$READLINK" /usr/bin/node "$SYSTEMCTL" "$BUSCTL" "$ANALYZE" "$SHA256SUM" "$GIT" "$TAR"; do tool "$t"; done
   chain "$(dirname "$DEST")" d
   chain /usr/lib d
   chain "$ETC" d
@@ -131,10 +141,13 @@ done
 if [ -e "$SHIM" ] || [ -L "$SHIM" ]; then no "the sleep shim is present (not a fresh host): $SHIM"; fi
 # ... and in systemd: nothing by the name, loaded or as a unit file, in any state
 [ -d /run/systemd/system ] || no "systemd isn't running"
-x=$("$SYSTEMCTL" list-units --all --plain --no-legend --no-pager 'sagebrush-*' 2>&1) || no "systemctl list-units failed"
-[ -z "$x" ] || no "systemd knows a sagebrush unit (not a fresh host): $(printf '%s' "$x" | head -n 1)"
-x=$("$SYSTEMCTL" list-unit-files --no-legend --no-pager 'sagebrush-*' 2>&1) || no "systemctl list-unit-files failed"
-[ -z "$x" ] || no "systemd has a sagebrush unit file (not a fresh host): $(printf '%s' "$x" | head -n 1)"
+# (unfiltered, then matched here: with a pattern that matches nothing, list-unit-files exits non-zero)
+x=$("$SYSTEMCTL" list-units --all --plain --no-legend --no-pager 2>&1) || no "systemctl list-units failed"
+x=$(printf '%s\n' "$x" | awk '{ u = ($1 == "●" || $1 == "*") ? $2 : $1; if (u ~ /^sagebrush-/) { print u; exit } }')
+[ -z "$x" ] || no "systemd knows a sagebrush unit (not a fresh host): $x"
+x=$("$SYSTEMCTL" list-unit-files --no-legend --no-pager 2>&1) || no "systemctl list-unit-files failed"
+x=$(printf '%s\n' "$x" | awk '$1 ~ /^sagebrush-/ { print $1; exit }')
+[ -z "$x" ] || no "systemd has a sagebrush unit file (not a fresh host): $x"
 for u in "$UNIT" sagebrush-backup.service sagebrush-backup.timer; do
   s=$("$SYSTEMCTL" show "$u" -p LoadState -p ActiveState -p SubState -p UnitFileState -p FragmentPath -p DropInPaths -p Names -p NeedDaemonReload 2>&1) \
     || no "systemctl show $u failed"
@@ -149,6 +162,23 @@ NeedDaemonReload=no"
   [ "$(printf '%s\n' "$s" | sort)" = "$(printf '%s\n' "$want" | sort)" ] || no "systemd's state for $u isn't absent (not a fresh host)"
 done
 prove_all
+# The commit, through an isolated bare copy (a plain object copy: no config, hooks or attributes of the clone come
+# along, so no filter or hook can run), archived into a root-only staging directory; then the launcher's bytes,
+# copied in once and verified against the reviewed tree's pin. /run is outside every install area.
+STAGE=$(mktemp -d /run/sb-release-install.XXXXXX) || no "can't create a staging directory"
+trap 'rm -rf -- "$STAGE"' EXIT
+# (safe.directory on the command line, a protected scope, only for reading the caller's clone as root)
+igit -c safe.directory="*" clone -q --bare --no-hardlinks --template= -- "$REPO" "$STAGE/repo.git" 2>/dev/null || no "can't read the clone"
+igit --git-dir="$STAGE/repo.git" rev-parse --verify --quiet "$COMMIT^{commit}" >/dev/null || no "no such commit"
+mkdir -m 0700 "$STAGE/tree"
+igit --git-dir="$STAGE/repo.git" -c core.attributesFile=/dev/null archive --format=tar "$COMMIT" \
+  | "$TAR" -x --no-same-owner --no-same-permissions -C "$STAGE/tree" || no "can't archive the commit"
+PIN=$(sed -n 's/^\([0-9a-f]\{64\}\)  sagebrush-agent-launch$/\1/p' "$STAGE/tree/lib/fleet/host/launcher.sha256" 2>/dev/null)
+[ -n "$PIN" ] || no "the commit has no launcher pin"
+case "$LAUNCHER" in /*) ;; *) no "<launcher> must be an absolute path" ;; esac
+[ -f "$LAUNCHER" ] && [ ! -L "$LAUNCHER" ] || no "<launcher> isn't a regular file"
+cp -- "$LAUNCHER" "$STAGE/launch"
+[ "$("$SHA256SUM" < "$STAGE/launch" | cut -d' ' -f1)" = "$PIN" ] || no "the launcher's digest isn't the pinned one"
 fi
 CREATE=""
 if [ "$VERIFY_ONLY" = 0 ]; then
@@ -221,7 +251,7 @@ fi
 # ---- step 2: close -------------------------------------------------------------------------------------------------
 [ -e "$CLOSED_PATH" ] && no "$CLOSED_PATH exists"
 work=$(mktemp -d "$(dirname "$DEST")/.sb-release.XXXXXX") || no "can't create a work directory next to <dest>"
-trap 'rm -rf -- "$work"' EXIT
+trap 'rm -rf -- "$work" "$STAGE"' EXIT
 printf '[Unit]\nConditionPathExists=%s\n' "$CLOSED_PATH" > "$work/closed.conf"
 atomic "$CLOSED" 0644 "$work/closed.conf"
 "$SYSTEMCTL" daemon-reload
@@ -232,8 +262,10 @@ cut 2
 
 # ---- step 3: the release ---------------------------------------------------------------------------------------------
 mkdir -m 0700 -- "$work/tree"
-git -c safe.directory="$REPO" archive --format=tar "$COMMIT" | tar -x --no-same-owner --no-same-permissions -C "$work/tree"
-(cd "$work/tree" && PATH=$ORIG_PATH scripts/launcher-build.sh "$work/tree/bin/sagebrush-agent-launch")
+igit --git-dir="$STAGE/repo.git" -c core.attributesFile=/dev/null archive --format=tar "$COMMIT" \
+  | "$TAR" -x --no-same-owner --no-same-permissions -C "$work/tree"
+cp -- "$STAGE/launch" "$work/tree/bin/sagebrush-agent-launch"
+[ "$("$SHA256SUM" < "$work/tree/bin/sagebrush-agent-launch" | cut -d' ' -f1)" = "$PIN" ] || no "the staged launcher changed"
 ln -s sagebrush-agent.mjs "$work/tree/bin/sagebrush-agent"
 chown -R -h 0:0 -- "$work/tree"
 chmod -R go-w -- "$work/tree"

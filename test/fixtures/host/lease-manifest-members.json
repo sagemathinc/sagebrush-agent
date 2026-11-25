@@ -55,6 +55,7 @@
   "lib/fleet/host/host-records.mjs",
   "lib/fleet/host/host-store.mjs",
   "lib/fleet/host/identity.mjs",
+  "lib/fleet/host/launcher.sha256",
   "lib/fleet/host/lease-client.mjs",
   "lib/fleet/host/lease-live.mjs",
   "lib/fleet/host/lease-machine.mjs",

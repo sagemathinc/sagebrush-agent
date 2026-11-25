@@ -119,6 +119,8 @@ jobs:
           (cd "$RUNNER_TEMP/bb/c" && scripts/launcher-build.sh "$RUNNER_TEMP/launch-2")
           cmp "$RUNNER_TEMP/launch-1" "$RUNNER_TEMP/launch-2"
           sha256sum "$RUNNER_TEMP/launch-1"
+          # the pinned digest the root installer accepts (lib/fleet/host/launcher.sha256) is exactly this build's
+          test "$(sha256sum < "$RUNNER_TEMP/launch-1" | cut -d' ' -f1)" = "$(cut -d' ' -f1 lib/fleet/host/launcher.sha256)"
       # The trust boundary (lease-on r1.12 §2.5, §2.6): the checker, the preload regression and the fresh installer
       # against the runner's real systemd, as root (scripts/release-trust-test.sh; the runner is disposable).
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -126,8 +128,7 @@ jobs:
           node-version: 24.21.0
       - run: sudo install -m 0755 -o root -g root "$(readlink -f "$(command -v node)")" /usr/bin/node
       - run: |
-          sudo env "PATH=$PATH" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" \
-            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*' scripts/release-trust-test.sh
+          sudo env SB_TEST_LAUNCHER="$RUNNER_TEMP/launch-1" scripts/release-trust-test.sh
 
   # The turn's syscall policy (schema/fleet/agent-seccomp-policy.json): regenerated from its pin, offline, in the pinned
   # Ubuntu 24.04 image with the pinned systemd, and required byte for byte (scripts/seccomp-policy-ci.sh). The network is

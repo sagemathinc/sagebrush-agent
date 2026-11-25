@@ -2,7 +2,9 @@
 # The trust boundary's rows (lease-on design r1.12 §2.6, §7): the checker, the preload regression, and the FRESH
 # installer against real systemd. Destructive to sagebrush state: run only on a disposable host (a CI runner, a VM).
 #
-#   sudo scripts/release-trust-test.sh          (root; systemd running; /usr/bin/node a root-owned node binary)
+#   sudo SB_TEST_LAUNCHER=<path> scripts/release-trust-test.sh
+#       (root; systemd running; /usr/bin/node a root-owned node binary; <path> the launcher scripts/launcher-build.sh
+#        built WITHOUT root, whose digest is the pinned one)
 #
 # Every row prints "ok" or "FAIL"; the script exits 1 if any row failed. It removes every sagebrush unit, drop-in,
 # shim, checker and test release before and after the installer rows.
@@ -20,9 +22,11 @@ rc() { local label=$1 want=$2; shift 2; local out r; out=$("$@" 2>&1); r=$?; if 
 [ "$(id -u)" = 0 ] || { echo "release-trust-test: run as root" >&2; exit 2; }
 [ -d /run/systemd/system ] || { echo "release-trust-test: systemd isn't running" >&2; exit 2; }
 [ "$(stat -c %u "$(readlink -f /usr/bin/node)")" = 0 ] || { echo "release-trust-test: /usr/bin/node must be root's" >&2; exit 2; }
+LAUNCH=${SB_TEST_LAUNCHER:?release-trust-test: SB_TEST_LAUNCHER (the non-root build of the launcher) is required}
+COMMIT=$(git -c safe.directory='*' -C "$REPO" rev-parse HEAD) || { echo "release-trust-test: no commit" >&2; exit 2; }
 
 # ---- A. the checker ------------------------------------------------------------------------------------------------
-T=/opt/sb-trust-test
+T=/var/lib/sb-trust-test   # (not /opt: a CI runner's /opt is writable, which the checker rightly refuses)
 mk_tree() {
   rm -rf "$T"; mkdir -p "$T/rel/bin" "$T/rel/lib"
   echo 'process.exit(0)' > "$T/rel/bin/sagebrush-agent.mjs"; echo y > "$T/rel/lib/a.mjs"
@@ -67,7 +71,8 @@ rm -f /run/sb-payload-ran /run/sb-benign-ran
 rm -rf "$T"
 
 # ---- C. the installer, fresh-only, against real systemd -----------------------------------------------------------
-D=/opt/sb-release-test
+P=/var/lib/sb-release-parent
+D=$P/release
 clean() {
   for u in $(systemctl list-units --all --plain --no-legend 'sagebrush-*' 2>/dev/null | awk '{print $1}') $UNIT sagebrush-backup.service sagebrush-backup.timer sagebrush-x.service sagebrush-y.service other.service; do
     systemctl stop "$u" 2>/dev/null; systemctl disable "$u" 2>/dev/null
@@ -76,30 +81,32 @@ clean() {
     [ -d "$d" ] || continue
     find "$d" -maxdepth 2 \( -name 'sagebrush-*' -o -lname '*sagebrush-*' -o -name 'other.service' \) -exec rm -rf {} + 2>/dev/null
   done
-  rm -rf /usr/lib/sagebrush /usr/lib/systemd/system-sleep/sagebrush-lease "$D" /opt/.sb-release.* /run/sb-*-ran
+  rm -rf /usr/lib/sagebrush /usr/lib/systemd/system-sleep/sagebrush-lease "$P" /run/sb-*-ran
+  mkdir -m 0755 "$P"; chown 0:0 "$P"
   systemctl daemon-reload; systemctl reset-failed 2>/dev/null; true
 }
 snap() {
   { for d in /etc/systemd/system /run/systemd/system /run/systemd/system.control /run/systemd/transient /run/systemd/generator \
-       /usr/lib/systemd/system /usr/lib/systemd/system-sleep /usr/lib /opt; do
-      [ -d "$d" ] && find "$d" -maxdepth 2 -printf '%p %u %m %s %T@\n' 2>/dev/null | grep -v -e '^/opt/sb-release-test' | sort
+       /usr/lib/systemd/system /usr/lib/systemd/system-sleep /usr/lib "$P"; do
+      [ -d "$d" ] && find "$d" -maxdepth 2 -printf '%p %u %m %s %T@\n' 2>/dev/null | sort
     done
-    systemctl list-units --all --plain --no-legend 'sagebrush-*' 2>/dev/null
-    systemctl list-unit-files --no-legend 'sagebrush-*' 2>/dev/null
+    systemctl list-units --all --plain --no-legend 2>/dev/null | grep sagebrush-
+    systemctl list-unit-files --no-legend 2>/dev/null | grep sagebrush-
     for u in $UNIT sagebrush-backup.service; do systemctl show "$u" -p LoadState -p ActiveState -p DropInPaths -p FragmentPath -p NeedDaemonReload 2>/dev/null; done
   } | md5sum
 }
-inst() { (cd "$REPO" && "$INSTALL" HEAD "$D"); }
+inst() { (cd "$REPO" && "$INSTALL" "$COMMIT" "$D" "$LAUNCH"); }
 markers() { ls /run/sb-*-ran 2>/dev/null | wc -l; }
-# refuses <label> <setup cmd> : the install refuses, snapshots identical, no new marker
+# refuses <label> <setup cmd> <expected message part>: the install refuses FOR THAT REASON, snapshots identical, no new
+# marker
 refuses() {
-  local label=$1 before after m0 out r
+  local label=$1 want=$3 before after m0 out r
   clean; eval "$2"
   before=$(snap); m0=$(markers)
   out=$(inst 2>&1); r=$?
   after=$(snap)
-  if [ "$r" != 0 ] && [ "$before" = "$after" ] && [ "$(markers)" = "$m0" ]; then ok "install refuses: $label (${out##*release-install: })"
-  else bad "install refuses: $label (exit $r, unchanged=$([ "$before" = "$after" ] && echo yes || echo no), markers $m0->$(markers): ${out:0:300})"; fi
+  if [ "$r" = 1 ] && [[ "$out" == *"$want"* ]] && [ "$before" = "$after" ] && [ "$(markers)" = "$m0" ]; then ok "install refuses: $label (${out##*release-install: })"
+  else bad "install refuses: $label (exit $r, want \"$want\", unchanged=$([ "$before" = "$after" ] && echo yes || echo no), markers $m0->$(markers): ${out:0:300})"; fi
 }
 unitfile() { printf '[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/sh -c "touch /run/sb-%s-ran"\n' "$1"; }
 
@@ -139,51 +146,69 @@ rc "verify: an outranking fragment refuses" 1 bash -c "cd '$REPO' && '$INSTALL' 
 rm -f /run/systemd/system.control/$UNIT; systemctl daemon-reload
 rc "verify: restored, it passes" 0 bash -c "cd '$REPO' && '$INSTALL' --verify '$D'"
 # reinstalling over it is refused (fresh only)
-refuses "an existing install (fresh only)" "inst >/dev/null 2>&1"
+refuses "an existing install (fresh only)" "inst >/dev/null 2>&1" "<dest> exists"
 
 # C2: <dest> exists
-refuses "<dest> a file" "touch $D"
-refuses "<dest> a directory" "mkdir $D"
-refuses "<dest> a link to a directory" "ln -s /usr $D"
-refuses "<dest> a dangling link" "ln -s /nonexistent $D"
+refuses "<dest> a file" "touch $D" "<dest> exists"
+refuses "<dest> a directory" "mkdir $D" "<dest> exists"
+refuses "<dest> a link to a directory" "ln -s /usr $D" "<dest> exists"
+refuses "<dest> a dangling link" "ln -s /nonexistent $D" "<dest> exists"
 # C3: each legacy entrypoint, separately
-refuses "a supervisor fragment on disk" "unitfile sup > /etc/systemd/system/$UNIT"
-refuses "a supervisor drop-in directory with a file" "mkdir /etc/systemd/system/$UNIT.d && echo '[Unit]' > /etc/systemd/system/$UNIT.d/x.conf"
-refuses "a backup service on disk" "unitfile bk > /etc/systemd/system/sagebrush-backup.service"
-refuses "a backup timer on disk" "printf '[Timer]\nOnCalendar=daily\n' > /usr/lib/systemd/system/sagebrush-backup.timer"
-refuses "a backup template on disk" "unitfile tpl > /usr/lib/systemd/system/sagebrush-backup@.service"
-refuses "the sleep shim" "printf '#!/bin/sh\ntouch /run/sb-shim-ran\n' > /usr/lib/systemd/system-sleep/sagebrush-lease"
-refuses "a file under /usr/lib/sagebrush" "mkdir -m 0755 /usr/lib/sagebrush && touch /usr/lib/sagebrush/release-trust"
-refuses "a unit in /run/systemd/system" "unitfile run > /run/systemd/system/sagebrush-x.service"
-refuses "a unit in system.control" "mkdir -p /run/systemd/system.control && unitfile ctl > /run/systemd/system.control/$UNIT"
-refuses "a generated unit" "mkdir -p /run/systemd/generator && unitfile gen > /run/systemd/generator/sagebrush-y.service"
-refuses "loaded only (file gone, no reload)" "unitfile ld > /etc/systemd/system/sagebrush-x.service && systemctl daemon-reload && rm /etc/systemd/system/sagebrush-x.service"
-refuses "a loaded transient unit" "systemd-run --unit=sagebrush-x --remain-after-exit /bin/true >/dev/null 2>&1"
-refuses "an alias under another name" "unitfile al > /etc/systemd/system/sagebrush-x.service && ln -s /etc/systemd/system/sagebrush-x.service /etc/systemd/system/other.service && systemctl daemon-reload"
-refuses "a drop-in for the supervisor in /run" "mkdir -p /run/systemd/system/$UNIT.d && printf '[Unit]\nConditionPathExists=\n' > /run/systemd/system/$UNIT.d/99-reset.conf"
-refuses "enabled (a wants link only)" "mkdir -p /etc/systemd/system/multi-user.target.wants && ln -s /usr/lib/systemd/system/sagebrush-backup.service /etc/systemd/system/multi-user.target.wants/sagebrush-backup.service"
-refuses "active" "unitfile act > /run/systemd/system/sagebrush-x.service && systemctl daemon-reload && systemctl start sagebrush-x.service"
-refuses "failed (remembered)" "printf '[Service]\nExecStart=/bin/false\n' > /run/systemd/system/sagebrush-x.service && systemctl daemon-reload && systemctl start sagebrush-x.service; rm /run/systemd/system/sagebrush-x.service; systemctl daemon-reload"
-refuses "all of them together" "unitfile a > /etc/systemd/system/$UNIT; unitfile b > /etc/systemd/system/sagebrush-backup.service; printf '#!/bin/sh\n' > /usr/lib/systemd/system-sleep/sagebrush-lease; mkdir -p /run/systemd/system/$UNIT.d; echo '[Unit]' > /run/systemd/system/$UNIT.d/x.conf; systemd-run --unit=sagebrush-x --remain-after-exit /bin/true >/dev/null 2>&1; systemctl daemon-reload"
+refuses "a supervisor fragment on disk" "unitfile sup > /etc/systemd/system/$UNIT" "a sagebrush systemd entry is present"
+refuses "a supervisor drop-in directory with a file" "mkdir /etc/systemd/system/$UNIT.d && echo '[Unit]' > /etc/systemd/system/$UNIT.d/x.conf" "not empty"
+refuses "a backup service on disk" "unitfile bk > /etc/systemd/system/sagebrush-backup.service" "a sagebrush systemd entry is present"
+refuses "a backup timer on disk" "printf '[Timer]\nOnCalendar=daily\n' > /usr/lib/systemd/system/sagebrush-backup.timer" "a sagebrush systemd entry is present"
+refuses "a backup template on disk" "unitfile tpl > /usr/lib/systemd/system/sagebrush-backup@.service" "a sagebrush systemd entry is present"
+refuses "the sleep shim" "printf '#!/bin/sh\ntouch /run/sb-shim-ran\n' > /usr/lib/systemd/system-sleep/sagebrush-lease" "the sleep shim is present"
+refuses "a file under /usr/lib/sagebrush" "mkdir -m 0755 /usr/lib/sagebrush && touch /usr/lib/sagebrush/release-trust" "not empty"
+refuses "a unit in /run/systemd/system" "unitfile run > /run/systemd/system/sagebrush-x.service" "a sagebrush systemd entry is present"
+refuses "a unit in system.control" "mkdir -p /run/systemd/system.control && unitfile ctl > /run/systemd/system.control/$UNIT" "a sagebrush systemd entry is present"
+refuses "a generated unit" "mkdir -p /run/systemd/generator && unitfile gen > /run/systemd/generator/sagebrush-y.service" "a sagebrush systemd entry is present"
+refuses "loaded only (file gone, no reload)" "unitfile ld > /etc/systemd/system/sagebrush-x.service && systemctl daemon-reload && rm /etc/systemd/system/sagebrush-x.service" "systemd knows a sagebrush unit"
+refuses "a loaded transient unit" "systemd-run --unit=sagebrush-x --remain-after-exit /bin/true >/dev/null 2>&1" "a sagebrush systemd entry is present"
+refuses "an alias under another name" "unitfile al > /etc/systemd/system/sagebrush-x.service && ln -s /etc/systemd/system/sagebrush-x.service /etc/systemd/system/other.service && systemctl daemon-reload" "a sagebrush systemd entry is present"
+refuses "a drop-in for the supervisor in /run" "mkdir -p /run/systemd/system/$UNIT.d && printf '[Unit]\nConditionPathExists=\n' > /run/systemd/system/$UNIT.d/99-reset.conf" "a sagebrush systemd entry is present"
+refuses "enabled (a wants link only)" "mkdir -p /etc/systemd/system/multi-user.target.wants && ln -s /usr/lib/systemd/system/sagebrush-backup.service /etc/systemd/system/multi-user.target.wants/sagebrush-backup.service" "a sagebrush systemd entry is present"
+refuses "active" "unitfile act > /run/systemd/system/sagebrush-x.service && systemctl daemon-reload && systemctl start sagebrush-x.service" "a sagebrush systemd entry is present"
+refuses "failed (remembered)" "printf '[Service]\nExecStart=/bin/false\n' > /run/systemd/system/sagebrush-x.service && systemctl daemon-reload && systemctl start sagebrush-x.service; rm /run/systemd/system/sagebrush-x.service; systemctl daemon-reload" "systemd knows a sagebrush unit"
+refuses "all of them together" "unitfile a > /etc/systemd/system/$UNIT; unitfile b > /etc/systemd/system/sagebrush-backup.service; printf '#!/bin/sh\n' > /usr/lib/systemd/system-sleep/sagebrush-lease; mkdir -p /run/systemd/system/$UNIT.d; echo '[Unit]' > /run/systemd/system/$UNIT.d/x.conf; systemd-run --unit=sagebrush-x --remain-after-exit /bin/true >/dev/null 2>&1; systemctl daemon-reload" "not a fresh host"
 # C4: each later chain failing while /usr/lib/sagebrush starts absent (it stays absent: the snapshot covers /usr/lib)
-refuses "/etc/systemd/system group-writable" "chmod g+w /etc/systemd/system"; chmod g-w /etc/systemd/system
-refuses "system-sleep foreign-owned" "chown 65534 /usr/lib/systemd/system-sleep"; chown 0 /usr/lib/systemd/system-sleep
-refuses "<dest>'s parent writable" "mkdir -p /opt && chmod o+w /opt"; chmod o-w /opt
-refuses "node through a writable directory" "mkdir -p /tmp/sb-node && cp \"\$(readlink -f /usr/bin/node)\" /tmp/sb-node/node && mv /usr/bin/node /usr/bin/node.sb-aside && ln -s /tmp/sb-node/node /usr/bin/node"
+refuses "/etc/systemd/system group-writable" "chmod g+w /etc/systemd/system" "group- or other-writable: /etc/systemd/system"; chmod g-w /etc/systemd/system
+refuses "system-sleep foreign-owned" "chown 65534 /usr/lib/systemd/system-sleep" "not owned by root: /usr/lib/systemd/system-sleep"; chown 0 /usr/lib/systemd/system-sleep
+refuses "<dest>'s parent writable" "chmod o+w $P" "group- or other-writable: $P"; chmod o-w "$P" 2>/dev/null
+refuses "node through a writable directory" "mkdir -p /tmp/sb-node && cp \"\$(readlink -f /usr/bin/node)\" /tmp/sb-node/node && mv /usr/bin/node /usr/bin/node.sb-aside && ln -s /tmp/sb-node/node /usr/bin/node" "group- or other-writable: /tmp"
 [ -e /usr/bin/node.sb-aside ] && { rm -f /usr/bin/node; mv /usr/bin/node.sb-aside /usr/bin/node; rm -rf /tmp/sb-node; }
 # C5: the PATH control: fakes first on PATH, never executed, refusals unchanged
 clean; mkdir -p /tmp/sb-fake
 for f in find stat readlink sh node systemctl busctl systemd-analyze; do printf '#!/bin/sh\ntouch /run/sb-fake-%s-ran\nexit 0\n' "$f" > /tmp/sb-fake/$f; chmod 755 /tmp/sb-fake/$f; done
 unitfile sup > /etc/systemd/system/$UNIT
-out=$(cd "$REPO" && PATH=/tmp/sb-fake:$PATH "$INSTALL" HEAD "$D" 2>&1); r=$?
-mkdir -p /opt/sb-trust-test/rel/lib && chmod 775 /opt/sb-trust-test/rel/lib
-PATH=/tmp/sb-fake:$PATH /bin/sh "$CHECK" /opt/sb-trust-test/rel >/dev/null 2>&1; r2=$?
+out=$(cd "$REPO" && PATH=/tmp/sb-fake:$PATH "$INSTALL" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
+mkdir -p "$T/rel/lib" && chmod 775 "$T/rel/lib"
+PATH=/tmp/sb-fake:$PATH /bin/sh "$CHECK" "$T/rel" >/dev/null 2>&1; r2=$?
 if [ "$r" != 0 ] && [ "$r2" != 0 ] && ! ls /run/sb-fake-*-ran >/dev/null 2>&1; then ok "PATH: fakes first on PATH never run; the installer and the checker still refuse"; else bad "PATH: a fake ran or a refusal changed ($r $r2; $(ls /run/sb-fake-*-ran 2>/dev/null))"; fi
-rm -rf /tmp/sb-fake /run/sb-fake-*-ran /opt/sb-trust-test
+rm -rf /tmp/sb-fake /run/sb-fake-*-ran "$T"
+# C10: the launcher pin (SEC on #172): a wrong digest refuses with nothing changed; the root installer runs no
+# toolchain, wrapper, Cargo config or git filter of the caller's, and the pinned launcher installs
+cp "$LAUNCH" /tmp/sb-bad-launch; printf '\0' >> /tmp/sb-bad-launch
+refuses "a launcher whose digest isn't the pinned one" "LAUNCH_SAVE=\$LAUNCH; LAUNCH=/tmp/sb-bad-launch" "the launcher's digest isn't the pinned one"; LAUNCH=$LAUNCH_SAVE; rm -f /tmp/sb-bad-launch
+clean; mkdir -p /tmp/sb-tool/bin /tmp/sb-tool/cargo
+for f in cargo rustc bash rustup cc; do printf '#!/bin/sh\ntouch /run/sb-tool-%s-ran\nexit 0\n' "$f" > /tmp/sb-tool/bin/$f; chmod 755 /tmp/sb-tool/bin/$f; done
+printf '#!/bin/sh\ntouch /run/sb-tool-wrapper-ran\nexec "$@"\n' > /tmp/sb-tool/wrap; chmod 755 /tmp/sb-tool/wrap
+printf '[build]\nrustc-wrapper = "/tmp/sb-tool/wrap"\n' > /tmp/sb-tool/cargo/config.toml
+printf '#!/bin/sh\ntouch /run/sb-tool-filter-ran\ncat\n' > /tmp/sb-tool/smudge; chmod 755 /tmp/sb-tool/smudge
+mkdir -p "$REPO/.git/info" 2>/dev/null; gitdir=$(git -c safe.directory='*' -C "$REPO" rev-parse --git-common-dir)
+cp "$gitdir/config" /tmp/sb-tool/config.bak; printf '* filter=evil\n' >> "$gitdir/info/attributes"
+git -c safe.directory='*' -C "$REPO" config filter.evil.smudge /tmp/sb-tool/smudge
+out=$(cd "$REPO" && env PATH=/tmp/sb-tool/bin:$PATH CARGO_HOME=/tmp/sb-tool/cargo RUSTC_WRAPPER=/tmp/sb-tool/wrap "$INSTALL" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
+if [ "$r" = 0 ] && ! ls /run/sb-tool-*-ran >/dev/null 2>&1; then ok "toolchain: the caller's cargo, rustc, bash, wrapper, Cargo config and git filter never run; the pinned launcher installs"
+else bad "toolchain: exit $r, ran: $(ls /run/sb-tool-*-ran 2>/dev/null | tr '\n' ' ') ${out:0:300}"; fi
+[ "$(sha256sum < "$D/bin/sagebrush-agent-launch" | cut -d' ' -f1)" = "$(cut -d' ' -f1 "$REPO/lib/fleet/host/launcher.sha256")" ] && ok "toolchain: the installed launcher is the pinned bytes" || bad "toolchain: the installed launcher isn't the pinned bytes"
+cp /tmp/sb-tool/config.bak "$gitdir/config"; sed -i '/^\* filter=evil$/d' "$gitdir/info/attributes"; rm -rf /tmp/sb-tool /run/sb-tool-*-ran
 # C6: cuts. After each, nothing starts; after the mkdirs only, a retry completes
 for step in 1m 2 3 4 5 6; do
   clean
-  (cd "$REPO" && SB_RELEASE_INSTALL_CUT=$step "$INSTALL" HEAD "$D" >/dev/null 2>&1)
+  out=$(cd "$REPO" && SB_RELEASE_INSTALL_CUT=$step "$INSTALL" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
+  [ "$r" = 9 ] && ok "cut after step $step: the install reached it" || bad "cut after step $step: didn't reach the cut (exit $r: ${out:0:300})"
   systemctl start $UNIT >/dev/null 2>&1; sleep 1
   main=$(systemctl show $UNIT -p ExecMainStartTimestampMonotonic --value 2>/dev/null)
   if [ "${main:-0}" = 0 ]; then ok "cut after step $step: nothing starts"; else bad "cut after step $step: the unit started"; fi

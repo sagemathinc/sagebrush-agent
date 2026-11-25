@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import {
-  G_MAX, MARGIN_MS, REOPEN_FILE, SLEEP_FILE, activationArgv, armArgv, armWatchdog, bootNow, gateOf, leaseActivate, leaseExpire,
+  G_MAX, MARGIN_MS, REOPEN_FILE, SLEEP_FILE, activationArgv, parseGateJson, parseReopen, parseSleep, armArgv, armWatchdog, bootNow, gateOf, leaseActivate, leaseExpire,
   liveCheck, monotonicDeadline, parseArgs, publish, readGate, readGateFile, readRecord, readTombstone, realSystem, unitObjectPath,
   watchdogTimer, writeRecord,
 } from "../lib/fleet/host/lease.mjs";
@@ -667,4 +667,14 @@ test("readGateFile reads the SAME object it looked at, through a handle that nev
   // an open refused for the object's type (a link swapped in: ELOOP): bad
   const eloop = { ...fsReal, openSync: () => { throw Object.assign(new Error("ELOOP"), { code: "ELOOP" }); } };
   assert.equal(readGateFile(e.dir, SLEEP_FILE, { fsx: eloop }).state, "bad");
+});
+
+test("SEC on S1: the gate files are parsed strictly, as the launcher parses them; JSON.parse's leniency never opens the gate", () => {
+  const probe = '{"gen":2,"phase":"pre","phase":"post","pre_ok":true,"pre_at":0}';
+  assert.equal(parseSleep(probe), null, "a duplicate phase is malformed");
+  assert.deepEqual(gateOf({ state: "ok", text: probe }, { state: "ok", text: '{"gen":2}' }, 1000), { open: false, why: "malformed" });
+  for (const t of ['{"gen":2.0}', '{"gen":2e0}', '{"gen":02}', '{"gen":-2}', '{"gen":2,"gen":2}', '{"gen":2} x']) assert.equal(parseReopen(t), null, t);
+  assert.deepEqual(parseReopen(' { "\\u0067en" : 2 } '), { gen: 2 }, "escapes and whitespace decode as in Rust");
+  assert.equal(parseGateJson('{"a":1,"a":1}'), null);
+  assert.equal(parseGateJson('{"a":9007199254740992}').a, Infinity, "above the safe range: kept out of range");
 });

@@ -1,5 +1,5 @@
 {
- "about": "The execution lease's runtime files, read by both lease.mjs (js) and the launcher's lease-check (rust). A tombstone's value, or null when refused; a record accepted or not. Rust is never more lenient than JS: where they differ (16-digit tombstones are never written by lease.mjs; 5.0 and duplicate keys, lg's or gen's, are never written by its JSON.stringify), Rust refuses, which fails closed. Records carry sg, the suspend gate's generation (lease-on r1.5 \u00a76.2), a safe integer >= 0. The gate rows decide the suspend gate (\u00a76.1) from the two files' texts (null = absent) and now on CLOCK_BOOTTIME (ms): open is the generation, or null when closed; JS and Rust must agree exactly.",
+ "about": "The execution lease's runtime files, read by both lease.mjs (js) and the launcher's lease-check (rust). A tombstone's value, or null when refused; a record accepted or not. Rust is never more lenient than JS: where they differ (16-digit tombstones are never written by lease.mjs; 5.0 and duplicate keys, lg's or gen's, are never written by its JSON.stringify), Rust refuses, which fails closed. Records carry sg, the suspend gate's generation (lease-on r1.5 \u00a76.2), a safe integer >= 0. The gate rows decide the suspend gate (\u00a76.1) from the two files' texts (null = absent) and now on CLOCK_BOOTTIME (ms): open is the generation, or null when closed; JS and Rust must agree exactly. The gate files are parsed strictly in BOTH languages (duplicate keys, fractions, exponents, signs, leading zeros, trailing data and nested values refused; escapes decoded alike).",
  "tombstones": [
   {
    "text": "0\n",
@@ -362,6 +362,262 @@
    "name": "not JSON",
    "sleep": "post 3",
    "reopen": "{\"gen\":3}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "SEC probe: pre then a duplicate post",
+   "sleep": "{\"gen\":2,\"phase\":\"pre\",\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "duplicate gen",
+   "sleep": "{\"gen\":2,\"gen\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "duplicate pre_ok",
+   "sleep": "{\"gen\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0,\"pre_ok\":true}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "duplicate pre_at",
+   "sleep": "{\"gen\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "duplicate phase (same value)",
+   "sleep": "{\"gen\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0,\"phase\":\"post\"}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "reopen duplicate gen",
+   "sleep": "{\"gen\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2,\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "gen 2.0",
+   "sleep": "{\"gen\":2.0,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "gen 2e0",
+   "sleep": "{\"gen\":2e0,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "gen 2E0",
+   "sleep": "{\"gen\":2E0,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "gen 02",
+   "sleep": "{\"gen\":02,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "gen -2",
+   "sleep": "{\"gen\":-2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "gen +2",
+   "sleep": "{\"gen\":+2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "gen 2.5",
+   "sleep": "{\"gen\":2.5,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "pre_at 0.0",
+   "sleep": "{\"gen\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0.0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "pre_at 0e0",
+   "sleep": "{\"gen\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0e0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "pre_at 00",
+   "sleep": "{\"gen\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":00}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "reopen gen 2.0",
+   "sleep": "{\"gen\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2.0}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "reopen gen 2e0",
+   "sleep": "{\"gen\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2e0}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "reopen gen 02",
+   "sleep": "{\"gen\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":02}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "pre_ok as a string",
+   "sleep": "{\"gen\":2,\"phase\":\"post\",\"pre_ok\":\"true\",\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "pre_ok null",
+   "sleep": "{\"gen\":2,\"phase\":\"post\",\"pre_ok\":null,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "trailing data",
+   "sleep": "{\"gen\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0} x",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "two objects",
+   "sleep": "{\"gen\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}{\"gen\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "a nested value",
+   "sleep": "{\"gen\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0,\"x\":{}}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "escaped value decodes to post",
+   "sleep": "{\"gen\":2,\"phase\":\"p\\u006fst\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": 2,
+   "rust": 2
+  },
+  {
+   "name": "escaped key decodes to gen",
+   "sleep": "{\"\\u0067en\":2,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": 2,
+   "rust": 2
+  },
+  {
+   "name": "whitespace around tokens",
+   "sleep": " { \"gen\" : 2 ,\n\"phase\":\"post\",\t\"pre_ok\":true , \"pre_at\":0 } \n",
+   "reopen": " {\"gen\":2}\n",
+   "now": 1000,
+   "js": 2,
+   "rust": 2
+  },
+  {
+   "name": "a surrogate escape",
+   "sleep": "{\"gen\":2,\"phase\":\"\\ud800\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "an unescaped control character",
+   "sleep": "{\"gen\":2,\"phase\":\"po\u0001st\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "an escaped NUL",
+   "sleep": "{\"gen\":2,\"phase\":\"post\\u0000\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "a string over 16 bytes",
+   "sleep": "{\"gen\":2,\"phase\":\"postpostpostpostp\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
+   "now": 1000,
+   "js": null,
+   "rust": null
+  },
+  {
+   "name": "gen of 21 digits",
+   "sleep": "{\"gen\":123456789012345678901,\"phase\":\"post\",\"pre_ok\":true,\"pre_at\":0}",
+   "reopen": "{\"gen\":2}",
    "now": 1000,
    "js": null,
    "rust": null

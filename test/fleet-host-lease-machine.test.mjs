@@ -16,7 +16,7 @@ import { fenceCauses, fenced, holdsFenceLock, raiseFence } from "../lib/fleet/ho
 import { HostStore } from "../lib/fleet/host/host-store.mjs";
 import { MARGIN_MS, helperScope, leaseActivate, leaseThaw, readRecord, readTombstone, thawScope, watchdogTimer } from "../lib/fleet/host/lease.mjs";
 import { readRecord as readRestore, writeRecord as writeRestore } from "../lib/fleet/host/restore-record.mjs";
-import { resumeCgroup, resumeRestored } from "../lib/fleet/host/restore-resume.mjs";
+import { requestResume, resumeCgroup, resumeRestored } from "../lib/fleet/host/restore-resume.mjs";
 import { IGNORED, LeaseMachine, MAX_TTL_MS, RENEW_MS } from "../lib/fleet/host/lease-machine.mjs";
 import { agentSlice } from "../lib/fleet/host/names.mjs";
 
@@ -73,7 +73,7 @@ function fakeFx(fenceDir) {
  * - timers: fake; `fire(kind)` runs the due ones ("expiry": the lease timers, "renew": the cadence).
  * - the service: `respond(reqBytes, over)` answers a request as the service would; `send` defaults to it.
  */
-async function world({ verifier = "fake", root = tmp("state"), fenceDir = tmp("fence"), leaseDir = tmp("lease"), restoreDir = tmp("restore"), b = 1_000_000 } = {}) {
+async function world({ verifier = "fake", root = tmp("state"), fenceDir = tmp("fence"), leaseDir = tmp("lease"), restoreDir = tmp("restore"), b = 1_000_000, resumeOp = null } = {}) {
   const w = { b, fenceDir, leaseDir, restoreDir, root, helperRuns: [], sent: [], pending: [] };
   const clock = { boot: () => w.b, mono: () => w.b * 1000 + 7_000_000_000 };
   w.clock = clock;
@@ -149,7 +149,7 @@ async function world({ verifier = "fake", root = tmp("state"), fenceDir = tmp("f
     nonce: () => Buffer.from(newId().slice(0, 16)).toString("base64url"), wall: () => 1_800_000_000_000,
   });
   sup = new Supervisor({ store, fx, verify: grantVerify, bodyOf, fenceDir, lease: machine, barrier: async (n, d) => { if (w.barrier) await w.barrier(n, d); },
-    restoreState: (id) => readRestore("agent", id, { dir: restoreDir })?.state ?? null });
+    restoreState: (id) => readRestore("agent", id, { dir: restoreDir })?.state ?? null, restoreResume: resumeOp ? resumeOp(w) : null });
   Object.assign(w, { sup, machine, close: () => store.close() });
   w.leaseUp = (id) => existsSync(join(fenceDir, "lease", id));
   w.record = (id) => readRecord(id, { dir: leaseDir });
@@ -939,3 +939,229 @@ test("the record the machine publishes is exactly the accepted lease, and a live
 for (const name of ["T2: SIGKILL/SIGSTOP of the supervisor; kept from restarting past the TTL", "T2: the re-arm seams with a crash at each", "T2d", "T2: a watchdog at each activation seam", "T2f", "T2g", "T2e: after real suspends", "suspend across the expiry and within the lease", "the backup-frozen slice at expiry", "the new host's first lease"]) {
   test(`(deferred to the qualification VM) ${name}`, { skip: "real systemd and kernel cgroups: lease part 2's VM rows" }, () => {});
 }
+
+// ---- the person's resume of a restored agent, wired: resume-restored (restore-resume.mjs requestResume, then the run state)
+
+/**
+ * The supervisor's restore resume over a world: requestResume with fakes for the shared core's verifiers and the host
+ * records, and the REAL resume helper (resumeRestored) run in process as its scope would be, its start through the
+ * executor's fake units (systemd's fence condition included). `w.resumeHook` replaces the whole request; `w.helperStart`
+ * replaces the helper's start; `w.requests` counts the calls and keeps the live lease each was given.
+ */
+const resumeOp = (w) => ({
+  request: async (agent, extra) => {
+    (w.requests ??= []).push({ agent, live: await extra.liveLease(agent) });
+    if (w.resumeHook) return w.resumeHook(agent, extra);
+    return requestResume(agent, {
+      restoreState: (id) => readRestore("agent", id, { dir: w.restoreDir })?.state ?? null,
+      tagsOf: () => [],
+      pairOf: () => ({ transfer: "T", receipt: "R" }),
+      verifyTransferReceipt: async () => ({ transfer: { agent }, receipt: { agent, gen: 1, nonce: "N" }, transferHash: "H" }),
+      checkTransferForHost: () => ({ first: false }),
+      host: { entryGen: () => w.entryGen ?? 1, recordTransfer: () => {} },
+      node: "/n", main: "/m",
+      run: async (argv) => {
+        const at = argv.indexOf("resume-restored");
+        const [id, gen, leaseId, lg] = argv.slice(at + 1);
+        const r = await resumeRestored(id, Number(gen), leaseId, Number(lg), {
+          restoreState: (x) => readRestore("agent", x, { dir: w.restoreDir })?.state, dir: w.leaseDir, fenceDir: w.fenceDir,
+          leaseFenceDir: join(w.fenceDir, "lease"), clock: w.clock, cgroupOf: () => resumeCgroup(id),
+          sys: { ...w.lsys, selfCgroup: () => resumeCgroup(id), start: w.helperStart ?? (async () => {
+            w.fx.log.push(["resume-start", id]);
+            if (!w.fx.u(id).masked && !fenced(id, { dir: w.fenceDir })) w.fx.u(id).active = true;
+          }) },
+        });
+        return { code: r.resumed ? 0 : 3, stdout: JSON.stringify(r) };
+      },
+      ...extra,
+    });
+  },
+});
+
+/** A restored agent waiting for its resume: granted, restore up, its record validated, its first lease accepted. */
+async function restored(w) {
+  const req = await asked(w);
+  raiseFence("restore", A, { dir: w.fenceDir });
+  restoreRecord(w, A, "validated");
+  const r = await w.sup.submit({ kind: "lease-response", authority: "host", agent: A, bytes: w.respond(req) });
+  assert.equal(r.status, "accepted");
+  assert.deepEqual(fenceCauses(A, { dir: w.fenceDir }), ["restore"]);
+  assert.equal(w.store.registry.agent(A).state, "provisioned");
+}
+const resumeRestoredOp = (w, agent = A) => w.sup.submit({ kind: "resume-restored", authority: "person", agent });
+const audits = (w) => w.fx.audits.filter((x) => x.kind === "agent.resume").map((x) => x.reason ? `${x.phase}:${x.reason}` : x.phase);
+
+test("resume-restored: the REAL requestResume and helper lower restore and start it; only then is the agent running", async () => {
+  const w = await world({ resumeOp });
+  await restored(w);
+  // Only a person may: the service, the local CLI and the host can't submit it (refused before anything runs).
+  for (const authority of ["service", "local", "host"]) {
+    await assert.rejects(w.sup.submit({ kind: "resume-restored", authority, agent: A }), (e) => e.code === "not_granted", authority);
+  }
+  assert.equal((w.requests ?? []).length, 0);
+  assert.deepEqual(fenceCauses(A, { dir: w.fenceDir }), ["restore"]);
+  const live = await w.machine.live(A);
+  w.barrier = async (n) => { if (n === "before_restore_resume") assert.equal(w.store.registry.agent(A).state, "provisioned", "not running before the helper"); };
+  assert.deepEqual(await resumeRestoredOp(w), { status: "resumed", started: true });
+  assert.deepEqual(w.requests.map((q) => q.live), [live], "given the lease MACHINE's live lease");
+  assert.deepEqual(fenceCauses(A, { dir: w.fenceDir }), []);
+  assert.equal(w.fx.u(A).active, true);
+  assert.equal(w.store.registry.agent(A).state, "running");
+  assert.deepEqual(audits(w), ["succeeded"]);
+  await w.close();
+});
+
+test("resume-restored refuses, with nothing changed and nothing launched, unless the agent is a granted, validated restore whose only fence is restore", async () => {
+  const cases = {
+    "no restore resume on this host": { op: false },
+    "not listed by the grant": { agent: B },
+    "restore not validated": { prep: (w) => restoreRecord(w, A, "published") },
+    "no restore record": { prep: (w) => { writeFileSync(join(w.restoreDir, `agent-${A}.json`), "{not json"); } },
+    "restore not up": { prep: (w) => { w.store.registry.agent(A); } , lower: true },
+    "another fence (agent)": { prep: (w) => raiseFence("agent", A, { dir: w.fenceDir }) },
+    "another fence (backup)": { prep: (w) => raiseFence("backup", A, { dir: w.fenceDir }) },
+    "start failed": { prep: (w) => w.store.registry.setStartFailed(A, "unit_failed") },
+    "deleted": { prep: (w) => w.store.registry.setState(A, "deleted") },
+  };
+  for (const [what, c] of Object.entries(cases)) {
+    const w = await world(c.op === false ? {} : { resumeOp });
+    await restored(w);
+    if (c.lower) await resumeRestoredOp(w); // restore lowered by a resume: a second one has nothing to do
+    if (c.prep) c.prep(w);
+    const before = { fences: fenceCauses(A, { dir: w.fenceDir }), state: w.store.registry.agent(A).state, n: (w.requests ?? []).length, log: w.fx.log.length };
+    await assert.rejects(resumeRestoredOp(w, c.agent ?? A), (e) => e.code === "not_granted", what);
+    assert.deepEqual({ fences: fenceCauses(A, { dir: w.fenceDir }), state: w.store.registry.agent(A).state, n: (w.requests ?? []).length, log: w.fx.log.length }, before, what);
+    await w.close();
+  }
+});
+
+test("resume-restored with lease up, or with a published record the lease machine has voided: waiting_for_lease, nothing launched or changed", async () => {
+  // lease up (no lease accepted yet): refused before any launch.
+  {
+    const w = await world({ resumeOp });
+    await asked(w);
+    raiseFence("restore", A, { dir: w.fenceDir });
+    restoreRecord(w, A, "validated");
+    assert.deepEqual(await resumeRestoredOp(w), { status: "refused", reason: "waiting_for_lease", started: false });
+    assert.equal((w.requests ?? []).length, 0, "nothing launched");
+    assert.deepEqual(fenceCauses(A, { dir: w.fenceDir }), ["lease", "restore"]);
+    await w.close();
+  }
+  // A record still published on disk, but voided in the machine (a supervisor restart or a gen change does this).
+  for (const voidIt of ["invalidate", "init"]) {
+    const w = await world({ resumeOp });
+    await restored(w);
+    assert.notEqual(w.record(A).state === "ok" ? w.record(A).rec : null, null, "still published");
+    w.machine[voidIt](A);
+    assert.deepEqual(await resumeRestoredOp(w), { status: "refused", reason: "waiting_for_lease", started: false }, voidIt);
+    assert.deepEqual(w.requests.map((q) => q.live), [null], voidIt);
+    assert.deepEqual(fenceCauses(A, { dir: w.fenceDir }), ["restore"], voidIt);
+    assert.equal(w.store.registry.agent(A).state, "provisioned", voidIt);
+    assert.equal(w.fx.u(A).active, false, voidIt);
+    await w.close();
+  }
+});
+
+test("resume-restored refused by requestResume or its helper: the reason, and nothing changes", async () => {
+  // Another entry_gen than the live lease's: not_this_lease, before any launch.
+  const w = await world({ resumeOp });
+  await restored(w);
+  w.entryGen = 9;
+  assert.deepEqual(await resumeRestoredOp(w), { status: "refused", reason: "not_this_lease", started: false });
+  assert.deepEqual(fenceCauses(A, { dir: w.fenceDir }), ["restore"]);
+  assert.equal(w.store.registry.agent(A).state, "provisioned");
+  assert.deepEqual(audits(w), ["refused:not_this_lease"]);
+  await w.close();
+});
+
+test("resume-restored with an unknown outcome (a throw, a timeout, an unreadable answer): stopped and contained with a fence, never left provisioned", async () => {
+  for (const how of ["throw", "timeout", "helper_failed", "garbage"]) {
+    const w = await world({ resumeOp });
+    await restored(w);
+    w.resumeHook = async () => {
+      if (how === "throw") throw new Error("EIO");
+      if (how === "timeout") throw Object.assign(new Error("helper timed out"), { code: "step_deadline" });
+      if (how === "helper_failed") return { resumed: false, reason: "helper_failed" };
+      return "nonsense";
+    };
+    const r = await resumeRestoredOp(w);
+    assert.deepEqual([r.status, r.reason, r.started], ["failed", "helper_unknown", false], how);
+    assert.equal(w.store.registry.agent(A).state, "stopped", how);
+    assert.ok(fenceCauses(A, { dir: w.fenceDir }).includes("agent"), `${how}: contained with its own fence`);
+    assert.equal(w.fx.u(A).active, false, how);
+    assert.deepEqual(audits(w), ["unknown_effect"], how);
+    await w.close();
+  }
+});
+
+test("resume-restored whose start couldn't be queued after the lowering: running recorded, then stopped with start_failed, contained with a fence", async () => {
+  const w = await world({ resumeOp });
+  await restored(w);
+  w.helperStart = async () => { throw new Error("systemctl start failed"); };
+  const r = await resumeRestoredOp(w);
+  assert.deepEqual([r.status, r.reason, r.started], ["failed", "start_failed", false]);
+  assert.equal(w.store.registry.agent(A).state, "stopped");
+  assert.equal(w.store.registry.agent(A).start_failed, "unit_failed");
+  assert.deepEqual(fenceCauses(A, { dir: w.fenceDir }), ["agent"], "restore lowered; its own fence raised");
+  assert.deepEqual(audits(w), ["unknown_effect"]);
+  // A person's plain resume then retries it (start_failed cleared), under a fresh lease.
+  const again = await w.sup.submit({ kind: "resume", authority: "person", agent: A });
+  assert.equal(again.status, "resumed");
+  assert.equal(w.store.registry.agent(A).start_failed, null);
+  await w.close();
+});
+
+test("recovery reconciles a crash between the helper's lowering and the run state: running, then started under a fresh lease; restore still up stays provisioned", async () => {
+  for (const crashAt of ["after_restore_resume", "before_restore_resume"]) {
+    const dirs = { root: tmp("state"), fenceDir: tmp("fence"), leaseDir: tmp("lease"), restoreDir: tmp("restore") };
+    const w = await world({ resumeOp, ...dirs });
+    await restored(w);
+    w.barrier = async (n) => { if (n === crashAt) throw new Error("crash"); };
+    await assert.rejects(resumeRestoredOp(w));
+    assert.equal(w.store.registry.agent(A).state, "provisioned", crashAt);
+    await w.close();
+    const w2 = await world({ resumeOp, ...dirs });
+    const r = await w2.sup.recover();
+    assert.equal(r.status, "recovered", crashAt);
+    if (crashAt === "after_restore_resume") {
+      assert.equal(w2.store.registry.agent(A).state, "running", "its resume happened");
+      assert.deepEqual(fenceCauses(A, { dir: w2.fenceDir }), ["lease"], "recovery raised lease; restore stays down");
+      // Its start waits for a fresh lease, then runs.
+      await w2.fire("renew");
+      assert.equal(w2.fx.u(A).active, true);
+      assert.deepEqual(fenceCauses(A, { dir: w2.fenceDir }), []);
+    } else {
+      assert.equal(w2.store.registry.agent(A).state, "provisioned", "restore still up: not resumed");
+      assert.deepEqual(fenceCauses(A, { dir: w2.fenceDir }), ["lease", "restore"]);
+    }
+    await w2.close();
+  }
+});
+
+test("recovery's reconciliation goes through the widening gate: with its proof unfinished the agent is never moved to running (contained instead); a person's resume then brings it back", async () => {
+  const dirs = { root: tmp("state"), fenceDir: tmp("fence"), leaseDir: tmp("lease"), restoreDir: tmp("restore") };
+  const w = await world({ resumeOp, ...dirs });
+  await restored(w);
+  w.barrier = async (n) => { if (n === "after_restore_resume") throw new Error("crash"); };
+  await assert.rejects(resumeRestoredOp(w));
+  // A process that survives every stop, and the agent's proof pending: recovery can't prove it down.
+  w.fx.u(A).active = true; w.fx.u(A).stuck = true;
+  w.store.grants.markProof(A);
+  w.barrier = null;
+  const r = await w.sup.recover();
+  assert.ok((r.unproven ?? []).includes(A), JSON.stringify(r));
+  assert.notEqual(w.store.registry.agent(A).state, "running", "never moved to running while its proof is unfinished");
+  assert.ok(fenceCauses(A, { dir: w.fenceDir }).includes("agent"), "contained with its own fence");
+  await w.close();
+  // The next start, with the process gone: proven, and left as containment left it; a person's resume brings it back.
+  const w2 = await world({ resumeOp, ...dirs });
+  const r2 = await w2.sup.recover();
+  assert.ok(!(r2.unproven ?? []).includes(A), JSON.stringify(r2));
+  assert.equal(w2.store.registry.agent(A).state, "stopped");
+  const again = await w2.sup.submit({ kind: "resume", authority: "person", agent: A });
+  assert.equal(again.status, "resumed", JSON.stringify(again));
+  await w2.fire("renew");
+  assert.equal(w2.store.registry.agent(A).state, "running");
+  assert.equal(w2.fx.u(A).active, true);
+  await w2.close();
+});

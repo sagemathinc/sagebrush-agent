@@ -3,6 +3,7 @@
 //! forbids: it never initializes a repository except on `init`, never skips the ctime or inode comparison, and never
 //! restores with CAP_SYS_RESOURCE.
 
+use std::os::unix::ffi::OsStrExt;
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -66,6 +67,8 @@ pub enum Request {
         #[serde(default)]
         path: Option<String>,
         dest: PathBuf,
+        /// Where the digest list goes (A2 r3.8.2 §4b): beside `dest`, never inside it.
+        digests: PathBuf,
     },
     Forget {
         snapshots: Vec<String>,
@@ -140,7 +143,7 @@ pub fn run(ctx: &Ctx, req: Request) -> Result<Value> {
         Request::CheckData { part, of } => check_data(ctx, part, of),
         Request::Snapshots {} => snapshots(ctx),
         Request::Dump { snapshot, path } => dump(ctx, &snapshot, &path),
-        Request::Restore { snapshot, path, dest } => restore(ctx, &snapshot, path.as_deref(), &dest),
+        Request::Restore { snapshot, path, dest, digests } => restore(ctx, &snapshot, path.as_deref(), &dest, &digests),
         Request::Forget { snapshots } => forget(ctx, &snapshots),
         Request::Prune {} => prune(ctx),
         Request::Usage { snapshot, path } => usage(ctx, &snapshot, path.as_deref()),
@@ -321,11 +324,24 @@ fn dump(ctx: &Ctx, snapshot: &str, path: &str) -> Result<Value> {
 /// Device nodes, FIFOs and sockets are never created, and no extended attribute is ever written (ACLs and file
 /// capabilities are extended attributes): the node stream is filtered before the library sees it, and the result
 /// counts what was skipped. The fill re-checks both before anything reaches an agent's tree.
-fn restore(ctx: &Ctx, snapshot: &str, path: Option<&str>, dest: &Path) -> Result<Value> {
+/// The digest list's place (launcher contract A2 r3.8.2 §4b): `digests.json` beside `dest` (never inside it, so
+/// fill-home never moves it), absolute, and not there yet.
+fn check_digests_place(dest: &Path, digests: &Path) -> Result<()> {
+    if !digests.is_absolute() || digests.file_name().map(|n| n.as_bytes()) != Some(b"digests.json".as_slice()) || digests.parent() != dest.parent() {
+        return Err(Fail::new("request_invalid", "digests must be digests.json beside dest"));
+    }
+    if fs::symlink_metadata(digests).is_ok() {
+        return Err(Fail::new("request_invalid", "digests must not exist yet"));
+    }
+    Ok(())
+}
+
+fn restore(ctx: &Ctx, snapshot: &str, path: Option<&str>, dest: &Path, digests: &Path) -> Result<Value> {
     caps::require_no_sys_resource()?;
     if !dest.is_absolute() {
         return Err(Fail::new("request_invalid", "dest must be absolute"));
     }
+    check_digests_place(dest, digests)?;
     let meta = fs::symlink_metadata(dest).map_err(|e| Fail::new("request_invalid", format!("dest: {e}")))?;
     if !meta.is_dir() {
         return Err(Fail::new("request_invalid", "dest must be an existing directory (not a symlink)"));
@@ -361,7 +377,10 @@ fn restore(ctx: &Ctx, snapshot: &str, path: Option<&str>, dest: &Path) -> Result
     opts.sparse = Some(SparseRestore::ByContentRequired);
     let plan = repo.prepare_restore(&opts, ls.clone(), &dest, false).map_err(lib("restore_failed"))?;
     repo.restore(plan, &opts, ls, &dest).map_err(lib("restore_failed"))?;
-    Ok(json!({ "snapshot": full(*snap.id), "skipped_special": skipped }))
+    // The digest list of exactly what was written (from the MAC-verified plaintext), then its hash for the launcher.
+    let bytes = crate::digests::listing(Path::new(dest_str))?;
+    let digests_sha256 = crate::digests::write_new(digests, &bytes)?;
+    Ok(json!({ "snapshot": full(*snap.id), "skipped_special": skipped, "digests_sha256": digests_sha256 }))
 }
 
 fn forget(ctx: &Ctx, ids: &[String]) -> Result<Value> {
@@ -561,7 +580,7 @@ mod tests {
         assert!(serde_json::from_str::<Request>(r#"{"op":"auto-init"}"#).is_err());
         assert!(serde_json::from_str::<Request>(r#"{"op":"init","force":true}"#).is_err());
         assert!(serde_json::from_str::<Request>(r#"{"op":"snapshots"}"#).is_ok());
-        assert!(serde_json::from_str::<Request>(r#"{"op":"restore","snapshot":"x","dest":"/d","no_cap_check":true}"#).is_err());
+        assert!(serde_json::from_str::<Request>(r#"{"op":"restore","snapshot":"x","dest":"/a/d","digests":"/a/digests.json","no_cap_check":true}"#).is_err());
         assert!(serde_json::from_str::<Request>(r#"{"op":"usage","snapshot":"x"}"#).is_ok());
         assert!(serde_json::from_str::<Request>(r#"{"op":"usage","snapshot":"x","path":"srv/a"}"#).is_ok());
         assert!(serde_json::from_str::<Request>(r#"{"op":"usage","snapshot":"x","exact":true}"#).is_err());
@@ -706,4 +725,22 @@ mod tests {
         assert_eq!(t.dirs[Path::new("")], 4080);
         assert_eq!(t.finish().blocks, 1 + 4 + 1, "the dot entries push the directory into a second block");
     }
+
+    #[test]
+    fn the_digest_list_goes_beside_dest_once() {
+        let base = std::env::temp_dir().join(format!("sbb-dplace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("data")).unwrap();
+        let dest = base.join("data");
+        assert!(check_digests_place(&dest, &base.join("digests.json")).is_ok());
+        for bad in [base.join("data/digests.json"), base.join("other.json"), PathBuf::from("digests.json"), std::env::temp_dir().join("digests.json")] {
+            assert_eq!(check_digests_place(&dest, &bad).unwrap_err().code, "request_invalid", "{bad:?}");
+        }
+        fs::write(base.join("digests.json"), b"x").unwrap();
+        assert_eq!(check_digests_place(&dest, &base.join("digests.json")).unwrap_err().code, "request_invalid", "already there");
+        // a request without digests isn't a restore request
+        assert!(serde_json::from_str::<Request>(r#"{"op":"restore","snapshot":"x","dest":"/a/d"}"#).is_err());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
 }

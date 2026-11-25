@@ -2,16 +2,20 @@
 // real temporary tree exactly as A2 does (the class's data under <attempt>/data, the marker written last with the
 // class's name; fill-home unlinks the marker first, then moves). Exit codes are scripted per call, so every branch
 // runs: a quota hit stops as not_fitting, out of space and partial steps retry in a new attempt, anything else fails;
-// filling is written before the first fill-home, and a filling record is never filled again.
+// filling is written before the first fill-home, and a filling record is never filled again. restore-stage writes a
+// real §4b digest list beside the class and reports its hash; tree-digest lists the real destination; validation
+// compares the two, so a published set settles as validated, and every tamper of the tree, the list or the reports fails.
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { EXIT, classPaths, destOf, fillExpect, outcomeOf, ownersOf, restoreFiller, writeExpectFile } from "../lib/fleet/host/restore-fill.mjs";
 import { realIo } from "../lib/fleet/host/store.mjs";
-import { MAX_ATTEMPTS, newRestoreRun, readRecord, retryRecord, writeRecord } from "../lib/fleet/host/restore-record.mjs";
+import { MAX_ATTEMPTS, newRestoreRun, ownerOf, readFillReport, readRecord, retryRecord, writeRecord } from "../lib/fleet/host/restore-record.mjs";
+import { copyKey, encodePath, quote } from "../lib/fleet/host/restore-validate.mjs";
 
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
 const RUN = newRestoreRun(1795500000000, () => Buffer.alloc(6)), RUN2 = newRestoreRun(1795600000000, () => Buffer.alloc(6));
@@ -20,19 +24,75 @@ const hex = (c) => c.repeat(64);
 const DATA = { home: { "a.txt": "A", "b.txt": "BB" }, sessions: { "s.db": "SSS" }, archive: { "old.txt": "O" }, tag: { "shared.txt": "T" } };
 const tree = (d) => (existsSync(d) ? Object.fromEntries(readdirSync(d).sort().map((k) => [k, readFileSync(join(d, k), "utf8")])) : null);
 
+const sha = (b) => createHash("sha256").update(b).digest("hex");
+
+/**
+ * A real tree's §4b listing (as the binary writes data/digests.json, or, `observed`, as tree-digest lists): every entry
+ * under `root` (not root itself), sorted by raw path bytes; EXPECTED modes with set-id cleared, OBSERVED as they are.
+ */
+function listing(root, { observed = false, copies = new Map() } = {}) {
+  const out = [];
+  const walk = (dir, rel) => {
+    for (const nm of readdirSync(dir, { encoding: "buffer" })) {
+      const raw = rel.length ? Buffer.concat([rel, Buffer.from("/"), nm]) : nm;
+      const full = Buffer.concat([Buffer.isBuffer(dir) ? dir : Buffer.from(dir), Buffer.from("/"), nm]);
+      const st = lstatSync(full);
+      const mode = st.mode & (observed ? 0o7777 : 0o7777 & ~0o6000);
+      if (st.isDirectory()) { out.push([raw, `{"path":${quote(encodePath(raw))},"type":"dir","size":0,"mode":${mode}}`, 0]); walk(full, raw); }
+      else if (st.isSymbolicLink()) { const t = readlinkSync(full, { encoding: "buffer" }); out.push([raw, `{"path":${quote(encodePath(raw))},"type":"symlink","size":${t.length},"mode":511,"target":${quote(encodePath(t))}}`, 0]); }
+      else if (st.isFile()) { const b = readFileSync(full); const c = copies.get(encodePath(raw)); out.push([raw, `{"path":${quote(encodePath(raw))},"type":"file","size":${b.length},"mode":${mode},"sha256":"${sha(b)}"${c ? `,"copy":"${c}"` : ""}}`, b.length]); }
+      else out.push([raw, `{"unexpected":${quote(encodePath(raw))},"type":"fifo"}`, -1]);
+    }
+  };
+  walk(root, Buffer.alloc(0));
+  out.sort((a, b) => Buffer.compare(a[0], b[0]));
+  const entries = out.filter((e) => e[2] >= 0);
+  return `{"v":1}\n${out.map((e) => e[1] + "\n").join("")}{"count":${entries.length},"total_bytes":${entries.reduce((n, e) => n + e[2], 0)}}\n`;
+}
+/**
+ * tree-digest's --copy-sqlite, on a real tree: every regular file starting "SQLite format 3\0" is copied into `dir` as
+ * <h>.db, with its X-wal and X-journal siblings as <h>.db-wal and <h>.db-journal (h = copyKey of the main's path);
+ * returns the copy names by encoded path, for the listing's `copy` keys. `skip(path)` leaves a copy out (a mutant).
+ */
+function copySqlite(root, dir, skip = () => false) {
+  const names = new Map();
+  const walk = (d, rel) => {
+    for (const n of readdirSync(d).sort()) {
+      const full = join(d, n), path = rel ? `${rel}/${n}` : n, st = lstatSync(full);
+      if (st.isDirectory()) { walk(full, path); continue; }
+      if (!st.isFile() || !readFileSync(full).subarray(0, 16).equals(Buffer.from("SQLite format 3\0", "latin1"))) continue;
+      const h = copyKey(encodePath(Buffer.from(path)));
+      for (const [x, name] of [["", `${h}.db`], ["-wal", `${h}.db-wal`], ["-journal", `${h}.db-journal`]]) {
+        if (!existsSync(full + x) || skip(path + x)) continue;
+        writeFileSync(join(dir, name), readFileSync(full + x), { flag: "wx", mode: 0o600 });
+        names.set(path + x, name);
+      }
+    }
+  };
+  walk(root, "");
+  return names;
+}
+const okStage = (digest) => `{"ok":true,"snapshot":"${SNAP}","skipped_special":0,"digests_sha256":"${digest}"}\n`;
+const okFill = (report = {}) => JSON.stringify({ placed: { dirs: 0, files: 1, symlinks: 0 }, refused: [], unexpected: [], truncated: false, ...report }) + "\n";
+
 const planOf = (kind, id, run = RUN) => ({ v: 1, host: "old-host", manifest: hex("1"), sha256: hex("2"), hoststore: hex("3"), sets: { [`${kind}-${id}`]: { run, snapshot: SNAP, tree: hex("4") } } });
 
 /**
  * A fake launcher on a real tree. `script(op, cls, attempt)` returns an exit code (default 0); a non-zero restore-stage
- * leaves a partial attempt (some data, no marker), a non-zero fill-home moves the first file only. `calls` records every
- * argv; `onCall(args)` runs first (the test sees the record as it is at that moment).
+ * leaves a partial attempt (some data, no marker), a non-zero fill-home moves the first file only. A successful
+ * restore-stage writes data/digests.json (the class's real listing) and prints the closed success line with its hash;
+ * fill-home prints its report (`report(cls)`, default nothing refused); tree-digest prints the destination's real
+ * observed listing, or what `observe(cls, text)` makes of it. `stdout(op, cls, text)` may replace any success line.
+ * `calls` records every argv; `onCall(args)` runs first (the test sees the record as it is at that moment).
  */
-function world(kind, { script = () => 0, onCall = () => {}, failDiscards = 0 } = {}) {
+function world(kind, { script = () => 0, onCall = () => {}, failDiscards = 0, report = () => ({}), observe = (c, t) => t,
+  stdout = (op, cls, t) => t, stopped = async () => true, unrestorable = () => [], beforeDigest = () => {}, seed = () => {},
+  listOf = (c, t) => t, identify = (c, o) => o, skipCopy = () => false, afterCopy = () => {} } = {}) {
   const base = mkdtempSync(join(tmpdir(), "sb-fill-"));
   const stage = join(base, "staging"), dir = join(base, "restore");
   const dests = {};
   for (const c of { agent: ["home", "sessions"], archive: ["archive"], tag: ["tag"] }[kind]) { dests[c] = join(base, "dest", c); mkdirSync(dests[c], { recursive: true }); }
-  const calls = [], cleaned = [], discarded = [];
+  const calls = [], cleaned = [], discarded = [], copiesRemoved = [];
   const flag = (args, f) => args[args.indexOf(`--${f}`) + 1];
   const launch = async (args) => {
     calls.push(args);
@@ -43,13 +103,31 @@ function world(kind, { script = () => 0, onCall = () => {}, failDiscards = 0 } =
     const name = `${run}/${owner}/${cls}/${attempt}`;
     const code = script(cmd, cls, Number(attempt));
     const leaf = { home: "home", sessions: "sessions" }[cls] ?? owner.slice(2);
+    if (cmd === "tree-digest") {
+      assert.equal(args.includes("--copy-sqlite"), cls === "sessions");
+      beforeDigest(cls, dests[cls]);
+      if (code !== 0) return { code, stdout: "", stderr: "" };
+      let copies = new Map();
+      if (cls === "sessions") {
+        const cdir = join(base, "copies", flag(args, "run"), owner);
+        if (existsSync(cdir)) return { code: EXIT.exists, stdout: "", stderr: "" };
+        mkdirSync(cdir, { recursive: true, mode: 0o700 });
+        copies = copySqlite(dests[cls], cdir, skipCopy);
+        afterCopy(cdir, copies);
+      }
+      return { code, stdout: observe(cls, listing(dests[cls], { observed: true, copies })), stderr: "" };
+    }
     if (cmd === "restore-stage") {
       if (existsSync(att)) return { code: EXIT.exists, stdout: "", stderr: "" };
       mkdirSync(join(att, "data", leaf), { recursive: true });
       const files = Object.entries(DATA[cls]);
       for (const [k, v] of code === 0 ? files : files.slice(0, 1)) writeFileSync(join(att, "data", leaf, k), v);
-      if (code === 0) writeFileSync(join(att, ".complete"), name);
-      return { code, stdout: "", stderr: "" };
+      if (code !== 0) return { code, stdout: "", stderr: "" };
+      seed(cls, join(att, "data", leaf));
+      const list = listOf(cls, listing(join(att, "data", leaf)));
+      writeFileSync(join(att, "data", "digests.json"), list);
+      writeFileSync(join(att, ".complete"), name);
+      return { code, stdout: stdout(cmd, cls, okStage(sha(list))), stderr: "" };
     }
     if (cmd === "fill-home") {
       if (!existsSync(join(att, ".complete")) || readFileSync(join(att, ".complete"), "utf8") !== name) return { code: 73, stdout: "", stderr: "" };
@@ -58,24 +136,26 @@ function world(kind, { script = () => 0, onCall = () => {}, failDiscards = 0 } =
       const src = join(att, "data", leaf);
       const names = readdirSync(src).sort();
       for (const k of code === 0 ? names : names.slice(0, 1)) renameSync(join(src, k), join(dests[cls], k));
-      return { code, stdout: "", stderr: "" };
+      return { code, stdout: code === 0 ? stdout(cmd, cls, okFill(report(cls))) : "", stderr: "" };
     }
     throw new Error(`unexpected launcher call ${cmd}`);
   };
-  const identifyDest = async (k, id, cls) => ({ epoch: { boot_id: "00000000-0000-4000-8000-000000000000", mnt_id: 7 }, fsid: "0123456789abcdef", object: { type: "dir", mode: 0o700, uid: 70000, gid: 70000, dev: [8, 1], ino: statSync(dests[cls]).ino, gen: 1, mnt_id: 7, projid: 70000, inherit: true } });
+  const identifyDest = async (k, id, cls) => ((x) => ({ ...x, object: identify(cls, x.object) }))({ epoch: { boot_id: "00000000-0000-4000-8000-000000000000", mnt_id: 7 }, fsid: "0123456789abcdef", object: { type: "dir", mode: 0o700, uid: 70000, gid: 70000, dev: [8, 1], ino: statSync(dests[cls]).ino, gen: 1, mnt_id: 7, projid: 70000, inherit: true } });
   const expectOf = async (k, id, cls) => join(base, "expect", `${cls}.json`);
-  const cleanDest = async (r) => { cleaned.push(r.attempt); for (const d of Object.values(dests)) for (const e of readdirSync(d)) rmSync(join(d, e)); };
+  const cleanDest = async (r) => { cleaned.push(r.attempt); for (const d of Object.values(dests)) for (const e of readdirSync(d)) rmSync(join(d, e), { recursive: true }); };
   let discardFailures = failDiscards;
   const discardStaging = async (r) => {
     if (discardFailures > 0 && r.state !== "staging") { discardFailures -= 1; throw new Error("crash in discard"); }
     discarded.push(r.attempt);
     if (!existsSync(stage)) return;
     for (const run of readdirSync(stage)) for (const owner of readdirSync(join(stage, run))) for (const cls of readdirSync(join(stage, run, owner))) {
-      for (const n of readdirSync(join(stage, run, owner, cls))) if (r.state !== "staging" || run !== r.run || n !== String(r.attempt)) rmSync(join(stage, run, owner, cls, n), { recursive: true });
+      for (const n of readdirSync(join(stage, run, owner, cls))) if (!["staging", "published"].includes(r.state) || run !== r.run || n !== String(r.attempt)) rmSync(join(stage, run, owner, cls, n), { recursive: true });
     }
   };
-  const fill = restoreFiller({ launch, mount: "/srv/sagebrush", identifyDest, expectOf, projidOf: () => 70000, cleanDest, discardStaging, dir, root: stage });
-  return { fill, calls, cleaned, discarded, dests, dir, stage, base };
+  const removeCopies = async (r) => { copiesRemoved.push(r.attempt); rmSync(join(base, "copies", r.run, ownerOf(r.kind, r.id)), { recursive: true, force: true }); };
+  const fill = restoreFiller({ launch, mount: "/srv/sagebrush", identifyDest, expectOf, projidOf: () => 70000, cleanDest, discardStaging, dir, root: stage,
+    stopped, unrestorableOf: (k, id, cls) => unrestorable(cls), removeCopies, copies: join(base, "copies") });
+  return { fill, calls, cleaned, discarded, copiesRemoved, dests, dir, stage, base };
 }
 
 test("classPaths: the class directory itself is restored, landing at data/<leaf> (A2 r3.5); outcomeOf: what each exit means", () => {
@@ -95,19 +175,21 @@ test("an agent restored: each class staged then filled, by exactly these launche
   const seen = [];
   const w = world("agent", { onCall: (args) => { if (args[0] === "fill-home") seen.push(readRecord("agent", id, { dir: w.dir })?.state); } });
   const r = await w.fill("agent", id, planOf("agent", id));
-  assert.deepEqual([r.state, r.attempt, r.dirty], ["published", 1, false]);
+  assert.deepEqual([r.state, r.attempt, r.dirty], ["validated", 1, false]);
   assert.deepEqual(w.calls, [
     ["restore-stage", "--mount", "/srv/sagebrush", "--owner", `a-${id}`, "--class", "home", "--run", RUN, "--attempt", "1", "--projid", "70000", "--snapshot", SNAP, "--path", `srv/sagebrush/agents/${id}/home`],
     ["restore-stage", "--mount", "/srv/sagebrush", "--owner", `a-${id}`, "--class", "sessions", "--run", RUN, "--attempt", "1", "--projid", "70000", "--snapshot", SNAP, "--path", `srv/sagebrush/agents/${id}/sessions`],
     ["fill-home", "--mount", "/srv/sagebrush", "--owner", `a-${id}`, "--class", "home", "--run", RUN, "--attempt", "1", "--source", "data/home", "--expect", join(w.base, "expect", "home.json")],
     ["fill-home", "--mount", "/srv/sagebrush", "--owner", `a-${id}`, "--class", "sessions", "--run", RUN, "--attempt", "1", "--source", "data/sessions", "--expect", join(w.base, "expect", "sessions.json")],
+    ["tree-digest", "--mount", "/srv/sagebrush", "--owner", `a-${id}`, "--class", "home", "--expect", join(w.base, "expect", "home.json")],
+    ["tree-digest", "--mount", "/srv/sagebrush", "--owner", `a-${id}`, "--class", "sessions", "--expect", join(w.base, "expect", "sessions.json"), "--copy-sqlite", "--run", RUN],
   ]);
   assert.deepEqual(seen, ["filling", "filling"], "the record says filling before every fill-home");
   assert.deepEqual([tree(w.dests.home), tree(w.dests.sessions)], [DATA.home, DATA.sessions]);
   assert.deepEqual(r.dest.home, { dev: String(8 * 2 ** 20 + 1), ino: String(statSync(w.dests.home).ino) });
-  // Settled: calling again does nothing more (validation is the next step's).
+  // Settled: calling again does nothing more.
   const n = w.calls.length;
-  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "published");
+  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "validated");
   assert.equal(w.calls.length, n);
 });
 
@@ -116,8 +198,9 @@ test("an archive and a tag folder: one class each, the a- and t- owners", async 
     const id = newId();
     const w = world(kind);
     const r = await w.fill(kind, id, planOf(kind, id));
-    assert.equal(r.state, "published", kind);
-    assert.deepEqual(w.calls.map((a) => [a[0], a[4], a[6]]), [["restore-stage", `${kind === "tag" ? "t" : "a"}-${id}`, kind], ["fill-home", `${kind === "tag" ? "t" : "a"}-${id}`, kind]]);
+    assert.equal(r.state, "validated", kind);
+    const o = `${kind === "tag" ? "t" : "a"}-${id}`;
+    assert.deepEqual(w.calls.map((a) => [a[0], a[4], a[6]]), [["restore-stage", o, kind], ["fill-home", o, kind], ["tree-digest", o, kind]]);
     assert.deepEqual(tree(w.dests[kind]), DATA[kind]);
   }
 });
@@ -153,13 +236,13 @@ test("out of space (77), a partial step (75) and an existing attempt (74) retry 
       const id = newId();
       const w = world("agent", { script: (op, cls, attempt) => (op === where && cls === "home" && attempt === 1 ? code : 0) });
       const r = await w.fill("agent", id, planOf("agent", id));
-      assert.deepEqual([r.state, r.attempt], ["published", 2], `${code} in ${where}`);
+      assert.deepEqual([r.state, r.attempt], ["validated", 2], `${code} in ${where}`);
       assert.deepEqual([tree(w.dests.home), tree(w.dests.sessions)], [DATA.home, DATA.sessions], `${code} in ${where}`);
       // Attempt 1 is never filled after attempt 2 began; a fill failure cleaned the destination before re-staging.
       const fills = w.calls.filter((a) => a[0] === "fill-home").map((a) => `${a[6]}:${a[10]}`);
       assert.equal(new Set(fills).size, fills.length, "no class filled twice from one attempt");
       if (where === "fill-home") assert.deepEqual(w.cleaned, [2], "the partial fill removed before the next attempt");
-      // Nothing is left: the first attempt is discarded whichever way it failed, the published one once it settled.
+      // Nothing is left: the first attempt is discarded whichever way it failed, the filled one once it is validated.
       assert.deepEqual(["home", "sessions"].map((c) => readdirSync(join(w.stage, RUN, `a-${id}`, c))), [[], []], `${code} in ${where}`);
     }
   }
@@ -186,14 +269,14 @@ test("a staged attempt without every marker exactly its name is never filled: a 
   const id = newId();
   const w = world("agent");
   // As a lying or interrupted launcher would leave it: both classes' data present, the sessions marker another attempt's.
-  writeRecord({ v: 1, kind: "agent", id, run: RUN, snapshot: SNAP, attempt: 1, state: "staging", dest: null, dirty: false, reason: null }, { dir: w.dir });
+  writeRecord({ v: 1, kind: "agent", id, run: RUN, snapshot: SNAP, attempt: 1, state: "staging", dest: null, digests: null, dirty: false, reason: null }, { dir: w.dir });
   for (const cls of ["home", "sessions"]) {
     const att = join(w.stage, RUN, `a-${id}`, cls, "1");
     mkdirSync(join(att, "data", cls), { recursive: true });
     writeFileSync(join(att, ".complete"), cls === "home" ? `${RUN}/a-${id}/home/1` : `${RUN}/a-${id}/sessions/2`);
   }
   const r = await w.fill("agent", id, planOf("agent", id));
-  assert.deepEqual([r.state, r.attempt], ["published", 2], "the torn attempt was retried");
+  assert.deepEqual([r.state, r.attempt], ["validated", 2], "the torn attempt was retried");
   assert.ok(!w.calls.some((a) => a[0] === "fill-home" && a[10] === "1"), "never filled");
   // And a launcher that exits 0 but leaves a wrong marker: checked before the record steps to staged.
   const id2 = newId();
@@ -205,7 +288,7 @@ test("a staged attempt without every marker exactly its name is never filled: a 
     }
   } });
   const r2 = await w2.fill("agent", id2, planOf("agent", id2));
-  assert.deepEqual([r2.state, r2.attempt], ["published", 2]);
+  assert.deepEqual([r2.state, r2.attempt], ["validated", 2]);
   assert.ok(!w2.calls.some((a) => a[0] === "fill-home" && a[10] === "1"));
 });
 
@@ -218,12 +301,12 @@ test("a crash after filling is written: the next call never refills that attempt
   await assert.rejects(w.fill("agent", id, planOf("agent", id)), /killed/);
   assert.deepEqual([readRecord("agent", id, { dir: w.dir }).state, readRecord("agent", id, { dir: w.dir }).attempt], ["filling", 1]);
   const r = await w.fill("agent", id, planOf("agent", id));
-  assert.deepEqual([r.state, r.attempt], ["published", 2]);
+  assert.deepEqual([r.state, r.attempt], ["validated", 2]);
   assert.deepEqual(w.cleaned, [2], "the partly filled destination emptied first");
   const fills = w.calls.filter((a) => a[0] === "fill-home").map((a) => `${a[6]}:${a[10]}`);
   assert.deepEqual(fills, ["home:1", "sessions:1", "home:2", "sessions:2"]);
   assert.deepEqual([tree(w.dests.home), tree(w.dests.sessions)], [DATA.home, DATA.sessions]);
-  // The consumed attempt 1 is discarded, and so is attempt 2 once the set is published.
+  // The consumed attempt 1 is discarded, and so is attempt 2 once the set is validated.
   assert.deepEqual(readdirSync(join(w.stage, RUN, `a-${id}`, "home")), []);
 });
 
@@ -231,13 +314,14 @@ test("refusals: a set not in the plan, a record of another restore, missing adap
   const id = newId();
   const w = world("agent");
   await rejects(w.fill("agent", newId(), planOf("agent", id)), "not_found");
-  writeRecord({ v: 1, kind: "agent", id, run: RUN2, snapshot: SNAP, attempt: 1, state: "staging", dest: null, dirty: false, reason: null }, { dir: w.dir });
+  writeRecord({ v: 1, kind: "agent", id, run: RUN2, snapshot: SNAP, attempt: 1, state: "staging", dest: null, digests: null, dirty: false, reason: null }, { dir: w.dir });
   await rejects(w.fill("agent", id, planOf("agent", id)), "not_granted");
   const ac = new AbortController();
   ac.abort();
   await rejects(w.fill("tag", id, { ...planOf("tag", id) }, { signal: ac.signal }), "outcome_unknown");
-  const ok = { launch: async () => ({ code: 0 }), mount: "/srv/sagebrush", identifyDest: async () => ({}), expectOf: async () => "x", projidOf: () => 1, cleanDest: async () => {}, discardStaging: async () => {} };
-  for (const k of ["launch", "identifyDest", "expectOf", "projidOf", "cleanDest", "discardStaging"]) {
+  const ok = { launch: async () => ({ code: 0 }), mount: "/srv/sagebrush", identifyDest: async () => ({}), expectOf: async () => "x", projidOf: () => 1, cleanDest: async () => {}, discardStaging: async () => {},
+    stopped: async () => true, unrestorableOf: () => [], removeCopies: async () => {} };
+  for (const k of ["launch", "identifyDest", "expectOf", "projidOf", "cleanDest", "discardStaging", "stopped", "unrestorableOf", "removeCopies"]) {
     assert.throws(() => restoreFiller({ ...ok, [k]: undefined }), (e) => e.code === "bad_form", k);
   }
   assert.throws(() => restoreFiller({ ...ok, mount: "srv" }), (e) => e.code === "bad_form");
@@ -342,21 +426,21 @@ test("a stopped set's next call only discards what a crash left; it never restag
   assert.equal(w.calls.length, before);
 });
 
-test("a published set's consumed staging is discarded before it is reported, on every call, a crash repaired", async () => {
+test("a validated set's consumed staging is discarded only after validated is durable, on every call, a crash repaired", async () => {
   const id = newId();
   const w = world("agent");
   const r = await w.fill("agent", id, planOf("agent", id));
-  assert.equal(r.state, "published");
+  assert.equal(r.state, "validated");
   // The staged copies (directories, symlinks, the emptied data) don't stay charged: nothing of the set is left.
   for (const cls of ["home", "sessions"]) assert.deepEqual(readdirSync(join(w.stage, RUN, `a-${id}`, cls)), [], cls);
   // A crash in that discard: the next call repairs it, with no launcher call.
   const id2 = newId();
   const w2 = world("agent", { failDiscards: 1 });
   await assert.rejects(w2.fill("agent", id2, planOf("agent", id2)), /crash in discard/);
-  assert.equal(readRecord("agent", id2, { dir: w2.dir }).state, "published");
+  assert.equal(readRecord("agent", id2, { dir: w2.dir }).state, "validated");
   assert.ok(existsSync(join(w2.stage, RUN, `a-${id2}`, "home", "1")), "left by the crash");
   const n = w2.calls.length;
-  assert.equal((await w2.fill("agent", id2, planOf("agent", id2))).state, "published");
+  assert.equal((await w2.fill("agent", id2, planOf("agent", id2))).state, "validated");
   assert.equal(w2.calls.length, n, "no launcher call");
   assert.equal(existsSync(join(w2.stage, RUN, `a-${id2}`, "home", "1")), false, "discarded now");
 });
@@ -373,6 +457,343 @@ test("a new attempt is staged only after every earlier one is discarded: two att
     },
   });
   const r = await w.fill("agent", id, planOf("agent", id));
-  assert.deepEqual([r.state, r.attempt], ["published", 2]);
+  assert.deepEqual([r.state, r.attempt], ["validated", 2]);
   assert.deepEqual(seen, [[false, false], [false, false]], "attempt 1's partial staging is gone before attempt 2 stages either class");
+});
+
+// ---- validation (A2 r3.8.3 / r3.9 §4a, §4b): the digest list bound by its recorded hash, the filled tree listed by
+// tree-digest, the compare less exactly fill's refused and the manifest's unrestorable entries, the SQLite copies.
+
+/** One agent set through validation, with `opts` for the world. Returns the world, the record and the id. */
+async function settle(opts = {}) {
+  const id = newId();
+  const w = world("agent", opts);
+  const r = await w.fill("agent", id, planOf("agent", id));
+  return { w, r, id };
+}
+const attemptDir = (w, id, cls, attempt = 1) => join(w.stage, RUN, `a-${id}`, cls, String(attempt));
+const failedAs = async (opts, reason, what) => {
+  const { w, r, id } = await settle(opts);
+  assert.deepEqual([r.state, r.reason], ["failed", reason], what);
+  assert.equal(w.calls.filter((a) => a[0] === "restore-stage").length, 2, `${what}: never re-staged`);
+  // A failed validation stays failed: the next call makes no launcher call, and the attempt is discarded.
+  const n = w.calls.length;
+  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "failed", what);
+  assert.equal(w.calls.length, n, `${what}: nothing retried automatically`);
+  assert.equal(existsSync(attemptDir(w, id, "home")), false, `${what}: the attempt is discarded once the stop is written`);
+  return { w, r, id };
+};
+
+test("validation: each class's hash is recorded as it stages, then the filled tree is the list's, and only then validated", async () => {
+  const seen = [];
+  const id = newId();
+  const w = world("agent", { onCall: (args) => { if (args[0] === "tree-digest") seen.push(readRecord("agent", id, { dir: w.dir })); } });
+  const r = await w.fill("agent", id, planOf("agent", id));
+  assert.equal(r.state, "validated");
+  // The record held both hashes from staging on, each the hash of the list the class's restore-stage wrote.
+  assert.deepEqual(Object.keys(r.digests), ["home", "sessions"]);
+  for (const cls of ["home", "sessions"]) assert.match(r.digests[cls], /^[0-9a-f]{64}$/);
+  assert.notEqual(r.digests.home, r.digests.sessions);
+  // tree-digest ran while the record was published, with the attempt (and its lists) still staged.
+  assert.deepEqual(seen.map((x) => x.state), ["published", "published"]);
+  // The fill reports were saved for the attempt; validated is durable before the attempt is discarded.
+  assert.deepEqual(readFillReport(r, "home", { dir: w.dir }), { v: 1, run: RUN, attempt: 1, cls: "home", refused: [], unexpected: [], truncated: false });
+  assert.equal(readRecord("agent", id, { dir: w.dir }).state, "validated");
+  assert.equal(existsSync(attemptDir(w, id, "home")), false);
+  // The sessions listing's copy directory is fresh each run and removed after it.
+  assert.deepEqual(w.copiesRemoved, [1, 1]);
+  assert.equal(existsSync(join(w.base, "copies", RUN, `a-${id}`)), false);
+});
+
+test("validation: a changed filled tree fails: a same-size byte change, missing, extra, type, size, mode, set-id, link target", async () => {
+  const seed = (cls, d) => { if (cls === "home") { symlinkSync("a.txt", join(d, "ln")); mkdirSync(join(d, "sub")); writeFileSync(join(d, "sub", "c.txt"), "C"); } };
+  const ok = await settle({ seed });
+  assert.equal(ok.r.state, "validated", "the seeded tree validates as filled");
+  const rows = {
+    "a same-size byte change": (d) => writeFileSync(join(d, "a.txt"), "Z"),
+    "a missing file": (d) => rmSync(join(d, "b.txt")),
+    "a missing directory": (d) => rmSync(join(d, "sub"), { recursive: true }),
+    "an extra file": (d) => writeFileSync(join(d, "extra"), ""),
+    "an extra empty directory": (d) => mkdirSync(join(d, "more")),
+    "a file turned into a directory": (d) => { rmSync(join(d, "a.txt")); mkdirSync(join(d, "a.txt")); },
+    "a size change": (d) => writeFileSync(join(d, "b.txt"), "BBB"),
+    "a mode change": (d) => chmodSync(join(d, "a.txt"), 0o600),
+    "a set-id bit fill failed to strip": (d) => chmodSync(join(d, "a.txt"), 0o2644),
+    "a directory's mode": (d) => chmodSync(join(d, "sub"), 0o700),
+    "a link's target": (d) => { rmSync(join(d, "ln")); symlinkSync("b.txt", join(d, "ln")); },
+    "a link replaced by its target's copy": (d) => { rmSync(join(d, "ln")); writeFileSync(join(d, "ln"), "A"); },
+  };
+  for (const [what, change] of Object.entries(rows)) {
+    await failedAs({ seed, beforeDigest: (cls, d) => { if (cls === "home") change(d); } }, "bad_form", what);
+  }
+  // A special file or a mount in the destination is an `unexpected` line: failed, whatever else matches.
+  const special = (cls, t) => (cls === "home" ? t.replace(/\{"count"/, '{"unexpected":"zz","type":"fifo"}\n{"count"') : t);
+  await failedAs({ observe: special }, "bad_form", "an unexpected entry");
+});
+
+test("validation: the digest list is used only when its bytes hash to the recorded value; a missing one is not_found", async () => {
+  const list = (w, id, cls) => join(attemptDir(w, id, cls), "data", "digests.json");
+  let ref;
+  // (after the last fill-home, before validation reads the lists)
+  const tamper = (f) => ({ onCall: (args) => { if (args[0] === "fill-home" && args[6] === "sessions") f(list(ref.w, ref.id, "home")); } });
+  const rows = {
+    "a byte changed": (p) => { const b = readFileSync(p); b[b.length - 3] ^= 1; writeFileSync(p, b); },
+    "truncated": (p) => writeFileSync(p, readFileSync(p).subarray(0, 20)),
+    "a well-formed substitute (the list of another tree)": (p) => writeFileSync(p, '{"v":1}\n{"count":0,"total_bytes":0}\n'),
+    "an extra line appended": (p) => writeFileSync(p, Buffer.concat([readFileSync(p), Buffer.from("\n")])),
+    // The tree changed after the fill AND the list replaced by the changed tree's own exact listing: well-formed and
+    // matching, so only the recorded hash catches it.
+    "a matching substitute for a changed tree": (p) => { writeFileSync(join(ref.w.dests.home, "a.txt"), "Z"); writeFileSync(p, listing(ref.w.dests.home)); },
+  };
+  for (const [what, f] of Object.entries(rows)) {
+    const id = newId();
+    const w = world("agent", tamper(f));
+    ref = { w, id };
+    const r = await w.fill("agent", id, planOf("agent", id));
+    assert.deepEqual([r.state, r.reason], ["failed", "bad_form"], what);
+  }
+  const id = newId();
+  const w = world("agent", tamper((p) => rmSync(p)));
+  ref = { w, id };
+  const r = await w.fill("agent", id, planOf("agent", id));
+  assert.deepEqual([r.state, r.reason], ["failed", "not_found"], "a missing list");
+  // A link planted in its place is never followed.
+  const id2 = newId();
+  const w2 = world("agent", tamper((p) => { const real = p + ".real"; renameSync(p, real); symlinkSync(real, p); }));
+  ref = { w: w2, id: id2 };
+  await assert.rejects(w2.fill("agent", id2, planOf("agent", id2)), (e) => e.code === "ELOOP");
+  assert.equal(readRecord("agent", id2, { dir: w2.dir }).state, "published", "never validated through a link");
+});
+
+test("validation: a malformed list fails even when the binary reported its exact hash (the format, not only the binding)", async () => {
+  const lines = (t) => t.split("\n").slice(0, -1);
+  const rows = {
+    "a duplicate path": (t) => { const l = lines(t); l.splice(2, 0, l[1]); return l.join("\n") + "\n"; },
+    "an extra field": (t) => t.replace('"type":"file"', '"type":"file","x":1'),
+    "the count off by one": (t) => t.replace(/"count":(\d+)/, (m, n) => `"count":${Number(n) + 1}`),
+    "the total off by one": (t) => t.replace(/"total_bytes":(\d+)/, (m, n) => `"total_bytes":${Number(n) + 1}`),
+    "no trailer": (t) => lines(t).slice(0, -1).join("\n") + "\n",
+    "no header": (t) => lines(t).slice(1).join("\n") + "\n",
+    "out of order": (t) => { const l = lines(t); [l[1], l[2]] = [l[2], l[1]]; return l.join("\n") + "\n"; },
+    "a set-id mode in the expected list": (t) => t.replace(/"mode":420/, '"mode":2468'),
+    "a blank line": (t) => t.replace("\n", "\n\n"),
+    "JSON.stringify's quoting": (t) => t.replace('"a.txt"', '"a\\u002etxt"'),
+    "an observed-only key": (t) => t.replace(/("sha256":"[0-9a-f]{64}")/, '$1,"copy":"x.db"'),
+  };
+  for (const [what, f] of Object.entries(rows)) {
+    await failedAs({ listOf: (cls, t) => (cls === "home" ? f(t) : t) }, "bad_form", what);
+  }
+});
+
+test("validation subtracts exactly the manifest's unrestorable entries and fill's refused subtrees; nothing else is excused", async () => {
+  // The manifest's unrestorable b.txt, absent after the fill: validated. Another omission besides it: failed.
+  const gone = (...names) => (cls, d) => { if (cls === "home") for (const n of names) rmSync(join(d, n), { recursive: true }); };
+  assert.equal((await settle({ unrestorable: (c) => (c === "home" ? ["b.txt"] : []), beforeDigest: gone("b.txt") })).r.state, "validated");
+  await failedAs({ unrestorable: (c) => (c === "home" ? ["b.txt"] : []), beforeDigest: gone("b.txt", "a.txt") }, "bad_form", "an additional omission");
+  await failedAs({ unrestorable: (c) => (c === "home" ? ["b.txt"] : []) }, "bad_form", "an unrestorable entry that is present anyway");
+  await failedAs({ unrestorable: (c) => (c === "home" ? ["nope"] : []) }, "bad_form", "an unrestorable path the list doesn't hold");
+  // fill refused a directory (another owner's) with 2 files: entries 3, the directory itself included (A2 r3.9).
+  const seed = (cls, d) => { if (cls === "home") { mkdirSync(join(d, "x%é")); writeFileSync(join(d, "x%é", "1"), "1"); writeFileSync(join(d, "x%é", "2"), "2"); } };
+  const refusedDir = (entries, path = "x%25é") => ({ seed, beforeDigest: gone("x%é"), report: (c) => (c === "home" ? { refused: [{ path, uid: 0, gid: 0, entries }] } : {}) });
+  assert.equal((await settle(refusedDir(3))).r.state, "validated", "the refused subtree, by its encoded path");
+  for (const n of [2, 4, 0]) await failedAs(refusedDir(n), "bad_form", `a refused directory counted ${n}`);
+  // A refused path not in the codec's form ("%" unencoded): fill's line isn't the closed shape, so every attempt is
+  // unusable, and the set fails once they are spent; never validated.
+  const raw = await settle(refusedDir(3, "x%é"));
+  assert.deepEqual([raw.r.state, raw.r.reason, raw.r.attempt], ["failed", "outcome_unknown", MAX_ATTEMPTS]);
+  // The subtree is matched on path + "/": a neighbour sharing the prefix ("x%é2", "x%é.txt") is not excused.
+  const neighbours = (cls, d) => { seed(cls, d); if (cls === "home") { writeFileSync(join(d, "x%é2"), "n"); writeFileSync(join(d, "x%é.txt"), "n"); } };
+  assert.equal((await settle({ ...refusedDir(3), seed: neighbours })).r.state, "validated", "the neighbours stay, compared as placed");
+  await failedAs({ ...refusedDir(3), seed: neighbours, beforeDigest: gone("x%é", "x%é2") }, "bad_form", "a neighbour missing is not excused");
+  // A refused empty directory is entries 1.
+  const empty = (entries) => ({ seed: (c, d) => { if (c === "home") mkdirSync(join(d, "e")); }, beforeDigest: gone("e"), report: (c) => (c === "home" ? { refused: [{ path: "e", uid: 0, gid: 0, entries }] } : {}) });
+  assert.equal((await settle(empty(1))).r.state, "validated");
+  await failedAs(empty(0), "bad_form", "a refused empty directory counted 0");
+  // Exactly 1000 refused entries (the report's bound) still validate; 1001 can't be reported (the line row, below).
+  const many = Array.from({ length: 1000 }, (_, i) => `r${String(i).padStart(4, "0")}`);
+  const thousand = await settle({
+    seed: (c, d) => { if (c === "home") for (const n of many) writeFileSync(join(d, n), ""); },
+    beforeDigest: (c, d) => { if (c === "home") for (const n of many) rmSync(join(d, n)); },
+    report: (c) => (c === "home" ? { refused: many.map((path) => ({ path, uid: 0, gid: 0, entries: 1 })) } : {}),
+  });
+  assert.equal(thousand.r.state, "validated", "1000 refused");
+  await failedAs(refusedDir(3, "y"), "bad_form", "a refused path the list doesn't hold");
+  // ... even when nothing else differs (fill names an entry the backup never had).
+  await failedAs({ report: (c) => (c === "home" ? { refused: [{ path: "y", uid: 0, gid: 0, entries: 1 }] } : {}) }, "bad_form", "only an unknown refused path");
+  // A refused file is entries 1; refused, yet present in the destination, is extra.
+  const file = (entries, keep = false) => ({ beforeDigest: keep ? undefined : gone("a.txt"), report: (c) => (c === "home" ? { refused: [{ path: "a.txt", uid: 0, gid: 0, entries }] } : {}) });
+  assert.equal((await settle(file(1))).r.state, "validated");
+  await failedAs(file(0), "bad_form", "a refused file counted 0");
+  await failedAs(file(1, true), "bad_form", "a refused file that is placed anyway");
+  // A report that is truncated, or lists anything unexpected, is never excused.
+  await failedAs({ report: (c) => (c === "home" ? { truncated: true } : {}) }, "bad_form", "a truncated report");
+  await failedAs({ report: (c) => (c === "sessions" ? { unexpected: [{ path: "p", type: "fifo" }] } : {}) }, "bad_form", "an unexpected entry in fill");
+});
+
+test("validation needs the set stopped and fenced; tree-digest's transient exits are retried a bounded number of times", async () => {
+  // Not stopped: nothing is validated or changed; the record stays published, its attempt kept.
+  const id = newId();
+  let stoppedNow = false;
+  const w = world("agent", { stopped: async () => stoppedNow });
+  await rejects(w.fill("agent", id, planOf("agent", id)), "not_granted");
+  assert.equal(readRecord("agent", id, { dir: w.dir }).state, "published");
+  assert.ok(!w.calls.some((a) => a[0] === "tree-digest"));
+  assert.ok(existsSync(attemptDir(w, id, "home")));
+  stoppedNow = true;
+  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "validated");
+  for (const v of [false, undefined, 1, "true"]) {
+    const i = newId(), x = world("agent", { stopped: async () => v });
+    await rejects(x.fill("agent", i, planOf("agent", i)), "not_granted");
+  }
+  // 75 (a read error mid-walk) twice, then 0: validated, the class listed three times.
+  let n = 0;
+  const flaky = await settle({ script: (op, cls) => (op === "tree-digest" && cls === "home" && ++n <= 2 ? EXIT.partial : 0) });
+  assert.equal(flaky.r.state, "validated");
+  assert.equal(flaky.w.calls.filter((a) => a[0] === "tree-digest" && a[6] === "home").length, 3);
+  // Transient every time: failed after DIGEST_TRIES, never re-staged.
+  const always = await failedAs({ script: (op, cls) => (op === "tree-digest" && cls === "home" ? EXIT.partial : 0) }, "outcome_unknown", "75 every time");
+  assert.equal(always.w.calls.filter((a) => a[0] === "tree-digest").length, 3);
+  // 74 (a stale copy directory): removed before each sessions listing, so a leftover from a crash is cleared.
+  const left = await settle({ seed: () => {}, onCall: () => {} });
+  assert.equal(left.r.state, "validated");
+  const id3 = newId();
+  const w3 = world("agent", { onCall: (args) => { if (args[0] === "tree-digest" && args[6] === "home") mkdirSync(join(w3.base, "copies", RUN, `a-${id3}`), { recursive: true }); } });
+  assert.equal((await w3.fill("agent", id3, planOf("agent", id3))).state, "validated", "a leftover copy directory removed first");
+  // Usage or limit (64) is bad_form; the root guard, an identity or anything else is outcome_unknown.
+  await failedAs({ script: (op) => (op === "tree-digest" ? 64 : 0) }, "bad_form", "64");
+  for (const code of [66, 72, 73]) await failedAs({ script: (op) => (op === "tree-digest" ? code : 0) }, "outcome_unknown", String(code));
+  // The destination is not the one the record names (another object now): failed before tree-digest runs.
+  let asked = 0; // (the fill identifies each class once; validation's second look at sessions finds another object)
+  const moved = await failedAs({ identify: (cls, o) => (cls === "sessions" && ++asked === 2 ? { ...o, ino: o.ino + 1 } : o) }, "outcome_unknown", "another destination");
+  assert.ok(!moved.w.calls.some((a) => a[0] === "tree-digest" && a[6] === "sessions"));
+});
+
+test("validation: tree-digest gets its scope (unit, MemoryMax=1G, the deadline); no listing is a failure", async () => {
+  const id = newId();
+  const scopes = [];
+  const w = world("agent");
+  const fill = restoreFiller({
+    launch: async (args, opts) => { if (args[0] === "tree-digest") scopes.push(opts.scope); return { code: 1, stdout: "", stderr: "" }; },
+    mount: "/srv/sagebrush", identifyDest: async () => ({}), expectOf: async () => "x", projidOf: () => 70000, cleanDest: async () => {},
+    discardStaging: async () => {}, stopped: async () => true, unrestorableOf: () => [], removeCopies: async () => {}, dir: w.dir, root: w.stage, validateSeconds: 900,
+  });
+  // (a published record, reached through the real world's fill, then validated by the scoped launcher)
+  const ww = world("agent", { stopped: async () => false });
+  await rejects(ww.fill("agent", id, planOf("agent", id)), "not_granted");
+  const scoped = restoreFiller({
+    launch: async (args, opts) => { scopes.push([args[0], opts.scope]); return { code: 1, stdout: "", stderr: "" }; },
+    mount: "/srv/sagebrush", identifyDest: async (k, i, cls) => ({ epoch: { boot_id: "00000000-0000-4000-8000-000000000000", mnt_id: 7 }, fsid: "0123456789abcdef", object: { type: "dir", mode: 0o700, uid: 70000, gid: 70000, dev: [8, 1], ino: statSync(ww.dests[cls]).ino, gen: 1, mnt_id: 7, projid: 70000, inherit: true } }),
+    expectOf: async () => "x", projidOf: () => 70000, cleanDest: async () => {}, discardStaging: async () => {}, stopped: async () => true,
+    unrestorableOf: () => [], removeCopies: async () => {}, dir: ww.dir, root: ww.stage, validateSeconds: 900,
+  });
+  const r = await scoped("agent", id, planOf("agent", id));
+  assert.deepEqual([r.state, r.reason], ["failed", "outcome_unknown"]);
+  assert.deepEqual(scopes, [["tree-digest", { unit: `sagebrush-validate-a-${id}.scope`, memoryMax: "1G", runtimeMaxSec: 900 }]]);
+  void fill;
+});
+
+test("validation: a crash at any point repeats it against the same recorded hashes and attempt; never a false validated", async () => {
+  // Killed during validation (in each class's tree-digest): published, the attempt kept; the next call validates.
+  for (const at of ["home", "sessions"]) {
+    let crash = true;
+    const id = newId();
+    const w = world("agent", { onCall: (args) => { if (args[0] === "tree-digest" && args[6] === at && crash) { crash = false; throw Object.assign(new Error("killed"), { code: "EIO" }); } } });
+    await assert.rejects(w.fill("agent", id, planOf("agent", id)), /killed/);
+    const mid = readRecord("agent", id, { dir: w.dir });
+    assert.equal(mid.state, "published", at);
+    assert.ok(existsSync(join(attemptDir(w, id, "home"), "data", "digests.json")), `${at}: the lists survive until validated`);
+    const r = await w.fill("agent", id, planOf("agent", id));
+    assert.deepEqual([r.state, r.attempt, r.digests], ["validated", 1, mid.digests], at);
+    assert.equal(w.calls.filter((a) => a[0] === "restore-stage").length, 2, `${at}: not re-staged`);
+  }
+  // Killed right after published was written (before validation began): the same.
+  let crash = true;
+  const id = newId();
+  const w = world("agent", { stopped: async () => { if (crash) { crash = false; throw new Error("killed"); } return true; } });
+  await assert.rejects(w.fill("agent", id, planOf("agent", id)), /killed/);
+  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "validated");
+  // The tree changed between the crash and the retry: the retry fails it (the same hashes, the same list).
+  let crash2 = true, broken = false;
+  const id2 = newId();
+  const w2 = world("agent", { onCall: (args) => { if (args[0] === "tree-digest" && crash2) { crash2 = false; throw new Error("killed"); } },
+    beforeDigest: (cls, d) => { if (broken && cls === "home") writeFileSync(join(d, "a.txt"), "Z"); } });
+  await assert.rejects(w2.fill("agent", id2, planOf("agent", id2)), /killed/);
+  broken = true;
+  assert.deepEqual((await w2.fill("agent", id2, planOf("agent", id2))).state, "failed");
+  // A fill report lost with the crash (removed by hand here): never validated without it.
+  const id3 = newId();
+  let once = true;
+  const w3 = world("agent", { onCall: (args) => { if (args[0] === "fill-home" && args[6] === "sessions" && once) { once = false; rmSync(join(w3.dir, `agent-${id3}.home.fill.json`)); } } });
+  const r3 = await w3.fill("agent", id3, planOf("agent", id3));
+  assert.deepEqual([r3.state, r3.reason], ["failed", "not_found"]);
+});
+
+test("restore-stage's and fill-home's lines: exactly the closed success shapes, else the attempt is unusable (a retry)", async () => {
+  const good = (t) => t;
+  const stageRows = {
+    "another snapshot": (t) => t.replace(SNAP, "b".repeat(64)),
+    "no digests_sha256": (t) => t.replace(/,"digests_sha256":"[0-9a-f]{64}"/, ""),
+    "an extra key": (t) => t.replace("}\n", ',"x":1}\n'),
+    "upper-case hex": (t) => t.replace(/"digests_sha256":"([0-9a-f]{64})"/, (m, h) => `"digests_sha256":"${h.toUpperCase()}"`),
+    "ok false": (t) => t.replace('"ok":true', '"ok":false'),
+    "two lines": (t) => t + t,
+    "no newline": (t) => t.slice(0, -1),
+    "empty": () => "",
+  };
+  for (const [what, f] of Object.entries(stageRows)) {
+    let first = true;
+    const { r, w } = await settle({ stdout: (op, cls, t) => (op === "restore-stage" && cls === "sessions" && first ? ((first = false), f(t)) : good(t)) });
+    assert.deepEqual([r.state, r.attempt], ["validated", 2], what);
+    assert.ok(!w.calls.some((a) => a[0] === "fill-home" && a[10] === "1"), `${what}: attempt 1 never filled`);
+  }
+  const fillRows = {
+    "no placed": (t) => t.replace(/"placed":\{[^}]*\},/, ""),
+    "a refused path absolute": (t) => t.replace('"refused":[]', '"refused":[{"path":"/x","uid":0,"gid":0,"entries":1}]'),
+    "an unknown special type": (t) => t.replace('"unexpected":[]', '"unexpected":[{"path":"x","type":"door"}]'),
+    "truncated not a boolean": (t) => t.replace('"truncated":false', '"truncated":0'),
+    "1001 refused": (t) => t.replace('"refused":[]', `"refused":[${Array.from({ length: 1001 }, (_, i) => `{"path":"f${i}","uid":0,"gid":0,"entries":1}`).join(",")}]`),
+  };
+  for (const [what, f] of Object.entries(fillRows)) {
+    let first = true;
+    const { r } = await settle({ stdout: (op, cls, t) => (op === "fill-home" && cls === "home" && first ? ((first = false), f(t)) : t) });
+    assert.deepEqual([r.state, r.attempt], ["validated", 2], what);
+  }
+});
+
+test("validation of sessions: each SQLite database's private copy passes quick_check; corruption, an omitted or changed copy fail", async (t) => {
+  let sqlite;
+  try { sqlite = await import("node:sqlite"); } catch { return t.skip("node:sqlite is unavailable"); }
+  const make = (path, { wal = false } = {}) => {
+    const db = new sqlite.DatabaseSync(path);
+    db.exec(`PRAGMA journal_mode=${wal ? "WAL" : "DELETE"}; PRAGMA wal_autocheckpoint=0; CREATE TABLE t (k INTEGER PRIMARY KEY, v TEXT); CREATE INDEX tv ON t (v);`);
+    const ins = db.prepare("INSERT INTO t (v) VALUES (?)");
+    db.exec("BEGIN");
+    for (let i = 0; i < 2000; i++) ins.run(`row ${i} ${"x".repeat(50)}`);
+    db.exec("COMMIT");
+    return db;
+  };
+  // A session store with a plain database and a WAL one, copied as the backup holds them (main and -wal).
+  const src = mkdtempSync(join(tmpdir(), "sb-sess-"));
+  make(join(src, "plain.db")).close();
+  const live = make(join(src, "live.db"), { wal: true });
+  live.exec("BEGIN");
+  for (let i = 0; i < 300; i++) live.prepare("INSERT INTO t (v) VALUES (?)").run(`late ${i}`);
+  live.exec("COMMIT");
+  const files = { "plain.db": readFileSync(join(src, "plain.db")), "live.db": readFileSync(join(src, "live.db")), "live.db-wal": readFileSync(join(src, "live.db-wal")) };
+  live.close();
+  const seedWith = (over = {}) => (cls, d) => { if (cls === "sessions") for (const [n, b] of Object.entries({ ...files, ...over })) writeFileSync(join(d, n), b); };
+  const opts = (o = {}) => ({ seed: seedWith(o.over), skipCopy: o.skipCopy, afterCopy: o.afterCopy });
+  // Sound: validated; the copies were made and removed.
+  const ok = await settle(opts());
+  assert.equal(ok.r.state, "validated");
+  // Corruption already in the backup (so the list matches the tree): quick_check catches it.
+  const bad = Buffer.from(files["plain.db"]);
+  for (let i = bad.length - 8192; i < bad.length - 4096; i++) bad[i] = 0x5a;
+  await failedAs(opts({ over: { "plain.db": bad } }), "bad_form", "a corrupt database");
+  // An omitted sidecar copy: refused by completeness, though the main alone would pass.
+  await failedAs(opts({ skipCopy: (p) => p === "live.db-wal" }), "bad_form", "an omitted -wal copy");
+  // A copy whose bytes aren't its entry's: refused before SQLite opens it.
+  await failedAs(opts({ afterCopy: (dir, names) => { const p = join(dir, names.get("live.db-wal")); const b = readFileSync(p); b[200] ^= 1; writeFileSync(p, b); } }), "bad_form", "a changed copy");
+  // A damaged WAL in the destination (a fill fault): the hash compare fails it, whatever SQLite would replay.
+  await failedAs({ ...opts(), beforeDigest: (cls, d) => { if (cls === "sessions") { const b = readFileSync(join(d, "live.db-wal")); b[40] ^= 1; writeFileSync(join(d, "live.db-wal"), b); } } }, "bad_form", "a damaged WAL in the destination");
 });

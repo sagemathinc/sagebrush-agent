@@ -45,6 +45,32 @@ fn tmpdir(tag: &str) -> PathBuf {
     d
 }
 
+/// A restore's place, as the launcher lays out an attempt: `<attempt>/data` to restore into, and the digest list's
+/// `<attempt>/digests.json` beside it (launcher contract A2 r3.8.2).
+fn staged(tag: &str) -> (PathBuf, PathBuf) {
+    let base = tmpdir(tag);
+    let dst = base.join("data");
+    fs::create_dir(&dst).unwrap();
+    (dst, base.join("digests.json"))
+}
+
+/// The digest list a restore wrote: present, and the very file its result names by SHA-256.
+fn digests_of(r: &Value, dig: &Path) -> String {
+    let bytes = fs::read(dig).expect("the digest list is written");
+    let h: String = sha2_hex(&bytes);
+    assert_eq!(r["digests_sha256"].as_str(), Some(h.as_str()), "the result names the file's hash: {r}");
+    String::from_utf8(bytes).unwrap()
+}
+
+fn sha2_hex(b: &[u8]) -> String {
+    let out = Command::new("sha256sum").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().and_then(|mut c| {
+        use std::io::Write as _;
+        c.stdin.take().unwrap().write_all(b)?;
+        c.wait_with_output()
+    }).unwrap();
+    String::from_utf8(out.stdout).unwrap().split_whitespace().next().unwrap().to_string()
+}
+
 fn write_private(p: &Path, data: &str) {
     fs::write(p, data).unwrap();
     fs::set_permissions(p, fs::Permissions::from_mode(0o600)).unwrap();
@@ -375,9 +401,11 @@ fn rows() {
     let src_ext = extents(&f);
     let sb = run(&h, json!({ "op": "backup", "sources": [sp], "host": "h1" }));
     assert!(sb["snapshot"]["summary"]["data_added_packed"].as_u64().unwrap() < 1 << 20, "holes aren't stored: {sb}");
-    let dst = tmpdir("restore");
-    let r = run(&h, json!({ "op": "restore", "snapshot": snapshot_id(&sb), "dest": dst }));
+    let (dst, dig) = staged("restore");
+    let r = run(&h, json!({ "op": "restore", "snapshot": snapshot_id(&sb), "dest": dst, "digests": dig }));
     assert_eq!(r["ok"], true, "{r}");
+    let list = digests_of(&r, &dig);
+    assert!(list.starts_with("{\"v\":1}\n") && list.contains("s.bin\",\"type\":\"file\",\"size\":1073741824,"), "the sparse file is listed by its full size");
     let got = fs::read_dir(&dst).unwrap().count();
     assert!(got > 0);
     let restored = walk_find(&dst, "s.bin").expect("s.bin restored");
@@ -515,8 +543,8 @@ fn full_ids_survive_a_shared_prefix() {
     let path_a = format!("{}/which", a.to_str().unwrap().trim_start_matches('/'));
     let d = run(&h, json!({ "op": "dump", "snapshot": sa, "path": path_a }));
     assert_eq!(d["text"], "snapshot A", "dump keeps A: {d}");
-    let dst = tmpdir("prefix-dst");
-    let r = run(&h, json!({ "op": "restore", "snapshot": sa, "dest": dst }));
+    let (dst, dig) = staged("prefix-dst");
+    let r = run(&h, json!({ "op": "restore", "snapshot": sa, "dest": dst, "digests": dig }));
     assert_eq!(r["ok"], true, "restore of A by its full id: {r}");
     assert_eq!(fs::read(walk_find(&dst, "which").unwrap()).unwrap(), b"snapshot A", "restore keeps A");
     // and the twin, by its own full id, is B's tree
@@ -549,9 +577,11 @@ fn restore_skips_specials_and_attributes() {
     }
     let b = run(&h, json!({ "op": "backup", "sources": [src], "host": "h1" }));
     assert_eq!(b["ok"], true, "{b}");
-    let dst = tmpdir("special-dst");
-    let r = run(&h, json!({ "op": "restore", "snapshot": snapshot_id(&b), "dest": dst }));
+    let (dst, dig) = staged("special-dst");
+    let r = run(&h, json!({ "op": "restore", "snapshot": snapshot_id(&b), "dest": dst, "digests": dig }));
     assert_eq!(r["ok"], true, "{r}");
+    let list = digests_of(&r, &dig);
+    assert!(!list.contains("pipe") && !list.contains("sock"), "the skipped specials aren't listed: {list}");
     assert_eq!(r["skipped_special"], 2, "the FIFO and the socket: {r}");
     assert!(walk_find(&dst, "pipe").is_none() && walk_find(&dst, "sock").is_none(), "no special file restored");
     let plain = walk_find(&dst, "plain").expect("the regular file is restored");
@@ -610,8 +640,8 @@ fn usage_bounds_a_restore() {
     // Without reading data it can't know the holes: the bound covers the whole 1 GiB.
     assert!(bound >= (1 << 30) / 4096, "{u}");
     // The restore of the same path, measured.
-    let dst = tmpdir("usage-dst");
-    let r = run(&h, json!({ "op": "restore", "snapshot": snapshot_id(&b), "path": path, "dest": dst }));
+    let (dst, dig) = staged("usage-dst");
+    let r = run(&h, json!({ "op": "restore", "snapshot": snapshot_id(&b), "path": path, "dest": dst, "digests": dig }));
     assert_eq!(r["ok"], true, "{r}");
     let (mut blocks, mut inodes, mut seen) = (0u64, 0u64, std::collections::HashSet::new());
     let mut stack = vec![dst.clone()];
@@ -677,9 +707,9 @@ fn restore_runs_without_proc() {
     fs::write(src.join("f"), b"no proc").unwrap();
     let b = run(&h, json!({ "op": "backup", "sources": [src], "host": "h1" }));
     assert_eq!(b["ok"], true, "{b}");
-    let dst = tmpdir("noproc-dst");
+    let (dst, dig) = staged("noproc-dst");
     let setup = "mount -t tmpfs -o ro,nosuid,nodev,noexec,size=4k none /proc";
-    let r = restore_in_namespace(&h, setup, json!({ "op": "restore", "snapshot": snapshot_id(&b), "dest": dst }));
+    let r = restore_in_namespace(&h, setup, json!({ "op": "restore", "snapshot": snapshot_id(&b), "dest": dst, "digests": dig }));
     assert_eq!(r["ok"], true, "{r}");
     assert_eq!(fs::read(walk_find(&dst, "f").expect("restored")).unwrap(), b"no proc");
 }
@@ -704,9 +734,9 @@ fn restore_reports_a_full_or_quota_limited_target() {
     let b = run(&h, json!({ "op": "backup", "sources": [src], "host": "h1" }));
     assert_eq!(b["ok"], true, "{b}");
     for (options, want) in [("size=256k", "no_space"), ("size=64m,usrquota,usrquota_block_hardlimit=256k", "quota_exceeded")] {
-        let dst = tmpdir("space-dst");
+        let (dst, dig) = staged("space-dst");
         let setup = format!("mount -t tmpfs -o mode=0777,nosuid,nodev,{options} none '{}'", dst.display());
-        let r = restore_in_namespace(&h, &setup, json!({ "op": "restore", "snapshot": snapshot_id(&b), "dest": dst }));
+        let r = restore_in_namespace(&h, &setup, json!({ "op": "restore", "snapshot": snapshot_id(&b), "dest": dst, "digests": dig }));
         assert_eq!(r["ok"], false, "{options}: {r}");
         assert_eq!(code(&r), want, "{options}: {r}");
     }
@@ -721,11 +751,11 @@ fn restore_refused_with_sys_resource() {
         eprintln!("note: CAP_SYS_RESOURCE isn't in this environment's bounding set; the refusal row runs on CI");
         return;
     }
-    let dst = tmpdir("capdst");
+    let (dst, dig) = staged("capdst");
     let base = tmpdir("caphost");
     let r = run_direct(
         &Host { state: base.clone(), secrets: base.clone(), cache: base.join("c"), prefix: "unused".into() },
-        json!({ "op": "restore", "snapshot": "a".repeat(64), "dest": dst }),
+        json!({ "op": "restore", "snapshot": "a".repeat(64), "dest": dst, "digests": dig }),
     );
     assert_eq!(code(&r), "capability_refused", "{r}");
     assert!(r["error"]["message"].as_str().unwrap().contains("CapBnd"), "{r}");

@@ -1,0 +1,203 @@
+{
+ "$comment": "Launcher contract A2 r3.8.2 §4b: each row's exact line (without its newline), from raw bytes. Rendered by the backup binary (digests.rs), the launcher (tree-digest's render) and parsed by validate.mjs; made by an independent generator.",
+ "rows": [
+  {
+   "name": "plain",
+   "type": "file",
+   "raw_path_hex": "612f62",
+   "size": 1,
+   "mode": 416,
+   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+   "valid": true,
+   "line": "{\"path\":\"a/b\",\"type\":\"file\",\"size\":1,\"mode\":416,\"sha256\":\"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b\"}"
+  },
+  {
+   "name": "a newline",
+   "type": "file",
+   "raw_path_hex": "610a62",
+   "size": 1,
+   "mode": 416,
+   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+   "valid": true,
+   "line": "{\"path\":\"a\\u000ab\",\"type\":\"file\",\"size\":1,\"mode\":416,\"sha256\":\"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b\"}"
+  },
+  {
+   "name": "a tab, U+0001 and U+001F",
+   "type": "file",
+   "raw_path_hex": "74097501761f77",
+   "size": 1,
+   "mode": 416,
+   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+   "valid": true,
+   "line": "{\"path\":\"t\\u0009u\\u0001v\\u001fw\",\"type\":\"file\",\"size\":1,\"mode\":416,\"sha256\":\"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b\"}"
+  },
+  {
+   "name": "a quote and a backslash",
+   "type": "file",
+   "raw_path_hex": "7122725c73",
+   "size": 1,
+   "mode": 416,
+   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+   "valid": true,
+   "line": "{\"path\":\"q\\\"r\\\\s\",\"type\":\"file\",\"size\":1,\"mode\":416,\"sha256\":\"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b\"}"
+  },
+  {
+   "name": "a percent sign",
+   "type": "file",
+   "raw_path_hex": "31303025",
+   "size": 1,
+   "mode": 416,
+   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+   "valid": true,
+   "line": "{\"path\":\"100%25\",\"type\":\"file\",\"size\":1,\"mode\":416,\"sha256\":\"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b\"}"
+  },
+  {
+   "name": "DEL",
+   "type": "file",
+   "raw_path_hex": "647f65",
+   "size": 1,
+   "mode": 416,
+   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+   "valid": true,
+   "line": "{\"path\":\"de\",\"type\":\"file\",\"size\":1,\"mode\":416,\"sha256\":\"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b\"}"
+  },
+  {
+   "name": "U+2028",
+   "type": "file",
+   "raw_path_hex": "6ce280a86d",
+   "size": 1,
+   "mode": 416,
+   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+   "valid": true,
+   "line": "{\"path\":\"l m\",\"type\":\"file\",\"size\":1,\"mode\":416,\"sha256\":\"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b\"}"
+  },
+  {
+   "name": "non-ASCII and supplementary",
+   "type": "file",
+   "raw_path_hex": "c3a9f09f9880",
+   "size": 1,
+   "mode": 416,
+   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+   "valid": true,
+   "line": "{\"path\":\"é😀\",\"type\":\"file\",\"size\":1,\"mode\":416,\"sha256\":\"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b\"}"
+  },
+  {
+   "name": "an invalid byte",
+   "type": "file",
+   "raw_path_hex": "78ff79",
+   "size": 1,
+   "mode": 416,
+   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+   "valid": true,
+   "line": "{\"path\":\"x%FFy\",\"type\":\"file\",\"size\":1,\"mode\":416,\"sha256\":\"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b\"}"
+  },
+  {
+   "name": "a truncated sequence",
+   "type": "file",
+   "raw_path_hex": "7ae282",
+   "size": 1,
+   "mode": 416,
+   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+   "valid": true,
+   "line": "{\"path\":\"z%E2%82\",\"type\":\"file\",\"size\":1,\"mode\":416,\"sha256\":\"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b\"}"
+  },
+  {
+   "name": "an overlong encoding",
+   "type": "file",
+   "raw_path_hex": "6fc080",
+   "size": 1,
+   "mode": 416,
+   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+   "valid": true,
+   "line": "{\"path\":\"o%C0%80\",\"type\":\"file\",\"size\":1,\"mode\":416,\"sha256\":\"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b\"}"
+  },
+  {
+   "name": "an encoded surrogate",
+   "type": "file",
+   "raw_path_hex": "73eda080",
+   "size": 1,
+   "mode": 416,
+   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+   "valid": true,
+   "line": "{\"path\":\"s%ED%A0%80\",\"type\":\"file\",\"size\":1,\"mode\":416,\"sha256\":\"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b\"}"
+  },
+  {
+   "name": "set-id cleared (EXPECTED mode)",
+   "type": "file",
+   "raw_path_hex": "62696e",
+   "size": 1,
+   "mode": 493,
+   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+   "valid": true,
+   "line": "{\"path\":\"bin\",\"type\":\"file\",\"size\":1,\"mode\":493,\"sha256\":\"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b\"}"
+  },
+  {
+   "name": "an empty file",
+   "type": "file",
+   "raw_path_hex": "65",
+   "size": 0,
+   "mode": 416,
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "valid": true,
+   "line": "{\"path\":\"e\",\"type\":\"file\",\"size\":0,\"mode\":416,\"sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}"
+  },
+  {
+   "name": "a directory",
+   "type": "dir",
+   "raw_path_hex": "646972",
+   "size": 0,
+   "mode": 488,
+   "valid": true,
+   "line": "{\"path\":\"dir\",\"type\":\"dir\",\"size\":0,\"mode\":488}"
+  },
+  {
+   "name": "a setgid directory as fill leaves it",
+   "type": "dir",
+   "raw_path_hex": "736861726564",
+   "size": 0,
+   "mode": 488,
+   "valid": true,
+   "line": "{\"path\":\"shared\",\"type\":\"dir\",\"size\":0,\"mode\":488}"
+  },
+  {
+   "name": "a symlink",
+   "type": "symlink",
+   "raw_path_hex": "6c",
+   "raw_target_hex": "2e2e2f612f62",
+   "size": 6,
+   "mode": 511,
+   "valid": true,
+   "line": "{\"path\":\"l\",\"type\":\"symlink\",\"size\":6,\"mode\":511,\"target\":\"../a/b\"}"
+  },
+  {
+   "name": "a non-UTF-8 symlink target",
+   "type": "symlink",
+   "raw_path_hex": "6c74",
+   "raw_target_hex": "74fe",
+   "size": 2,
+   "mode": 511,
+   "valid": true,
+   "line": "{\"path\":\"lt\",\"type\":\"symlink\",\"size\":2,\"mode\":511,\"target\":\"t%FE\"}"
+  },
+  {
+   "name": "a target with a percent",
+   "type": "symlink",
+   "raw_path_hex": "6c70",
+   "raw_target_hex": "353025",
+   "size": 3,
+   "mode": 511,
+   "valid": true,
+   "line": "{\"path\":\"lp\",\"type\":\"symlink\",\"size\":3,\"mode\":511,\"target\":\"50%25\"}"
+  },
+  {
+   "name": "an empty target",
+   "type": "symlink",
+   "raw_path_hex": "6c65",
+   "raw_target_hex": "",
+   "size": 0,
+   "mode": 511,
+   "valid": false,
+   "line": "{\"path\":\"le\",\"type\":\"symlink\",\"size\":0,\"mode\":511,\"target\":\"\"}"
+  }
+ ]
+}

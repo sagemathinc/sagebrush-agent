@@ -9,6 +9,7 @@
 
 mod caps;
 mod config;
+mod digests;
 mod error;
 mod logcap;
 mod ops;

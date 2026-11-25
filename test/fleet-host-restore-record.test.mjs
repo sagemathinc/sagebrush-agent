@@ -14,7 +14,8 @@ import { RESTORE_DIR, RESTORE_STAGING, fenceFiles } from "../lib/fleet/host/name
 import { realIo } from "../lib/fleet/host/store.mjs";
 import {
   CLASSES, FAILED_REASONS, KINDS, MAX_ATTEMPTS, RESTORE_RUN, STATES, checkRecord, markerPath, newRecord, newRestoreRun, ownerOf,
-  readMarker, readRecord, recordName, recoveryStep, restoreReady, retryRecord, runTime, stagingDir, stagingName, step, writeRecord,
+  readMarker, readRecord, recordName, recoveryStep, restoreReady, retryRecord, runTime, stagingDir, stagingName, step as rawStep,
+  writeRecord, digestsWhole, checkFillReport, readFillReport, writeFillReport,
 } from "../lib/fleet/host/restore-record.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
@@ -24,6 +25,12 @@ const RUN = newRestoreRun(T1, () => Buffer.alloc(6)), RUN2 = newRestoreRun(T1 + 
 const SNAP = "a".repeat(64), SNAP2 = "b".repeat(64);
 const DEST = { home: { dev: "2049", ino: "131" }, sessions: { dev: "2049", ino: "132" } };
 const fresh = () => mkdtempSync(join(tmpdir(), "sb-restore-"));
+/** A class's digest list hash, as its restore-stage would report it (distinct per class and attempt). */
+const H = (r, cls) => String(CLASSES[r.kind].indexOf(cls) + 1).repeat(2) + r.attempt + "f".repeat(61);
+/** Every class's hash not yet recorded, recorded (the "digest" step), as a whole staging records them. */
+const dig = (r) => CLASSES[r.kind].reduce((x, c) => (x.digests !== null && Object.hasOwn(x.digests, c) ? x : rawStep(x, "digest", { cls: c, sha256: H(x, c) })), r);
+/** The steps, where reaching staged first records every class's hash (as the fill does). */
+const step = (r, to, o) => (to === "staged" && !r.dirty && r.state === "staging" && !digestsWhole(r) ? rawStep(dig(r), "staged", o) : rawStep(r, to, o));
 
 /** A record in `state`, reached by the steps themselves (never hand-built), for kind "agent". */
 function at(state, { attempt = 1, id = newId() } = {}) {
@@ -116,7 +123,7 @@ test("restore runs: the launcher's 16 characters of [a-z2-7], ordered by their d
 test("the record's closed shape: a new record, and every invariant refused", () => {
   const id = newId();
   const r = newRecord({ kind: "agent", id, run: RUN, snapshot: SNAP });
-  assert.deepEqual(r, { v: 1, kind: "agent", id, run: RUN, snapshot: SNAP, attempt: 1, state: "staging", dest: null, dirty: false, reason: null });
+  assert.deepEqual(r, { v: 1, kind: "agent", id, run: RUN, snapshot: SNAP, attempt: 1, state: "staging", dest: null, digests: null, dirty: false, reason: null });
   const f = at("filling");
   const bad = [
     [r, { v: 2 }], [r, { kind: "host" }], [r, { id: "nope" }], [r, { run: "x" }], [r, { snapshot: "A".repeat(64) }],
@@ -224,13 +231,76 @@ test("a stop is restarted only by the person's new request: a new run, attempt 1
   assert.equal(retryRecord(at("failed"), { run: RUN2, snapshot: SNAP }).reason, null);
 });
 
+test("digest list hashes (A2 r3.8.3): recorded class by class while staging, once each; staged and after need all", () => {
+  const s = at("staging");
+  const h = rawStep(s, "digest", { cls: "home", sha256: H(s, "home") });
+  assert.deepEqual([h.state, h.digests], ["staging", { home: H(s, "home") }]);
+  refused(() => rawStep(h, "digest", { cls: "home", sha256: "e".repeat(64) }), "not_granted"); // never replaced
+  refused(() => rawStep(h, "staged"), "bad_form"); // sessions' hash is missing
+  refused(() => rawStep(s, "staged"), "bad_form");
+  const both = rawStep(h, "digest", { cls: "sessions", sha256: H(s, "sessions") });
+  assert.deepEqual(rawStep(both, "staged").digests, { home: H(s, "home"), sessions: H(s, "sessions") });
+  for (const [cls, sha256] of [["archive", H(s, "home")], ["tag", H(s, "home")], ["x", H(s, "home")], [undefined, H(s, "home")],
+    ["home", "A".repeat(64)], ["home", "a".repeat(63)], ["home", "a".repeat(65)], ["home", 7], ["home", undefined]]) {
+    refused(() => rawStep(s, "digest", { cls, sha256 }), "bad_form");
+  }
+  // Only while staging and not dirty: never after staged, never into a dirty attempt.
+  for (const st of ["staged", "filling", "published", "validated", "not_fitting", "failed"]) {
+    refused(() => rawStep(at(st), "digest", { cls: "home", sha256: H(s, "home") }), "not_granted");
+  }
+  refused(() => rawStep(step(at("filling"), "retry"), "digest", { cls: "home", sha256: H(s, "home") }), "not_granted");
+  // A new attempt (automatic or the person's) starts with none; a stop keeps them, a clean too.
+  assert.equal(step(both, "retry").digests, null);
+  assert.equal(step(at("filling"), "retry").digests, null);
+  assert.equal(retryRecord(step(at("filling"), "failed", { reason: "bad_form" }), { run: RUN2, snapshot: SNAP }).digests, null);
+  assert.deepEqual(step(at("published"), "failed", { reason: "bad_form" }).digests, at("published").digests);
+  // The shape: some of the kind's classes, each 64 lower-case hex; none is null, never {}.
+  for (const digests of [{}, { home: "A".repeat(64) }, { archive: "a".repeat(64) }, { home: "a".repeat(64), x: "a".repeat(64) }, [], "x", { home: null }]) {
+    refused(() => checkRecord({ ...s, digests }), "bad_form");
+  }
+  for (const st of ["staged", "filling", "published", "validated"]) {
+    refused(() => checkRecord({ ...at(st), digests: { home: H(s, "home") } }), "bad_form");
+    refused(() => checkRecord({ ...at(st), digests: null }), "bad_form");
+  }
+  const tg = newRecord({ kind: "tag", id: newId(), run: RUN, snapshot: SNAP });
+  refused(() => rawStep(tg, "digest", { cls: "home", sha256: H(s, "home") }), "bad_form");
+  assert.equal(rawStep(rawStep(tg, "digest", { cls: "tag", sha256: H(tg, "tag") }), "staged").state, "staged");
+});
+
+test("fill reports: bound to the run, attempt and class; paths in A2 §4b's codec; at most 1000 per list", () => {
+  const dir = join(fresh(), "restore");
+  const r1 = at("filling");
+  const rep = { refused: [{ path: "x%25%FF/y", uid: 1, gid: 2, entries: 1 }], unexpected: [{ path: "p", type: "fifo" }], truncated: false };
+  writeFillReport(r1, "home", rep, { dir });
+  assert.deepEqual(readFillReport(r1, "home", { dir }), { v: 1, run: r1.run, attempt: 1, cls: "home", ...rep });
+  assert.equal(readFillReport(r1, "sessions", { dir }), null, "another class's");
+  const r2 = step(r1, "retry");
+  assert.equal(readFillReport(r2, "home", { dir }), null, "another attempt's report is never used");
+  assert.equal(readFillReport({ ...r1, run: RUN2 }, "home", { dir }), null, "another run's");
+  writeFileSync(join(dir, `agent-${r1.id}.home.fill.json`), "{");
+  refused(() => readFillReport(r1, "home", { dir }), "bad_form");
+  const base = { v: 1, run: RUN, attempt: 1, cls: "home", refused: [], unexpected: [], truncated: false };
+  const one = (path) => ({ ...base, refused: [{ path, uid: 0, gid: 0, entries: 1 }] });
+  for (const path of ["x%25", "%FF", "a/b", "x%E2%82", "\u00e9"]) checkFillReport(one(path));
+  for (const path of ["x%", "x%2", "%ff", "%41", "/a", "a/", "a//b", ".", "a/..", "", "a\u0000b", "x".repeat(4097)]) refused(() => checkFillReport(one(path)), "bad_form");
+  checkFillReport({ ...base, refused: Array.from({ length: 1000 }, (_, i) => ({ path: `f${i}`, uid: 0, gid: 0, entries: 1 })) });
+  refused(() => checkFillReport({ ...base, refused: Array.from({ length: 1001 }, (_, i) => ({ path: `f${i}`, uid: 0, gid: 0, entries: 1 })) }), "bad_form");
+  refused(() => checkFillReport({ ...base, unexpected: Array.from({ length: 1001 }, (_, i) => ({ path: `f${i}`, type: "fifo" })) }), "bad_form");
+  for (const bad of [{ ...base, x: 1 }, { ...base, truncated: 0 }, { ...base, cls: "x" }, { ...base, attempt: 0 }, { ...base, unexpected: [{ path: "p", type: "door" }] },
+    { ...base, refused: [{ path: "a", uid: -1, gid: 0, entries: 1 }] }, { ...base, refused: [{ path: "a", uid: 0, gid: 0, entries: 1.5 }] }]) refused(() => checkFillReport(bad), "bad_form");
+});
+
 test("recovery's first step: from every record state and every disk state, every class's marker exactly its name", () => {
   const whole = (r) => Object.fromEntries(CLASSES[r.kind].map((c) => [c, stagingName(r, c)]));
   assert.equal(recoveryStep(null, { markers: {}, begun: false }), "start");
   const s = at("staging");
   assert.equal(recoveryStep(s, { markers: {}, begun: false }), "stage");
   assert.equal(recoveryStep(s, { markers: {}, begun: true }), "retry");
-  assert.equal(recoveryStep(s, { markers: whole(s), begun: true }), "promote");
+  // Every marker but not every class's digest list hash: the lists can't be trusted, so a retry, never a promote.
+  assert.equal(recoveryStep(s, { markers: whole(s), begun: true }), "retry");
+  assert.equal(recoveryStep(rawStep(s, "digest", { cls: "home", sha256: H(s, "home") }), { markers: whole(s), begun: true }), "retry");
+  assert.equal(recoveryStep(s, { markers: whole(s), begun: false }), "retry", "(markers without the directory: not a stage over them)");
+  assert.equal(recoveryStep(dig(s), { markers: whole(s), begun: true }), "promote");
   // One class whole is not the set whole; a marker of any other name (another class, attempt, run or owner), a torn
   // one, or one with a trailing newline is not this class's.
   const other = step(s, "retry");
@@ -240,9 +310,9 @@ test("recovery's first step: from every record state and every disk state, every
     { ...whole(s), home: whole(s).home.replace(RUN, RUN2) }, { ...whole(s), home: whole(s).home.replace("a-", "t-") },
     { ...whole(s), home: whole(s).home.slice(0, -1) }, { ...whole(s), home: whole(s).home + "\n" },
     Object.assign(Object.create(whole(s)), {}), null, undefined,
-  ]) assert.equal(recoveryStep(s, { markers, begun: true }), "retry", JSON.stringify(markers));
+  ]) assert.equal(recoveryStep(dig(s), { markers, begun: true }), "retry", JSON.stringify(markers));
   // Extra classes' markers don't matter; only the set's classes do.
-  assert.equal(recoveryStep(s, { markers: { ...whole(s), tag: "x" }, begun: true }), "promote");
+  assert.equal(recoveryStep(dig(s), { markers: { ...whole(s), tag: "x" }, begun: true }), "promote");
   const st = at("staged");
   assert.equal(recoveryStep(st, { markers: whole(st), begun: true }), "fill");
   assert.equal(recoveryStep(st, { markers: { home: whole(st).home }, begun: true }), "retry");

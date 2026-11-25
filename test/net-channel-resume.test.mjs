@@ -3,9 +3,10 @@
 // resume only at the stored resume_n + 1). A stand-in host that answers any resume_n can't catch an app that skips
 // one; this one refuses it, as a host does.
 //
-// The rule (channel §3.3, and its addendum's part 1): an attempt that never sent message 1 can't have been committed,
-// so the next attempt keeps its resume_n (with a new request id and token); once message 1 has gone out, the next is
-// resume_n + 1.
+// The rule (channel §3.3 and its addendum A2): resume_n moves only on an authenticated message 2. Accepted: the next
+// is resume_n + 1. Refused (the host already has this record live at resume_n, because its reply was lost): the next
+// is resume_n + 1. With no valid message 2 (message 1 never sent, or sent and nothing came back) the next attempt keeps
+// resume_n, with a new request id and token.
 
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -40,10 +41,12 @@ const key = () => keyFromSeed(new Uint8Array(32).fill(seed++));
 /**
  * A fleet (a native device's chain), a host (its certified X25519 key, its channel store) and a session record for
  * the app's channel key; then a local server standing in for the relay and the host. `plan` says what each attempt
- * meets, in order: "reject" (the upgrade refused with 403), "reset" (the connection reset during the upgrade): in both
- * the app never sends message 1; "accept" (the real acceptance, message 2, kept open), "accept-close" (accepted, then
- * the transport lost). (A socket closed AFTER the upgrade is the uncertain case: the app may have sent message 1, and
- * the channel addendum's part 2 decides what it does next.)
+ * meets, in order: "reject" (the upgrade refused with 403), "reset" (the connection reset during the upgrade),
+ * "drop" (the socket closed right after the upgrade, before the host reads message 1), "accept" (the real acceptance
+ * and its message 2, kept open), "accept-close" (accepted, then the transport lost), "commit-drop" (accepted and
+ * committed, then the socket closed with no message 2: a lost reply), "refuse-drop" (the host's refusal not delivered).
+ * Whenever the real acceptance answers with its refusal (the record already live at that counter), the host sends it
+ * as message 2 and closes the socket, unless the step is "refuse-drop".
  */
 async function world(t, plan, { wrapOpen = (o) => o } = {}) {
   const fleet = newId(), host = newId(), agent = newId(), ctx = { aud: AUD, fleet };
@@ -64,7 +67,7 @@ async function world(t, plan, { wrapOpen = (o) => o } = {}) {
     exceptions_sha256: b64(new Uint8Array(32).fill(2)) };
   const record = seal("sb.browser-session.v1", sN, body, N);
 
-  const h = { opens: [], accepted: [], refused: [], sockets: [], asks: [] };
+  const h = { opens: [], accepted: [], refused: [], refusals: [], sockets: [], asks: [] };
   let attempt = 0;
   const step = () => plan[Math.min(attempt, plan.length - 1)];
   const wss = new WebSocketServer({
@@ -82,6 +85,7 @@ async function world(t, plan, { wrapOpen = (o) => o } = {}) {
     attempt++;
     h.sockets.push(socket);
     const n = parseOpenTarget(req.url).resume_n;
+    if (what === "drop") return socket.terminate();
     socket.once("message", async (data) => {
       const prologue = { fleet, aud: AUD, session: body.session, host, agent, browser_gen: body.browser_gen, host_gen: 3, resume_n: n };
       let a;
@@ -91,7 +95,14 @@ async function world(t, plan, { wrapOpen = (o) => o } = {}) {
         h.refused.push({ n, code: e instanceof FleetError ? e.code : String(e) });
         return socket.terminate();
       }
+      if (a.refused) {
+        h.refusals.push(a.refused.resume_n);
+        if (what === "refuse-drop") return socket.terminate();
+        socket.send(a.reply().message, { binary: true });
+        return setTimeout(() => socket.terminate(), 30); // (the host closes its candidate after the refusal)
+      }
       h.accepted.push(n);
+      if (what === "commit-drop") return socket.terminate();
       socket.send(a.reply().message, { binary: true });
       if (what === "accept-close") setTimeout(() => socket.terminate(), 30);
     });
@@ -158,4 +169,43 @@ test("an opened socket whose first send throws never handed message 1 over: the 
   assert.deepEqual(h.asks.map((a) => a.resume_n), [0, 1, 1]);
   assert.notEqual(h.asks[1].request, h.asks[2].request, "a fresh request id");
   assert.notEqual(h.asks[1].token, h.asks[2].token, "a fresh token");
+});
+
+test("a fresh session's reply lost after the commit: the retry at 0 gets the host's refusal naming 0, then 1 is accepted", async (t) => {
+  const { h, opens } = await world(t, ["commit-drop", "accept"]);
+  // (the wire first: the third attempt's counter is what the refusal decides)
+  await until(() => h.opens.length >= 3, 4000, "three attempts");
+  assert.deepEqual(h.opens.slice(0, 3), [0, 0, 1], "after the refusal naming 0, the next attempt is 1");
+  await until(() => opens() === 1, 4000, "the open");
+  assert.deepEqual(h.opens, [0, 0, 1]);
+  assert.deepEqual(h.accepted, [0, 1], "0 committed once, then 1");
+  assert.deepEqual(h.refusals, [0], "the retry at 0 met the authenticated refusal");
+  assert.deepEqual(h.refused, [], "no silent refusal");
+});
+
+test("a resume's reply lost after the commit: the retry at the same resume_n is refused by the host, and the next is accepted", async (t) => {
+  const { h, opens } = await world(t, ["accept-close", "commit-drop", "accept"]);
+  await until(() => opens() === 2, 4000, "the second open");
+  assert.deepEqual(h.opens, [0, 1, 1, 2]);
+  assert.deepEqual(h.accepted, [0, 1, 2]);
+  assert.deepEqual(h.refusals, [1]);
+  assert.deepEqual(h.refused, []);
+});
+
+test("the refusal itself lost: the app keeps resume_n until a refusal arrives, then moves on", async (t) => {
+  const { h, opens } = await world(t, ["commit-drop", "refuse-drop", "refuse-drop", "accept"]);
+  await until(() => opens() === 1, 4000, "the open");
+  assert.deepEqual(h.opens, [0, 0, 0, 0, 1]);
+  assert.deepEqual(h.refusals, [0, 0, 0], "each retry at 0 was refused; two refusals were lost");
+  assert.deepEqual(h.accepted, [0, 1]);
+  assert.deepEqual(h.refused, []);
+});
+
+test("the socket closed right after the upgrade, before the host read message 1: the app keeps resume_n, and recovers", async (t) => {
+  const { h, opens } = await world(t, ["accept-close", "drop", "drop", "accept"]);
+  await until(() => opens() === 2, 4000, "the second open");
+  assert.deepEqual(h.opens, [0, 1, 1, 1], "no climbing counter");
+  assert.deepEqual(h.accepted, [0, 1]);
+  assert.deepEqual(h.refusals, []);
+  assert.deepEqual(h.refused, []);
 });

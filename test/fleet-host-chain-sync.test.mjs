@@ -25,6 +25,8 @@ const HONEST = F.objects.chain.map(enc); // seq 0..5
 const LEASED = F.leases.chain.map(enc); // the same 0..5, then 6..8 (lease keys and a policy)
 const UID = process.getuid();
 const tmp = () => mkdtempSync(join(tmpdir(), "sb-sync-"));
+/** A host root with the package's /var/lib/sagebrush (0755; the test's uid stands for root). */
+const hostRoot = () => { const r = tmp(); mkdirSync(join(r, "var/lib/sagebrush"), { recursive: true, mode: 0o755 }); return r; };
 const machine = () => "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
 const ctx = { aud: AUD, fleet: FLEET };
 
@@ -37,7 +39,7 @@ async function extend(entries, by, byId, op, extra) {
 
 /** A paired host on disk at the honest chain's head (seq 5), its certificate signed by the native device N. */
 async function pairedHost() {
-  const root = tmp(), p = hostPaths(root);
+  const root = hostRoot(), p = hostPaths(root);
   firstBoot(p, { machineId: machine, brokerUid: UID });
   const fresh = await classify(p, { machineId: machine, brokerUid: UID, rootUid: UID });
   const chain = await replayChain(HONEST, ctx);

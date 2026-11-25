@@ -3,7 +3,7 @@
 // resume. The fake app's click counter is the effect oracle: at most one click; exactly one where the effect ran; the
 // outcome is the definitive result after a resume, `not run` only for a command never sent or explicitly refused,
 // `unknown` for every other sent command after the session is lost, and never `not run` when a click happened.
-// (This oracle is the fake app's; macapp's net sidecar is qualified separately.)
+// (This oracle is the fake app's; the app's net sidecar is qualified separately.)
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { connect, manualClock, sessions, settle } from "./fleet-channel-harness.mjs";

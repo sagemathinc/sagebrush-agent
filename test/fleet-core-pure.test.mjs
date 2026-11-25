@@ -1,4 +1,4 @@
-// lib/fleet/core/ is what a page, a Worker or the app's web view loads as it is (agents-ui mirrors it byte for byte):
+// lib/fleet/core/ is what a page, a Worker or the app's web view loads as it is (the page mirrors it byte for byte):
 // its source alone is checked here, without loading it, so a mistake in it is reported as itself.
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";

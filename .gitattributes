@@ -10,3 +10,6 @@ test/fixtures/*.json text eol=lf
 schema/fleet/*.json text eol=lf
 # IANA's registry files, byte-pinned (their sha256s are in schema/fleet/browser/special-addresses.json): never converted
 schema/fleet/browser/iana/*.csv -text
+# The turn's syscall policy fixtures: the pinned systemd's exact output (escapes included) and the derived numbers,
+# compared byte for byte by scripts/seccomp-policy.mjs: never converted.
+test/fixtures/seccomp/* -text

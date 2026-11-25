@@ -45,7 +45,7 @@ const key = () => keyFromSeed(new Uint8Array(32).fill(seed++));
  * the transport lost). (A socket closed AFTER the upgrade is the uncertain case: the app may have sent message 1, and
  * the channel addendum's part 2 decides what it does next.)
  */
-async function world(t, plan) {
+async function world(t, plan, { wrapOpen = (o) => o } = {}) {
   const fleet = newId(), host = newId(), agent = newId(), ctx = { aud: AUD, fleet };
   const N = key(), nId = newId(), rec = key();
   const sN = { kind: "device", id: nId, alg: "ed25519", key: N.key };
@@ -64,7 +64,7 @@ async function world(t, plan) {
     exceptions_sha256: b64(new Uint8Array(32).fill(2)) };
   const record = seal("sb.browser-session.v1", sN, body, N);
 
-  const h = { opens: [], accepted: [], refused: [], sockets: [] };
+  const h = { opens: [], accepted: [], refused: [], sockets: [], asks: [] };
   let attempt = 0;
   const step = () => plan[Math.min(attempt, plan.length - 1)];
   const wss = new WebSocketServer({
@@ -98,7 +98,7 @@ async function world(t, plan) {
   });
   const url = `ws://127.0.0.1:${wss.address().port}/`;
   const states = [];
-  const make = netChannel({ allowLoopback: true, open: loopbackOpen, authToken: async () => token(), retryMs: 20, handshakeMs: 2000 });
+  const make = netChannel({ allowLoopback: true, open: wrapOpen(loopbackOpen), authToken: async (o) => { const tk = token(); h.asks.push({ resume_n: o.resume_n, request: o.request, token: tk }); return tk; }, retryMs: 20, handshakeMs: 2000 });
   const c = make({
     start: { session: body.session, browserGen: 1, hostStaticPub: Buffer.from(encKey.raw).toString("base64url"), relayUrl: url },
     record, key: app, policy: { exceptions: [] }, onCommand() {}, onState: (s, reason) => states.push(reason ? `${s}:${reason}` : s),
@@ -135,4 +135,27 @@ test("once message 1 has gone out and the host committed, the next attempt is re
   assert.deepEqual(h.opens, [0, 1, 2]);
   assert.deepEqual(h.accepted, [0, 1, 2]);
   assert.deepEqual(h.refused, []);
+});
+
+test("an opened socket whose first send throws never handed message 1 over: the next attempt keeps the resume_n, with a fresh request and token", async (t) => {
+  let sockets = 0, thrown = 0;
+  // (the second transport's first send throws, as a socket closing under the send does)
+  const wrapOpen = (open) => async (url, headers) => {
+    const ws = await open(url, headers);
+    if (++sockets === 2) {
+      const send = ws.send.bind(ws);
+      let first = true;
+      ws.send = (...a) => { if (first) { first = false; thrown++; throw new Error("send failed"); } return send(...a); };
+    }
+    return ws;
+  };
+  const { h, opens } = await world(t, ["accept-close", "accept", "accept"], { wrapOpen });
+  await until(() => opens() === 2, 4000, "the second open");
+  assert.equal(thrown, 1, "the send threw once");
+  assert.deepEqual(h.opens, [0, 1, 1], "the attempt after the throw keeps resume_n 1");
+  assert.deepEqual(h.accepted, [0, 1]);
+  assert.deepEqual(h.refused, []);
+  assert.deepEqual(h.asks.map((a) => a.resume_n), [0, 1, 1]);
+  assert.notEqual(h.asks[1].request, h.asks[2].request, "a fresh request id");
+  assert.notEqual(h.asks[1].token, h.asks[2].token, "a fresh token");
 });

@@ -17,6 +17,7 @@ import {
 } from "../lib/fleet/host/lease.mjs";
 import { realIo } from "../lib/fleet/host/store.mjs";
 import { chmodSync, symlinkSync } from "node:fs";
+import * as fsReal from "node:fs";
 import { fenced, lowerFence, raiseFence, stop } from "../lib/fleet/host/fence.mjs";
 import { lockFile } from "../lib/fleet/host/store.mjs";
 
@@ -653,4 +654,17 @@ test("the helpers refuse a lease from another gate generation (`suspended`), low
   const r = await leaseActivate(A, "L", 1, { dir: e.dir, fenceDir: e.fenceDir, sys, clock: c, lock: locks.lock });
   assert.deepEqual(r, { activated: false, reason: "suspended", lowered: false });
   assert.ok(existsSync(e.fence), "lease stays raised");
+});
+
+test("readGateFile reads the SAME object it looked at, through a handle that never follows a link", () => {
+  const e = env();
+  gateFiles(e.dir, sleepText(3), reopenText(3));
+  const real = (k) => (...a) => (fsReal[k])(...a);
+  // lstat answers for another object (a swap between the look and the open): bad, so the gate reads closed.
+  const swapped = { ...fsReal, lstatSync: (p) => { const st = fsReal.lstatSync(p); return Object.assign(Object.create(Object.getPrototypeOf(st)), st, { ino: st.ino + 1 }); } };
+  assert.equal(readGateFile(e.dir, SLEEP_FILE, { fsx: swapped }).state, "bad");
+  assert.equal(readGateFile(e.dir, SLEEP_FILE, { fsx: { ...fsReal, openSync: real("openSync") } }).state, "ok");
+  // an open refused for the object's type (a link swapped in: ELOOP): bad
+  const eloop = { ...fsReal, openSync: () => { throw Object.assign(new Error("ELOOP"), { code: "ELOOP" }); } };
+  assert.equal(readGateFile(e.dir, SLEEP_FILE, { fsx: eloop }).state, "bad");
 });

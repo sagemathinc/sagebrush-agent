@@ -6,7 +6,7 @@
 // reason and changes no fence. Against a fake systemd, clock and lock (as the lease's own tests), and fakes for the
 // shared core's verifiers and the supervisor's host records.
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
@@ -433,5 +433,55 @@ test("the supervisor with the REAL liveLease: a published, live record for the c
     const s = supervisor({ liveLease: real(w), checkTransferForHost: () => ({ first: true }) });
     assert.deepEqual(await requestResume(A, s.opts), { resumed: false, reason }, JSON.stringify(w));
     assert.ok(!s.kinds().includes("recordTransfer") && !s.kinds().includes("run"), reason);
+  }
+});
+
+// ---- SR1 (restore owner on S1): a lease from another suspend-gate generation never resumes a restored agent
+
+const gateWrite = (dir, sleep, reopen) => {
+  for (const [name, text] of [["sleep", sleep], ["reopen", reopen]]) {
+    const f = join(dir, name);
+    if (existsSync(f)) unlinkSync(f);
+    if (text !== null) writeFileSync(f, text, { mode: 0o644 });
+  }
+};
+const S = (gen, phase = "post") => JSON.stringify({ gen, phase, pre_ok: true, pre_at: 0 });
+const R = (gen) => JSON.stringify({ gen });
+
+test("C7' (ii): the helper refuses a lease from another gate generation, and while the gate is closed: lease_not_live, restore raised, the record byte-identical", async () => {
+  const w = await world();
+  gateWrite(w.e.dir, S(1), R(1));
+  writeRecord(A, { ...w.rec, sg: 1 }, { dir: w.e.dir }); // the lease, published under gate (1, 1)
+  const before = readFileSync(join(w.e.dir, A));
+  assert.deepEqual(await w.resume(), { resumed: true, reason: null, lowered: true }, "open at its generation: resumes (the control)");
+  // Again, from the start, for the two refusals.
+  for (const [label, sleep, reopen] of [["the gate moved to (2, 2)", S(2), R(2)], ["the gate closed (pre at 2)", S(2, "pre"), R(1)]]) {
+    const v = await world();
+    gateWrite(v.e.dir, S(1), R(1));
+    writeRecord(A, { ...v.rec, sg: 1 }, { dir: v.e.dir });
+    const rec = readFileSync(join(v.e.dir, A));
+    gateWrite(v.e.dir, sleep, reopen);
+    assert.deepEqual(await v.resume(), { resumed: false, reason: "lease_not_live", lowered: false }, label);
+    assert.equal(v.restoreUp(), true, `${label}: restore still raised`);
+    assert.deepEqual(readFileSync(join(v.e.dir, A)), rec, `${label}: the record byte-identical`);
+  }
+  assert.ok(before.length > 0);
+});
+
+test("C7' (i): requestResume with the REAL liveLease over a closed gate, or one open at another generation, launches and records nothing", async () => {
+  const dirFor = (sleep, reopen, sg) => {
+    const dir = mkdtempSync(join(tmpdir(), "sb-resume-gate-"));
+    writeRecord(A, { lease_id: "L7", lg: 3, expiry_tick: 1_000_000 + 600_000, gen: 5, sg }, { dir });
+    gateWrite(dir, sleep, reopen);
+    const timers = { [watchdogTimer(A, 3)]: { active: "active", sub: "waiting", next: 9e15 } };
+    const sys = { timer: async (unit) => timers[unit] };
+    return (a) => liveLease(a, { dir, sys, clock: { boot: () => 1_000_000, mono: () => 5_000_000_000 } });
+  };
+  const open = supervisor({ liveLease: dirFor(S(2), R(2), 2), checkTransferForHost: () => ({ first: true }) });
+  assert.deepEqual(await requestResume(A, open.opts), { resumed: true, reason: null }, "open at its generation (the control)");
+  for (const [label, live] of [["closed (pre)", dirFor(S(3, "pre"), R(2), 2)], ["open at another generation", dirFor(S(3), R(3), 2)], ["no gate files, lease at sg 2", dirFor(null, null, 2)]]) {
+    const s = supervisor({ liveLease: live, checkTransferForHost: () => ({ first: true }) });
+    assert.deepEqual(await requestResume(A, s.opts), { resumed: false, reason: "waiting_for_lease" }, label);
+    assert.ok(!s.kinds().includes("recordTransfer") && !s.kinds().includes("run"), `${label}: nothing launched or recorded`);
   }
 });

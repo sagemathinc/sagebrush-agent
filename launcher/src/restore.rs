@@ -39,6 +39,10 @@ const MAX_LIST: usize = 1000;
 const MAX_MARKER: usize = 64;
 const MAX_UIDS: usize = 64;
 const MARKER: &str = ".complete";
+/// The digest list's fixed name beside the class (A2 r3.6 §4b), in the attempt's `data/`. A class leaf can't take it.
+pub const DIGESTS: &str = "digests.json";
+/// The longest listing (A2 r3.6 §4b): `digests.json`, and `tree-digest`'s output.
+pub const MAX_LISTING: u64 = 512 << 20;
 const MAX_ELF_PHNUM: usize = 64;
 /// resolv.conf (and only it) may be owned by a system service account below this uid: on a stock Ubuntu 24.04 host,
 /// /etc/resolv.conf resolves to systemd-resolved's stub file, owned by `systemd-resolve`. Agents (70000+) and people
@@ -142,8 +146,19 @@ pub fn request(snapshot: &str, path: &str) -> Result<Vec<u8>> {
     if !snapshot_ok(snapshot) || !rel_ok(path) {
         return Err(err(Fail::Usage, "bad arguments"));
     }
+    // r3.6: the leaf `digests.json` is reserved for the digest list beside the class.
+    if leaf(path) == DIGESTS {
+        return Err(err(Fail::Usage, "bad arguments"));
+    }
     let dest = format!("/data/{}", leaf(path));
-    let r = format!("{{\"op\":\"restore\",\"snapshot\":{},\"path\":{},\"dest\":{}}}", json::quote(snapshot), json::quote(path), json::quote(&dest));
+    let digests = format!("/data/{DIGESTS}");
+    let r = format!(
+        "{{\"op\":\"restore\",\"snapshot\":{},\"path\":{},\"dest\":{},\"digests\":{}}}",
+        json::quote(snapshot),
+        json::quote(path),
+        json::quote(&dest),
+        json::quote(&digests)
+    );
     if r.len() > MAX_REQUEST {
         return Err(err(Fail::Usage, "the request is too large"));
     }
@@ -252,8 +267,9 @@ fn is_space_error(e: &io::Error) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
-    /// The snapshot the binary restored (its full id) and how many specials it skipped.
-    Ok(String, u64),
+    /// The snapshot the binary restored (its full id), how many specials it skipped, and the SHA-256 (64 lowercase hex)
+    /// of the digest list it wrote (A2 r3.6).
+    Ok(String, u64, String),
     Failed(String),
 }
 
@@ -264,13 +280,14 @@ pub fn reply(out: &[u8]) -> Option<Reply> {
         return None;
     }
     let v = json::parse_with(body, MAX_OUT)?;
-    if let Some(f) = v.exact(&["ok", "snapshot", "skipped_special"]) {
+    if let Some(f) = v.exact(&["ok", "snapshot", "skipped_special", "digests_sha256"]) {
         if f[0] != &Value::Bool(true) {
             return None;
         }
         let snap = f[1].str().filter(|s| snapshot_ok(s))?;
+        let digests = f[3].str().filter(|s| crate::sha256::is_hex64(s))?;
         // A non-negative integer: the reader refuses signs, fractions and exponents.
-        return Some(Reply::Ok(snap.to_string(), f[2].int()?));
+        return Some(Reply::Ok(snap.to_string(), f[2].int()?, digests.to_string()));
     }
     let f = v.exact(&["ok", "error"])?;
     if f[0] != &Value::Bool(false) {
@@ -534,15 +551,54 @@ fn stage_inner<O: RestoreOps, R: Runner<O::H>>(o: &mut O, r: &mut R, a: &StageAr
             Err(limit_error(classify(q, s, now)))
         }
         Some(Reply::Failed(_)) => Ok(Done { out: stdout, result: Err(err(Fail::Partial, "the restore failed")) }),
-        Some(Reply::Ok(snap, _)) if snap != a.snapshot => Err(err(Fail::Partial, "the restored snapshot isn't the requested one")),
-        Some(Reply::Ok(..)) => {
+        Some(Reply::Ok(snap, ..)) if snap != a.snapshot => Err(err(Fail::Partial, "the restored snapshot isn't the requested one")),
+        Some(Reply::Ok(_, _, digests)) => {
             // 11. The marker, written by the launcher only, once the data is durable (O1, O2).
             o.syncfs(&att).map_err(|_| err(Fail::Partial, "the staged data can't be made durable"))?;
+            // 11.1a (r3.6): the digest list is the one the binary reported, before any marker.
+            digests_bound(o, &data, mnt, &digests)?;
             o.create_marker(&att, MARKER, n.path().as_bytes()).map_err(|_| err(Fail::Partial, "the marker can't be written"))?;
             o.fsync(&att).map_err(|_| err(Fail::Partial, "the marker can't be made durable"))?;
             Ok(Done { out: stdout, result: Ok(()) })
         }
     }
+}
+
+/// A2 r3.6 §3 step 11.1a: `data/digests.json` beneath `data` (no symlink, no other mount), a regular root-owned file
+/// with one link and at most MAX_LISTING bytes, read through its own handle and hashed; the hash must be the binary's
+/// reported `digests_sha256`. Anything else is 75 `bad_result`, and no marker is written.
+fn digests_bound<O: RestoreOps>(o: &mut O, data: &O::H, mnt: u64, want: &str) -> Result<()> {
+    let bad = || err(Fail::Partial, "bad_result");
+    let ok = |id: &Ident| kind_of(id) == Some(Kind::File) && id.nlink == 1 && id.uid == 0 && id.size <= MAX_LISTING && id.mnt_id == mnt;
+    let id = match o.at(data, DIGESTS, At::Path) {
+        Ok(h) => o.ident(&h).map_err(|_| bad())?,
+        Err(_) => return Err(bad()),
+    };
+    if !ok(&id) {
+        return Err(bad());
+    }
+    let h = o.at(data, DIGESTS, At::File).map_err(|_| bad())?;
+    let again = o.ident(&h).map_err(|_| bad())?;
+    if (again.dev, again.ino) != (id.dev, id.ino) || !ok(&again) {
+        return Err(bad());
+    }
+    let mut sum = crate::sha256::Sha256::new();
+    let mut off = 0u64;
+    loop {
+        let chunk = o.pread(&h, 1 << 20, off).map_err(|_| bad())?;
+        if chunk.is_empty() {
+            break;
+        }
+        off += chunk.len() as u64;
+        if off > MAX_LISTING {
+            return Err(bad());
+        }
+        sum.update(&chunk);
+    }
+    if off != again.size || crate::sha256::hex(&sum.finish()) != want {
+        return Err(bad());
+    }
+    Ok(())
 }
 
 // ---- fill-home (A2 §4)
@@ -1128,6 +1184,8 @@ mod tests {
             Ok(self.exe.clone())
         }
         fn pread(&mut self, h: &FH, len: usize, off: u64) -> io::Result<Vec<u8>> {
+            self.tick("pread")?;
+            self.log.push(format!("pread {}", h.p));
             let b = self.files.get(&h.p).cloned().unwrap_or_default();
             let s = (off as usize).min(b.len());
             Ok(b[s..(s + len).min(b.len())].to_vec())
@@ -1168,7 +1226,30 @@ mod tests {
         f.file(BIN, 0, 0o755);
         f.files.insert(BIN.into(), elf(false));
         f.exe = "/opt/sagebrush/1/bin/sagebrush-agent-launch".into();
+        // The fake binary's digest list (A2 r3.6): planted in the attempt's data just before the launcher's syncfs.
+        f.hook = Some(("syncfs", 1, plant_digests));
         f
+    }
+
+    const DIG: &[u8] = b"{\"v\":1}\n{\"count\":0,\"total_bytes\":0}\n";
+    fn dig_hex(b: &[u8]) -> String {
+        let mut s = crate::sha256::Sha256::new();
+        s.update(b);
+        crate::sha256::hex(&s.finish())
+    }
+    /// The attempt's data directory: the last `mkdir .../data` the fake logged.
+    fn data_dir(f: &Fake) -> String {
+        f.log.iter().rev().find_map(|l| l.strip_prefix("mkdir ").filter(|p| p.ends_with("/data")).map(str::to_string)).expect("a data dir was made")
+    }
+    fn put_digests(f: &mut Fake, body: &[u8]) {
+        let p = format!("{}/{DIGESTS}", data_dir(f));
+        f.nodes.remove(&p);
+        f.add(&p, S_IFREG | 0o600, 0, 0);
+        f.node(&p).id.size = body.len() as u64;
+        f.files.insert(p, body.to_vec());
+    }
+    fn plant_digests(f: &mut Fake) {
+        put_digests(f, DIG);
     }
 
     fn owner() -> String {
@@ -1196,7 +1277,10 @@ mod tests {
         }
     }
     fn ok_reply() -> Vec<u8> {
-        format!("{{\"snapshot\":\"{SNAP}\",\"skipped_special\":0,\"ok\":true}}\n").into_bytes()
+        ok_reply_with(&dig_hex(DIG))
+    }
+    fn ok_reply_with(digests: &str) -> Vec<u8> {
+        format!("{{\"snapshot\":\"{SNAP}\",\"skipped_special\":0,\"ok\":true,\"digests_sha256\":\"{digests}\"}}\n").into_bytes()
     }
     fn failed(code: &str) -> Vec<u8> {
         format!("{{\"ok\":false,\"error\":{{\"code\":\"{code}\",\"message\":\"x\"}}}}\n").into_bytes()
@@ -1231,13 +1315,16 @@ mod tests {
         // A plain 1025-byte path that fits is accepted (the bound is the encoding, not the raw length).
         assert!(request(SNAP, &"b".repeat(1025)).is_ok());
         let r = String::from_utf8(request(SNAP, "srv/x").unwrap()).unwrap();
-        assert_eq!(r, format!("{{\"op\":\"restore\",\"snapshot\":\"{SNAP}\",\"path\":\"srv/x\",\"dest\":\"/data/x\"}}"));
+        assert_eq!(r, format!("{{\"op\":\"restore\",\"snapshot\":\"{SNAP}\",\"path\":\"srv/x\",\"dest\":\"/data/x\",\"digests\":\"/data/digests.json\"}}"));
+        // r3.6: the leaf `digests.json` is reserved beside the class.
+        assert_eq!(code(request(SNAP, "srv/sagebrush/agents/x/digests.json")), 64);
+        assert!(request(SNAP, "srv/sagebrush/agents/x/digests.json.d").is_ok());
         // R1: dest is exactly /data/<leaf> for each class's path, and the bound counts it: a path whose request is 4097
         // bytes only because of the leaf repeated in dest is usage.
         for (path, want) in [("srv/sagebrush/agents/x/home", "home"), ("srv/sagebrush/agents/x/sessions", "sessions"), ("srv/sagebrush/archive/x", "x"), ("srv/sagebrush/tags/t", "t"), ("solo", "solo")] {
             assert_eq!(leaf(path), want);
             let r = String::from_utf8(request(SNAP, path).unwrap()).unwrap();
-            assert!(r.ends_with(&format!(",\"dest\":\"/data/{want}\"}}")), "{r}");
+            assert!(r.ends_with(&format!(",\"dest\":\"/data/{want}\",\"digests\":\"/data/digests.json\"}}")), "{r}");
         }
         let p = |k: usize| format!("a/{}", "b".repeat(k));
         let k = (1..MAX_REQUEST).take_while(|k| request(SNAP, &p(*k)).is_ok()).last().unwrap();
@@ -1349,7 +1436,13 @@ mod tests {
 
     #[test]
     fn exactly_one_closed_json_object_on_one_line() {
-        assert_eq!(reply(&ok_reply()), Some(Reply::Ok(SNAP.into(), 0)));
+        assert_eq!(reply(&ok_reply()), Some(Reply::Ok(SNAP.into(), 0, dig_hex(DIG))));
+        // r3.6: digests_sha256 is required, exact (64 lowercase hex), and no other key is allowed.
+        let without = format!("{{\"snapshot\":\"{SNAP}\",\"skipped_special\":0,\"ok\":true}}\n");
+        let extra = format!("{{\"snapshot\":\"{SNAP}\",\"skipped_special\":0,\"ok\":true,\"digests_sha256\":\"{}\",\"x\":1}}\n", dig_hex(DIG));
+        for bad in [without, extra, String::from_utf8(ok_reply_with(&"A".repeat(64))).unwrap(), String::from_utf8(ok_reply_with(&"a".repeat(63))).unwrap(), String::from_utf8(ok_reply_with(&"g".repeat(64))).unwrap()] {
+            assert_eq!(reply(bad.as_bytes()), None, "{bad}");
+        }
         assert_eq!(reply(&failed("quota_exceeded")), Some(Reply::Failed("quota_exceeded".into())));
         let long = format!("{{\"ok\":false,\"error\":{{\"code\":\"no_space\",\"message\":\"{}\"}}}}\n", "m".repeat(10_000));
         assert_eq!(reply(long.as_bytes()), Some(Reply::Failed("no_space".into())), "a long message still classifies");
@@ -1658,6 +1751,95 @@ mod tests {
         }
     }
 
+    // ---- the digest list's binding (A2 r3.6 §3 step 11.1a)
+
+    fn plant_none(_f: &mut Fake) {}
+    fn plant_symlink(f: &mut Fake) {
+        let p = format!("{}/{DIGESTS}", data_dir(f));
+        f.add(&p, S_IFLNK | 0o777, 0, 0);
+    }
+    fn plant_dir(f: &mut Fake) {
+        let p = format!("{}/{DIGESTS}", data_dir(f));
+        f.dir(&p, 0, 0o700);
+    }
+    fn plant_two_links(f: &mut Fake) {
+        plant_digests(f);
+        let p = format!("{}/{DIGESTS}", data_dir(f));
+        f.node(&p).id.nlink = 2;
+    }
+    fn plant_foreign(f: &mut Fake) {
+        plant_digests(f);
+        let p = format!("{}/{DIGESTS}", data_dir(f));
+        f.node(&p).id.uid = UID;
+    }
+    fn plant_huge(f: &mut Fake) {
+        plant_digests(f);
+        let p = format!("{}/{DIGESTS}", data_dir(f));
+        f.node(&p).id.size = MAX_LISTING + 1;
+    }
+    fn plant_other(f: &mut Fake) {
+        put_digests(f, b"{\"v\":1}\n{\"count\":1,\"total_bytes\":0}\n");
+    }
+    fn plant_short(f: &mut Fake) {
+        plant_digests(f);
+        let p = format!("{}/{DIGESTS}", data_dir(f));
+        f.node(&p).id.size = DIG.len() as u64 + 1; // the bytes read don't reach the size statx reported
+    }
+
+    #[test]
+    fn the_digest_list_must_be_the_reported_one_before_any_marker() {
+        // The match: the marker is written, after the syncfs, and the printed line carries the hash.
+        let mut f = host();
+        let d = restore_stage(&mut f, &mut exited(ok_reply()), &stage_args("home"));
+        assert_eq!(rcode(&d), 0, "{:?}", d.result);
+        assert!(String::from_utf8(d.out.clone()).unwrap().contains(&dig_hex(DIG)));
+        let att = attempt_path("home");
+        assert!(f.nodes.contains_key(&format!("{att}/.complete")));
+        // Each other list (or none): 75 bad_result, and NO marker.
+        let rows: [(&str, Hook); 8] = [
+            ("missing", plant_none),
+            ("a symlink", plant_symlink),
+            ("a directory", plant_dir),
+            ("two links", plant_two_links),
+            ("not root's", plant_foreign),
+            ("over 512 MiB", plant_huge),
+            ("another list (a hash mismatch)", plant_other),
+            ("shorter than its size", plant_short),
+        ];
+        for (what, plant) in rows {
+            let mut f = host();
+            f.hook = Some(("syncfs", 1, plant));
+            let d = restore_stage(&mut f, &mut exited(ok_reply()), &stage_args("home"));
+            assert_eq!(rcode(&d), 75, "{what}");
+            assert!(!f.nodes.contains_key(&format!("{}/.complete", attempt_path("home"))), "{what}: no marker");
+            assert!(!f.log.iter().any(|l| l.starts_with("marker ")), "{what}");
+            // Refused before a single byte is read: the cap, the kind, the links and the owner are checked first.
+            if !what.starts_with("another list") && !what.starts_with("shorter") {
+                assert!(!f.log.iter().any(|l| l.starts_with("pread ") && l.ends_with(DIGESTS)), "{what}: nothing read");
+            }
+        }
+        // A reply naming another hash than the list's: 75, no marker.
+        let mut f = host();
+        let d = restore_stage(&mut f, &mut exited(ok_reply_with(&"0".repeat(64))), &stage_args("home"));
+        assert_eq!(rcode(&d), 75);
+        assert!(!f.log.iter().any(|l| l.starts_with("marker ")));
+        // A reply without the hash is bad_result before the syncfs.
+        let mut f = host();
+        let without = format!("{{\"snapshot\":\"{SNAP}\",\"skipped_special\":0,\"ok\":true}}\n").into_bytes();
+        assert_eq!(rcode(&restore_stage(&mut f, &mut exited(without), &stage_args("home"))), 75);
+        assert_eq!(f.count("syncfs"), 0);
+    }
+
+    #[test]
+    fn fill_home_never_moves_the_digest_list() {
+        let (mut f, _) = staged("home");
+        let p = format!("{}/data/{DIGESTS}", attempt_path("home"));
+        let before = (f.nodes[&p].id.ino, f.files[&p].clone());
+        let x = fill_expect(&mut f, "home");
+        fill_home(&mut f, &fill_args("home", x)).unwrap();
+        assert_eq!((f.nodes[&p].id.ino, f.files[&p].clone()), before, "the list stays, the same inode and bytes");
+    }
+
     #[test]
     fn a_syncfs_or_marker_failure_is_75_and_leaves_no_marker() {
         let mut f = host();
@@ -1726,7 +1908,11 @@ mod tests {
         // R3 (A2 r3.5): the class's contents land in data/<leaf>, the launcher's own root 0700 directory; nothing else
         // (no sibling class) is staged.
         let src = format!("{att}/data/{}", leaf(stage_args(class).path));
-        assert_eq!(f.nodes.keys().filter(|k| k.starts_with(&format!("{att}/data/"))).collect::<Vec<_>>(), vec![&src]);
+        // r3.6: beside it, only the binary's digest list.
+        let digests = format!("{att}/data/{DIGESTS}");
+        let mut want = vec![&digests, &src];
+        want.sort();
+        assert_eq!(f.nodes.keys().filter(|k| k.starts_with(&format!("{att}/data/"))).collect::<Vec<_>>(), want);
         let put = |f: &mut Fake, rel: &str, mode: u16, uid: u32| {
             let path = format!("{src}/{rel}");
             f.add(&path, mode, uid, uid);

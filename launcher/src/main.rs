@@ -29,6 +29,7 @@ mod landlock;
 mod lease;
 mod profile;
 mod secret;
+mod sha256;
 mod stage;
 mod tree;
 #[allow(unsafe_code)]

@@ -476,6 +476,24 @@ test("systemd preflight: a paused agent's late valid answer (a busy event loop) 
   await close();
 });
 
+test("the transfer records follow accepted grants' entries, not the plan: an expiry restart moves no entry_gen", async () => {
+  const { sup, store, close } = await setup();
+  await sup.submit({ kind: "grant", bytes: grant(1, [entry(A), entry(B)]) });
+  const rec = (id) => store.grants.record(id);
+  assert.deepEqual([rec(A).entry_gen, rec(A).listed_since, rec(B).entry_gen], [1, 1, 1]);
+  await sup.submit({ kind: "expiry", authority: "host" });
+  // After expiry every listed agent is planned anew (its unit step moves the registry's gen), but only B's entry changed.
+  const r = await sup.submit({ kind: "grant", bytes: grant(2, [entry(A), entry(B, { x: 2 })]) });
+  assert.equal(r.status, "applied");
+  assert.deepEqual([store.registry.agent(A).gen, rec(A).entry_gen, rec(A).listed_since], [2, 1, 1]);
+  assert.deepEqual([rec(B).entry_gen, rec(B).listed_since], [2, 1]);
+  assert.equal(store.grants.digestAt(1), sha256b64(grant(1, [entry(A), entry(B)])));
+  // A dropped: its records go with it
+  await sup.submit({ kind: "grant", bytes: grant(3, [entry(B, { x: 2 })]) });
+  assert.deepEqual([rec(A), rec(B).entry_gen, rec(B).listed_since], [null, 2, 1]);
+  await close();
+});
+
 // ---- lifecycle ops and authority
 
 test("who may do what: the service and the local CLI only narrow; a person also resumes and deletes", async () => {

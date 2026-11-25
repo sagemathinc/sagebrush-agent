@@ -2,7 +2,7 @@
 //! restored tree, as this process wrote it from the repository's MAC-verified plaintext, in the one listing format the
 //! launcher's `tree-digest` also gives for the filled destination. Validation compares the two line for line, so
 //! every byte here is fixed by §4b:
-//! - JSON Lines: a `{"v":1}` header, one line per entry sorted by the bytes of its encoded path (no duplicates), then
+//! - JSON Lines: a `{"v":1}` header, one line per entry sorted by its RAW path bytes (no duplicates), then
 //!   `{"count":C,"total_bytes":B}`;
 //! - entries: `{"path":P,"type":"file","size":N,"mode":M,"sha256":H}`, `{"path":P,"type":"dir","size":0,"mode":M}`,
 //!   `{"path":P,"type":"symlink","size":N,"mode":511,"target":T}`, keys in that order, no whitespace;
@@ -99,9 +99,10 @@ pub fn line_symlink(raw: &[u8], target: &[u8]) -> String {
     format!("{{\"path\":{},\"type\":\"symlink\",\"size\":{},\"mode\":511,\"target\":{}}}\n", quote(&encode(raw)), target.len(), quote(&encode(target)))
 }
 
-/// One entry of the listing, already rendered: its encoded path (the sort key) and its line.
+/// One entry of the listing, already rendered: its raw path bytes (the sort key: §4b sorts the filesystem's bytes,
+/// never the encoded text, whose `%XX` would order differently) and its line.
 struct Line {
-    key: String,
+    key: Vec<u8>,
     text: String,
 }
 
@@ -162,7 +163,7 @@ fn listing_bounded(root: &Path, max_path: usize) -> Result<Vec<u8>> {
             if m.dev() != dev {
                 return Err(fail("digests: a mount inside the restored tree".into()));
             }
-            let key = encode(&path);
+            let key = path.clone();
             let mode = m.mode() & 0o7777 & !0o6000;
             let ft = m.file_type();
             let text = if ft.is_dir() {
@@ -185,9 +186,9 @@ fn listing_bounded(root: &Path, max_path: usize) -> Result<Vec<u8>> {
             }
         }
     }
-    lines.sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
+    lines.sort_by(|a, b| a.key.cmp(&b.key));
     if lines.windows(2).any(|w| w[0].key == w[1].key) {
-        return Err(fail("digests: two entries with one encoded path".into()));
+        return Err(fail("digests: two entries with one path".into()));
     }
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(b"{\"v\":1}\n");
@@ -282,6 +283,25 @@ mod tests {
             "{\"count\":4,\"total_bytes\":5}".to_string(),
         ];
         assert_eq!(out, want.join("\n") + "\n");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn entries_are_sorted_by_their_raw_bytes_never_their_encoded_text() {
+        // Raw order: "%" (0x25) < "d" < "d/%x" < "d/\xff" < "z" < "é" (0xc3) < "\xe2\x82" < "\xff". Sorting the encoded
+        // text instead would put "%25", "%E2%82" and "%FF" first, and "é" last.
+        let d = tmpdir("order");
+        use std::os::unix::ffi::OsStrExt;
+        let os = |b: &[u8]| std::ffi::OsStr::from_bytes(b).to_os_string();
+        for n in [&b"%"[..], b"z", "é".as_bytes(), b"\xe2\x82", b"\xff"] {
+            fs::write(d.join(os(n)), b"").unwrap();
+        }
+        fs::create_dir(d.join("d")).unwrap();
+        fs::write(d.join("d").join(os(b"\xff")), b"").unwrap();
+        fs::write(d.join("d").join("%x"), b"").unwrap();
+        let out = String::from_utf8(listing(&d).unwrap()).unwrap();
+        let paths: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("{\"path\":\"")).map(|l| &l[..l.find('"').unwrap()]).collect();
+        assert_eq!(paths, ["%25", "d", "d/%25x", "d/%FF", "z", "é", "%E2%82", "%FF"], "{out}");
         fs::remove_dir_all(&d).unwrap();
     }
 

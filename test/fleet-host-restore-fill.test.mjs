@@ -134,15 +134,17 @@ function world(kind, { script = () => 0, onCall = () => {}, failDiscards = 0, re
       rmSync(join(att, ".complete"));
       assert.equal(flag(args, "source"), `data/${leaf}`);
       const src = join(att, "data", leaf);
-      const names = readdirSync(src).sort();
-      for (const k of code === 0 ? names : names.slice(0, 1)) renameSync(join(src, k), join(dests[cls], k));
+      // (names as bytes, as the launcher moves them: a name that isn't UTF-8 is moved as it is)
+      const names = readdirSync(src, { encoding: "buffer" }).sort(Buffer.compare);
+      const under = (d, k) => Buffer.concat([Buffer.from(d + "/"), k]);
+      for (const k of code === 0 ? names : names.slice(0, 1)) renameSync(under(src, k), under(dests[cls], k));
       return { code, stdout: code === 0 ? stdout(cmd, cls, okFill(report(cls))) : "", stderr: "" };
     }
     throw new Error(`unexpected launcher call ${cmd}`);
   };
   const identifyDest = async (k, id, cls) => ((x) => ({ ...x, object: identify(cls, x.object) }))({ epoch: { boot_id: "00000000-0000-4000-8000-000000000000", mnt_id: 7 }, fsid: "0123456789abcdef", object: { type: "dir", mode: 0o700, uid: 70000, gid: 70000, dev: [8, 1], ino: statSync(dests[cls]).ino, gen: 1, mnt_id: 7, projid: 70000, inherit: true } });
   const expectOf = async (k, id, cls) => join(base, "expect", `${cls}.json`);
-  const cleanDest = async (r) => { cleaned.push(r.attempt); for (const d of Object.values(dests)) for (const e of readdirSync(d)) rmSync(join(d, e), { recursive: true }); };
+  const cleanDest = async (r) => { cleaned.push(r.attempt); for (const d of Object.values(dests)) for (const e of readdirSync(d, { encoding: "buffer" })) rmSync(Buffer.concat([Buffer.from(d + "/"), e]), { recursive: true }); };
   let discardFailures = failDiscards;
   const discardStaging = async (r) => {
     if (discardFailures > 0 && r.state !== "staging") { discardFailures -= 1; throw new Error("crash in discard"); }
@@ -561,8 +563,12 @@ test("validation: the digest list is used only when its bytes hash to the record
   const id2 = newId();
   const w2 = world("agent", tamper((p) => { const real = p + ".real"; renameSync(p, real); symlinkSync(real, p); }));
   ref = { w: w2, id: id2 };
-  await assert.rejects(w2.fill("agent", id2, planOf("agent", id2)), (e) => e.code === "ELOOP");
-  assert.equal(readRecord("agent", id2, { dir: w2.dir }).state, "published", "never validated through a link");
+  const linked = await w2.fill("agent", id2, planOf("agent", id2));
+  assert.deepEqual([linked.state, linked.reason], ["failed", "bad_form"], "a link is never a list: a durable stop");
+  assert.equal(readRecord("agent", id2, { dir: w2.dir }).state, "failed");
+  const n2 = w2.calls.length;
+  assert.equal((await w2.fill("agent", id2, planOf("agent", id2))).state, "failed");
+  assert.equal(w2.calls.length, n2, "no launch, no revalidation, no re-stage after it");
 });
 
 test("validation: a malformed list fails even when the binary reported its exact hash (the format, not only the binding)", async () => {
@@ -796,4 +802,65 @@ test("validation of sessions: each SQLite database's private copy passes quick_c
   await failedAs(opts({ afterCopy: (dir, names) => { const p = join(dir, names.get("live.db-wal")); const b = readFileSync(p); b[200] ^= 1; writeFileSync(p, b); } }), "bad_form", "a changed copy");
   // A damaged WAL in the destination (a fill fault): the hash compare fails it, whatever SQLite would replay.
   await failedAs({ ...opts(), beforeDigest: (cls, d) => { if (cls === "sessions") { const b = readFileSync(join(d, "live.db-wal")); b[40] ^= 1; writeFileSync(join(d, "live.db-wal"), b); } } }, "bad_form", "a damaged WAL in the destination");
+});
+
+test("permanent list or report faults are a durable failed; an interruption stays published and is validated again", async () => {
+  const list = (w, id, cls) => join(attemptDir(w, id, cls), "data", "digests.json");
+  const report = (w, id, cls) => join(w.dir, `agent-${id}.${cls}.fill.json`);
+  const rows = {
+    "the list replaced by a directory": (w, id) => { rmSync(list(w, id, "home")); mkdirSync(list(w, id, "home")); },
+    "the list replaced by a link": (w, id) => { const p = list(w, id, "home"); renameSync(p, p + ".x"); symlinkSync(p + ".x", p); },
+    "a report that isn't JSON": (w, id) => writeFileSync(report(w, id, "sessions"), "{"),
+    "a report of another shape": (w, id) => writeFileSync(report(w, id, "home"), '{"v":1}\n'),
+    "a report replaced by another attempt's": (w, id) => { const x = JSON.parse(readFileSync(report(w, id, "home"), "utf8")); writeFileSync(report(w, id, "home"), JSON.stringify({ ...x, attempt: 2 }) + "\n"); },
+  };
+  for (const [what, f] of Object.entries(rows)) {
+    const id = newId();
+    // (tampered after the last fill-home's report is saved: at validation's first look, before any tree-digest)
+    const once = { done: false };
+    const w = world("agent", { stopped: async () => { if (!once.done) { once.done = true; f(w, id); } return true; } });
+    const r = await w.fill("agent", id, planOf("agent", id));
+    assert.equal(r.state, "failed", what);
+    assert.ok(["bad_form", "not_found"].includes(r.reason), `${what}: ${r.reason}`);
+    assert.ok(!w.calls.some((a) => a[0] === "tree-digest"), `${what}: nothing listed`);
+    const n = w.calls.length;
+    assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "failed", what);
+    assert.equal(w.calls.length, n, `${what}: no launch, no revalidation, no re-stage`);
+  }
+  // An interruption (the list unreadable for a moment: EIO from the read) is not a verdict: still published, and the
+  // next call validates from the start, against the same hashes.
+  const id = newId();
+  let fault = true;
+  const w = world("agent", { stopped: async () => { if (fault) { fault = false; throw Object.assign(new Error("EIO"), { code: "EIO" }); } return true; } });
+  await assert.rejects(w.fill("agent", id, planOf("agent", id)), /EIO/);
+  assert.equal(readRecord("agent", id, { dir: w.dir }).state, "published");
+  assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "validated");
+});
+
+test("names through the whole restore: a literal %, bytes that aren't UTF-8, UTF-8 and nested names, in raw order", async () => {
+  const B = (s) => Buffer.from(s, "latin1");
+  const seed = (cls, d) => {
+    if (cls !== "home") return;
+    for (const n of [Buffer.from("%"), Buffer.from("z"), Buffer.from("é"), B("\xe2\x82"), B("\xff")]) writeFileSync(Buffer.concat([Buffer.from(d + "/"), n]), n);
+    mkdirSync(join(d, "d"));
+    writeFileSync(Buffer.concat([Buffer.from(d + "/d/"), B("\xff")]), "x");
+    writeFileSync(join(d, "d", "%x"), "y");
+  };
+  const ok = await settle({ seed });
+  assert.equal(ok.r.state, "validated");
+  // The list the binary wrote is in raw order (the paths as encoded, in that order).
+  let seen = null;
+  await settle({ seed, listOf: (cls, t) => { if (cls === "home") seen = t; return t; } });
+  const paths = seen.split("\n").filter((l) => l.startsWith('{"path"')).map((l) => JSON.parse(l).path);
+  assert.deepEqual(paths, ["%25", "a.txt", "b.txt", "d", "d/%25x", "d/%FF", "z", "é", "%E2%82", "%FF"]);
+  // Controls: either side in the ENCODED order (the old bug) is refused, even with the list's exact hash.
+  const encodedOrder = (t) => {
+    const l = t.split("\n").slice(0, -1);
+    const body = l.slice(1, -1).sort((a, b) => Buffer.compare(Buffer.from(JSON.parse(a).path), Buffer.from(JSON.parse(b).path)));
+    return [l[0], ...body, l[l.length - 1]].join("\n") + "\n";
+  };
+  await failedAs({ seed, listOf: (cls, t) => (cls === "home" ? encodedOrder(t) : t) }, "bad_form", "the binary's list in encoded order");
+  await failedAs({ seed, observe: (cls, t) => (cls === "home" ? encodedOrder(t) : t) }, "bad_form", "tree-digest's listing in encoded order");
+  // And a changed byte inside a name that isn't UTF-8 is a different path: missing plus extra.
+  await failedAs({ seed, beforeDigest: (cls, d) => { if (cls === "home") renameSync(Buffer.concat([Buffer.from(d + "/"), B("\xff")]), Buffer.concat([Buffer.from(d + "/"), B("\xfe")])); } }, "bad_form", "0xff renamed 0xfe");
 });

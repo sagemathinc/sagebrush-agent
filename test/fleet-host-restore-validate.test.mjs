@@ -250,3 +250,28 @@ test("the shared listing corpus (test/fixtures/listing-corpus.json): each valid 
   }
   assert.equal(valid, rows.filter((r) => r.valid).length);
 });
+
+test("entries are sorted by their RAW bytes (A2 §4b), never their encoded text: %, invalid bytes, UTF-8, nested", () => {
+  // Raw: "%" 0x25 < "d" < "d/%x" < "d/\xff" < "z" < "é" 0xc3 < "\xe2\x82" < "\xff" (the same order the backup binary's
+  // own row pins). The encoded text would sort "%25", "%E2%82", "%FF" first, and "é" last.
+  const raw = ["%25", "d", "d/%25x", "d/%FF", "z", "é", "%E2%82", "%FF"];
+  const entry = (p) => (p === "d" ? dir(p) : file(p, ""));
+  assert.deepEqual([...parseListing(text(raw.map(entry))).entries.keys()], raw);
+  // The encoded order, and every adjacent swap of the raw one: refused as unsorted.
+  const encoded = [...raw].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+  assert.notDeepEqual(encoded, raw);
+  refused(() => parseListing(text(encoded.map(entry))), "bad_form");
+  for (let i = 0; i + 1 < raw.length; i++) {
+    const swapped = [...raw];
+    [swapped[i], swapped[i + 1]] = [swapped[i + 1], swapped[i]];
+    refused(() => parseListing(text(swapped.map(entry))), "bad_form");
+  }
+  // The observed side the same, with an unexpected entry in raw order among them.
+  const obs = text([file("%25", ""), { unexpected: "z", type: "fifo" }, file("%FF", "")]);
+  assert.deepEqual(parseListing(obs, { observed: true }).unexpected, [{ path: "z", type: "fifo" }]);
+  refused(() => parseListing(text([file("%FF", ""), { unexpected: "z", type: "fifo" }]), { observed: true }), "bad_form");
+  // The compare reports differences in the raw order too.
+  const want = new Map(raw.map((p) => [p, entry(p)]));
+  const diff = compareTrees(want, new Map());
+  assert.deepEqual(diff.missing.paths, raw);
+});

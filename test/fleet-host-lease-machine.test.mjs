@@ -14,7 +14,7 @@ import * as core from "../lib/fleet/core/index.mjs";
 import { Supervisor } from "../lib/fleet/host/executor.mjs";
 import { fenceCauses, fenced, holdsFenceLock, raiseFence } from "../lib/fleet/host/fence.mjs";
 import { HostStore } from "../lib/fleet/host/host-store.mjs";
-import { MARGIN_MS, helperScope, leaseActivate, leaseThaw, readRecord, readTombstone, thawScope, watchdogTimer } from "../lib/fleet/host/lease.mjs";
+import { MARGIN_MS, helperScope, leaseActivate, leaseThaw, readGate, readRecord, readTombstone, thawScope, watchdogTimer } from "../lib/fleet/host/lease.mjs";
 import { readRecord as readRestore, writeRecord as writeRestore } from "../lib/fleet/host/restore-record.mjs";
 import { RESUME_HELPER_MS, requestResume, resumeCgroup, resumeRestored } from "../lib/fleet/host/restore-resume.mjs";
 import { IGNORED, LeaseMachine, MAX_TTL_MS, RENEW_MS } from "../lib/fleet/host/lease-machine.mjs";
@@ -1428,5 +1428,53 @@ test("C7' (iii), the REAL helper held at after_checks: a queued reopen does noth
   assert.ok(w.sleepSys.calls.includes("kill"));
   assert.equal(w.sleepSys.freeze, "0");
   assert.equal(readFileSync(join(w.leaseDir, "reopen"), "utf8"), R(1));
+  await w.close();
+});
+
+// ---- TESTS H2 (#168): the reopen is close-aware: close() cuts it short, and nothing of it runs after the close
+
+const held = () => { let release; const p = new Promise((r) => { release = r; }); return { p, release }; };
+const realWait = async (fn, ms = 5000) => { for (const end = Date.now() + ms; !fn() && Date.now() < end;) await new Promise((r) => setTimeout(r, 5)); return fn(); };
+
+test("TESTS H2: close() during a reopen whose mask is held returns at once; the op ends Closing; the late mask never leads to a freeze, kill, thaw or acknowledgement", async () => {
+  const w = await world({ sleepOpts: reopenSeams });
+  await granted(w, [A]);
+  await w.fire("renew");
+  gateWrite(w, S(1), null);
+  const h = held();
+  let masked = false;
+  w.sleepSys.maskAll = async () => { w.sleepSys.calls.push("mask"); masked = true; await h.p; };
+  const op = w.sup.submit({ kind: "sleep-reopen", authority: "host" }).then(() => "resolved", (e) => e?.message);
+  assert.ok(await realWait(() => masked), "the reopen is at its mask");
+  const closing = w.sup.close();
+  assert.equal(await Promise.race([closing.then(() => "closed"), new Promise((r) => setTimeout(() => r("held"), 100))]), "closed", "close isn't held by the mask");
+  assert.equal(await op, "closing");
+  h.release();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(w.sleepSys.calls, ["mask"], "nothing after the late mask: no freeze, kill or thaw");
+  assert.equal(w.sleepSys.freeze, "1", "the parent stays frozen");
+  assert.equal(existsSync(join(w.leaseDir, "reopen")), false, "never acknowledged");
+  assert.equal(readGate({ dir: w.leaseDir, clock: w.clock }).open, false, "the gate stays closed, for the next start's reopen");
+  await w.close();
+});
+
+test("TESTS H2: close() while the reopen waits for an activation lock: the op ends Closing, a lock granted after the close is released, nothing is spent, thawed or acknowledged", async () => {
+  const w = await world({ sleepOpts: reopenSeams });
+  await granted(w, [A]);
+  await w.fire("renew");
+  const lg = w.machine.current(A).lg;
+  gateWrite(w, S(1), null);
+  const h = held();
+  let asked = false, released = 0;
+  w.sup.sleepOpts.lock = async () => { asked = true; await h.p; return { release: async () => { released++; } }; };
+  const op = w.sup.submit({ kind: "sleep-reopen", authority: "host" }).then(() => "resolved", (e) => e?.message);
+  assert.ok(await realWait(() => asked), "the reopen waits for the lock");
+  assert.equal(await Promise.race([w.sup.close().then(() => "closed"), new Promise((r) => setTimeout(() => r("held"), 1000))]), "closed", "close isn't held by the lock");
+  assert.equal(await op, "closing");
+  h.release();
+  assert.ok(await realWait(() => released === 1), "the late lock was released");
+  assert.ok(!(readTombstone(A, { dir: w.leaseDir }) >= lg), "nothing spent after the close");
+  assert.ok(!w.sleepSys.calls.includes("freeze=0"), "never thawed");
+  assert.equal(existsSync(join(w.leaseDir, "reopen")), false, "never acknowledged");
   await w.close();
 });

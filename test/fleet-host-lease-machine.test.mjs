@@ -16,7 +16,7 @@ import { fenceCauses, fenced, holdsFenceLock, raiseFence } from "../lib/fleet/ho
 import { HostStore } from "../lib/fleet/host/host-store.mjs";
 import { MARGIN_MS, helperScope, leaseActivate, leaseThaw, readRecord, readTombstone, thawScope, watchdogTimer } from "../lib/fleet/host/lease.mjs";
 import { readRecord as readRestore, writeRecord as writeRestore } from "../lib/fleet/host/restore-record.mjs";
-import { requestResume, resumeCgroup, resumeRestored } from "../lib/fleet/host/restore-resume.mjs";
+import { RESUME_HELPER_MS, requestResume, resumeCgroup, resumeRestored } from "../lib/fleet/host/restore-resume.mjs";
 import { IGNORED, LeaseMachine, MAX_TTL_MS, RENEW_MS } from "../lib/fleet/host/lease-machine.mjs";
 import { agentSlice } from "../lib/fleet/host/names.mjs";
 
@@ -1164,4 +1164,75 @@ test("recovery's reconciliation goes through the widening gate: with its proof u
   assert.equal(w2.store.registry.agent(A).state, "running");
   assert.equal(w2.fx.u(A).active, true);
   await w2.close();
+});
+
+test("resume-restored cut short by the executor's close: the op ends at once with Closing, a pending proof is durable, and the next start proves the agent down before the reconciliation records its resume", async () => {
+  for (const late of [true, false]) {
+    const dirs = { root: tmp("state"), fenceDir: tmp("fence"), leaseDir: tmp("lease"), restoreDir: tmp("restore") };
+    const w = await world({ resumeOp, ...dirs });
+    await restored(w);
+    // The helper hangs: the request never answers (a stuck systemd-run, a lock wait).
+    let held;
+    w.resumeHook = (agent, extra) => { held = { agent, extra }; return new Promise(() => {}); };
+    const op = resumeRestoredOp(w);
+    for (let i = 0; i < 50 && !held; i++) await new Promise((r) => setImmediate(r));
+    assert.ok(held, "the request is in flight");
+    const closed = await Promise.race([w.sup.close().then(() => true), new Promise((r) => setTimeout(() => r(false), 2000))]);
+    assert.ok(closed, "the close ended within 2 s, not after the helper's wait");
+    await assert.rejects(op, /closing/, "the op ends with Closing, like a crash there");
+    assert.equal(w.store.registry.agent(A).state, "provisioned", "nothing recorded about an outcome it never saw");
+    assert.ok(w.store.grants.pendingProofs().includes(A), "a durable pending proof: the helper may still act");
+    // The helper finishes after the close (it lowers restore and queues the start), or never does.
+    if (late) {
+      delete w.resumeHook;
+      const r = await resumeOp(w).request(A, held.extra);
+      assert.equal(r.resumed, true, JSON.stringify(r));
+      assert.deepEqual(fenceCauses(A, { dir: w.fenceDir }), []);
+    }
+    await w.close();
+    // The next start: the pending proof first (masked, proven down), then the reconciliation (restore down: resumed).
+    const w2 = await world({ resumeOp, ...dirs });
+    const rec = await w2.sup.recover();
+    assert.equal(rec.status, "recovered", JSON.stringify(rec));
+    assert.ok(!w2.store.grants.pendingProofs().includes(A), "proven down");
+    const firstMask = w2.fx.log.findIndex((l) => l[0] === "mask" && l[1] === A);
+    const firstStart = w2.fx.log.findIndex((l) => (l[0] === "start" || l[0] === "helper-start") && l[1] === A);
+    assert.ok(firstMask >= 0 && (firstStart === -1 || firstMask < firstStart), JSON.stringify(w2.fx.log));
+    if (late) {
+      assert.equal(w2.store.registry.agent(A).state, "running", "its resume happened: recorded now");
+      assert.deepEqual(fenceCauses(A, { dir: w2.fenceDir }), ["lease"]);
+      await w2.fire("renew");
+      assert.equal(w2.fx.u(A).active, true, "started again under a fresh lease");
+    } else {
+      assert.equal(w2.store.registry.agent(A).state, "provisioned", "restore still up: not resumed");
+      assert.deepEqual(fenceCauses(A, { dir: w2.fenceDir }), ["lease", "restore"]);
+    }
+    await w2.close();
+  }
+});
+
+test("resume-restored closed before its helper is launched: nothing is launched, and the op ends with Closing", async () => {
+  const w = await world({ resumeOp });
+  await restored(w);
+  let closing;
+  w.barrier = async (n) => { if (n === "before_restore_resume") closing = w.sup.close(); };
+  await assert.rejects(resumeRestoredOp(w), /closing/);
+  await closing;
+  assert.equal((w.requests ?? []).length, 0, "no helper launched after the close");
+  assert.deepEqual(fenceCauses(A, { dir: w.fenceDir }), ["restore"]);
+  assert.equal(w.store.registry.agent(A).state, "provisioned");
+  await w.close();
+});
+
+test("the restore resume's helper wait is RESUME_HELPER_MS (10 s) by default, inside the supervisor's stop timeout", async () => {
+  assert.equal(RESUME_HELPER_MS, 10_000);
+  let seen;
+  await requestResume(A, {
+    restoreState: () => "validated", tagsOf: () => [], pairOf: () => ({ transfer: "T", receipt: "R" }),
+    verifyTransferReceipt: async () => ({ transfer: { agent: A }, receipt: { agent: A, gen: 1, nonce: "N" }, transferHash: "H" }),
+    checkTransferForHost: () => ({ first: false }), host: { entryGen: () => 1, recordTransfer: () => {} },
+    liveLease: async () => ({ gen: 1, lease_id: newId(), lg: 1 }), node: "/n", main: "/m",
+    run: async (argv, o) => { seen = o.ms; return { code: 0, stdout: '{"resumed":true,"reason":null}' }; },
+  });
+  assert.equal(seen, RESUME_HELPER_MS);
 });

@@ -225,8 +225,11 @@ pub fn write_new(path: &Path, bytes: &[u8]) -> Result<String> {
     }
     let from = std::ffi::CString::new(tmp.as_os_str().as_bytes()).map_err(|_| fail("digests: a NUL in a path".into()))?;
     let to = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| fail("digests: a NUL in a path".into()))?;
+    // By the system call itself: musl (the shipped static build) has no renameat2 wrapper.
     // SAFETY: both are valid NUL-terminated strings; AT_FDCWD with absolute paths.
-    let r = unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE) };
+    let r = unsafe {
+        libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE)
+    };
     if r != 0 {
         let e = std::io::Error::last_os_error();
         let _ = fs::remove_file(&tmp);

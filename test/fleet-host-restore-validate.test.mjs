@@ -275,3 +275,19 @@ test("entries are sorted by their RAW bytes (A2 §4b), never their encoded text:
   const diff = compareTrees(want, new Map());
   assert.deepEqual(diff.missing.paths, raw);
 });
+
+test("checkClass on its own: the list's hash first, then a report that exists and is whole, then the compare", () => {
+  const list = Buffer.from(text(tree()));
+  const sha256 = H(list);
+  const report = { refused: [], unexpected: [], truncated: false };
+  const observed = text(tree());
+  assert.equal(mod.checkClass({ list, sha256, report, observed }).ok, true);
+  const no = (x, reason) => { const v = mod.checkClass({ list, sha256, report, observed, ...x }); assert.deepEqual([v.ok, v.reason], [false, reason], JSON.stringify(Object.keys(x))); };
+  no({ list: null }, "not_found");
+  no({ report: null }, "not_found");
+  no({ sha256: H("x") }, "bad_form");
+  no({ report: { ...report, truncated: true } }, "bad_form");
+  no({ report: { ...report, unexpected: [{ path: "p", type: "fifo" }] } }, "bad_form");
+  no({ observed: text([...tree(), file("c", "")]) }, "bad_form");
+  no({ observed: "{" }, "bad_form");
+});

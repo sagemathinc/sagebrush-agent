@@ -244,14 +244,17 @@ test("the transfer records: closed shape, durable across a reopen", async () => 
 });
 
 test("hostRecords carries the writer, bound to its store: the resume gate's host.recordTransfer", async () => {
-  const store = await HostStore.open(fresh());
+  const root = fresh();
+  const store = await HostStore.open(root);
   await accept(store, 1, { [X]: d("x1") });
   const host = hostRecords(store, { id: HOST, fingerprint: FP });
   // The shape the resume gate checks before it uses the records (entryGen and recordTransfer are functions).
   assert.equal(typeof host.entryGen, "function");
   assert.equal(typeof host.recordTransfer, "function");
   assert.ok(Object.isFrozen(host));
-  host.recordTransfer(X, T(1, N(1), d("t1")));
+  // Synchronous: no promise, and the record is on disk when it returns (the resume gate launches right after it).
+  assert.equal(host.recordTransfer(X, T(1, N(1), d("t1"))), undefined);
+  assert.deepEqual(JSON.parse(readFileSync(join(root, "transfers", "transfers.json"), "utf8")).accepted[X], T(1, N(1), d("t1")));
   assert.deepEqual(host.acceptedTransfer(X), T(1, N(1), d("t1")));
   assert.equal(host.nonceSeen(N(1)), d("t1"));
   // It refuses as the exported writer does.

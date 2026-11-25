@@ -253,8 +253,9 @@ const verify = (bytes) => { const body = JSON.parse(String(bytes)); return { bod
 const bodyOf = (bytes) => JSON.parse(String(bytes));
 
 /** The executor over fake units, with a fake chain seam recording its calls in `log`. */
-async function exec({ certValid = true, grantValid = true } = {}) {
+async function exec({ certValid = true, grantValid = true, stuck = () => null } = {}) {
   const fenceDir = join(tmp(), "fence"), log = [], units = {};
+  let proofs = 0; // (the all-slice proofs so far: `stuck(n)` makes the n-th read "nonempty" or "throw")
   const u = (id) => (units[id] ??= { active: false, masked: false });
   const idOf = (unit) => /^sagebrush-agents?-([a-z2-7]{26})\.(service|slice)$/.exec(unit)?.[1] ?? null;
   const fx = {
@@ -268,7 +269,14 @@ async function exec({ certValid = true, grantValid = true } = {}) {
       stop: (unit) => { log.push(["sys-stop", unit]); for (const [id, s] of Object.entries(units)) if (unit === "sagebrush-agents.slice" || idOf(unit) === id) s.active = false; },
       jobs: () => [], cancel: () => {}, rootUnits: () => [],
       activeAgentUnits: () => Object.entries(units).filter(([, s]) => s.active).map(([id]) => `sagebrush-agent-${id}.service`),
-      procCount: (unit) => Object.entries(units).filter(([id, s]) => s.active && (unit === "sagebrush-agents.slice" || idOf(unit) === id)).length,
+      procCount: (unit) => {
+        if (unit === "sagebrush-agents.slice") {
+          const how = stuck(proofs++);
+          if (how === "throw") throw new Error("cgroup.procs unreadable");
+          if (how === "nonempty") return 1;
+        }
+        return Object.entries(units).filter(([id, s]) => s.active && (unit === "sagebrush-agents.slice" || idOf(unit) === id)).length;
+      },
     },
   };
   const chain = {
@@ -279,7 +287,7 @@ async function exec({ certValid = true, grantValid = true } = {}) {
   };
   const store = await HostStore.open(join(tmp(), "state"));
   const holder = { barrier: null };
-  const sup = new Supervisor({ store, fx, verify, bodyOf, fenceDir, chain, barrier: async (n, d) => { log.push(["barrier", n]); if (holder.barrier) await holder.barrier(n, d); } });
+  const sup = new Supervisor({ store, fx, verify, bodyOf, fenceDir, chain, deadlines: { "adopt-retry": 5 }, barrier: async (n, d) => { log.push(["barrier", n]); if (holder.barrier) await holder.barrier(n, d); } });
   return { sup, store, log, units, u, fenceDir, holder };
 }
 const cand = { state: { seq: 6 }, entries: [new Uint8Array(1)], fromSeq: 6 };
@@ -335,6 +343,112 @@ test("chain-adopt, the grant ended: the expiry stop before the commit; only a NE
   assert.equal(newer.status, "applied", JSON.stringify(newer));
   assert.equal(existsSync(join(x.fenceDir, "expiry")), false);
   assert.equal(x.u(F.ids.agent).active, true);
+});
+
+test("chain-adopt, an unproven stop (a cgroup still non-empty, or one that can't be read), for the revoked and the expired candidate: no commit before the proof, exactly one after", async () => {
+  for (const [branch, opts, barrierName, status] of [["revoked", { certValid: false }, "after_revoked_stop", "revoked"], ["expired", { grantValid: false }, "after_grant_stop", "expired"]]) {
+    for (const how of ["nonempty", "throw"]) {
+      // Stuck for the adoption's first two attempts.
+      const x = await exec({ ...opts, stuck: (n) => (n < 2 ? how : null) });
+      await x.sup.recover();
+      await x.sup.submit({ kind: "grant", bytes: grantBytes(1, [F.ids.agent]) });
+      x.log.length = 0;
+      const commitsAt = [];
+      let queued = null;
+      x.holder.barrier = async (n) => {
+        if (n !== barrierName) return;
+        commitsAt.push(x.log.filter((l) => l[0] === "commit").length);
+        // While the stop isn't proven, another input waits behind the adoption (it holds the queue).
+        if (commitsAt.length === 1) queued = x.sup.submit({ kind: "grant", bytes: grantBytes(2, [F.ids.agent]) }).then((r) => ({ r, commits: x.log.filter((l) => l[0] === "commit").length }));
+      };
+      const r = await adopt(x.sup);
+      assert.equal(r.status, status, `${branch}/${how}`);
+      assert.equal(r.proven, true);
+      assert.deepEqual(commitsAt, [0, 0, 0], `${branch}/${how}: three attempts, no commit before the proof`);
+      assert.equal(x.log.filter((l) => l[0] === "commit").length, 1, "exactly one commit, after it");
+      const q = await queued;
+      assert.equal(q.commits, 1, "the queued input ran only after the proven stop and the commit");
+      if (branch === "revoked") assert.deepEqual(q.r, { status: "refused", reason: "revoked" });
+      assert.equal(x.u(F.ids.agent).active, branch === "expired" && q.r.status === "applied", "nothing runs again but what a newer grant restarts");
+    }
+  }
+});
+
+test("close during an adoption's unproven stop: nothing committed, the adoption resolves unproven, queued and later inputs refused", async () => {
+  for (const opts of [{ certValid: false }, { grantValid: false }]) {
+    const x = await exec({ ...opts, stuck: () => "nonempty" });
+    await x.sup.recover();
+    await x.sup.submit({ kind: "grant", bytes: grantBytes(1, [F.ids.agent]) });
+    x.log.length = 0;
+    let attempts = 0, closing = null, queued = null;
+    x.holder.barrier = async (n) => {
+      if (n !== "after_revoked_stop" && n !== "after_grant_stop") return;
+      attempts += 1;
+      if (attempts === 2) {
+        queued = x.sup.submit({ kind: "stop-all", authority: "person" }).then(() => "ran", (e) => e.code);
+        closing = x.sup.close();
+      }
+    };
+    const r = await adopt(x.sup);
+    assert.equal(r.proven, false, JSON.stringify(opts));
+    assert.equal(x.log.filter((l) => l[0] === "commit").length, 0, "nothing committed");
+    await closing;
+    assert.equal(await queued, "in_progress");
+    await assert.rejects(adopt(x.sup), (e) => e.code === "in_progress");
+  }
+});
+
+test("the sync's lifetime: stop() while a scheduled sync is fetching arms nothing more; a restart's timers are its own", async () => {
+  const h = await pairedHost();
+  let release;
+  const held = () => new Promise((r) => { release = () => r(new Response("no", { status: 500 })); });
+  const set = [];
+  let fire = null;
+  const s = new ChainSync({ snapshot: h.chain, aud: AUD, fleet: FLEET, host: HOST, signer: h.keys.sign, gen: () => 1, submit: async () => ({}),
+    origin: "https://dev.sagebrush.space", fetch: held, wall: () => NOW, timers: { set: (ms, fn) => { set.push(ms); fire = fn; return { ms }; }, clear: () => {} } });
+  const settle = () => new Promise((r) => setTimeout(r, 20));
+  // Start, fire the first sync, stop while it fetches, then let it finish: no timer armed for the stopped lifetime.
+  s.start();
+  fire();
+  await settle();
+  s.stop();
+  release();
+  await settle();
+  assert.deepEqual(set, [0], "stop during the fetch: nothing re-armed");
+  // Stop then restart while an old sync is still fetching: the old one's end arms nothing; the new one's arms the hour once.
+  s.start();
+  const fireOld = fire;
+  fireOld();
+  await settle();
+  const releaseOld = release;
+  s.stop();
+  s.start({ first: 7 });
+  const fireNew = fire;
+  releaseOld();
+  await settle();
+  assert.deepEqual(set, [0, 0, 7], "the old lifetime's end armed nothing");
+  fireNew();
+  await settle();
+  release();
+  await settle();
+  assert.deepEqual(set, [0, 0, 7, SYNC_EVERY_MS], "the new lifetime arms its hour, once");
+  s.stop();
+  // A start without a stop while a sync fetches: the old lifetime ends there too; only the new one arms.
+  s.start();
+  fire();
+  await settle();
+  const releaseOld2 = release;
+  s.start({ first: 9 });
+  const fireNew2 = fire;
+  releaseOld2();
+  await settle();
+  assert.deepEqual(set.slice(4), [0, 9], "the replaced lifetime's end armed nothing");
+  fireNew2();
+  await settle();
+  release();
+  await settle();
+  assert.deepEqual(set.slice(4), [0, 9, SYNC_EVERY_MS]);
+  s.stop();
 });
 
 test("chain-adopt is an emergency: it runs before a QUEUED start, never preempting the op already running; host only; refused without the seam", async () => {

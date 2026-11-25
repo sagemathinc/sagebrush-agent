@@ -590,6 +590,28 @@ test("registry: every emitter's refusal is a host-owned registered name whose me
   for (const n of printed) assert.ok(meaning(n)?.owner === "host", n);
 });
 
+test("an idle daemon stays up until SIGTERM: the real wait holds the process open, and SIGTERM ends it with 0", async () => {
+  const mod = new URL("../lib/fleet/host/host-main.mjs", import.meta.url).href;
+  const { spawn } = await import("node:child_process");
+  const child = spawn(process.execPath, ["--input-type=module", "-e",
+    `const { untilSigterm } = await import(${JSON.stringify(mod)}); process.stdout.write("waiting\\n"); await untilSigterm(); process.stdout.write("ended\\n"); process.exit(0);`],
+  { stdio: ["ignore", "pipe", "pipe"] });
+  let out = "", err = "";
+  child.stdout.on("data", (b) => { out += b; });
+  child.stderr.on("data", (b) => { err += b; });
+  const exited = new Promise((r) => child.on("exit", (code, signal) => r({ code, signal })));
+  try {
+    for (let i = 0; i < 200 && !out.includes("waiting"); i++) await new Promise((r) => setTimeout(r, 50));
+    assert.match(out, /waiting/, err);
+    await new Promise((r) => setTimeout(r, 1500));
+    assert.equal(child.exitCode, null, `still running after 1.5 s (${err})`);
+    child.kill("SIGTERM");
+    assert.deepEqual(await exited, { code: 0, signal: null });
+    assert.match(out, /ended/);
+    assert.doesNotMatch(err, /unsettled top-level await/);
+  } finally { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); }
+});
+
 // ---- the bin's hand-over (§1)
 
 test("the bin hands `host` over before the chat agent's own statements: with ANTHROPIC_BASE_URL set and a chat-agent argument", () => {

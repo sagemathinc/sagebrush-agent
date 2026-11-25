@@ -1000,3 +1000,139 @@ pub fn mount_setattr_idmap(clone: &OwnedFd, userns: &OwnedFd) -> io::Result<()> 
     };
     if r != 0 { Err(last()) } else { Ok(()) }
 }
+
+// ---- A5 (turn): the status and go pipes, the stdio check, the setid and its read-back.
+
+/// fcntl(fd, F_SETFD, FD_CLOEXEC) on an inherited descriptor number (fds 3 and 4, §1's first action).
+pub fn fd_cloexec(fd: libc::c_int) -> io::Result<()> {
+    // SAFETY: plain integer arguments; an invalid fd is EBADF.
+    let r = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// Whether `fd` is a pipe opened write-only (fstat S_IFIFO, then F_GETFL's access mode).
+pub fn fd_is_pipe_writer(fd: libc::c_int) -> io::Result<bool> {
+    let mut st = core::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `st` is writable for a whole stat; an invalid fd is EBADF.
+    let r = unsafe { libc::fstat(fd, st.as_mut_ptr()) };
+    if r != 0 {
+        return Err(last());
+    }
+    // SAFETY (§6 conversion 2): fstat returned 0, so the kernel initialized the whole struct.
+    let st = unsafe { st.assume_init() };
+    // SAFETY: plain integer arguments.
+    let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if fl < 0 {
+        return Err(last());
+    }
+    Ok(st.st_mode & libc::S_IFMT == libc::S_IFIFO && fl & libc::O_ACCMODE == libc::O_WRONLY)
+}
+
+/// Whether `fd` is an AF_UNIX SOCK_STREAM socket (fstat S_IFSOCK, then SO_DOMAIN and SO_TYPE).
+pub fn fd_is_unix_stream(fd: libc::c_int) -> io::Result<bool> {
+    let mut st = core::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `st` is writable for a whole stat; an invalid fd is EBADF.
+    let r = unsafe { libc::fstat(fd, st.as_mut_ptr()) };
+    if r != 0 {
+        return Err(last());
+    }
+    // SAFETY (§6 conversion 2): fstat returned 0, so the kernel initialized the whole struct.
+    let st = unsafe { st.assume_init() };
+    if st.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+        return Ok(false);
+    }
+    let opt = |name: libc::c_int| -> io::Result<libc::c_int> {
+        let mut v: libc::c_int = 0;
+        let mut len = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `v` and `len` are writable and `len` holds v's size.
+        let r = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, name, (&mut v as *mut libc::c_int).cast(), &mut len) };
+        if r != 0 { Err(last()) } else { Ok(v) }
+    };
+    Ok(opt(libc::SO_DOMAIN)? == libc::AF_UNIX && opt(libc::SO_TYPE)? == libc::SOCK_STREAM)
+}
+
+/// close_range(from, ~0U, 0): every descriptor from `from` up.
+pub fn close_range_from(from: libc::c_uint) -> io::Result<()> {
+    // SAFETY: plain integer arguments; no OwnedFd the caller still holds is at or above `from` (the caller's duty).
+    let r = unsafe { libc::syscall(libc::SYS_close_range, from, libc::c_uint::MAX, 0 as libc::c_uint) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// write(fd, buf) on an inherited descriptor number (the status pipe, fd 3).
+pub fn write_raw(fd: libc::c_int, buf: &[u8]) -> io::Result<usize> {
+    // SAFETY: `buf` is readable for its length; an invalid fd is EBADF.
+    let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+    if n < 0 { Err(last()) } else { Ok(n as usize) }
+}
+
+/// read(fd, buf) on an inherited descriptor number (the go pipe, fd 4).
+pub fn read_raw(fd: libc::c_int, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `buf` is writable for its length; an invalid fd is EBADF.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 { Err(last()) } else { Ok(n as usize) }
+}
+
+/// setgroups(gids).
+pub fn setgroups(gids: &[u32]) -> io::Result<()> {
+    // SAFETY: `gids` is readable for its length (gid_t is u32 on Linux).
+    let r = unsafe { libc::setgroups(gids.len(), gids.as_ptr()) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// setresgid(g, g, g).
+pub fn setresgid(g: u32) -> io::Result<()> {
+    // SAFETY: plain integer arguments.
+    let r = unsafe { libc::setresgid(g, g, g) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// setresuid(u, u, u).
+pub fn setresuid(u: u32) -> io::Result<()> {
+    // SAFETY: plain integer arguments.
+    let r = unsafe { libc::setresuid(u, u, u) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// getresuid(): (real, effective, saved).
+pub fn getresuid() -> io::Result<(u32, u32, u32)> {
+    let (mut r, mut e, mut s) = (0, 0, 0);
+    // SAFETY: the three are writable.
+    let x = unsafe { libc::getresuid(&mut r, &mut e, &mut s) };
+    if x != 0 { Err(last()) } else { Ok((r, e, s)) }
+}
+
+/// getresgid(): (real, effective, saved).
+pub fn getresgid() -> io::Result<(u32, u32, u32)> {
+    let (mut r, mut e, mut s) = (0, 0, 0);
+    // SAFETY: the three are writable.
+    let x = unsafe { libc::getresgid(&mut r, &mut e, &mut s) };
+    if x != 0 { Err(last()) } else { Ok((r, e, s)) }
+}
+
+/// getgroups(): the supplementary groups (at most 65536).
+pub fn getgroups() -> io::Result<Vec<u32>> {
+    let mut v = vec![0u32; 65536];
+    // SAFETY: `v` is writable for its length.
+    let n = unsafe { libc::getgroups(v.len() as libc::c_int, v.as_mut_ptr()) };
+    if n < 0 {
+        return Err(last());
+    }
+    v.truncate(n as usize);
+    Ok(v)
+}
+
+/// fcntl(fd, F_GETFD): a descriptor's flags (tests only: they read back FD_CLOEXEC).
+#[cfg(test)]
+pub fn fd_flags(fd: libc::c_int) -> io::Result<libc::c_int> {
+    // SAFETY: plain integer arguments; an invalid fd is EBADF.
+    let r = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if r < 0 { Err(last()) } else { Ok(r) }
+}
+
+/// dup(fd): a new, inheritable descriptor (no FD_CLOEXEC), the lowest free number (tests only).
+#[cfg(test)]
+pub fn dup_inheritable(from: &OwnedFd) -> io::Result<libc::c_int> {
+    // SAFETY: `from` is open; dup takes a plain integer and returns a new descriptor or -1.
+    let r = unsafe { libc::dup(from.as_raw_fd()) };
+    if r < 0 { Err(last()) } else { Ok(r) }
+}

@@ -3,13 +3,14 @@
 // before message 2 (H2), on a real chain, host certificate and signed record, and a real DurableState under the
 // host's lock. Linux only, as the host store is.
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, b64, newId, keyFromSeed, seal, applyChainEntry as apply, hostFingerprint, verifyHostCert, sha256b64 } from "../lib/fleet/index.mjs";
 import { lockDir, realIo } from "../lib/fleet/host/store.mjs";
-import { acceptMessage1, openChannelStore, prologueBytes } from "../lib/fleet/channel/accept.mjs";
+import { acceptMessage1, openChannelStore, prologueBytes, STORE_NAME } from "../lib/fleet/channel/accept.mjs";
+import { message2Outcome } from "../lib/fleet/channel/message2.mjs";
 import { initiator, x25519Generate } from "../lib/fleet/channel/noise.mjs";
 
 const AUD = "https://dev.sagebrush.space";
@@ -34,7 +35,7 @@ async function setup(t) {
   const store = openChannelStore(dir, lock);
   let gen = 1;
   const s = {
-    fleet, host, agent, chain, cert, encKey, store, dir, lock,
+    fleet, host, agent, chain, cert, encKey, store, dir, lock, N, sN,
     // a session as the app makes it: its X25519 key, and the record the person's device signs
     session(extra = {}) {
       const app = x25519Generate();
@@ -82,10 +83,11 @@ test("fresh vs resume (r4.1): a fresh session needs a strictly higher browser_ge
   assert.equal(await code(() => handshake(s, s.session({ browser_gen: 4 }))), "browser_gen_stale", "lower");
   assert.equal(await code(() => handshake(s, s.session({ browser_gen: 5, session: one.body.session }))), "browser_gen_stale", "the live session's id at its own gen");
   assert.equal(await code(() => handshake(s, s.session({ browser_gen: 3, session: one.body.session }))), "browser_gen_stale", "an old id at an old gen");
-  // resume: exactly resume_n + 1, the same record and key
-  assert.equal(await code(() => handshake(s, one, 2)), "replay", "a skipped resume_n");
+  // resume: exactly resume_n + 1, the same record and key; the exact live record at another counter gets A2's
+  // authenticated refusal naming the stored value, and nothing is written
+  assert.deepEqual((await handshake(s, one, 2)).a.refused, { host_gen: 3, browser_gen: 5, resume_n: 0 }, "a skipped resume_n");
   assert.equal((await handshake(s, one, 1)).a.accepted.resume_n, 1);
-  assert.equal(await code(() => handshake(s, one, 1)), "replay", "the same resume_n again");
+  assert.deepEqual((await handshake(s, one, 1)).a.refused, { host_gen: 3, browser_gen: 5, resume_n: 1 }, "the same resume_n again");
   const otherKey = s.session({ browser_gen: 5, session: one.body.session });
   assert.equal(await code(() => handshake(s, otherKey, 2)), "bad_form", "the live session, re-signed with another app key");
   // a new session replaces the old one: the old one never resumes again
@@ -175,8 +177,8 @@ test("(a) durable before message 2: a failed commit gives no message 2; a lost r
   const lp = s.prologue(lost);
   await acceptMessage1(s.message1(lost, lp).writeMessage1(lost.record), s.ctx(lp)); // (reply() never called)
   assert.equal(s.store.get().agents[s.agent].live.session, lost.body.session, "committed");
-  assert.equal(await code(() => handshake(s, lost, 0)), "browser_gen_stale", "the same fresh attempt again: never rolled back");
-  assert.equal((await handshake(s, lost, 1)).a.accepted.resume_n, 1, "the app's next attempt is the next resume_n");
+  assert.deepEqual((await handshake(s, lost, 0)).a.refused, { host_gen: 3, browser_gen: 4, resume_n: 0 }, "the same fresh attempt again: never rolled back, and told so (A2)");
+  assert.equal((await handshake(s, lost, 1)).a.accepted.resume_n, 1, "then the next resume_n");
 });
 
 test("(b) two responders sharing one store: concurrent fresh sessions at one browser_gen, and concurrent resumes, have exactly one winner", async (t) => {
@@ -187,9 +189,9 @@ test("(b) two responders sharing one store: concurrent fresh sessions at one bro
   assert.equal(both.find((r) => r.status === "rejected").reason.code, "browser_gen_stale");
   const winner = both[0].status === "fulfilled" ? a : b;
   assert.equal(s.store.get().agents[s.agent].live.session, winner.body.session);
-  const resumes = await Promise.allSettled([handshake(s, winner, 1), handshake(s, winner, 1)]);
-  assert.deepEqual(resumes.map((r) => r.status).sort(), ["fulfilled", "rejected"]);
-  assert.equal(resumes.find((r) => r.status === "rejected").reason.code, "replay");
+  const resumes = await Promise.all([handshake(s, winner, 1), handshake(s, winner, 1)]);
+  assert.deepEqual(resumes.map((r) => (r.a.accepted ? "accepted" : "refused")).sort(), ["accepted", "refused"], "one winner; the loser is told the stored value (A2)");
+  assert.equal(resumes.find((r) => r.a.refused).a.refused.resume_n, 1);
   assert.equal(s.store.get().agents[s.agent].live.resume_n, 1);
   // a second store on the same directory can't open while the first holds the lock
   await assert.rejects(lockDir(s.dir), (e) => e.code === "in_progress");
@@ -202,4 +204,113 @@ test("the store refuses a file that isn't its closed shape", async (t) => {
     assert.throws(() => s.store.commit((st) => { Object.assign(st, bad); if (bad.extra === undefined) delete st.extra; if (bad.v === 2) st.v = 2; if (bad.agents.x) st.agents = bad.agents; }), (e) => e.code === "bad_form", JSON.stringify(bad));
   }
   assert.equal(s.store.get().agents[s.agent].high, 2, "unchanged");
+});
+
+// ---- addendum A2: the one authenticated answer to a refusal, and the app's reading of message 2
+
+const storeText = (s) => readFileSync(join(s.dir, STORE_NAME), "utf8");
+const attemptOf = (sess, resume_n) => ({ host_gen: sess.body.host_gen, browser_gen: sess.body.browser_gen, resume_n });
+/** One attempt through the real acceptMessage1 and compare-and-set; `lose` drops message 2 (reply never sent). */
+async function attempt(s, sess, resume_n, { lose = false } = {}) {
+  const p = s.prologue(sess, resume_n);
+  const I = s.message1(sess, p);
+  const a = await acceptMessage1(I.writeMessage1(sess.record), s.ctx(p));
+  if (lose) return { a };
+  const r2 = a.reply();
+  const i2 = I.readMessage2(r2.message);
+  return { a, r2, outcome: message2Outcome(i2.payload, attemptOf(sess, resume_n)) };
+}
+
+test("A2: a fresh session whose message 2 was lost: the retry at 0 is told 0, with no effect, and resume 1 then succeeds", async (t) => {
+  const s = await setup(t);
+  const sess = s.session({ browser_gen: 4 });
+  await attempt(s, sess, 0, { lose: true }); // (committed; message 2 never reaches the app)
+  const before = storeText(s);
+  const retry = await attempt(s, sess, 0);
+  assert.deepEqual(retry.a.refused, { host_gen: 3, browser_gen: 4, resume_n: 0 });
+  assert.equal(retry.a.accepted, undefined, "nothing admitted");
+  assert.deepEqual(Object.keys(retry.r2), ["message"], "a refusal hands out no transport");
+  assert.deepEqual(retry.outcome, { refused: true, next: 1 }, "the app reads the authenticated refusal");
+  assert.equal(storeText(s), before, "the store is byte-identical: nothing written");
+  const next = await attempt(s, sess, 1);
+  assert.deepEqual([next.a.accepted.resume_n, next.outcome.accepted], [1, true]);
+});
+
+test("A2: a resume whose message 2 was lost: the retry at n is told n, then n + 1 resumes; a lost refusal is answered the same again", async (t) => {
+  const s = await setup(t);
+  const sess = s.session({ browser_gen: 2 });
+  await attempt(s, sess, 0);
+  await attempt(s, sess, 1, { lose: true });
+  const before = storeText(s);
+  // (the refusal's own message 2 lost too: the same retry gets the same answer, still with no effect)
+  const first = await attempt(s, sess, 1, { lose: true });
+  assert.deepEqual(first.a.refused, { host_gen: 3, browser_gen: 2, resume_n: 1 });
+  const again = await attempt(s, sess, 1);
+  assert.deepEqual([again.a.refused.resume_n, again.outcome], [1, { refused: true, next: 2 }]);
+  assert.equal(storeText(s), before);
+  assert.equal((await attempt(s, sess, 2)).a.accepted.resume_n, 2);
+});
+
+test("A2: an attempt that never committed (its message 1 lost): the retry at the same n is simply accepted", async (t) => {
+  const s = await setup(t);
+  const sess = s.session({ browser_gen: 2 });
+  await attempt(s, sess, 0);
+  // (message 1 at 1 never reached the host: nothing happened there, so the retry at 1 is the next)
+  const r = await attempt(s, sess, 1);
+  assert.deepEqual([r.a.accepted.resume_n, r.outcome.accepted], [1, true]);
+});
+
+test("A2: silence stays silent: another key, record or session, and a replaced or stale one, get no message 2 at all", async (t) => {
+  const s = await setup(t);
+  const one = s.session({ browser_gen: 5 });
+  await attempt(s, one, 0);
+  const before = storeText(s);
+  // (the live session re-signed with another app key; the same fields re-signed into another record; another session)
+  assert.equal(await code(() => attempt(s, s.session({ browser_gen: 5, session: one.body.session }), 0)), "browser_gen_stale");
+  assert.equal(await code(() => attempt(s, s.session({ browser_gen: 5, session: one.body.session }), 2)), "bad_form");
+  // (the same session, generation and app key in another valid record, signed by the same device: its hash differs)
+  const otherBody = { ...one.body, at_ms: one.body.at_ms + 1 };
+  const resigned = { ...one, body: otherBody, record: seal("sb.browser-session.v1", s.sN, otherBody, s.N) };
+  assert.equal(await code(() => attempt(s, resigned, 2)), "bad_form", "another record of the live session: silent");
+  assert.equal(await code(() => attempt(s, resigned, 0)), "browser_gen_stale", "and fresh: silent");
+  assert.equal(await code(() => attempt(s, s.session({ browser_gen: 6 }), 1)), "browser_gen_stale", "a session never accepted");
+  assert.equal(storeText(s), before);
+  await attempt(s, s.session({ browser_gen: 6 }), 0);
+  assert.equal(await code(() => attempt(s, one, 1)), "browser_gen_stale", "a replaced session: silent, even with its exact old record");
+  assert.equal(await code(() => attempt(s, one, 0)), "browser_gen_stale");
+});
+
+test("A2: a replayed old message 1 of the live session gets the refusal, writes nothing, and doesn't disturb the session", async (t) => {
+  const s = await setup(t);
+  const sess = s.session({ browser_gen: 3 });
+  const p1 = s.prologue(sess, 0);
+  const old = s.message1(sess, p1).writeMessage1(sess.record);
+  await acceptMessage1(old, s.ctx(p1)).then((a) => a.reply());
+  await attempt(s, sess, 1);
+  const before = storeText(s);
+  const replayed = await acceptMessage1(old, s.ctx(p1));
+  assert.deepEqual(replayed.refused, { host_gen: 3, browser_gen: 3, resume_n: 1 });
+  replayed.reply();
+  assert.equal(storeText(s), before);
+  assert.equal((await attempt(s, sess, 2)).a.accepted.resume_n, 2, "the live session goes on");
+});
+
+test("A2: the app's reading of message 2: two closed shapes, exactly this attempt's values, and nothing else", () => {
+  const at = { host_gen: 3, browser_gen: 5, resume_n: 2 };
+  const p = (v) => new TextEncoder().encode(JSON.stringify(v));
+  const bad = (v, why) => assert.throws(() => message2Outcome(typeof v === "string" ? new TextEncoder().encode(v) : p(v), at), (e) => e instanceof FleetError && e.code === "bad_form", why);
+  assert.deepEqual(message2Outcome(p({ browser_gen: 5, host_gen: 3, resume_n: 2 }), at), { accepted: true });
+  assert.deepEqual(message2Outcome(p({ browser_gen: 5, host_gen: 3, refused: "resume_n", resume_n: 2 }), at), { refused: true, next: 3 });
+  bad({ browser_gen: 5, host_gen: 3, resume_n: 1 }, "accepted at another counter");
+  bad({ browser_gen: 5, host_gen: 4, resume_n: 2 }, "accepted at another host_gen");
+  bad({ browser_gen: 5, host_gen: 3, refused: "resume_n", resume_n: 1 }, "a refusal naming n - 1");
+  bad({ browser_gen: 5, host_gen: 3, refused: "resume_n", resume_n: 3 }, "a refusal naming n + 1");
+  bad({ browser_gen: 6, host_gen: 3, refused: "resume_n", resume_n: 2 }, "another browser_gen");
+  bad({ browser_gen: 5, host_gen: 2, refused: "resume_n", resume_n: 2 }, "another host_gen");
+  bad({ browser_gen: 5, host_gen: 3, refused: "other", resume_n: 2 }, "another refused value");
+  bad({ browser_gen: 5, host_gen: 3, refused: "resume_n", resume_n: 2, x: 1 }, "an extra key");
+  bad({ browser_gen: 5, refused: "resume_n", resume_n: 2 }, "a missing key");
+  bad('{"host_gen":3,"browser_gen":5,"resume_n":2}', "not canonical");
+  const top = { host_gen: 3, browser_gen: 5, resume_n: Number.MAX_SAFE_INTEGER };
+  assert.throws(() => message2Outcome(p({ browser_gen: 5, host_gen: 3, refused: "resume_n", resume_n: Number.MAX_SAFE_INTEGER }), top), (e) => e.code === "bad_form", "no next past the safe integers");
 });

@@ -20,7 +20,9 @@ use crate::err::{err, Error, Fail, Result};
 use crate::json::{self, Value};
 use crate::profile::{ProfileOps, MAX_SUBPATHS, PROFILES};
 use crate::tree::{anchor_policy, child as tchild, identity, kind_of, open_err, pre, At, Kind, Obj};
+use crate::{sys, tree};
 use std::io;
+use std::os::fd::OwnedFd;
 
 /// The staged profile's fixed path in the turn's view (r2.1 §7.1; advisor §5).
 pub const STAGED: &str = "/run/sagebrush/claude-profile";
@@ -366,6 +368,143 @@ pub fn stage<O: TurnOps>(o: &mut O, host: O::H, tf: &TurnFile, step: &mut u8) ->
         }
     }
     Ok(Staged { profile: staged, root: turn })
+}
+
+// ---- the real operations (A5 r4.6)
+
+/// The user-namespace child (step 6): it unshares a user namespace, says so with one byte, and waits. Dropping this
+/// closes its go pipe (it exits) and reaps it, on every path, so no child outlives `userns`.
+struct NsChild {
+    pid: libc::pid_t,
+    go: Option<OwnedFd>,
+}
+
+impl Drop for NsChild {
+    fn drop(&mut self) {
+        drop(self.go.take());
+        loop {
+            match sys::waitpid(self.pid, 0) {
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                _ => break,
+            }
+        }
+    }
+}
+
+/// Write `data` to `name` beneath the child's /proc directory in ONE write (the kernel takes a map whole).
+fn write_proc(dir: &OwnedFd, name: &std::ffi::CStr, data: &[u8]) -> io::Result<()> {
+    let f = sys::openat2(dir, name, libc::O_WRONLY, 0)?;
+    if sys::write(&f, data)? != data.len() {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
+    Ok(())
+}
+
+/// The namespace entry `name` beneath an opened `/proc/<pid>/ns`, required to be a USER namespace (EINVAL otherwise).
+fn user_ns_entry(nsdir: &OwnedFd, name: &std::ffi::CStr) -> io::Result<OwnedFd> {
+    let ns = sys::open_ns_entry(nsdir, name)?;
+    if sys::ns_type(&ns)? != libc::CLONE_NEWUSER {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    Ok(ns)
+}
+
+fn make_userns(host: &OwnedFd, seen_as: u32, on_disk: u32) -> io::Result<OwnedFd> {
+    let (ready_r, ready_w) = sys::pipe()?;
+    let (go_r, go_w) = sys::pipe()?;
+    let pid = sys::fork()?;
+    if pid == 0 {
+        // The child: raw syscalls only, then _exit; it never returns into the launcher.
+        drop(ready_r);
+        drop(go_w);
+        let ok = sys::unshare_user().is_ok();
+        if ok {
+            let _ = sys::write(&ready_w, b"U");
+        }
+        drop(ready_w); // on a failure the parent reads EOF, never waits on a child that waits on it
+        let mut b = [0u8; 1];
+        let _ = sys::read(&go_r, &mut b); // until the parent closes the go pipe
+        sys::exit_now(if ok { 0 } else { 1 });
+    }
+    drop(ready_w);
+    drop(go_r);
+    let child = NsChild { pid, go: Some(go_w) };
+    let pidfd = sys::pidfd_open(child.pid)?;
+    let mut b = [0u8; 1];
+    if sys::read(&ready_r, &mut b)? != 1 || b[0] != b'U' {
+        return Err(io::Error::from_raw_os_error(libc::EPERM)); // the child couldn't make its namespace
+    }
+    // Every path through the HOST root, before the switch (r4.6); the child is unreaped, so its pid is its own.
+    let dir = sys::openat2(host, &tree::c(&format!("proc/{}", child.pid))?, libc::O_PATH | libc::O_DIRECTORY, 0)?;
+    write_proc(&dir, c"setgroups", b"deny")?;
+    let line = map_line(seen_as, on_disk);
+    write_proc(&dir, c"uid_map", line.as_bytes())?;
+    write_proc(&dir, c"gid_map", line.as_bytes())?;
+    let nsdir = sys::openat2(&dir, c"ns", libc::O_PATH | libc::O_DIRECTORY, 0)?;
+    let ns = user_ns_entry(&nsdir, c"user")?;
+    sys::pidfd_alive(&pidfd)?; // still our child after the opens
+    drop(child); // reaped
+    Ok(ns)
+}
+
+impl TurnOps for tree::RealOps {
+    type P = OwnedFd;
+    fn pidfd(&mut self, pid: u32) -> io::Result<OwnedFd> {
+        sys::pidfd_open(pid as libc::pid_t)
+    }
+    fn alive(&mut self, p: &OwnedFd) -> io::Result<bool> {
+        match sys::pidfd_alive(p) {
+            Ok(()) => Ok(true),
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+    fn join_ns(&mut self, p: &OwnedFd) -> io::Result<()> {
+        sys::setns(p, libc::CLONE_NEWNET | libc::CLONE_NEWNS)
+    }
+    fn unshare_private(&mut self) -> io::Result<()> {
+        sys::unshare_mount_ns()?;
+        sys::make_root_private()
+    }
+    fn turn_root(&mut self) -> io::Result<OwnedFd> {
+        sys::open_root()
+    }
+    fn read_handle(&mut self, h: &OwnedFd, max: usize) -> io::Result<Vec<u8>> {
+        let mut out = vec![0u8; max + 1];
+        let mut n = 0;
+        loop {
+            let k = sys::pread(h, &mut out[n..], n as u64)?;
+            if k == 0 {
+                break;
+            }
+            n += k;
+            if n > max {
+                return Err(io::Error::from_raw_os_error(libc::EFBIG));
+            }
+        }
+        out.truncate(n);
+        Ok(out)
+    }
+    fn clone_tree(&mut self, h: &OwnedFd) -> io::Result<OwnedFd> {
+        sys::open_tree_clone(h)
+    }
+    fn userns(&mut self, host: &OwnedFd, seen_as: u32, on_disk: u32) -> io::Result<OwnedFd> {
+        make_userns(host, seen_as, on_disk)
+    }
+    fn idmap(&mut self, clone: &OwnedFd, userns: &OwnedFd) -> io::Result<()> {
+        sys::mount_setattr_idmap(clone, userns)
+    }
+    fn move_onto(&mut self, clone: &OwnedFd, target: &OwnedFd) -> io::Result<()> {
+        sys::move_mount(clone, target)
+    }
+    fn at_mounted(&mut self, dir: &OwnedFd, name: &str) -> io::Result<OwnedFd> {
+        // Only for the re-reads of a mount this turn just made, and only ONE validated component (SEC on part 3a): never
+        // general path resolution. BENEATH | NO_SYMLINKS | NO_MAGICLINKS still hold; only NO_XDEV is absent.
+        if !segment_ok(name) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        sys::openat2(dir, &tree::c(name)?, libc::O_PATH, 0)
+    }
 }
 
 #[cfg(test)]
@@ -937,5 +1076,78 @@ mod tests {
         assert_eq!(code(parse_turn_file(bad("\"gids\":[80001]", &format!("\"gids\":[{}]", many.join(","))).as_bytes(), TURN)), 65, "65 gids");
         let dup = good.replace("\"mountpoints\":[{", "\"mountpoints\":[{\"name\":\"projects\",\"ino\":1,\"gen\":1},{");
         assert_eq!(code(parse_turn_file(dup.as_bytes(), TURN)), 65, "a duplicate mountpoint name");
+    }
+
+    /// The real operations that run unprivileged on this kernel (the rest need root and are the VM's rows).
+    mod real {
+        use super::*;
+
+        fn my_ids() -> (u32, u32) {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::metadata("/proc/self").unwrap();
+            (m.uid(), m.gid())
+        }
+
+        #[test]
+        fn the_userns_child_makes_a_user_namespace_and_is_reaped() {
+            let (uid, gid) = my_ids();
+            if uid != gid {
+                eprintln!("SKIPPED: uid {uid} != gid {gid}: an unprivileged gid_map can map only the caller's own gid");
+                return;
+            }
+            let mut o = tree::RealOps;
+            let host = o.root().unwrap();
+            // This thread's own children (each test runs on its own thread): none may be left over, not even a zombie.
+            let children = || std::fs::read_to_string("/proc/thread-self/children").ok();
+            match o.userns(&host, uid, uid) {
+                Ok(ns) => {
+                    assert_eq!(sys::ns_type(&ns).unwrap(), libc::CLONE_NEWUSER);
+                    match children() {
+                        Some(c) => assert_eq!(c.trim(), "", "the child is reaped"),
+                        None => eprintln!("SKIPPED (reap check): no /proc/thread-self/children on this kernel"),
+                    }
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EPERM) || e.raw_os_error() == Some(libc::EACCES) => {
+                    eprintln!("SKIPPED: this kernel or container refuses an unprivileged user namespace ({e})");
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+
+        #[test]
+        fn only_a_user_namespace_entry_is_taken() {
+            let mut o = tree::RealOps;
+            let root = o.root().unwrap();
+            let nsdir = sys::openat2(&root, &tree::c(&format!("proc/{}/ns", std::process::id())).unwrap(), libc::O_PATH | libc::O_DIRECTORY, 0).unwrap();
+            assert!(user_ns_entry(&nsdir, c"user").is_ok());
+            assert_eq!(user_ns_entry(&nsdir, c"net").err().and_then(|e| e.raw_os_error()), Some(libc::EINVAL), "a network namespace isn't one");
+        }
+
+        #[test]
+        fn at_mounted_takes_one_validated_component_only() {
+            let mut o = tree::RealOps;
+            let root = o.root().unwrap();
+            let tmp = o.dir_from_root(&root, "tmp").unwrap();
+            for bad in ["a/b", "..", ".", "", "x\u{0}y"] {
+                assert_eq!(o.at_mounted(&tmp, bad).err().and_then(|e| e.raw_os_error()), Some(libc::EINVAL), "{bad:?}");
+            }
+        }
+
+        #[test]
+        fn read_handle_is_bounded_and_alive_sees_this_process() {
+            let d = std::env::temp_dir().join(format!("sbl-turn-{}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("f"), b"12345").unwrap();
+            let mut o = tree::RealOps;
+            let root = o.root().unwrap();
+            let dir = o.dir_from_root(&root, &d.to_str().unwrap()[1..]).unwrap();
+            let h = o.at(&dir, "f", At::File).unwrap();
+            assert_eq!(o.read_handle(&h, 5).unwrap(), b"12345");
+            let h = o.at(&dir, "f", At::File).unwrap();
+            assert_eq!(o.read_handle(&h, 4).err().and_then(|e| e.raw_os_error()), Some(libc::EFBIG));
+            std::fs::remove_dir_all(&d).unwrap();
+            let me = o.pidfd(std::process::id()).unwrap();
+            assert!(o.alive(&me).unwrap());
+        }
     }
 }

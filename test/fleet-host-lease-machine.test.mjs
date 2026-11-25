@@ -1137,3 +1137,31 @@ test("recovery reconciles a crash between the helper's lowering and the run stat
     await w2.close();
   }
 });
+
+test("recovery's reconciliation goes through the widening gate: with its proof unfinished the agent is never moved to running (contained instead); a person's resume then brings it back", async () => {
+  const dirs = { root: tmp("state"), fenceDir: tmp("fence"), leaseDir: tmp("lease"), restoreDir: tmp("restore") };
+  const w = await world({ resumeOp, ...dirs });
+  await restored(w);
+  w.barrier = async (n) => { if (n === "after_restore_resume") throw new Error("crash"); };
+  await assert.rejects(resumeRestoredOp(w));
+  // A process that survives every stop, and the agent's proof pending: recovery can't prove it down.
+  w.fx.u(A).active = true; w.fx.u(A).stuck = true;
+  w.store.grants.markProof(A);
+  w.barrier = null;
+  const r = await w.sup.recover();
+  assert.ok((r.unproven ?? []).includes(A), JSON.stringify(r));
+  assert.notEqual(w.store.registry.agent(A).state, "running", "never moved to running while its proof is unfinished");
+  assert.ok(fenceCauses(A, { dir: w.fenceDir }).includes("agent"), "contained with its own fence");
+  await w.close();
+  // The next start, with the process gone: proven, and left as containment left it; a person's resume brings it back.
+  const w2 = await world({ resumeOp, ...dirs });
+  const r2 = await w2.sup.recover();
+  assert.ok(!(r2.unproven ?? []).includes(A), JSON.stringify(r2));
+  assert.equal(w2.store.registry.agent(A).state, "stopped");
+  const again = await w2.sup.submit({ kind: "resume", authority: "person", agent: A });
+  assert.equal(again.status, "resumed", JSON.stringify(again));
+  await w2.fire("renew");
+  assert.equal(w2.store.registry.agent(A).state, "running");
+  assert.equal(w2.fx.u(A).active, true);
+  await w2.close();
+});

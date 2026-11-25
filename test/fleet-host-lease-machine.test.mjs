@@ -1482,3 +1482,32 @@ test("TESTS H2: close() while the reopen waits for an activation lock: the op en
   assert.equal(existsSync(join(w.leaseDir, "reopen")), false, "never acknowledged");
   await w.close();
 });
+
+test("TESTS H2: close() DURING the activation lock's release returns at once; the release completes later, exactly once; no thaw, no acknowledgement, and only fresh authority after", async () => {
+  const w = await world({ sleepOpts: reopenSeams });
+  await granted(w, [A]);
+  await w.fire("renew");
+  const old = w.machine.current(A);
+  gateWrite(w, S(1), null);
+  const h = held();
+  let releasing = false, released = 0;
+  w.sup.sleepOpts.lock = async () => ({ release: async () => { releasing = true; await h.p; released++; } });
+  const op = w.sup.submit({ kind: "sleep-reopen", authority: "host" }).then(() => "resolved", (e) => e?.message);
+  assert.ok(await realWait(() => releasing), "the reopen is in the lock's release");
+  assert.equal(await Promise.race([w.sup.close().then(() => "closed"), new Promise((r) => setTimeout(() => r("held"), 200))]), "closed", "close isn't held by the release");
+  assert.equal(await op, "closing");
+  assert.equal(released, 0, "the release is still pending");
+  h.release();
+  assert.ok(await realWait(() => released === 1), "the release completed later");
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(released, 1, "exactly once");
+  assert.ok(!w.sleepSys.calls.includes("freeze=0"), "never thawed");
+  assert.equal(w.sleepSys.freeze, "1");
+  assert.equal(existsSync(join(w.leaseDir, "reopen")), false, "never acknowledged");
+  assert.equal(readGate({ dir: w.leaseDir, clock: w.clock }).open, false, "the gate stays closed");
+  // only fresh authority: the old lease voided and spent, `lease` raised; nothing from before the suspend is used again
+  assert.equal(w.machine.current(A), null);
+  assert.ok(readTombstone(A, { dir: w.leaseDir }) >= old.lg);
+  assert.equal(w.leaseUp(A), true);
+  await w.close();
+});

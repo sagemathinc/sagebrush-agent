@@ -172,7 +172,7 @@ test("the generation rule: lower or equal-but-different refused; byte-identical 
   await s.close();
 });
 
-test("highwater only increases: astra2's sequence (gen 2 intent held, gen 3 begun, gen 2 released)", async () => {
+test("highwater only increases: the tests review's sequence (gen 2 intent held, gen 3 begun, gen 2 released)", async () => {
   const dir = fresh();
   const s = await GrantState.open(dir);
   let release;
@@ -363,7 +363,7 @@ test("anything but the exact closed state is refused at load and left as found",
   }
 });
 
-test("astra2's interleaving: a stale begin across lock loss can't touch a replacement's accepted grant bytes", async () => {
+test("the tests review's interleaving: a stale begin across lock loss can't touch a replacement's accepted grant bytes", async () => {
   const dir = fresh();
   const old = await GrantState.open(dir);
   let release;

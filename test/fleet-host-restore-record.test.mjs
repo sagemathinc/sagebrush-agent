@@ -68,9 +68,19 @@ test("the restore fence: per agent at fence/restore/<id>, lowered only by a resu
   await lowerFence("agent", a, "resume-agent", { dir, agentState: "stopped" });
   await lowerFence("backup", a, "backup-recovery", { dir });
   assert.equal(fenced(a, { dir }), true, "the restore fence is still up");
-  await lowerFence("restore", a, "resume-restored", { dir, restoreState: "validated" });
+  // Only from the agent's own resume helper scope (S2), read by lowerFence itself (cgroupOf is its test seam): the
+  // supervisor's cgroup, another agent's resume scope, the lease helper's scope, none or garbage are refused.
+  const scopeOf = (x) => `/sagebrush.slice/sagebrush-agents.slice/sagebrush-agents-${x}.slice/sagebrush-restore-resume-${x}.scope`;
+  for (const own of ["/sagebrush.slice/sagebrush-supervisor.service", "/system.slice/sagebrush.service", scopeOf(b),
+    `/sagebrush.slice/sagebrush-agents.slice/sagebrush-agents-${a}.slice/sagebrush-lease-activate-${a}.scope`,
+    `/sagebrush.slice/sagebrush-agents.slice/sagebrush-agents-${b}.slice/sagebrush-restore-resume-${a}.scope`, `${scopeOf(a)}/x`, null, ""]) {
+    await rejects(lowerFence("restore", a, "resume-restored", { dir, restoreState: "validated", cgroupOf: () => own }), "not_granted");
+  }
+  await rejects(lowerFence("restore", a, "resume-restored", { dir, restoreState: "validated" }), "not_granted"); // this test process's own cgroup
+  assert.equal(fenced(a, { dir }), true);
+  await lowerFence("restore", a, "resume-restored", { dir, restoreState: "validated", cgroupOf: () => scopeOf(a) });
   assert.equal(fenced(a, { dir }), false);
-  await lowerFence("restore", b, "resume-restored", { dir, restoreState: "validated" }); // never raised: fine
+  await lowerFence("restore", b, "resume-restored", { dir, restoreState: "validated", cgroupOf: () => scopeOf(b) }); // never raised: fine
   refused(() => raiseFence("restore", "nope", { dir }), "bad_form");
   await rejects(stop({ agent: a }, "restore", { dir }), "bad_form");
 });

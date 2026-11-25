@@ -51,7 +51,7 @@ function open(r, role, t, { over = {}, headers = {}, nonce = rid(), request = ri
   r.live.add(ws);
   return new Promise((resolve) => {
     ws.on("open", () => resolve({ ws, nonce, request }));
-    ws.on("unexpected-response", (_req, res) => { resolve({ status: res.statusCode }); res.resume(); });
+    ws.on("unexpected-response", (_req, res) => { resolve({ status: res.statusCode, text: res.statusMessage }); res.resume(); });
     ws.on("error", () => resolve({ status: "error" }));
   });
 }
@@ -106,7 +106,7 @@ test("ingress refusals happen before any control-plane call: the query, the role
     assert.equal(big.status, 431, "the header block over 98,304 bytes");
     // (the relay token, A1 §3: no token, or one out of its exact form, is 401 before any control-plane call; a session
     //  cookie is never read on this route, so one without a token is refused the same)
-    assert.equal((await open(r, "app", t, { headers: { "sagebrush-relay-token": undefined } })).status, 401, "no relay token");
+    assert.deepEqual(await open(r, "app", t, { headers: { "sagebrush-relay-token": undefined } }), { status: 401, text: "Unauthorized" }, "no relay token");
     assert.equal((await open(r, "app", t, { headers: { "sagebrush-relay-token": undefined, cookie: `__Host-sb_session=${t.account}` } })).status, 401, "a session cookie, no token");
     for (const bad of [`rt2.${"A".repeat(43)}`, `rt1.${"A".repeat(42)}B`, `rt1.${"A".repeat(44)}`, "rt1."])
       assert.equal((await open(r, "app", t, { headers: { "sagebrush-relay-token": bad } })).status, 401, `a token out of form: ${bad.slice(0, 6)}`);

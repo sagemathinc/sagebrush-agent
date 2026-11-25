@@ -8,12 +8,13 @@
 //   node scripts/seccomp-policy.mjs generate               write the artifact from the fixtures (a reviewed change)
 //   node scripts/seccomp-policy.mjs check <filter> <unistd_64.h> <version>
 //        the pinned tools' raw outputs: the version line must be the pin's, the filter output byte for byte the
-//        fixture, the numbers the fixture's, and the artifact byte for byte what the fixtures generate
+//        fixture except its machine-dependent tail (the running kernel's Unlisted section, canonicalOutput), the
+//        numbers the fixture's, and the artifact byte for byte what the fixtures generate
 //   node scripts/seccomp-policy.mjs debs                   the pin's .debs, one `url sha256 package version arch file` per line
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { buildPolicy, numbersFile, serializePolicy } from "../lib/fleet/host/seccomp-policy.mjs";
+import { buildPolicy, canonicalOutput, numbersFile, serializePolicy } from "../lib/fleet/host/seccomp-policy.mjs";
 
 const at = (p) => fileURLToPath(new URL(`../${p}`, import.meta.url));
 export const ARTIFACT = at("schema/fleet/agent-seccomp-policy.json");
@@ -34,7 +35,14 @@ export function check(filterRaw, unistdText, versionText, pin = readPin()) {
   const bad = [];
   const first = String(versionText).split("\n")[0];
   if (first !== pin.groups_from.systemd_version) bad.push(`the systemd version is ${JSON.stringify(first)}, not the pin's`);
-  if (!Buffer.from(filterRaw).equals(readFileSync(FILTER_FIXTURE))) bad.push("the syscall-filter output differs from the fixture");
+  // Byte for byte, except the one machine-dependent tail (the running kernel's Unlisted section), cut on BOTH sides.
+  let same = false;
+  try {
+    same = canonicalOutput(filterRaw).equals(canonicalOutput(readFileSync(FILTER_FIXTURE)));
+  } catch (e) {
+    bad.push(e.message);
+  }
+  if (!same) bad.push("the syscall-filter output differs from the fixture");
   if (numbersFile(unistdText) !== readFileSync(NUMBERS_FIXTURE, "utf8")) bad.push("the x86_64 numbers differ from the fixture");
   if (generated(pin) !== readFileSync(ARTIFACT, "utf8")) bad.push("the artifact isn't what the fixtures generate");
   return bad;

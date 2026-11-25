@@ -4,7 +4,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { buildPolicy, expand, FILTER, GROUPS, numbersFile, parseSyscallFilter, serializePolicy, systemdMajorRefusal } from "../lib/fleet/host/seccomp-policy.mjs";
 import { ARTIFACT, check, debLines, FILTER_FIXTURE, generated, NUMBERS_FIXTURE, readPin } from "../scripts/seccomp-policy.mjs";
 
@@ -110,6 +114,49 @@ test("CI's comparison: the pinned tools' raw outputs must equal the fixtures, an
   const other = structuredClone(pin);
   other.groups_from.debs[0].sha256 = "0".repeat(64);
   assert.match(check(Buffer.from(filterText, "latin1"), unistd, version, other).join(), /the artifact isn't what the fixtures generate/);
+});
+
+test("CI's comparison accepts exactly the three machine-dependent tails, and nothing else may differ", () => {
+  const version = "systemd 255 (255.4-1ubuntu8.19)\n";
+  const run = (t) => check(Buffer.from(t, "latin1"), unistd, version);
+  assert.ok(filterText.endsWith("#   utrap_install\n\n"), "the fixture's tail: the kernel's list couldn't be read");
+  const head = filterText.slice(0, -1);
+  const unlisted = "\n# Unlisted System Calls (supported by the local kernel, but not included in any of the groups listed above):\n#   host_only_call\n#   another_one\n";
+  // The three tails the pinned systemd prints: all accepted, and the head compared byte for byte.
+  assert.deepEqual(run(head + "\n"), [], "the list couldn't be read");
+  assert.deepEqual(run(head), [], "the kernel lists nothing more");
+  assert.deepEqual(run(head + unlisted), [], "the running kernel's Unlisted section");
+  assert.deepEqual(run(head + unlisted.replace("Unlisted System Calls", "Unlisted System Calls\x1b[0m")), [], "with systemd's escape");
+  // Anything else differs: a named group's member, an Ungrouped entry, a malformed or doubled Unlisted section, text after it.
+  for (const [what, t] of [
+    ["a named member", head.replace("    accept4\n", "    accept5\n")],
+    ["an Ungrouped entry removed", head.replace("#   arc_gettls\n", "")],
+    ["an Ungrouped entry added", head + "#   zz_extra\n"],
+    ["a malformed Unlisted line", head + unlisted.replace("#   another_one", "#   another one")],
+    ["two Unlisted sections", head + unlisted + unlisted],
+    ["text after the Unlisted section", head + unlisted + "x\n"],
+    ["two empty lines", head + "\n\n"],
+  ]) assert.ok(run(t).length > 0, what);
+});
+
+test("the check command itself: a changed or absent Unlisted section passes, a named or Ungrouped change fails", () => {
+  const dir = mkdtempSync(join(tmpdir(), "sbl-seccomp-"));
+  const write = (name, text) => { const f = join(dir, name); writeFileSync(f, text, "latin1"); return f; };
+  const u = write("unistd_64.h", unistd);
+  const v = write("version", "systemd 255 (255.4-1ubuntu8.19)\n+PAM\n");
+  const head = filterText.slice(0, -1);
+  const unlisted = "\n# Unlisted System Calls (supported by the local kernel, but not included in any of the groups listed above):\n#   host_only_call\n";
+  const cli = (text) => spawnSync(process.execPath, [fileURLToPath(new URL("../scripts/seccomp-policy.mjs", import.meta.url)), "check", write("filter", text), u, v], { encoding: "utf8" });
+  try {
+    for (const t of [filterText, head, head + unlisted]) assert.equal(cli(t).status, 0, cli(t).stderr);
+    for (const t of [head.replace("    accept4\n", "    accept5\n"), head.replace("#   arc_gettls\n", ""), head + unlisted.replace("host_only_call", "host only")]) {
+      const r = cli(t);
+      assert.equal(r.status, 1);
+      assert.match(r.stderr, /seccomp policy: /);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("the host's systemd: exactly the pinned major, else a hard refusal (unreadable or mismatch)", () => {

@@ -2,8 +2,10 @@
 // lib/fleet/request.mjs and channel/relay.mjs, Node's): one corpus of host opens, app opens and replacement
 // authorizations, valid and broken one way each, gives the same code and the same admitted fields through Node's face,
 // through the core on Node's backend, and through the core alone on the WebCrypto backend in a process of its own
-// (fleet-relay-core-child.mjs). The core consumes nothing: an open it admitted admits again; Node's face refuses the
-// second as a replay. And an authorization's body is closed: exactly its seven fields, in form, canonical.
+// (fleet-relay-core-child.mjs). The core consumes no nonce or request id: an open it admitted admits again; Node's face
+// refuses the second as a replay. The app open's relay token (channel addendum A1) is consumed through ctx by both, before
+// any other check; AppTokens, the service's store, takes a row once. And an authorization's body is closed: exactly its
+// seven fields, in form, canonical.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash, createHmac, randomBytes } from "node:crypto";
@@ -40,9 +42,16 @@ async function world() {
   return { fleet, host, agent, H, stranger, genesis, chain, session };
 }
 
-/** Every case: { kind, target, headers } or { kind: "commit", header, body }, with ctx differences, and why. */
+const ACCOUNT = newId(), ACCOUNT_SESSION = newId();
+const tokenKey = (t) => createHash("sha256").update(t, "utf8").digest("base64url");
+const newToken = () => `rt1.${b64(randomBytes(32))}`;
+
+/**
+ * Every case: { kind, target, headers } or { kind: "commit", header, body }, with ctx differences, and why; and the
+ * token rows the app cases were issued (by key), as the service would hold them.
+ */
 function corpus(w) {
-  const cases = [];
+  const cases = [], tokens = {};
   const add = (why, k) => cases.push({ why, ...k });
   const fields = (s, role, extra = {}) => ({ role, fleet: w.fleet, session: s.body.session, agent: w.agent, browser_gen: s.body.browser_gen, host_gen: 3, resume_n: 0, ...extra });
   const sigFor = (target, method = "GET", body = new Uint8Array(0), { k = w.H, gen = 3, ts = NOW, ...more } = {}) =>
@@ -67,23 +76,45 @@ function corpus(w) {
   add("host: the signature's form", { kind: "host", target: ht, headers: { "sagebrush-sig": sigFor(ht).replace("gen=3", "gen=03") } });
 
   const at = core.openTarget(fields(s, "app"));
-  const app = (extra = {}, rec = s.record) => ({ "sagebrush-browser-record": b64(rec), "sagebrush-request": nonce(), ...extra });
-  add("app: valid", { kind: "app", target: at, headers: app() });
-  add("app: another account's fleet", { kind: "app", target: at, headers: app(), ctx: { fleets: [newId()] } });
-  add("app: the record's session isn't the open's", { kind: "app", target: core.openTarget(fields(w.session(), "app")), headers: app() });
-  add("app: the record's browser_gen isn't the open's", { kind: "app", target: core.openTarget(fields(s, "app", { browser_gen: 3 })), headers: app() });
-  add("app: the record's host_gen isn't the open's", { kind: "app", target: core.openTarget(fields(s, "app", { host_gen: 4 })), headers: app(), ctx: { gen: 4 } });
-  add("app: before the window", { kind: "app", target: at, headers: app(), ctx: { now: NOW - 1001 } });
-  add("app: at the window's end", { kind: "app", target: at, headers: app(), ctx: { now: NOW + 3_600_000 } });
-  add("app: the host's gen moved on", { kind: "app", target: at, headers: app(), ctx: { gen: 4 } });
-  add("app: headers over 98,304 bytes", { kind: "app", target: at, headers: app({ "x-filler": "a".repeat(core.HEADERS_MAX - 100) }) });
-  add("app: a request id out of form", { kind: "app", target: at, headers: app({ "sagebrush-request": "x" }) });
-  add("app: a record header over 87,252", { kind: "app", target: at, headers: app({ "sagebrush-browser-record": "A".repeat(core.RECORD_HEADER_MAX + 1) }) });
-  add("app: a record header that isn't base64url", { kind: "app", target: at, headers: app({ "sagebrush-browser-record": "a+b/" }) });
-  add("app: a record of another type", { kind: "app", target: at, headers: app({}, seal("sb.device-chain.v1", { kind: "device", id: newId(), alg: "ed25519", key: w.H.key }, { x: 1 }, w.H)) });
+  // (an app open's headers, with a token issued for exactly that open unless `row` says otherwise: null, none issued;
+  // an object, fields of the row changed)
+  const appOpen = (why, target, { extra = {}, rec = s.record, ctx, row = {}, token = newToken() } = {}) => {
+    const id = nonce();
+    if (row !== null) {
+      const { role, ...f } = core.parseOpenTarget(target);
+      tokens[tokenKey(token)] = { account: ACCOUNT, account_session: ACCOUNT_SESSION, ...f, host: w.host, request: id, expires_ms: NOW + core.APP_TOKEN_MS, ...row };
+    }
+    add(why, { kind: "app", target, ctx, headers: { "sagebrush-relay-token": token, "sagebrush-browser-record": b64(rec), "sagebrush-request": id, ...extra } });
+  };
+  appOpen("app: valid", at);
+  appOpen("app: the record's session isn't the open's", core.openTarget(fields(w.session(), "app")));
+  appOpen("app: the record's browser_gen isn't the open's", core.openTarget(fields(s, "app", { browser_gen: 3 })));
+  appOpen("app: the record's host_gen isn't the open's", core.openTarget(fields(s, "app", { host_gen: 4 })), { ctx: { gen: 4 } });
+  appOpen("app: before the window", at, { ctx: { now: NOW - 1001 } });
+  appOpen("app: at the window's end", at, { ctx: { now: NOW + 3_600_000 }, row: { expires_ms: NOW + 3_600_001 } });
+  appOpen("app: the host's gen moved on", at, { ctx: { gen: 4 } });
+  appOpen("app: headers over 98,304 bytes", at, { extra: { "x-filler": "a".repeat(core.HEADERS_MAX - 100) } });
+  appOpen("app: a request id out of form", at, { extra: { "sagebrush-request": "x" } });
+  appOpen("app: a record header over 87,252", at, { extra: { "sagebrush-browser-record": "A".repeat(core.RECORD_HEADER_MAX + 1) } });
+  appOpen("app: a record header that isn't base64url", at, { extra: { "sagebrush-browser-record": "a+b/" } });
+  appOpen("app: a record of another type", at, { rec: seal("sb.device-chain.v1", { kind: "device", id: newId(), alg: "ed25519", key: w.H.key }, { x: 1 }, w.H) });
   const tampered = Uint8Array.from(s.record); tampered[tampered.length - 5] ^= 1;
-  add("app: a tampered record", { kind: "app", target: at, headers: app({}, tampered) });
-  add("app: a host target", { kind: "app", target: ht, headers: app() });
+  appOpen("app: a tampered record", at, { rec: tampered });
+  appOpen("app: a host target", ht);
+  // (the relay token, A1 §3: its form, its row, the row's expiry and session, and its binding to this exact open)
+  appOpen("app: no relay token", at, { extra: { "sagebrush-relay-token": undefined } });
+  appOpen("app: a relay token out of form", at, { token: `rt2.${b64(randomBytes(32))}` });
+  appOpen("app: a relay token with a non-zero pad bit", at, { token: newToken().slice(0, -1) + "B" });
+  appOpen("app: a relay token never issued", at, { row: null });
+  appOpen("app: the token at its expiry", at, { ctx: { now: NOW + core.APP_TOKEN_MS } });
+  appOpen("app: the token 1 ms before its expiry", at, { ctx: { now: NOW + core.APP_TOKEN_MS - 1 }, row: {} });
+  appOpen("app: the account session ended", at, { ctx: { sessionDead: true } });
+  for (const k of ["fleet", "agent", "session"]) appOpen(`app: the token's ${k} isn't the open's`, at, { row: { [k]: newId() } });
+  for (const k of ["browser_gen", "host_gen", "resume_n"]) appOpen(`app: the token's ${k} isn't the open's`, at, { row: { [k]: 7 } });
+  appOpen("app: the token's request id isn't the open's", at, { row: { request: nonce() } });
+  appOpen("app: the token's host isn't the record's", at, { row: { host: newId() } });
+  appOpen("app: another account's session (the token's), the record still valid", at, { row: { account: newId() } });
+  for (const k of cases) if (k.headers?.["sagebrush-relay-token"] === undefined && k.kind === "app") delete k.headers["sagebrush-relay-token"];
 
   const body = { fleet: w.fleet, session: s.body.session, agent: w.agent, browser_gen: 2, resume_n: 0, host_nonce: nonce(), app_request: nonce() };
   const commit = (b) => ({ kind: "commit", header: sigFor(core.COMMIT_ROUTE, "POST", b), body: b64(b) });
@@ -99,16 +130,19 @@ function corpus(w) {
   add("commit: null", commit(enc("null")));
   add("commit: an array", commit(enc("[1]")));
   add("commit: not UTF-8", commit(Uint8Array.of(0xff)));
+  cases.tokens = tokens;
   return cases;
 }
 
-const nodeCtx = (w, c = {}) => ({
+// (the token rows looked up, not taken: the parity runs each case through three verifiers; AppTokens' own rows take them)
+const nodeCtx = (w, c = {}, tokens = {}) => ({
   aud: AUD, now: c.now ?? NOW,
   hostKey: (h) => { if (h !== w.host) throw new FleetError("unknown_host"); return w.H.raw; },
   currentGen: () => c.gen ?? 3, agentHasBrowser: (h, a) => a === w.agent && c.granted !== false,
-  accountFleets: () => c.fleets ?? [w.fleet], chainOf: () => w.chain, consumeNonce: () => true, consumeRequest: () => true,
+  consumeAppToken: (key) => tokens[key] ?? null, sessionLive: (account, session) => account === ACCOUNT && session === ACCOUNT_SESSION && !c.sessionDead,
+  chainOf: () => w.chain, consumeNonce: () => true, consumeRequest: () => true,
 });
-const coreCtx = (w, c) => { const { consumeNonce, consumeRequest, ...rest } = nodeCtx(w, c); return rest; };
+const coreCtx = (w, c, tokens) => { const { consumeNonce, consumeRequest, ...rest } = nodeCtx(w, c, tokens); return rest; };
 
 async function run(face, w, k, ctx) {
   try {
@@ -123,20 +157,34 @@ async function run(face, w, k, ctx) {
   }
 }
 
+// (the token's codes, A1 §3: one code for every missing, unknown, expired or session-ended token; bad_form for a binding)
+const EXPECT = {
+  "app: no relay token": "unauthenticated", "app: a relay token out of form": "unauthenticated", "app: a relay token with a non-zero pad bit": "unauthenticated",
+  "app: a relay token never issued": "unauthenticated", "app: the token at its expiry": "unauthenticated", "app: the account session ended": "unauthenticated",
+  "app: another account's session (the token's), the record still valid": "unauthenticated",
+  "app: the token's fleet isn't the open's": "bad_form", "app: the token's agent isn't the open's": "bad_form", "app: the token's session isn't the open's": "bad_form",
+  "app: the token's browser_gen isn't the open's": "bad_form", "app: the token's host_gen isn't the open's": "bad_form", "app: the token's resume_n isn't the open's": "bad_form",
+  "app: the token's request id isn't the open's": "bad_form", "app: the token's host isn't the record's": "bad_form",
+  "app: at the window's end": "grant_expired", "app: the host's gen moved on": "stale_generation",
+};
+
 test("the corpus: Node's face, the core on Node's backend and the core on WebCrypto alone give the same code and fields", async () => {
   const w = await world();
   const cases = corpus(w);
   const child = JSON.parse(execFileSync(process.execPath, [CHILD], {
-    input: JSON.stringify({ AUD, NOW, fleet: w.fleet, host: w.host, agent: w.agent, hostRaw: b64(w.H.raw), genesis: b64(w.genesis), cases, control: CONTROL }),
+    input: JSON.stringify({ AUD, NOW, fleet: w.fleet, host: w.host, agent: w.agent, hostRaw: b64(w.H.raw), genesis: b64(w.genesis), cases, tokens: cases.tokens, account: ACCOUNT, account_session: ACCOUNT_SESSION, control: CONTROL }),
     encoding: "utf8", maxBuffer: 1 << 22,
   })).out;
   assert.equal(child.length, cases.length);
   const valid = cases.filter((k) => k.why.endsWith(": valid")).length;
   assert.equal(valid, 3, "one valid case of each kind");
+  const admitted = new Set(["app: the token 1 ms before its expiry"]);
+  for (const why of [...Object.keys(EXPECT), ...admitted]) assert.ok(cases.some((k) => k.why === why), `a case named ${why}`);
   for (const [i, k] of cases.entries()) {
-    const viaNode = await run(nodeFace, w, k, nodeCtx(w, k.ctx));
-    const viaCore = await run(core, w, k, coreCtx(w, k.ctx));
-    if (k.why.endsWith(": valid")) assert.equal(viaNode.code, "ok", k.why); else assert.notEqual(viaNode.code, "ok", k.why);
+    const viaNode = await run(nodeFace, w, k, nodeCtx(w, k.ctx, cases.tokens));
+    const viaCore = await run(core, w, k, coreCtx(w, k.ctx, cases.tokens));
+    if (k.why.endsWith(": valid") || admitted.has(k.why)) assert.equal(viaNode.code, "ok", k.why); else assert.notEqual(viaNode.code, "ok", k.why);
+    if (EXPECT[k.why]) assert.equal(viaNode.code, EXPECT[k.why], k.why);
     assert.equal(viaCore.code, viaNode.code, `core, Node's backend: ${k.why}`);
     assert.equal(child[i].code, viaNode.code, `core, WebCrypto: ${k.why}`);
     if (viaNode.code === "ok") {
@@ -147,6 +195,36 @@ test("the corpus: Node's face, the core on Node's backend and the core on WebCry
       assert.deepEqual(want, viaNode.value, `core's fields: ${k.why}`);
       assert.deepEqual(child[i].value, viaCore.value, `WebCrypto's fields: ${k.why}`);
     }
+  }
+});
+
+test("the core takes the token before the record, with a store that takes: a bad record burns it, and of two at once one wins; on both backends", async () => {
+  const w = await world();
+  const all = corpus(w);
+  const valid = all.find((k) => k.why === "app: valid");
+  const tokenRows = (k) => { const key = createHash("sha256").update(k.headers["sagebrush-relay-token"], "utf8").digest("base64url"); return { [key]: all.tokens[key] }; };
+  const tampered = Buffer.from(valid.headers["sagebrush-browser-record"], "base64url");
+  tampered[tampered.length - 5] ^= 1;
+  const bad = { ...valid, headers: { ...valid.headers, "sagebrush-browser-record": tampered.toString("base64url") } };
+  // (each sequence its own rows: the bad record first, then the same token with the good one; and two at once)
+  const sequences = [{ cases: [bad, valid], tokens: tokenRows(valid) }, { cases: [valid, valid], tokens: tokenRows(valid), concurrent: true }];
+  const inProcess = [];
+  for (const q of sequences) {
+    const rows = new Map(Object.entries(q.tokens));
+    const ctx = { ...coreCtx(w, {}, {}), consumeAppToken: async (key) => { const r = rows.get(key) ?? null; rows.delete(key); return r; } };
+    const one = (k) => run(core, w, k, ctx).then((r) => r.code);
+    const codes = q.concurrent ? await Promise.all(q.cases.map(one)) : [await one(q.cases[0]), await one(q.cases[1])];
+    inProcess.push({ codes, left: rows.size });
+  }
+  const child = JSON.parse(execFileSync(process.execPath, [CHILD], {
+    input: JSON.stringify({ AUD, NOW, fleet: w.fleet, host: w.host, agent: w.agent, hostRaw: b64(w.H.raw), genesis: b64(w.genesis), cases: [], tokens: {}, sequences,
+      account: ACCOUNT, account_session: ACCOUNT_SESSION, control: CONTROL }),
+    encoding: "utf8", maxBuffer: 1 << 22,
+  })).sequences;
+  for (const [name, got] of [["Node's backend", inProcess], ["WebCrypto alone", child]]) {
+    assert.notEqual(got[0].codes[0], "ok", `${name}: the bad record is refused`);
+    assert.deepEqual([got[0].codes[1], got[0].left], ["unauthenticated", 0], `${name}: and its token is gone, so the good record after it finds nothing`);
+    assert.deepEqual([[...got[1].codes].sort(), got[1].left], [["ok", "unauthenticated"], 0], `${name}: two at once, exactly one admitted`);
   }
 });
 
@@ -168,32 +246,33 @@ test("the control plane's MACs on the WebCrypto backend alone equal an independe
   assert.deepEqual(r.control.back, { v: 1, answer: "admit", call: CONTROL.id, call_sha256: sha(body), result: "refused", code: "not_granted" });
 });
 
-test("the core consumes nothing: what it admitted admits again, and it asks for no consume function; Node's face refuses the replay", async () => {
+test("the core consumes no nonce or request id: what it admitted admits again (its token looked up, not taken); Node's face refuses the replay", async () => {
   const w = await world();
-  const cases = corpus(w).filter((k) => k.why.endsWith(": valid"));
+  const all = corpus(w), cases = all.filter((k) => k.why.endsWith(": valid"));
   for (const k of cases) {
-    const ctx = coreCtx(w);
+    const ctx = coreCtx(w, {}, all.tokens);
     assert.equal((await run(core, w, k, ctx)).code, "ok");
     assert.equal((await run(core, w, k, ctx)).code, "ok", `again: ${k.why}`);
     const seen = new Set();
     const once = (x) => (seen.has(x) ? false : (seen.add(x), true));
-    const strict = { ...nodeCtx(w), consumeNonce: (h, x) => once(x), consumeRequest: once };
+    const strict = { ...nodeCtx(w, {}, all.tokens), consumeNonce: (h, x) => once(x), consumeRequest: once };
     assert.equal((await run(nodeFace, w, k, strict)).code, "ok");
     assert.equal((await run(nodeFace, w, k, strict)).code, "replay", `Node's face again: ${k.why}`);
   }
   const host = cases.find((k) => k.kind === "host");
-  const r = await core.verifyHostOpen({ target: host.target, headers: host.headers }, coreCtx(w));
+  const r = await core.verifyHostOpen({ target: host.target, headers: host.headers }, coreCtx(w, {}, all.tokens));
   assert.match(r.nonce, core.B22, "the host's nonce, for the relay to consume");
   const appCase = cases.find((k) => k.kind === "app");
-  const a = await core.verifyAppOpen({ target: appCase.target, headers: appCase.headers }, coreCtx(w));
+  const a = await core.verifyAppOpen({ target: appCase.target, headers: appCase.headers }, coreCtx(w, {}, all.tokens));
   assert.equal(a.request, appCase.headers["sagebrush-request"], "the app's request id, for the relay to consume");
+  assert.deepEqual([a.account, a.account_session], [ACCOUNT, ACCOUNT_SESSION], "the token's account and session, for the relay's timers");
 });
 
 test("the core's verifyRequest: §5.1's order, and the nonce returned, not consumed", async () => {
   const w = await world();
   const T = `${core.ROUTE}/x`;
   const h = signRequest({ aud: AUD, method: "POST", target: T, body: Uint8Array.of(1), host: w.host, key: w.H, fields: { gen: 3, ts: NOW, nonce: nonce() } });
-  const ctx = coreCtx(w);
+  const ctx = coreCtx(w, {}, {});
   const f = await coreVerifyRequest({ header: h, method: "POST", target: T, body: Uint8Array.of(1) }, ctx);
   assert.equal((await coreVerifyRequest({ header: h, method: "POST", target: T, body: Uint8Array.of(1) }, ctx)).nonce, f.nonce);
   // (order: a bad audience is reported before skew, skew before the host, the host before the signature)

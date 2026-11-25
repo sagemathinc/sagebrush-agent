@@ -80,6 +80,7 @@ export class FakeWorker {
   constructor(key, { wallNow = () => Date.now() } = {}) {
     this.key = key; this.wallNow = wallNow; this.seen = new Set(); this.calls = { admit: 0, epochs: 0, refusedAuth: 0 };
     this.hold = null; this.cursor = 0; this.feedQueue = []; this.epochOf = () => 0;
+    this.tokens = new Map(); // (relay token -> its account, as the issuer's rows; taken once)
     this.decide = (p) => this.defaultDecide(p);
     this.transport = async ({ method, target, headers, body, signal }) => {
       let call;
@@ -100,13 +101,20 @@ export class FakeWorker {
     };
   }
 
+  /** A relay token for `account`, as the issuer would give one (A1 §2). */
+  issueToken(account) {
+    const token = `rt1.${randomBytes(32).toString("base64url")}`;
+    this.tokens.set(token, account);
+    return token;
+  }
+
   /** An empty feed answer that advances the cursor past since. */
   empty(since, over = {}) {
     this.cursor = Math.max(this.cursor + 1, since + 1);
     return { result: "ok", since, cursor: this.cursor, at_ms: this.wallNow(), more: false, agents: [], accounts: [], hosts: [], ...over };
   }
 
-  /** Facts from the request, as the real Worker would after its checks. Host sig: "host=..;gen=..;nonce=.."; app record: starts with the host id; cookie: the account. */
+  /** Facts from the request, as the real Worker would after its checks. Host sig: "host=..;gen=..;nonce=.."; app record: starts with the host id; token: one issueToken() gave, taken once (its account). */
   defaultDecide(p) {
     const ep = (agent, account, host) => ({ agent: this.epochOf("agent", agent), account: this.epochOf("account", account), host: this.epochOf("host", host) });
     if (p.kind === "commit") {
@@ -123,10 +131,13 @@ export class FakeWorker {
     }
     // (the record's end and the session's expiry: fixed by the test in `app`, else an hour from now; past either one,
     //  the Worker refuses grant_expired, as the real one does)
+    const account = this.tokens.get(p.token);
+    if (account === undefined) return { result: "refused", code: "unauthenticated" };
+    this.tokens.delete(p.token);
     const now = this.wallNow(), notAfter = this.app?.not_after_ms ?? now + 3_600_000, session = this.app?.session_ms ?? now + 3_600_000;
     if (this.app?.checkWindow !== false && (now >= notAfter || now >= session)) return { result: "refused", code: "grant_expired" };
-    return { result: "ok", role: "app", ...tuple, host: p.record.slice(0, 26), request: p.request, account: p.cookie, account_session: "sess-1", account_session_expires_ms: session,
-      signer: newId(), chain_seq: 1, not_after_ms: notAfter, epochs: ep(q.agent, p.cookie, p.record.slice(0, 26)) };
+    return { result: "ok", role: "app", ...tuple, host: p.record.slice(0, 26), request: p.request, account, account_session: "sess-1", account_session_expires_ms: session,
+      signer: newId(), chain_seq: 1, not_after_ms: notAfter, epochs: ep(q.agent, account, p.record.slice(0, 26)) };
   }
 }
 

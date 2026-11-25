@@ -669,6 +669,21 @@ test("no request for an agent not listed, ended, or stopped by a person; a resum
   await w.close();
 });
 
+test("a transferred agent (execution lease §4): no lease is ever requested for it again, and nothing starts it", async () => {
+  const w = await world();
+  await granted(w, [A]);
+  await w.fire("renew");
+  assert.equal(w.fx.u(A).active, true);
+  raiseFence("transferred", A, { dir: w.fenceDir });
+  assert.deepEqual(await w.sup.submit({ kind: "lease-request", authority: "host", agent: A }), { status: "skipped", reason: "transferred" });
+  // Even with a person's own fence lowered and no other cause up: still skipped, and a resume starts nothing.
+  const n = w.sent.length;
+  w.advance(RENEW_MS);
+  await w.fire("renew");
+  assert.equal(w.sent.length, n, "the cadence asks nothing for it");
+  await w.close();
+});
+
 test("a lease lowers only lease: with agent, backup or an unvalidated restore up, the helper never runs, and nothing else is lowered", async () => {
   for (const other of ["restore", "agent", "backup"]) {
     const w = await world();

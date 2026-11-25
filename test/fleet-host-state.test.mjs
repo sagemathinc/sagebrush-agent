@@ -104,7 +104,7 @@ test("the readers over a real HostStore: the registry's agents and states, their
   // Without a lease reader, no lease is ever live.
   assert.equal((await hostState(hostStateReaders(store, { fenceDir, restoreDir }))).agents[B].lease, "none");
   // Every cause name fenceCauses can return is a CAUSES name, in CAUSES order.
-  for (const c of ["all", "backup", "restore"]) raiseFence(c, A, { dir: fenceDir });
+  for (const c of ["all", "backup", "restore", "transferred"]) raiseFence(c, A, { dir: fenceDir });
   assert.deepEqual(fenceCauses(A, { dir: fenceDir }), CAUSES.filter((c) => c !== "agent"));
   await store.close();
 });

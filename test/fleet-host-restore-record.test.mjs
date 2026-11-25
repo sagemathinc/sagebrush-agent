@@ -16,7 +16,7 @@ import { realIo } from "../lib/fleet/host/store.mjs";
 import {
   CLASSES, FAILED_REASONS, KINDS, MAX_ATTEMPTS, RESTORE_RUN, STATES, checkRecord, markerPath, newRecord, newRestoreRun, ownerOf,
   readMarker, readRecord, recordName, recoveryStep, restoreReady, retryRecord, runTime, stagingDir, stagingName, step as rawStep,
-  writeRecord, digestsWhole, checkFillReport, readFillReport, writeFillReport, readRegular,
+  writeRecord, digestsWhole, checkFillReport, readFillReport, writeFillReport, readRegular, MAX_RECORD_BYTES,
 } from "../lib/fleet/host/restore-record.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
@@ -370,7 +370,61 @@ test("records on disk: durable, 0600 in a 0700 directory, absent is null, anythi
   refused(() => readRecord("agent", r.id, { dir }), "bad_form");
   rmSync(file);
   mkdirSync(file);
-  assert.throws(() => readRecord("agent", r.id, { dir }), (e) => e.code === "EISDIR");
+  refused(() => readRecord("agent", r.id, { dir }), "bad_form");
+});
+
+test("records are read as one regular file: a link, a FIFO, a socket or an oversized file is refused, never followed or waited on", () => {
+  const dir = join(fresh(), "restore");
+  const r = at("filling");
+  writeRecord(r, { dir });
+  const file = join(dir, recordName("agent", r.id));
+  const real = join(dir, "real");
+  fs.renameSync(file, real);
+  // A link to a valid record is still refused (never followed).
+  fs.symlinkSync(real, file);
+  refused(() => readRecord("agent", r.id, { dir }), "bad_form");
+  rmSync(file);
+  // A FIFO: refused at once, the read never blocks on it.
+  execFileSync("mkfifo", [file]);
+  refused(() => readRecord("agent", r.id, { dir }), "bad_form");
+  rmSync(file);
+  execFileSync("python3", ["-I", "-c", "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])", file]);
+  refused(() => readRecord("agent", r.id, { dir }), "bad_form");
+  rmSync(file);
+  // Longer than any record can be, even when it starts as a valid one.
+  writeFileSync(file, JSON.stringify(r) + " ".repeat(MAX_RECORD_BYTES));
+  refused(() => readRecord("agent", r.id, { dir }), "bad_form");
+  writeFileSync(file, JSON.stringify(r) + " ".repeat(MAX_RECORD_BYTES - JSON.stringify(r).length));
+  assert.deepEqual(readRecord("agent", r.id, { dir }), r, "exactly the bound is read");
+  // An I/O error is an interruption, thrown as it is.
+  for (const code of ["EIO", "EACCES"]) {
+    const x = { ...fs, openSync: () => { throw Object.assign(new Error(code), { code }); } };
+    assert.throws(() => readRecord("agent", r.id, { dir, fsx: x }), (e) => e.code === code, code);
+  }
+});
+
+test("a record replaced by rename while read is read again, not called malformed; one that keeps changing is refused", () => {
+  const dir = join(fresh(), "restore");
+  const r = at("filling");
+  writeRecord(r, { dir });
+  const st = fs.statSync(join(dir, recordName("agent", r.id)));
+  // The first look meets another object (a write renamed over it between lstat and open); the next looks are whole.
+  const swapped = (times) => {
+    let n = 0;
+    return { ...fs, fstatSync: (fd) => {
+      const s = fs.fstatSync(fd);
+      return n++ < times ? Object.assign(Object.create(Object.getPrototypeOf(s)), s, { ino: st.ino + 1 }) : s;
+    } };
+  };
+  for (const times of [1, 2]) assert.deepEqual(readRecord("agent", r.id, { dir, fsx: swapped(times) }), r, `${times}`);
+  refused(() => readRecord("agent", r.id, { dir, fsx: swapped(3) }), "bad_form");
+  // Another type swapped in is refused at once, never looked at again.
+  let looks = 0;
+  const fifo = { ...fs, fstatSync: (fd) => { looks++; const s = fs.fstatSync(fd); return Object.assign(Object.create(Object.getPrototypeOf(s)), s, { mode: 0o10600 }); } };
+  refused(() => readRecord("agent", r.id, { dir, fsx: fifo }), "bad_form");
+  assert.equal(looks, 1);
+  // The fill report keeps one look: it is written once, never replaced.
+  refused(() => readRegular(join(dir, recordName("agent", r.id)), 1000, "it", swapped(1)), "bad_form");
 });
 
 test("markers are the launcher's: read per class, exactly as written; this side never writes or removes one", async () => {

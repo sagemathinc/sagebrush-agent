@@ -2568,7 +2568,7 @@ mod tests {
         let d = restore_stage(&mut f, &mut r, &a);
         assert_eq!(rcode(&d), 0, "{:?}", d.result);
         let att = format!("srv/sagebrush/.restore/{RUN}/host/hoststore/1");
-        // The shared parents are root:root 0700 and carry no project of their own (grader, r3.14 r2): only the attempt is
+        // The shared parents are root:root 0700 and carry no project of their own (A2 r3.14 r2 §1): only the attempt is
         // charged, so a hoststore and an agent's stage in one run never block each other.
         for p in [format!("srv/sagebrush/.restore/{RUN}"), format!("srv/sagebrush/.restore/{RUN}/host"), format!("srv/sagebrush/.restore/{RUN}/host/hoststore"), att.clone()] {
             let n = &f.nodes[&p];

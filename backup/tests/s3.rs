@@ -262,7 +262,9 @@ fn restore_prefix() -> Vec<String> {
     assert!(sudo_ok, "CAP_SYS_RESOURCE is in the bounding set and there is no passwordless sudo to remove it for the restore rows");
     // SAFETY: getuid and getgid have no preconditions.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    ["sudo", "-n", "setpriv", &format!("--reuid={uid}"), &format!("--regid={gid}"), "--clear-groups", "--bounding-set=-sys_resource", "--inh-caps=-sys_resource", "--"]
+    // (--pdeathsig SIGKILL: the binary's parent there is sudo, so it is bound as the launcher's stage binds it, by an
+    //  inherited SIGKILL death signal, not by --parent-pid)
+    ["sudo", "-n", "setpriv", &format!("--reuid={uid}"), &format!("--regid={gid}"), "--clear-groups", "--bounding-set=-sys_resource", "--inh-caps=-sys_resource", "--pdeathsig", "SIGKILL", "--"]
         .iter()
         .map(|s| s.to_string())
         .collect()
@@ -270,20 +272,27 @@ fn restore_prefix() -> Vec<String> {
 
 fn run_args(h: &Host, req: Value, extra: &[&str]) -> Value {
     let prefix = if req["op"] == "restore" { restore_prefix() } else { Vec::new() };
-    let mut cmd = match prefix.split_first() {
+    match prefix.split_first() {
         Some((prog, rest)) => {
             let mut c = Command::new(prog);
             c.args(rest).arg(BIN);
-            c
+            run_cmd(&mut c, h, req, extra)
         }
-        None => Command::new(BIN),
-    };
-    run_cmd(&mut cmd, h, req, extra)
+        None => run_bound(h, req, extra),
+    }
+}
+
+/// The binary run directly (this test process its parent), bound by `--parent-pid`, as Node's spawns run it.
+fn run_bound(h: &Host, req: Value, extra: &[&str]) -> Value {
+    let pid = std::process::id().to_string();
+    let mut all: Vec<&str> = vec!["--parent-pid", &pid];
+    all.extend_from_slice(extra);
+    run_cmd(&mut Command::new(BIN), h, req, &all)
 }
 
 /// The binary run directly, with whatever capabilities this process has.
 fn run_direct(h: &Host, req: Value) -> Value {
-    run_cmd(&mut Command::new(BIN), h, req, &[])
+    run_bound(h, req, &[])
 }
 
 fn run_cmd(cmd: &mut Command, h: &Host, req: Value, extra: &[&str]) -> Value {
@@ -685,7 +694,7 @@ fn restore_in_namespace(h: &Host, setup: &str, req: Value) -> Value {
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let script = format!(
         "{setup} && \
-         exec setpriv --reuid={uid} --regid={gid} --clear-groups --bounding-set=-sys_resource --inh-caps=-sys_resource -- \"$0\" \"$@\""
+         exec setpriv --reuid={uid} --regid={gid} --clear-groups --bounding-set=-sys_resource --inh-caps=-sys_resource --pdeathsig SIGKILL -- \"$0\" \"$@\""
     );
     let mut cmd = Command::new("sudo");
     cmd.args(["-n", "unshare", "-m", "--propagation", "private", "--", "sh", "-c", &script, BIN]);

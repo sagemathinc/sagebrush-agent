@@ -602,6 +602,25 @@ test("a lock lost INSIDE the host store's copy or import (the real holder killed
   }
 });
 
+for (const which of ["exclusion", "restore"]) {
+  for (const inside of ["supervisorStopped", "registryFresh"]) {
+    test(`the ${which} lock lost INSIDE the awaited ${inside} (answering yes): nothing after it runs`, async () => {
+      const h = host();
+      const path = which === "exclusion" ? h.exclusion.path : join(h.dir, ".lock");
+      const after = [];
+      for (const k of ["registryFresh", "backupEnabled", "choose", "newRun", "stageHostStore", "importHostStore"]) {
+        if (k === inside) continue;
+        const f = h.deps[k];
+        h.deps[k] = (...a) => { after.push(k); return f(...a); };
+      }
+      h.deps[inside] = async () => { killHolder(path); await settle(); return true; };
+      await rejects(h.run(), "outcome_unknown");
+      assert.deepEqual(after, [], `${which} lost inside ${inside}: nothing after it`);
+      assert.equal(existsSync(join(h.dir, BEGIN)), false, `${which} lost inside ${inside}: nothing begun`);
+    });
+  }
+}
+
 test("close: the RESTORE lock's holder killed at each step, as the exclusion's: the same stop, and close again finishes", async () => {
   for (const [step, committed] of [["close:locked", false], ["close:checked", false], ["close:committed", true], ["close:archived", true]]) {
     const h = host();

@@ -9,14 +9,17 @@
 # id. The crate's one dependency must already be in cargo's cache (`cargo fetch --locked` first): the build itself never
 # touches the network. Two builds from two directories must be byte-identical (the CI job checks it).
 #
-# The toolchain is closed as scripts/backup-build.sh closes its own (host backup init/run d6 §4.1), except that the
-# launcher is pure Rust, so no C toolchain is pinned (its bytes reproduce across hosts' gcc and binutils versions):
-# - every tool by absolute path: cargo and rustc from cargo's home (rustc 1.99.0), the linker $TOOLS/cc, set
-#   explicitly for the target (the one rustc picks by default);
+# The toolchain is closed exactly as scripts/backup-build.sh closes its own (host backup init/run d6 §4.1). The launcher
+# is pure Rust, but it links through gcc, whose `as` and `ld` write the final ELF, so the linker's packages are pinned:
+# - Ubuntu 24.04's gcc-13 13.3.0-6ubuntu2~24.04.1 and binutils 2.42-4ubuntu2.10, exactly, checked by their installed
+#   package versions, and gcc-13 must run 13.3.0 (another compiler or binutils gives other bytes: refused);
+# - every tool by absolute path: cargo and rustc from cargo's home (rustc 1.99.0), the linker $TOOLS/gcc-13, set
+#   explicitly for the target;
 # - cargo runs under `env -i` with a closed list of variables, all set here (nothing inherited: no RUSTFLAGS,
 #   CARGO_ENCODED_RUSTFLAGS, RUSTC_WRAPPER, RUSTC or CARGO_* override reaches it);
 # - a cargo config file anywhere cargo would read one ($CARGO_HOME, or a .cargo/ in the source root, the work directory
 #   or any of their parents) refuses the build.
+# CI builds on the pinned runner image ubuntu-24.04. A change of any pinned package moves the pin, deliberately.
 set -eu
 
 [ "$#" -eq 1 ] || { echo "usage: scripts/launcher-build.sh <out>" >&2; exit 2; }
@@ -39,7 +42,10 @@ clean() {
 
 version=$(clean "$RUSTC" --version 2>/dev/null | cut -d' ' -f2)
 [ "$version" = 1.99.0 ] || no "rust 1.99.0 is required (found ${version:-none})"
-[ -x "$TOOLS/cc" ] || no "$TOOLS/cc is missing"
+pkg() { clean "$TOOLS/dpkg-query" -W -f '${Version}' "$1" 2>/dev/null || echo none; }
+[ "$(pkg gcc-13)" = 13.3.0-6ubuntu2~24.04.1 ] || no "gcc-13 13.3.0-6ubuntu2~24.04.1 is required (found $(pkg gcc-13))"
+[ "$(pkg binutils)" = 2.42-4ubuntu2.10 ] || no "binutils 2.42-4ubuntu2.10 is required (found $(pkg binutils))"
+[ "$(clean "$TOOLS/gcc-13" -dumpfullversion 2>/dev/null)" = 13.3.0 ] || no "gcc-13 must be gcc 13.3.0"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -66,7 +72,7 @@ clean \
   CARGO_TARGET_DIR="$work/target" \
   CARGO_INCREMENTAL=0 \
   RUSTFLAGS="--remap-path-prefix=$root=/sagebrush --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$work=/build -C link-arg=-Wl,--build-id=none" \
-  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$TOOLS/cc" \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$TOOLS/gcc-13" \
   "$CARGO" build --locked --offline --release --manifest-path "$root/launcher/Cargo.toml" --target "$target"
 
 # static: no dynamic loader (the launcher refuses one that names one, as the backup binary's check does)

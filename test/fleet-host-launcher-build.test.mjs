@@ -1,5 +1,5 @@
-// scripts/launcher-build.sh's toolchain closure, as scripts/backup-build.sh's (host backup init/run d6 §4.1) without a C
-// toolchain (the launcher is pure Rust): rustc 1.99.0 refuses any other, every tool is named by path, cargo runs under
+// scripts/launcher-build.sh's toolchain closure, exactly scripts/backup-build.sh's (host backup init/run d6 §4.1) for the
+// linker (the launcher is pure Rust, linked through gcc-13 and binutils): the pinned packages and versions refuse any other, every tool is named by path, cargo runs under
 // `env -i` with a closed list of variables, and a cargo config file anywhere cargo would read one refuses. Over a copy
 // of the real script whose tool directory is a mock one; the mock cargo logs the environment it was given and exits
 // 97, before any build.
@@ -13,9 +13,10 @@ import { test } from "./host-linux-only.mjs";
 
 const SCRIPT = readFileSync(fileURLToPath(new URL("../scripts/launcher-build.sh", import.meta.url)), "utf8");
 const exe = (p, body) => { writeFileSync(p, `#!/bin/sh\n${body}\n`); chmodSync(p, 0o755); };
+const PINNED = { "gcc-13": "13.3.0-6ubuntu2~24.04.1", binutils: "2.42-4ubuntu2.10" };
 
-/** A world: root/scripts/launcher-build.sh (its TOOLS the mock directory), the mock cc, a cargo home with mock cargo and rustc. */
-function world({ rustc = "1.99.0", cc = true } = {}) {
+/** A world: root/scripts/launcher-build.sh (its TOOLS the mock directory), the mock tools, a cargo home with mock cargo and rustc. */
+function world({ versions = PINNED, rustc = "1.99.0", gcc13 = "13.3.0" } = {}) {
   const w = mkdtempSync(join(tmpdir(), "sb-lbuild-"));
   const root = join(w, "root"), tools = join(w, "tools"), home = join(w, "home"), cargoHome = join(w, "cargo");
   for (const d of [join(root, "scripts"), join(root, "launcher"), tools, home, join(cargoHome, "bin")]) mkdirSync(d, { recursive: true });
@@ -23,7 +24,9 @@ function world({ rustc = "1.99.0", cc = true } = {}) {
   writeFileSync(join(root, "scripts/launcher-build.sh"), SCRIPT.replace("\nTOOLS=/usr/bin\n", `\nTOOLS=${tools}\n`));
   exe(join(root, "scripts/backup-static-check.sh"), "exit 0");
   writeFileSync(join(root, "launcher/Cargo.toml"), "");
-  if (cc) exe(join(tools, "cc"), "exit 0");
+  const cases = Object.entries(versions).map(([p, v]) => `  ${p}) printf %s '${v}' ;;`).join("\n");
+  exe(join(tools, "dpkg-query"), `for a; do last=$a; done\ncase "$last" in\n${cases}\n  *) exit 1 ;;\nesac`);
+  exe(join(tools, "gcc-13"), `echo ${gcc13}`);
   const log = join(w, "cargo-env");
   exe(join(cargoHome, "bin/rustc"), `echo "rustc ${rustc} (mock)"`);
   exe(join(cargoHome, "bin/cargo"), `env > '${log}'\nexit 97`);
@@ -53,7 +56,7 @@ test("the launcher's build reaches cargo with exactly the recipe's variables; no
     "CARGO_HOME", "CARGO_INCREMENTAL", "CARGO_TARGET_DIR", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER", "HOME", "PATH", "RUSTC",
     "RUSTFLAGS", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "SOURCE_DATE_EPOCH",
   ]);
-  assert.equal(e.CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER, join(x.tools, "cc"), "the named linker, never the caller's");
+  assert.equal(e.CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER, join(x.tools, "gcc-13"), "the pinned linker, never the caller's");
   assert.equal(e.RUSTC, join(x.cargoHome, "bin/rustc"));
   assert.equal(e.RUSTUP_TOOLCHAIN, "1.99.0");
   assert.equal(e.SOURCE_DATE_EPOCH, "0");
@@ -66,8 +69,16 @@ test("the launcher's build reaches cargo with exactly the recipe's variables; no
   assert.deepEqual(Object.keys(envOf(y)).sort(), Object.keys(e).sort());
 });
 
-test("another rustc, or no linker, refuses before cargo", () => {
-  for (const [what, opts] of Object.entries({ rustc: { rustc: "1.98.0" }, "no cc": { cc: false } })) {
+test("any other toolchain version, or a missing package, refuses before cargo", () => {
+  const cases = {
+    "gcc-13": { versions: { ...PINNED, "gcc-13": "13.3.0-6ubuntu2~24.04.2" } },
+    binutils: { versions: { ...PINNED, binutils: "2.42-4ubuntu2.11" } },
+    "binutils missing": { versions: { "gcc-13": PINNED["gcc-13"] } },
+    "gcc-13 missing": { versions: { binutils: PINNED.binutils } },
+    "gcc-13 runs another gcc": { gcc13: "15.2.0" },
+    rustc: { rustc: "1.98.0" },
+  };
+  for (const [what, opts] of Object.entries(cases)) {
     const x = world(opts);
     const r = build(x);
     assert.equal(r.status, 1, `${what}: refused (${r.stderr})`);

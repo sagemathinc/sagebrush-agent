@@ -287,9 +287,19 @@ trap 'rm -rf -- "$work" "$STAGE"' EXIT
 printf '[Unit]\nConditionPathExists=%s\n' "$CLOSED_PATH" > "$work/closed.conf"
 atomic "$CLOSED" 0644 "$work/closed.conf"
 "$SYSTEMCTL" daemon-reload
-[ "$(show DropInPaths)" = "$CLOSED" ] || no "the closing drop-in isn't the unit's only drop-in"
+# On a fresh host the unit has no fragment yet: systemd reports it not-found, and shows no drop-ins for a unit it
+# can't load (DropInPaths is empty). A not-found unit can't start; and systemd reads a unit's fragment together with
+# its drop-ins from disk, on a reload or on demand, so from the moment the fragment exists the closing condition
+# applies. Here: not-found, no reload pending, inactive, and on disk the closing drop-in is the unit's ONLY drop-in in
+# every lookup directory. The effective closed condition itself is proven at step 6, once the fragment is loaded.
+[ "$(show LoadState)" = not-found ] || no "the unit isn't not-found after the close"
 [ "$(show NeedDaemonReload)" = no ] || no "systemd needs a reload after the close"
 [ "$(show ActiveState)" = inactive ] || no "the unit isn't inactive"
+for d in $("$ANALYZE" unit-paths); do
+  [ -e "$d/$UNIT.d" ] || [ -L "$d/$UNIT.d" ] || continue
+  [ "$d/$UNIT.d" = "$DROPDIR" ] || no "another drop-in directory for the unit: $d/$UNIT.d"
+  [ "$(cd "$DROPDIR" && "$FIND" . -mindepth 1 -print)" = "./00-closed.conf" ] || no "the closing drop-in isn't the unit's only drop-in"
+done
 cut 2
 
 # ---- step 3: the release ---------------------------------------------------------------------------------------------

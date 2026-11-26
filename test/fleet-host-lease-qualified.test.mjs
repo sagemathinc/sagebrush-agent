@@ -116,8 +116,8 @@ test("the generator: deterministic, and on this tree its member set equals the c
   assert.ok(Object.keys(a.files).every((p) => !p.startsWith("test/")), "A2's machinery joins with A2");
 });
 
-test("the generator: each of the nine declarations matches exactly one flagged line of this tree", () => {
-  assert.equal(DECLARED.length, 9);
+test("the generator: each of the ten declarations matches exactly one flagged line of this tree", () => {
+  assert.equal(DECLARED.length, 10);
   for (const d of DECLARED) {
     const lines = fs.readFileSync(join(REPO, d.file), "utf8").split("\n").map((l) => l.trim());
     assert.equal(lines.filter((l) => l === d.line).length, 1, `${d.file}: ${d.line}`);

@@ -224,3 +224,22 @@ test("raw bytes: a repeated key (at the root, nested, or escaped) refuses; only 
   put(good);
   assert.deepEqual(readInput("agent", w.a, { dir, uid: UID }), x);
 });
+
+test("raw bytes: an invalid UTF-8 byte INSIDE a string (an unrestorable path) refuses; it isn't decoded into a replacement character that round-trips", () => {
+  const w = world();
+  const dir = dirOf();
+  const x = build(w, "agent", w.a, { unrestorableOf: () => ["a/b"] });
+  writeInput(x, { dir, uid: UID });
+  const p = join(dir, INPUTS, `agent-${w.a}.json`);
+  const good = readFileSync(p);
+  const at = good.indexOf(Buffer.from('"a/b"'));
+  assert.ok(at > 0);
+  for (const bytes of [[0xff], [0xc3], [0xed, 0xa0, 0x80]]) { // a stray byte, a truncated sequence, an encoded surrogate
+    writeFileSync(p, Buffer.concat([good.subarray(0, at + 2), Buffer.from(bytes), good.subarray(at + 2)]));
+    refused(() => readInput("agent", w.a, { dir, uid: UID }), "bad_form");
+  }
+  // The same path written with a real U+FFFD by the writer is an input: only the writer's bytes count.
+  const y = build(w, "agent", w.a, { unrestorableOf: () => ["a\ufffdb"] });
+  writeInput(y, { dir, uid: UID });
+  assert.deepEqual(readInput("agent", w.a, { dir, uid: UID }), y);
+});

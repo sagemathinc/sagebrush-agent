@@ -1966,7 +1966,8 @@ test("restore-abandon-finish: the host's op only, with an abandons seam; owned u
   await none.close();
   const B = `tag-${"b".repeat(25)}a`, C = `tag-${"c".repeat(25)}a`;
   const calls = [];
-  let answer = { sets: { [`archive-${A}`]: { status: "abandoned" }, [B]: { status: "refused", reason: "bad_form" }, [C]: { status: "busy" } } };
+  const D = `tag-${"d".repeat(25)}a`;
+  let answer = { sets: { [`archive-${A}`]: { status: "abandoned" }, [B]: { status: "refused", reason: "bad_form" }, [C]: { status: "busy" }, [D]: { status: "corrupt", reason: "not_granted" } } };
   const restoreWorker = { hold: async () => ({ release: async () => {}, invalidate: () => {} }), dispatch: async () => ({ dispatched: null }),
     abandons: async (ms, signal) => { calls.push([ms, signal instanceof AbortSignal]); return answer; } };
   const { sup, fx, close } = await setup({ restoreWorker });
@@ -1975,7 +1976,8 @@ test("restore-abandon-finish: the host's op only, with an abandons seam; owned u
   answer = { sets: {} };
   assert.deepEqual(await sup.submit({ kind: "restore-abandon-finish", authority: "host" }), { status: "idle", sets: {} });
   assert.deepEqual(calls, [[300000, true], [300000, true]]);
-  const want = [{ kind: "restore.abandon", set: `archive-${A}`, phase: "succeeded" }, { kind: "restore.abandon", set: B, phase: "failed", reason: "bad_form" }]
+  const want = [{ kind: "restore.abandon", set: `archive-${A}`, phase: "succeeded" }, { kind: "restore.abandon", set: B, phase: "failed", reason: "bad_form" },
+    { kind: "restore.abandon", set: D, phase: "failed", reason: "corrupt: not_granted" }]
     .sort((x, y) => (x.set < y.set ? -1 : 1));
   assert.deepEqual(fx.audits.filter((r) => r.kind === "restore.abandon"), want);
   restoreWorker.abandons = async () => { throw new FleetError("outcome_unknown", "x"); };

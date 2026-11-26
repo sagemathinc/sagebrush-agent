@@ -110,7 +110,7 @@ test("the finish: the kill, then under the set lock the final record's destinati
     assert.equal(m.staging.size, 0, "all staging discarded");
     assert.equal(m.inversions, 0);
     // The audit pair reads back complete, and the finish again is a no-op.
-    auditPair(r, join(w.dir, ABANDON));
+    auditPair(r, join(w.dir, ABANDON), { restoreRun: RUN });
     assert.deepEqual(await finishAbandon(kind, id, model(w, r).deps, opts(w)), { status: "abandoned" });
   }
   // A set that never started (no record): a record at the intent's binding, then abandoned.
@@ -325,6 +325,73 @@ test("the gates: restoreReady is abandoning for a required set with an intent; a
   writeRecord(reach("agent", w.a, "files_validated"), { dir: w.dir });
   refused(() => updatePlan(replanSet(readPlan({ dir: w.dir }), "agent", w.a, RUN2), { dir: w.dir }), "not_granted");
   assert.deepEqual(await finishAbandon("agent", w.a, model(w, reach("agent", w.a, "files_validated")).deps, opts(w)), { status: "abandoned" });
+});
+
+test("H1: an already-abandoned set is a finish success only with its audit pair complete, at every observation; the tick reports it corrupt", async () => {
+  const finished = async () => {
+    const w = world();
+    const r0 = reach("archive", w.d, "failed");
+    writeRecord(r0, { dir: w.dir });
+    writeIntent(w, "archive", w.d);
+    assert.deepEqual(await finishAbandon("archive", w.d, model(w, r0).deps, opts(w)), { status: "abandoned" });
+    return { w, r0, aPath: join(w.dir, ABANDON, attestationName("archive", w.d)), iPath: join(w.dir, ABANDON, intentName("archive", w.d)) };
+  };
+  const breaks = [
+    ["the attestation deleted", (x) => rmSync(x.aPath), "not_granted"],
+    ["the attestation malformed", (x) => writeFileSync(x.aPath, "{}\n"), "not_granted"],
+    ["the attestation of another attempt", (x) => writeFileSync(x.aPath, readFileSync(x.aPath, "utf8").replace('"attempt":1', '"attempt":2')), "not_granted"],
+    ["the intent malformed", (x) => writeFileSync(x.iPath, "{}\n"), "bad_form"],
+    ["the intent of another restore", (x) => writeFileSync(x.iPath, JSON.stringify({ ...JSON.parse(readFileSync(x.iPath, "utf8")), restore_run: RUN2 }) + "\n"), "not_granted"],
+  ];
+  // The early observation (the record already abandoned when the finish starts), and the tick.
+  for (const [what, brk, code] of breaks) {
+    const x = await finished();
+    brk(x);
+    await rejects(finishAbandon("archive", x.w.d, model(x.w, x.r0).deps, opts(x.w)), code);
+    const out = await finishOnce(() => model(x.w, x.r0).deps, opts(x.w));
+    assert.equal(out.sets[`archive-${x.w.d}`]?.status, "corrupt", `${what}: reported by the tick, never skipped`);
+  }
+  // A complete pair: the finish is a success, the tick lists nothing.
+  const ok = await finished();
+  assert.deepEqual(await finishAbandon("archive", ok.w.d, model(ok.w, ok.r0).deps, opts(ok.w)), { status: "abandoned" });
+  assert.deepEqual(await finishOnce(() => model(ok.w, ok.r0).deps, opts(ok.w)), { sets: {} });
+  // The set-lock observation: another finisher wrote abandoned (its attestation then lost) between the first check and
+  // the set lock.
+  const s = world();
+  const r1 = reach("archive", s.d, "failed");
+  writeRecord(r1, { dir: s.dir });
+  writeIntent(s, "archive", s.d);
+  const m = model(s, r1, { on: { stop: () => writeRecord(step(r1, "abandoned"), { dir: s.dir }) } });
+  await rejects(finishAbandon("archive", s.d, m.deps, opts(s)), "not_granted");
+  assert.deepEqual(m.calls, ["stop"], "no cleanup claimed for it");
+  // The final-lock observation: abandoned written, the attestation deleted, between the cleanup and the final locks.
+  const f = world();
+  const r2 = reach("archive", f.d, "failed");
+  writeRecord(r2, { dir: f.dir });
+  writeIntent(f, "archive", f.d);
+  const n = model(f, r2);
+  const withLocks = n.deps.withLocks;
+  n.deps.withLocks = (fn) => { writeRecord(step(r2, "abandoned"), { dir: f.dir }); rmSync(join(f.dir, ABANDON, attestationName("archive", f.d))); return withLocks(fn); };
+  await rejects(finishAbandon("archive", f.d, n.deps, opts(f)), "not_granted");
+});
+
+test("H2: the audit pair binds the intent to THIS restore's run: close refuses another restore's intent", async () => {
+  const w = world();
+  const r0 = reach("tag", w.t, "failed");
+  writeRecord(r0, { dir: w.dir });
+  writeIntent(w, "tag", w.t);
+  assert.deepEqual(await finishAbandon("tag", w.t, model(w, r0).deps, opts(w)), { status: "abandoned" });
+  const r = readRecord("tag", w.t, { dir: w.dir });
+  const adir = join(w.dir, ABANDON);
+  auditPair(r, adir, { restoreRun: RUN });
+  refused(() => auditPair(r, adir, { restoreRun: RUN2 }), "not_granted");
+  refused(() => auditPair(r, adir, {}), "bad_form");
+  const { closeBlockers } = await import("../lib/fleet/host/restore-begin.mjs");
+  const blockersOf = () => closeBlockers(readPlan({ dir: w.dir }), { dir: w.dir, restoreRaised: () => false, uid: UID }).filter((x) => x.startsWith(`tag-${w.t}`));
+  assert.deepEqual(blockersOf(), []);
+  const iPath = join(adir, intentName("tag", w.t));
+  writeFileSync(iPath, JSON.stringify({ ...JSON.parse(readFileSync(iPath, "utf8")), restore_run: RUN2 }) + "\n");
+  assert.ok(blockersOf()[0]?.startsWith(`tag-${w.t}: abandoned, but corrupt`), "close refuses it");
 });
 
 test("the sidecars' closed shapes: the intent's fields, its reason bound, its nonce canonical; the set its path names", () => {

@@ -395,7 +395,22 @@ fn restore(ctx: &Ctx, snapshot: &str, path: Option<&str>, dest: &Path, digests: 
     let repo = ctx.open(false)?;
     let snap = one_snapshot(&repo, snapshot)?;
     let repo = repo.to_indexed().map_err(lib("index_failed"))?;
-    let node = repo.node_from_snapshot_and_path(&snap, path.unwrap_or("")).map_err(lib("restore_failed"))?;
+    let node = match path {
+        None => repo.node_from_snapshot_and_path(&snap, "").map_err(lib("restore_failed"))?,
+        Some(p) => match resolve(snap.tree, p, |id| repo.get_tree(id).map(|t| t.nodes).map_err(lib("restore_failed")))? {
+            Resolved::Node(n) => n,
+            // An EMPTY source (restore empty-source d1): absent from the tree of a strict snapshot (the binary's own mark,
+            // matched exactly) whose `paths` names exactly this source. Nothing is written into `dest` (the stage's own
+            // fresh directory stays as it is); the digest list is an empty destination's. Anything else is refused.
+            Resolved::Absent if proves_empty(snap.tags.iter(), snap.paths.iter(), p) => {
+                let bytes = crate::digests::listing(dest)?;
+                let digests_sha256 = crate::digests::write_new(digests, &bytes)?;
+                return Ok(json!({ "snapshot": full(*snap.id), "skipped_special": 0, "digests_sha256": digests_sha256 }));
+            }
+            Resolved::Absent => return Err(Fail::new("restore_absent", "restore: the path isn't in the snapshot, and the snapshot doesn't prove it was empty")),
+            Resolved::NotADirectory => return Err(Fail::new("restore_absent", "restore: an ancestor of the path isn't a directory")),
+        },
+    };
     let special = |n: &Node| matches!(n.node_type, NodeType::Dev { .. } | NodeType::Chardev { .. } | NodeType::Fifo | NodeType::Socket);
     let ls = repo
         .ls(&node, &LsOptions::default())
@@ -494,6 +509,41 @@ fn posix_mode(go: u32) -> u32 {
     m
 }
 
+/// Where a requested path is in a snapshot (shared by `tree` and `restore`; restore empty-source d1, SEC S1).
+enum Resolved {
+    /// The path's own node.
+    Node(Node),
+    /// A component is missing from a directory that WAS read: what an empty source looks like (the archiver keeps no
+    /// node for one, d2r7). The only case that may ever prove "empty", and only from a strict snapshot naming it.
+    Absent,
+    /// An ancestor isn't a directory: structural, never "absent" (so never read as an empty source).
+    NotADirectory,
+}
+
+/// Resolve `path` (relative, normalized) from the snapshot's root tree `root`, component by component. `get(id)` reads
+/// one tree's nodes; its failure is a read failure (the caller's code), never "absent".
+fn resolve(root: rustic_core::TreeId, path: &str, get: impl Fn(&rustic_core::TreeId) -> Result<Vec<Node>>) -> Result<Resolved> {
+    let mut subtree = Some(root);
+    let mut node: Option<Node> = None;
+    for comp in path.split('/') {
+        let Some(id) = subtree else { return Ok(Resolved::NotADirectory) };
+        let Some(found) = get(&id)?.into_iter().find(|n| n.name().as_bytes() == comp.as_bytes()) else { return Ok(Resolved::Absent) };
+        if !found.is_dir() && found.subtree.is_some() {
+            return Ok(Resolved::NotADirectory);
+        }
+        subtree = if found.is_dir() { found.subtree } else { None };
+        node = Some(found);
+    }
+    Ok(node.map_or(Resolved::Absent, Resolved::Node))
+}
+
+/// Whether a snapshot's own record proves the absent `path` was an EMPTY source (restore empty-source d1): the
+/// binary's strict mark among its tags, matched as a whole tag (SEC S2), and `"/" + path` exactly among its paths.
+fn proves_empty<'a>(mut tags: impl Iterator<Item = &'a String>, mut paths: impl Iterator<Item = &'a String>, path: &str) -> bool {
+    let want = format!("/{path}");
+    tags.any(|t| t == STRICT_MARK) && paths.any(|q| *q == want)
+}
+
 /// The requested path isn't in the snapshot (d2r7): structural, and distinct, because an EMPTY source is never stored
 /// (the archiver keeps no node for it), which a strict snapshot naming the source in its `paths` proves (d2r8).
 fn absent() -> Fail {
@@ -536,16 +586,11 @@ fn tree(ctx: &Ctx, snapshot: &str, path: &str, cursor: Option<&str>) -> Result<V
     let repo = repo.to_indexed().map_err(lib("index_failed"))?;
     // The path, resolved component by component: a component missing from a tree that WAS read is structural; a
     // tree that can't be read is a read failure.
-    let mut node: Option<Node> = None;
-    let mut subtree = Some(snap.tree);
-    for comp in path.split('/') {
-        let id = subtree.ok_or_else(absent)?;
-        let t = repo.get_tree(&id).map_err(lib("tree_failed"))?;
-        let found = t.nodes.into_iter().find(|n| n.name().as_bytes() == comp.as_bytes()).ok_or_else(absent)?;
-        subtree = found.subtree;
-        node = Some(found);
-    }
-    let root = node.ok_or_else(absent)?;
+    let root = match resolve(snap.tree, path, |id| repo.get_tree(id).map(|t| t.nodes).map_err(lib("tree_failed")))? {
+        Resolved::Node(n) => n,
+        Resolved::Absent => return Err(absent()),
+        Resolved::NotADirectory => return Err(refused("tree: an ancestor of the path isn't a directory")),
+    };
 
     // The walk: (relative path, depth, node), depth first. A stack of (a directory's relative path, its children's
     // depth, its remaining nodes). The requested path's own node is depth 0; its direct children are depth 1.
@@ -967,6 +1012,52 @@ mod tests {
             let name = c["name"].as_str().unwrap();
             assert_eq!(is_gen_tmp(name), c["leftover"].as_bool().unwrap(), "{name:?}");
         }
+    }
+
+    #[test]
+    fn only_the_whole_mark_and_the_exact_path_prove_an_empty_source() {
+        let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let yes = |tags: &[&str], paths: &[&str], p: &str| proves_empty(v(tags).iter(), v(paths).iter(), p);
+        assert!(yes(&["sb-state=good", STRICT_MARK], &["/srv/a", "/srv/cfg"], "srv/cfg"));
+        for (what, tags) in [("no mark", vec!["sb-state=good"]), ("a suffix", vec!["sagebrush.walk=strictX"]), ("a prefix of it", vec!["sagebrush.walk=stric"]),
+            ("another case", vec!["SAGEBRUSH.WALK=strict"]), ("inside a longer tag", vec!["x.sagebrush.walk=strict"]), ("split across two tags", vec!["sagebrush.walk=", "strict"])] {
+            assert!(!yes(&tags, &["/srv/cfg"], "srv/cfg"), "{what}");
+        }
+        for (what, p) in [("a descendant", "srv/cfg/child"), ("a suffix", "srv/cfgx"), ("a parent", "srv"), ("another", "srv/b")] {
+            assert!(!yes(&[STRICT_MARK], &["/srv/cfg"], p), "{what}");
+        }
+        assert!(!yes(&[STRICT_MARK], &["/srv/cfg/"], "srv/cfg"), "a trailing slash isn't the path");
+    }
+
+    #[test]
+    fn the_resolver_tells_absent_from_not_a_directory() {
+        use rustic_core::{Id, TreeId};
+        use std::{collections::HashMap, ffi::OsStr};
+        let (root, d) = (TreeId::from(Id::random()), TreeId::from(Id::random()));
+        let mut dir = Node::new_node(OsStr::new("d"), NodeType::Dir, Default::default());
+        dir.subtree = Some(d);
+        let file = Node::new_node(OsStr::new("f"), NodeType::File, Default::default());
+        let inner = Node::new_node(OsStr::new("x"), NodeType::File, Default::default());
+        let trees: HashMap<TreeId, Vec<Node>> = [(root, vec![dir, file]), (d, vec![inner])].into_iter().collect();
+        let get = |id: &TreeId| trees.get(id).cloned().ok_or_else(|| Fail::new("restore_failed", "unreadable"));
+        let what = |p: &str| match resolve(root, p, get) {
+            Ok(Resolved::Node(n)) => format!("node {}", n.name().to_string_lossy()),
+            Ok(Resolved::Absent) => "absent".into(),
+            Ok(Resolved::NotADirectory) => "not a directory".into(),
+            Err(e) => e.code.to_string(),
+        };
+        assert_eq!(what("d/x"), "node x");
+        assert_eq!(what("f"), "node f");
+        assert_eq!(what("y"), "absent", "missing from a directory that was read");
+        assert_eq!(what("d/y"), "absent");
+        assert_eq!(what("f/below"), "not a directory", "a file at an ancestor is structural, never absent (SEC S1)");
+        assert_eq!(what("d/x/below"), "not a directory");
+        // A tree that can't be read is a read failure, never absent (TESTS T2's unit half).
+        let lost: HashMap<TreeId, Vec<Node>> = [(root, trees[&root].clone())].into_iter().collect();
+        assert_eq!(match resolve(root, "d/x", |id: &TreeId| lost.get(id).cloned().ok_or_else(|| Fail::new("restore_failed", "unreadable"))) {
+            Err(e) => e.code.to_string(),
+            Ok(_) => "resolved".into(),
+        }, "restore_failed");
     }
 
     #[test]

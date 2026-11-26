@@ -97,7 +97,7 @@ const planOf = (kind, id, run = RUN) => withConfig({ v: 1, host: "old-host", man
  */
 function world(kind, { script = () => 0, onCall = () => {}, failDiscards = 0, report = () => ({}), observe = (c, t) => t,
   stdout = (op, cls, t) => t, stopped = async () => true, unrestorable = () => [], beforeDigest = () => {}, seed = () => {},
-  listOf = (c, t) => t, identify = (c, o) => o, skipCopy = () => false, afterCopy = () => {}, hooks = {} } = {}) {
+  listOf = (c, t) => t, identify = (c, o) => o, skipCopy = () => false, afterCopy = () => {}, hooks = {}, empty = () => false } = {}) {
   const base = mkdtempSync(join(tmpdir(), "sb-fill-"));
   const stage = join(base, "staging"), dir = join(base, "restore");
   const dests = {};
@@ -130,7 +130,7 @@ function world(kind, { script = () => 0, onCall = () => {}, failDiscards = 0, re
     if (cmd === "restore-stage") {
       if (existsSync(att)) return { code: EXIT.exists, stdout: "", stderr: "" };
       mkdirSync(join(att, "data", leaf), { recursive: true });
-      const files = Object.entries(DATA[cls]);
+      const files = empty(cls) ? [] : Object.entries(DATA[cls]); // (an empty source restores as nothing written)
       for (const [k, v] of code === 0 ? files : files.slice(0, 1)) writeFileSync(join(att, "data", leaf, k), v);
       if (code !== 0) return { code, stdout: "", stderr: "" };
       seed(cls, join(att, "data", leaf));
@@ -643,6 +643,15 @@ const failedAs = async (opts, reason, what) => {
   assert.equal(existsSync(attemptDir(w, id, "home")), false, `${what}: the attempt is discarded once the stop is written`);
   return { w, r, id };
 };
+
+test("an empty source (restore empty-source d1): a class staged as nothing, with the empty digest list, validates and fills an empty destination", async () => {
+  const { w, r, id } = await settle({ empty: (c) => c === "home" });
+  assert.equal(r.state, "files_validated");
+  assert.equal(r.digests.home, sha('{"v":1}\n{"count":0,"total_bytes":0}\n'), "the empty list's hash, recorded at staging");
+  assert.deepEqual(readdirSync(w.dests.home), [], "the filled home is empty");
+  assert.notDeepEqual(readdirSync(w.dests.sessions), [], "the other class as usual");
+  assert.ok(id);
+});
 
 test("validation: each class's hash is recorded as it stages, then the filled tree is the list's, and only then validated", async () => {
   const seen = [];

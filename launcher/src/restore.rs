@@ -1606,6 +1606,9 @@ mod tests {
 
     // ---- restore-stage
 
+    // (This row is also the empty source's (restore empty-source d1): the child writes nothing into data/<leaf> and
+    // answers the empty digest list, DIG; the leaf stays the launcher's root 0700 directory, the list is bound, and the
+    // marker follows syncfs, exactly as for any class.)
     #[test]
     fn restore_stage_makes_the_attempt_runs_the_child_and_writes_the_marker_only_after_syncfs() {
         let mut f = host();

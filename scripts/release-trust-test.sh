@@ -87,13 +87,20 @@ clean() {
   systemctl daemon-reload; systemctl reset-failed 2>/dev/null; true
 }
 snap() { snaptext | md5sum; }
+# The whole tree of every install area, recursively: each entry's type, owner, group, mode, size, mtime and link
+# target, and the sha256 of every regular file's contents (so a changed byte, mode, owner or link anywhere shows).
+snaptree() {
+  [ -e "$1" ] || [ -L "$1" ] || return 0
+  find "$1" -printf '%y %p %u %g %m %s %T@ ->%l\n' 2>/dev/null | sort
+  find "$1" -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null
+}
 snaptext() {
   { for d in /etc/systemd/system /run/systemd/system /run/systemd/system.control /run/systemd/transient /run/systemd/generator \
        /usr/lib/systemd/system /usr/lib/systemd/system-sleep /usr/lib/sagebrush "$P"; do
-      [ -d "$d" ] && find "$d" -maxdepth 2 -printf '%p %u %m %s %T@\n' 2>/dev/null | sort
+      snaptree "$d"
     done
     # (of /usr/lib, only the sagebrush entry: package updates may change the rest at any time)
-    find /usr/lib -maxdepth 1 -name 'sagebrush*' -printf '%p %u %m %s %T@\n' 2>/dev/null
+    find /usr/lib -maxdepth 1 -name 'sagebrush*' -printf '%y %p %u %g %m %s %T@ ->%l\n' 2>/dev/null
     systemctl list-units --all --plain --no-legend 2>/dev/null | grep sagebrush-
     systemctl list-unit-files --no-legend 2>/dev/null | grep sagebrush-
     for u in $UNIT sagebrush-backup.service; do systemctl show "$u" -p LoadState -p ActiveState -p DropInPaths -p FragmentPath -p NeedDaemonReload 2>/dev/null; done
@@ -103,18 +110,21 @@ snaptext() {
 ri() { (cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin ${CUT:+SB_RELEASE_INSTALL_CUT=$CUT} /bin/sh "$SBIN" "$@"); }
 inst() { ri "$COMMIT" "$D" "$LAUNCH"; }
 markers() { ls /run/sb-*-ran 2>/dev/null | wc -l; }
-# refuses <label> <setup cmd> <expected message part>: the install refuses FOR THAT REASON, snapshots identical, no new
-# marker
-refuses() {
+# refuse_check <label> <setup cmd> <expected message part> [<change after the install, for the controls>]: 0 when the
+# install refuses FOR THAT REASON with the snapshots identical and no new marker; prints why otherwise
+refuse_check() {
   local label=$1 want=$3 before after m0 out r
   clean; eval "$2"
   snaptext > /tmp/sb-snap-before; before=$(md5sum < /tmp/sb-snap-before); m0=$(markers)
   out=$(inst 2>&1); r=$?
+  [ -z "${4:-}" ] || eval "$4"
   snaptext > /tmp/sb-snap-after; after=$(md5sum < /tmp/sb-snap-after)
   [ "$before" = "$after" ] || diff /tmp/sb-snap-before /tmp/sb-snap-after | head -20 | sed 's/^/     changed: /'
-  if [ "$r" = 1 ] && [[ "$out" == *"$want"* ]] && [ "$before" = "$after" ] && [ "$(markers)" = "$m0" ]; then ok "install refuses: $label (${out##*release-install: })"
-  else bad "install refuses: $label (exit $r, want \"$want\", unchanged=$([ "$before" = "$after" ] && echo yes || echo no), markers $m0->$(markers): ${out:0:300})"; fi
+  REFUSE_OUT="exit $r, want \"$want\", unchanged=$([ "$before" = "$after" ] && echo yes || echo no), markers $m0->$(markers): ${out:0:300}"
+  [ "$r" = 1 ] && [[ "$out" == *"$want"* ]] && [ "$before" = "$after" ] && [ "$(markers)" = "$m0" ] && REFUSE_OUT=${out##*release-install: }
 }
+# refuses <label> <setup cmd> <expected message part>: the refusal row
+refuses() { if refuse_check "$@"; then ok "install refuses: $1 ($REFUSE_OUT)"; else bad "install refuses: $1 ($REFUSE_OUT)"; fi; }
 unitfile() { printf '[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/sh -c "touch /run/sb-%s-ran"\n' "$1"; }
 
 install -o root -g root -m 0755 "$INSTALL" "$SBIN"
@@ -156,6 +166,10 @@ rm -f /run/systemd/system.control/$UNIT; systemctl daemon-reload
 rc "verify: restored, it passes" 0 ri --verify "$D"
 # reinstalling over it is refused (fresh only)
 refuses "an existing install (fresh only)" "inst >/dev/null 2>&1" "<dest> exists"
+# Controls for the helper itself (TESTS on #172): with a change slipped in after the refused install, the same row must
+# FAIL, for a deep file's contents and for a link's target inside the existing release
+if refuse_check "control: a deep content change" "inst >/dev/null 2>&1" "<dest> exists" "printf x >> '$D/lib/fleet/host/lease.mjs'" >/dev/null; then bad "control: a deep content change went unseen by the refusal helper"; else ok "control: a deep content change (lib/fleet/host/lease.mjs) makes the refusal helper fail"; fi
+if refuse_check "control: a link retarget" "inst >/dev/null 2>&1" "<dest> exists" "ln -sfn sagebrush-agent-chat.mjs '$D/bin/sagebrush-agent'" >/dev/null; then bad "control: a link retarget went unseen by the refusal helper"; else ok "control: a link retarget (bin/sagebrush-agent) makes the refusal helper fail"; fi
 
 # C2: <dest> exists
 refuses "<dest> a file" "touch $D" "<dest> exists"

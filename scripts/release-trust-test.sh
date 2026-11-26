@@ -130,7 +130,8 @@ rc "install: the installed release's manifest equals the checkout's" 0 /usr/bin/
 [ "$(systemctl show $UNIT -p DropInPaths --value)" = "" ] && ok "install: opened (no drop-in)" || bad "install: a drop-in remains"
 systemctl start $UNIT 2>/dev/null; sleep 2
 pre=$(systemctl show $UNIT -p ExecStartPre --value); main=$(systemctl show $UNIT -p ExecMainStartTimestampMonotonic --value)
-case "$pre" in *"status=0/0"*) ok "start: release-trust ran and passed";; *) bad "start: release-trust didn't pass ($pre)";; esac
+# (systemd prints an exited command's status as "code=exited ; status=0", or "status=0/0" in older versions)
+case "$pre" in *"code=exited ; status=0 "* | *"code=exited ; status=0/0"*) ok "start: release-trust ran and passed";; *) bad "start: release-trust didn't pass ($pre)";; esac
 [ "${main:-0}" != 0 ] && ok "start: node ran after the check" || bad "start: node didn't run"
 systemctl stop $UNIT 2>/dev/null; systemctl reset-failed $UNIT 2>/dev/null
 # C9: a writable member stops the start in ExecStartPre; a payload dispatcher never runs

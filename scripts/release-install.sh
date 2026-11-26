@@ -5,7 +5,7 @@
 # THE ONLY SUPPORTED ENTRYPOINT (lease-on r1.13). First install this script root-owned, e.g.:
 #   sudo install -o root -g root -m 0755 scripts/release-install.sh /usr/local/sbin/sagebrush-release-install
 # then run it, from inside a clone holding <commit>, with systemd running:
-#   sudo /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh /usr/local/sbin/sagebrush-release-install <commit> <dest> <launcher>
+#   sudo /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh /usr/local/sbin/sagebrush-release-install <commit> <dest> <launcher> <backup>
 #   sudo /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh /usr/local/sbin/sagebrush-release-install --verify <dest>
 # (Tests only: SB_RELEASE_INSTALL_CUT=<step>, passed explicitly inside env -i, stops with status 9 right after that
 # step, as a crash there would.)
@@ -20,6 +20,10 @@
 # toolchain, build script or tool the caller chose: the commit is read through an isolated bare copy of the clone (no
 # config, hooks or local attributes, so no filter runs), and the launcher's bytes are verified against the pin before
 # anything on the host changes.
+# <backup> is the backup binary built the same way (scripts/backup-build.sh), its bytes exactly the SHA-256 pinned at
+# <commit> (lib/fleet/host/backup.sha256), verified before anything on the host changes and installed as
+# bin/sagebrush-agent-backup (root 0755). A fix to either binary reaches an installed host only by an upgrade in place
+# (a later design), never by copying a file in: the pinned runners refuse a binary that isn't the release's own.
 #
 # It installs a release and the trust boundary that keeps release code from running as root unless the tree is
 # root's: the checker /usr/lib/sagebrush/release-trust (outside the release), the supervisor unit (ExecStartPre: the
@@ -28,10 +32,12 @@
 # FRESH hosts only: any earlier sagebrush entrypoint, on disk or known to systemd, refuses with nothing touched.
 # Upgrade-in-place is a launch prerequisite (a later design), not done here. Steps (refusing at the first failure):
 #   0/1 (i)  read-only: <dest> absent; the absence probe; every destination and tool chain proven; what to create;
-#            the commit archived (isolated) and the launcher's bytes verified against its pin, staged under /run.
+#            the commit archived (isolated), the launcher's and the backup binary's bytes verified against their
+#            pins, staged under /run.
 #       (ii) create the missing directories, then prove every chain again.
 #   2  close: the closing drop-in (an unmet condition), daemon-reload, its loading verified.
-#   3  the release: the staged archive, the staged launcher, the dispatcher link, root's; the checker passes on it.
+#   3  the release: the staged archive, the staged launcher and backup binary, the dispatcher link, root's; the
+#      checker passes on it. The host's state directory /var/lib/sagebrush (root 0755) is created in (ii) if missing.
 #   4  the checker, the unit and the shim, each atomically (exclusive temp, owner, mode, fsync, rename, dir fsync).
 #   5  daemon-reload.  6  the EFFECTIVE unit verified, still closed.  7  open: the drop-in removed, reload, verified.
 # A cut at any point leaves nothing startable: before step 4 there is no unit; from step 2 to 7 the unit is closed.
@@ -68,13 +74,16 @@ LIBDIR=/usr/lib/sagebrush
 CHECKER=$LIBDIR/release-trust
 SLEEPDIR=/usr/lib/systemd/system-sleep
 SHIM=$SLEEPDIR/sagebrush-lease
+# the host's state directory: the supervisor's identity refuses a host where it (or any parent) isn't root's alone
+STATEDIR=/var/lib/sagebrush
 
 no() { printf 'release-install: %s\n' "$1" >&2; exit 1; }
 
-case "$#:${1:-}" in 2:--verify) ;; 3:*) ;; *) no "usage: scripts/release-install.sh <commit> <dest> <launcher> | --verify <dest>" ;; esac
+case "$#:${1:-}" in 2:--verify) ;; 4:*) ;; *) no "usage: scripts/release-install.sh <commit> <dest> <launcher> <backup> | --verify <dest>" ;; esac
 COMMIT=$1
 DEST=$2
 LAUNCHER=${3:-}
+BACKUP=${4:-}
 cut() { if [ "${SB_RELEASE_INSTALL_CUT:-}" = "$1" ]; then printf 'release-install: cut after step %s\n' "$1" >&2; exit 9; fi; }
 case "$DEST" in /*) ;; *) no "<dest> must be an absolute path" ;; esac
 case "$DEST" in *[!A-Za-z0-9/._-]*) no "<dest> has characters outside [A-Za-z0-9/._-]" ;; esac
@@ -156,6 +165,7 @@ prove_all() {
   chain /usr/lib d
   chain "$ETC" d
   chain "$SLEEPDIR" d
+  if [ -e "$STATEDIR" ] || [ -L "$STATEDIR" ]; then chain "$STATEDIR" d; else chain "$(dirname "$STATEDIR")" d; fi
   if [ -e "$LIBDIR" ] || [ -L "$LIBDIR" ]; then empty_trace "$LIBDIR"; fi
   if [ -e "$DROPDIR" ] || [ -L "$DROPDIR" ]; then empty_trace "$DROPDIR"; fi
   return 0
@@ -238,11 +248,19 @@ digest() {
 }
 GOT=$(digest "$STAGE/launch")
 [ "$GOT" = "$PIN" ] || no "the launcher's digest isn't the pinned one (got $GOT, pinned $PIN)"
+BPIN=$(sed -n 's/^\([0-9a-f]\{64\}\)  sagebrush-agent-backup$/\1/p' "$STAGE/tree/lib/fleet/host/backup.sha256" 2>/dev/null)
+[ -n "$BPIN" ] || no "the commit has no backup binary pin"
+case "$BACKUP" in /*) ;; *) no "<backup> must be an absolute path" ;; esac
+[ -f "$BACKUP" ] && [ ! -L "$BACKUP" ] || no "<backup> isn't a regular file"
+cp -- "$BACKUP" "$STAGE/backup"
+GOT=$(digest "$STAGE/backup")
+[ "$GOT" = "$BPIN" ] || no "the backup binary's digest isn't the pinned one (got $GOT, pinned $BPIN)"
 fi
 CREATE=""
 if [ "$VERIFY_ONLY" = 0 ]; then
   [ -e "$LIBDIR" ] || CREATE="$CREATE $LIBDIR"
   [ -e "$DROPDIR" ] || CREATE="$CREATE $DROPDIR"
+  [ -e "$STATEDIR" ] || [ -L "$STATEDIR" ] || CREATE="$CREATE $STATEDIR"
 fi
 
 # ---- phase (ii): create, then prove again ----------------------------------------------------------------------------
@@ -304,6 +322,7 @@ render() { sed "s#@RELEASE@#$DEST#g" "$1" > "$2"; }
 if [ "$VERIFY_ONLY" = 1 ]; then
   [ -d /run/systemd/system ] || no "systemd isn't running"
   verify open || no "the effective unit isn't exactly the installed one"
+  chain "$STATEDIR" d
   printf 'release-install: the effective %s is the installed one for %s\n' "$UNIT" "$DEST"
   exit 0
 fi
@@ -336,10 +355,12 @@ igit --git-dir="$STAGE/repo.git" -c core.attributesFile=/dev/null archive --form
   | "$TAR" -x --no-same-owner --no-same-permissions -C "$work/tree"
 cp -- "$STAGE/launch" "$work/tree/bin/sagebrush-agent-launch"
 [ "$(digest "$work/tree/bin/sagebrush-agent-launch")" = "$PIN" ] || no "the staged launcher changed"
+cp -- "$STAGE/backup" "$work/tree/bin/sagebrush-agent-backup"
+[ "$(digest "$work/tree/bin/sagebrush-agent-backup")" = "$BPIN" ] || no "the staged backup binary changed"
 ln -s sagebrush-agent.mjs "$work/tree/bin/sagebrush-agent"
 chown -R -h 0:0 -- "$work/tree"
 chmod -R go-w -- "$work/tree"
-chmod 0755 -- "$work/tree" "$work/tree/bin/sagebrush-agent-launch"
+chmod 0755 -- "$work/tree" "$work/tree/bin/sagebrush-agent-launch" "$work/tree/bin/sagebrush-agent-backup"
 mv -T -- "$work/tree" "$DEST"
 sync -- "$(dirname "$DEST")"
 /bin/sh "$DEST/scripts/release-trust.sh" "$DEST" || no "the installed release doesn't pass its own checker"

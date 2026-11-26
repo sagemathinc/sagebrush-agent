@@ -67,7 +67,8 @@ jobs:
   # SHA-256). The restore rows remove CAP_SYS_RESOURCE with `sudo setpriv`, as the launcher's runner will, and one
   # restores with no /proc (`sudo unshare -m`), as the runner's filesystem view has none.
   backup:
-    runs-on: ubuntu-latest
+    # (a pinned image: the backup binary's C toolchain is part of its pin; scripts/backup-build.sh)
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -87,17 +88,31 @@ jobs:
           SB_TEST_WEED: ${{ runner.temp }}/weed/bin/weed
           SB_TEST_REQUIRE_WEED: "1"
           SB_TEST_REQUIRE_NOPROC: "1"
-      # The shipped build: static musl, checked to name no dynamic loader (the launcher refuses one that does).
+      # The shipped build (init/run d3 §4.1): scripts/backup-build.sh, static musl, run from two different directories,
+      # must produce byte-identical binaries, equal to the pin the root installer and the pinned runner accept
+      # (lib/fleet/host/backup.sha256), and checked to name no dynamic loader (the launcher refuses one that does).
       - run: sudo apt-get update && sudo apt-get install -y musl-tools && rustup target add x86_64-unknown-linux-musl
-      - run: cargo build --locked --release --manifest-path backup/Cargo.toml --target x86_64-unknown-linux-musl
-      - run: scripts/backup-static-check-test.sh backup/target/x86_64-unknown-linux-musl/release/sagebrush-agent-backup
+      - run: cargo fetch --locked --manifest-path backup/Cargo.toml
+      - run: |
+          for d in "$RUNNER_TEMP/a" "$RUNNER_TEMP/bb/c"; do
+            mkdir -p "$d" && git archive HEAD backup scripts | tar -x -C "$d"
+          done
+          (cd "$RUNNER_TEMP/a" && scripts/backup-build.sh "$RUNNER_TEMP/backup-1")
+          (cd "$RUNNER_TEMP/bb/c" && scripts/backup-build.sh "$RUNNER_TEMP/backup-2")
+          cmp "$RUNNER_TEMP/backup-1" "$RUNNER_TEMP/backup-2"
+          sha256sum "$RUNNER_TEMP/backup-1"
+          test "$(sha256sum < "$RUNNER_TEMP/backup-1" | cut -d' ' -f1)" = "$(cut -d' ' -f1 lib/fleet/host/backup.sha256)"
+      - run: scripts/backup-static-check-test.sh "$RUNNER_TEMP/backup-1"
+      # the compilers that made it, as recorded in the binary (the pinned gcc, and Rust's own musl objects)
+      - run: readelf -p .comment "$RUNNER_TEMP/backup-1" | grep -F "13.3.0-6ubuntu2~24.04.1"
 
   # The launcher (launcher/, sagebrush-agent-launch, root-run and security-critical): its unit and CLI tests, then
   # the shipped release build. Its Landlock rows need the kernel's ABI 4; SB_TEST_REQUIRE_LANDLOCK makes a runner
   # kernel without it fail the job rather than skip them.
   launcher:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # (a pinned image: it builds the backup binary too, whose C toolchain is part of its pin)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -127,8 +142,13 @@ jobs:
         with:
           node-version: 24.21.0
       - run: sudo install -m 0755 -o root -g root "$(readlink -f "$(command -v node)")" /usr/bin/node
+      # the backup binary the installer installs beside the launcher: the pinned build (the backup job checks it twice)
+      - run: cargo fetch --locked --manifest-path backup/Cargo.toml
       - run: |
-          sudo env SB_TEST_LAUNCHER="$RUNNER_TEMP/launch-1" scripts/release-trust-test.sh
+          scripts/backup-build.sh "$RUNNER_TEMP/backup-1"
+          test "$(sha256sum < "$RUNNER_TEMP/backup-1" | cut -d' ' -f1)" = "$(cut -d' ' -f1 lib/fleet/host/backup.sha256)"
+      - run: |
+          sudo env SB_TEST_LAUNCHER="$RUNNER_TEMP/launch-1" SB_TEST_BACKUP="$RUNNER_TEMP/backup-1" scripts/release-trust-test.sh
 
   # The turn's syscall policy (schema/fleet/agent-seccomp-policy.json): regenerated from its pin, offline, in the pinned
   # Ubuntu 24.04 image with the pinned systemd, and required byte for byte (scripts/seccomp-policy-ci.sh). The network is

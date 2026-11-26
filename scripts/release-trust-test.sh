@@ -2,9 +2,9 @@
 # The trust boundary's rows (lease-on design r1.12 §2.6, §7): the checker, the preload regression, and the FRESH
 # installer against real systemd. Destructive to sagebrush state: run only on a disposable host (a CI runner, a VM).
 #
-#   sudo SB_TEST_LAUNCHER=<path> scripts/release-trust-test.sh
-#       (root; systemd running; /usr/bin/node a root-owned node binary; <path> the launcher scripts/launcher-build.sh
-#        built WITHOUT root, whose digest is the pinned one)
+#   sudo SB_TEST_LAUNCHER=<path> SB_TEST_BACKUP=<path> scripts/release-trust-test.sh
+#       (root; systemd running; /usr/bin/node a root-owned node binary; the launcher scripts/launcher-build.sh and the
+#        backup binary scripts/backup-build.sh built WITHOUT root, each with its pinned digest)
 #
 # Every row prints "ok" or "FAIL"; the script exits 1 if any row failed. It removes every sagebrush unit, drop-in,
 # shim, checker and test release before and after the installer rows.
@@ -24,6 +24,7 @@ rc() { local label=$1 want=$2; shift 2; local out r; out=$("$@" 2>&1); r=$?; if 
 [ -d /run/systemd/system ] || { echo "release-trust-test: systemd isn't running" >&2; exit 2; }
 [ "$(stat -c %u "$(readlink -f /usr/bin/node)")" = 0 ] || { echo "release-trust-test: /usr/bin/node must be root's" >&2; exit 2; }
 LAUNCH=${SB_TEST_LAUNCHER:?release-trust-test: SB_TEST_LAUNCHER (the non-root build of the launcher) is required}
+BACKUPBIN=${SB_TEST_BACKUP:?release-trust-test: SB_TEST_BACKUP (the non-root build of the backup binary) is required}
 COMMIT=$(git -c safe.directory='*' -C "$REPO" rev-parse HEAD) || { echo "release-trust-test: no commit" >&2; exit 2; }
 
 # ---- A. the checker ------------------------------------------------------------------------------------------------
@@ -82,7 +83,7 @@ clean() {
     [ -d "$d" ] || continue
     find "$d" -maxdepth 2 \( -name 'sagebrush-*' -o -lname '*sagebrush-*' -o -name 'other.service' \) -exec rm -rf {} + 2>/dev/null
   done
-  rm -rf /usr/lib/sagebrush /usr/lib/systemd/system-sleep/sagebrush-lease "$P" /run/sb-*-ran
+  rm -rf /usr/lib/sagebrush /usr/lib/systemd/system-sleep/sagebrush-lease "$P" /run/sb-*-ran /var/lib/sagebrush
   mkdir -m 0755 "$P"; chown 0:0 "$P"
   systemctl daemon-reload; systemctl reset-failed 2>/dev/null; true
 }
@@ -96,7 +97,7 @@ snaptree() {
 }
 snaptext() {
   { for d in /etc/systemd/system /run/systemd/system /run/systemd/system.control /run/systemd/generator \
-       /usr/lib/systemd/system /usr/lib/systemd/system-sleep /usr/lib/sagebrush "$P"; do
+       /usr/lib/systemd/system /usr/lib/systemd/system-sleep /usr/lib/sagebrush "$P" /var/lib/sagebrush; do
       snaptree "$d"
     done
     # (/run/systemd/transient holds units the host makes on its own at any time, a CI runner's log collection among
@@ -113,7 +114,7 @@ snaptext() {
 }
 # ri <args>: the ONLY supported invocation: an absolute env -i on the root-owned copy (the cut, in tests, explicitly)
 ri() { (cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin ${CUT:+SB_RELEASE_INSTALL_CUT=$CUT} /bin/sh "$SBIN" "$@"); }
-inst() { ri "$COMMIT" "$D" "$LAUNCH"; }
+inst() { ri "$COMMIT" "$D" "$LAUNCH" "$BACKUPBIN"; }
 markers() { ls /run/sb-*-ran 2>/dev/null | wc -l; }
 # refuse_check <label> <setup cmd> <expected message part> [<change after the install, for the controls>]: 0 when the
 # install refuses FOR THAT REASON with the snapshots identical and no new marker; prints why otherwise
@@ -138,10 +139,15 @@ clean
 out=$(inst 2>&1); r=$?
 if [ "$r" = 0 ]; then ok "install: a clean host installs"; else bad "install: a clean host (exit $r: ${out:0:400})"; fi
 rc "install: --verify passes" 0 ri --verify "$D"
+r=0; out=$(cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" 2>&1) || r=$?
+[ "$r" = 1 ] && [[ "$out" == *"usage:"* ]] && ok "install: three arguments (no <backup>) is a usage refusal" || bad "install: three arguments (exit $r: ${out:0:200})"
 rc "install: the installed release's manifest equals the checkout's" 0 /usr/bin/node --input-type=module -e "
   const { leaseManifest } = await import('$REPO/lib/fleet/host/lease-manifest.mjs');
   process.exit(JSON.stringify(leaseManifest('$REPO')) === JSON.stringify(leaseManifest('$D')) ? 0 : 1);"
 [ "$(readlink "$D/bin/sagebrush-agent")" = sagebrush-agent.mjs ] && ok "install: the dispatcher link" || bad "install: the dispatcher link"
+[ "$(stat -c '%u %a %F' "$D/bin/sagebrush-agent-backup")" = "0 755 regular file" ] && [ "$(sha256sum < "$D/bin/sagebrush-agent-backup" | cut -d' ' -f1)" = "$(cut -d' ' -f1 "$REPO/lib/fleet/host/backup.sha256")" ] \
+  && ok "install: the backup binary is the pinned bytes, root 0755" || bad "install: the backup binary ($(stat -c '%u %a %F' "$D/bin/sagebrush-agent-backup" 2>&1))"
+[ "$(stat -c '%u %g %a %F' /var/lib/sagebrush)" = "0 0 755 directory" ] && ok "install: the host's state directory, root 0755" || bad "install: the state directory ($(stat -c '%u %g %a %F' /var/lib/sagebrush 2>&1))"
 [ "$(systemctl show $UNIT -p DropInPaths --value)" = "" ] && ok "install: opened (no drop-in)" || bad "install: a drop-in remains"
 systemctl start $UNIT 2>/dev/null; sleep 2
 pre=$(systemctl show $UNIT -p ExecStartPre --value); main=$(systemctl show $UNIT -p ExecMainStartTimestampMonotonic --value)
@@ -210,7 +216,7 @@ refuses "node through a writable directory" "mkdir -p /tmp/sb-node && cp \"\$(re
 clean; mkdir -p /tmp/sb-fake
 for f in find stat readlink sh node systemctl busctl systemd-analyze; do printf '#!/bin/sh\ntouch /run/sb-fake-%s-ran\nexit 0\n' "$f" > /tmp/sb-fake/$f; chmod 755 /tmp/sb-fake/$f; done
 unitfile sup > /etc/systemd/system/$UNIT
-out=$(cd "$REPO" && /usr/bin/env -i PATH=/tmp/sb-fake:/usr/bin:/bin /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
+out=$(cd "$REPO" && /usr/bin/env -i PATH=/tmp/sb-fake:/usr/bin:/bin /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" "$BACKUPBIN" 2>&1); r=$?
 mkdir -p "$T/rel/lib" && chmod 775 "$T/rel/lib"
 PATH=/tmp/sb-fake:$PATH /bin/sh "$CHECK" "$T/rel" >/dev/null 2>&1; r2=$?
 if [ "$r" != 0 ] && [ "$r2" != 0 ] && ! ls /run/sb-fake-*-ran >/dev/null 2>&1; then ok "PATH: fakes first on PATH never run; the installer and the checker still refuse"; else bad "PATH: a fake ran or a refusal changed ($r $r2; $(ls /run/sb-fake-*-ran 2>/dev/null))"; fi
@@ -219,6 +225,12 @@ rm -rf /tmp/sb-fake /run/sb-fake-*-ran "$T"
 # toolchain, wrapper, Cargo config or git filter of the caller's, and the pinned launcher installs
 cp "$LAUNCH" /tmp/sb-bad-launch; printf '\0' >> /tmp/sb-bad-launch
 refuses "a launcher whose digest isn't the pinned one" "LAUNCH_SAVE=\$LAUNCH; LAUNCH=/tmp/sb-bad-launch" "the launcher's digest isn't the pinned one"; LAUNCH=$LAUNCH_SAVE; rm -f /tmp/sb-bad-launch
+cp "$BACKUPBIN" /tmp/sb-bad-backup; printf '\0' >> /tmp/sb-bad-backup
+refuses "a backup binary whose digest isn't the pinned one" "BACKUP_SAVE=\$BACKUPBIN; BACKUPBIN=/tmp/sb-bad-backup" "the backup binary's digest isn't the pinned one"; BACKUPBIN=$BACKUP_SAVE; rm -f /tmp/sb-bad-backup
+ln -sf "$BACKUPBIN" /tmp/sb-link-backup
+refuses "a backup binary given as a link" "BACKUP_SAVE=\$BACKUPBIN; BACKUPBIN=/tmp/sb-link-backup" "<backup> isn't a regular file"; BACKUPBIN=$BACKUP_SAVE; rm -f /tmp/sb-link-backup
+refuses "an empty <backup>" "BACKUP_SAVE=\$BACKUPBIN; BACKUPBIN=" "<backup> must be an absolute path"; BACKUPBIN=$BACKUP_SAVE
+refuses "a host state directory others can write" "mkdir -m 0777 -p /var/lib/sagebrush; chmod 0777 /var/lib/sagebrush" "group- or other-writable: /var/lib/sagebrush"; rm -rf /var/lib/sagebrush
 clean; mkdir -p /tmp/sb-tool/bin /tmp/sb-tool/cargo
 for f in cargo rustc bash rustup cc; do printf '#!/bin/sh\ntouch /run/sb-tool-%s-ran\nexit 0\n' "$f" > /tmp/sb-tool/bin/$f; chmod 755 /tmp/sb-tool/bin/$f; done
 printf '#!/bin/sh\ntouch /run/sb-tool-wrapper-ran\nexec "$@"\n' > /tmp/sb-tool/wrap; chmod 755 /tmp/sb-tool/wrap
@@ -232,7 +244,7 @@ git -c safe.directory='*' -C "$REPO" config filter.evil.smudge /tmp/sb-tool/smud
 # TAR_OPTIONS) refuses at entry, before any tool runs; the clean supported invocation, with a git filter configured
 # in the clone, installs the pinned launcher and runs no filter
 out=$(cd "$REPO" && /usr/bin/env -i PATH=/tmp/sb-tool/bin:/usr/bin:/bin CARGO_HOME=/tmp/sb-tool/cargo RUSTC_WRAPPER=/tmp/sb-tool/wrap \
-  "TAR_OPTIONS=--checkpoint=1 --checkpoint-action=exec=/tmp/sb-tool/tarmark" /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
+  "TAR_OPTIONS=--checkpoint=1 --checkpoint-action=exec=/tmp/sb-tool/tarmark" /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" "$BACKUPBIN" 2>&1); r=$?
 if [ "$r" = 1 ] && [[ "$out" == *"isn't the supported one"* ]] && ! ls /run/sb-tool-*-ran >/dev/null 2>&1 && [ ! -e "$D" ]; then ok "toolchain: a dirty environment (PATH fakes, Cargo home and wrapper, TAR_OPTIONS) refuses at entry; nothing of it ran"
 else bad "toolchain (dirty environment): exit $r, ran: $(ls /run/sb-tool-*-ran 2>/dev/null | tr '\n' ' ') ${out:0:300}"; fi
 clean
@@ -260,7 +272,7 @@ cc -shared -fPIC -o /tmp/sb-env/p.so /tmp/sb-env/p.c 2>/dev/null || echo "     (
 snaptext > /tmp/sb-snap-before
 out=$(cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin "TAR_OPTIONS=--checkpoint=1 --checkpoint-action=exec=/tmp/sb-env/tar" \
   "GIT_CONFIG_PARAMETERS='core.fsmonitor=/tmp/sb-env/fsmon'" LD_PRELOAD=/tmp/sb-env/p.so BASH_ENV=/tmp/sb-env/bashenv ENV=/tmp/sb-env/bashenv \
-  /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
+  /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" "$BACKUPBIN" 2>&1); r=$?
 snaptext > /tmp/sb-snap-after
 m=$(ls /run/sb-env-* 2>/dev/null | grep -v -e '^/run/sb-env-preload-env$' -e '^/run/sb-env-preload-sh$' -e '^/run/sb-env-preload-dash$' -e '^/run/sb-env-preload-release-install$' | tr '\n' ' ')
 # (an LD_PRELOAD given to the interpreter itself acts before any script line: that is the launcher's to prevent, and
@@ -271,17 +283,17 @@ rm -rf /tmp/sb-env /run/sb-env-*
 # C11: the entrypoint contract (lease-on r1.13): only a root-owned script path, only the exact environment, only a
 # self-contained object store
 clean
-r=0; out=$(cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh "$INSTALL" "$COMMIT" "$D" "$LAUNCH" 2>&1) || r=$?
+r=0; out=$(cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh "$INSTALL" "$COMMIT" "$D" "$LAUNCH" "$BACKUPBIN" 2>&1) || r=$?
 if [ "$(stat -c %u "$INSTALL")" != 0 ]; then
   [ "$r" = 1 ] && [[ "$out" == *"not owned by root"* ]] && [ ! -e "$D" ] && ok "entrypoint: the caller's own (non-root) copy refuses" || bad "entrypoint: the caller's copy ran ($r: ${out:0:200})"
 fi
 mkdir -p /var/lib/sb-inst-w && chmod 0777 /var/lib/sb-inst-w && install -o root -g root -m 0755 "$INSTALL" /var/lib/sb-inst-w/ri
-r=0; out=$(cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh /var/lib/sb-inst-w/ri "$COMMIT" "$D" "$LAUNCH" 2>&1) || r=$?
+r=0; out=$(cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh /var/lib/sb-inst-w/ri "$COMMIT" "$D" "$LAUNCH" "$BACKUPBIN" 2>&1) || r=$?
 [ "$r" = 1 ] && [[ "$out" == *"group- or other-writable: /var/lib/sb-inst-w"* ]] && [ ! -e "$D" ] && ok "entrypoint: a root-owned copy in a writable directory refuses" || bad "entrypoint: a writable parent ran ($r: ${out:0:200})"
 rm -rf /var/lib/sb-inst-w
-r=0; out=$(cd /usr/local/sbin && /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh sagebrush-release-install "$COMMIT" "$D" "$LAUNCH" 2>&1) || r=$?
+r=0; out=$(cd /usr/local/sbin && /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh sagebrush-release-install "$COMMIT" "$D" "$LAUNCH" "$BACKUPBIN" 2>&1) || r=$?
 [ "$r" = 1 ] && [[ "$out" == *"absolute, root-owned path"* ]] && ok "entrypoint: a relative script path refuses" || bad "entrypoint: a relative path ran ($r: ${out:0:200})"
-r=0; out=$(cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin SB_EXTRA=1 /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" 2>&1) || r=$?
+r=0; out=$(cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin SB_EXTRA=1 /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" "$BACKUPBIN" 2>&1) || r=$?
 [ "$r" = 1 ] && [[ "$out" == *"isn't the supported one"* ]] && [ ! -e "$D" ] && ok "entrypoint: one extra variable refuses" || bad "entrypoint: an extra variable ran ($r: ${out:0:200})"
 for kind in alternates http-alternates; do
   clean; rm -rf /var/lib/sb-alt
@@ -289,7 +301,7 @@ for kind in alternates http-alternates; do
   git -c safe.directory='*' clone -q --no-hardlinks "$REPO" /var/lib/sb-alt && mkdir -p /var/lib/sb-alt/.git/objects/info
   if [ "$kind" = alternates ]; then echo "$(git -c safe.directory='*' -C "$REPO" rev-parse --path-format=absolute --git-common-dir)/objects" > /var/lib/sb-alt/.git/objects/info/alternates
   else echo "https://example.invalid/objects" > /var/lib/sb-alt/.git/objects/info/http-alternates; fi
-  r=0; out=$(cd /var/lib/sb-alt && /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" 2>&1) || r=$?
+  r=0; out=$(cd /var/lib/sb-alt && /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" "$BACKUPBIN" 2>&1) || r=$?
   [ "$r" = 1 ] && [[ "$out" == *"uses alternates"* ]] && [ ! -e "$D" ] && ok "entrypoint: a clone with $kind refuses" || bad "entrypoint: $kind didn't refuse ($r: ${out:0:200})"
 done
 rm -rf /var/lib/sb-alt

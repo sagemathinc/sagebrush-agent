@@ -222,8 +222,8 @@ fn tree_digest(rest: &[String]) -> err::Result<()> {
         (args::flags(&kept, &["mount", "owner", "class", "expect"])?, None)
     };
     tree::parse_mount(v[0])?;
-    if args::rel(v[3]).is_none() || v[2] == "config" {
-        // (`config` is staged only: nothing is ever filled to list, A2 r3.13 §5)
+    if args::rel(v[3]).is_none() || v[2] == "config" || v[2] == "hoststore" {
+        // (`config` and `hoststore` are staged only: nothing is ever filled to list, A2 r3.13 §5, r3.14 §1)
         return Err(bad());
     }
     if !sys::is_root() {
@@ -257,8 +257,9 @@ fn a2(cmd: &str, rest: &[String]) -> err::Result<()> {
     } else {
         let v = args::flags(rest, &["mount", "owner", "class", "run", "attempt", "source", "expect"])?;
         let name = restore::Name::parse(v[3], v[1], v[2], v[4]).ok_or_else(bad)?;
-        // `config` is staged only, never filled (A2 r3.13 §4): usage, before the root guard and anything else.
-        if name.class == restore::Class::Config {
+        // `config` and `hoststore` are staged only, never filled (A2 r3.13 §4, r3.14 §1): usage, before the root guard
+        // and anything else.
+        if name.class.stage_only() {
             return Err(bad());
         }
         tree::parse_mount(v[0])?;

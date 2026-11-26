@@ -406,6 +406,8 @@ test("N2: a transport failure keeps its own code (transient, never config_unboun
   }
   assert.equal(await prove(saved, t.root, { fail: (req) => (req.op === "dump" ? "dump_failed" : null) }), "dump_failed", "current's dump failing");
   assert.equal(await prove(saved, t.root, { pageEntries: 3, fail: (req) => (req.cursor ? "tree_refused" : null) }), "config_unbound");
+  // On the first page too, with a strict record naming the source: refused is structural, never an empty source.
+  assert.equal(await prove(saved, t.root, { fail: (req) => (req.op === "tree" ? "tree_refused" : null) }), "config_unbound");
   const b = store(saved, t.root, { pageEntries: 3 });
   let n = 0;
   const lossy = async (req, o) => { if (++n === 2) throw Object.assign(new Error("lost"), { code: "lock_lost" }); return b(req, o); };

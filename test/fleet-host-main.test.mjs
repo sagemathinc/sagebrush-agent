@@ -880,7 +880,7 @@ test("the bin hands `host` over before ANY chat-agent module is loaded: with ANT
   const env = { ...process.env, ANTHROPIC_BASE_URL: "http://127.0.0.1:9" };
   const a = spawnSync(process.execPath, [bin, "host", "--port", "1"], { env, encoding: "utf8", timeout: 30_000 });
   assert.equal(a.status, 2);
-  assert.match(a.stderr, /^usage: sagebrush-agent host run \| reset-identity$/m);
+  assert.match(a.stderr, /^usage: sagebrush-agent host run \| reset-identity \| restore status \| restore retry <kind>-<id> \| restore close$/m);
   assert.doesNotMatch(a.stderr, /ANTHROPIC_BASE_URL|unknown argument/);
   // The control: a resolve hook that fails the moment any chat-agent module (or its ws or zod) is even resolved. Host
   // mode never trips it; the chat agent does at once.
@@ -888,7 +888,7 @@ test("the bin hands `host` over before ANY chat-agent module is loaded: with ANT
   const reg = `data:text/javascript,${encodeURIComponent(`import { register } from "node:module"; register(${JSON.stringify(hook)});`)}`;
   const h1 = spawnSync(process.execPath, ["--import", reg, bin, "host", "--port", "1"], { env, encoding: "utf8", timeout: 30_000 });
   assert.equal(h1.status, 2, h1.stderr);
-  assert.match(h1.stderr, /^usage: sagebrush-agent host run \| reset-identity$/m);
+  assert.match(h1.stderr, /^usage: sagebrush-agent host run \| reset-identity \| restore status \| restore retry <kind>-<id> \| restore close$/m);
   assert.doesNotMatch(h1.stderr, /CHAT GRAPH/);
   const c1 = spawnSync(process.execPath, ["--import", reg, bin, "--help"], { env, encoding: "utf8", timeout: 30_000 });
   assert.notEqual(c1.status, 0);

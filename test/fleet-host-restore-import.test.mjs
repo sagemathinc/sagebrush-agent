@@ -3,7 +3,7 @@
 // grant is kept read-only as provenance and never attached; the audit is archived read-only; the other entries are
 // listed as kept in the backup, not restored. Against a real HostStore in a temporary root.
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
@@ -14,12 +14,12 @@ import { fenced, lowerFence } from "../lib/fleet/host/fence.mjs";
 import { fenceFiles } from "../lib/fleet/host/names.mjs";
 import { STEPS } from "../lib/fleet/host/deprovision-record.mjs";
 import { realIo } from "../lib/fleet/host/store.mjs";
-import { chmodSync } from "node:fs";
 import { dirname } from "node:path";
 import { buildManifest, canonical, sha256 } from "../lib/fleet/host/backup-manifest.mjs";
 import { newPlan } from "../lib/fleet/host/restore-plan.mjs";
 import { newRestoreRun } from "../lib/fleet/host/restore-record.mjs";
 import { BY_RULE, DISPOSITION, NOT_RESTORED, PER_HOST, copyReadOnly, importHostStore } from "../lib/fleet/host/restore-import.mjs";
+import { copyReader } from "../lib/fleet/host/hoststore-reader.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
@@ -29,6 +29,8 @@ const RUN = "20261124T030000Z-abcdefgh", RRUN = newRestoreRun(1795500000000, () 
 const tmp = () => mkdtempSync(join(tmpdir(), "sb-import-"));
 
 /** An old host's registry: two live agents (one with a start failure), a tombstone, a tag; and its manifest and plan. */
+const UID = typeof process.getuid === "function" ? process.getuid() : -1; // (Linux-only rows; off Linux the file only loads)
+
 function fixture({ dead2 = null } = {}) {
   const [a, b, dead, t] = [newId(), newId(), newId(), newId()];
   const registry = {
@@ -61,6 +63,14 @@ function copyOf(registry, { entries = ["registry", "grant", "audit", "state", "h
   }
   if (entries.includes("audit")) { writeFileSync(join(c, "audit", "000001.log"), "line 1\n"); mkdirSync(join(c, "audit", "old")); writeFileSync(join(c, "audit", "old", "000000.log"), "line 0\n"); }
   for (const e of ["state", "harness-sessions", "harness-turns", "config"]) if (entries.includes(e)) writeFileSync(join(c, e, "x.json"), "{}");
+  return exactModes(c);
+}
+/** As the backup writes a copy (and the launcher stages it): directories exactly 0700, files exactly 0600. */
+function exactModes(c) {
+  const go = (p) => {
+    if (lstatSync(p).isDirectory()) { chmodSync(p, 0o700); for (const n of readdirSync(p)) go(join(p, n)); } else if (lstatSync(p).isFile()) chmodSync(p, 0o600);
+  };
+  go(c);
   return c;
 }
 
@@ -75,7 +85,7 @@ test("the import: the registry restored exactly, the grant kept read-only as pro
   const { root, store, restoreDir, fenceDir } = await host();
   try {
     const copy = copyOf(registry);
-    const r = await importHostStore({ copy, store, root, plan, manifest, restoreDir, fenceDir });
+    const r = await importHostStore({ uid: UID, copy, store, root, plan, manifest, restoreDir, fenceDir });
     assert.deepEqual(r.entries, {
       registry: "restored", grant: "provenance", audit: "archived",
       config: PER_HOST, "harness-sessions": NOT_RESTORED, "harness-turns": NOT_RESTORED, state: BY_RULE,
@@ -89,7 +99,7 @@ test("the import: the registry restored exactly, the grant kept read-only as pro
     assert.deepEqual(store.registry.tag(t), { gid: 80001 });
     assert.deepEqual(store.registry.ids(), [a, b, dead].sort());
     // A retry of the same import (a crash after it was durable) is a no-op with the same report.
-    assert.deepEqual(await importHostStore({ copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir }), r);
+    assert.deepEqual(await importHostStore({ uid: UID, copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir }), r);
     // this host's first grant, at its own low generation, sets it (the old value would have refused it)
     assert.equal(store.registry.setGrant(a, 1, registry.agents[a].tags).gen, 1);
     refused(() => store.registry.setGrant(b, 0, registry.agents[b].tags), "bad_form"); // a grant generation is 1 or more
@@ -110,7 +120,7 @@ test("the import: the registry restored exactly, the grant kept read-only as pro
     assert.equal(statSync(arch).mode & 0o777, 0o500);
     for (const e of ["state", "harness-sessions", "harness-turns", "config", "profiles", "pool"]) assert.equal(existsSync(join(root, e, "x.json")), false, e);
     // After the host has moved on (a new agent recorded), the same import is refused: it was once, onto an empty one.
-    await rejects(importHostStore({ copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir }), "not_granted");
+    await rejects(importHostStore({ uid: UID, copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir }), "not_granted");
   } finally { await store.close(); }
 });
 
@@ -123,7 +133,7 @@ test("a restored agent never starts on its own: every live agent is restore-fenc
     const seen = [];
     const real = store.registry.importRestored.bind(store.registry);
     store.registry.importRestored = (copy) => { seen.push([fenced(a, { dir: fenceDir }), fenced(b, { dir: fenceDir }), store.deprovision.record(dead)?.done]); return real(copy); };
-    await importHostStore({ copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir });
+    await importHostStore({ uid: UID, copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir });
     assert.deepEqual(seen, [[true, true, true]], "the fences and the deleted agent's record are durable before the registry is written");
     assert.equal(store.registry.agent(a).state, "running", "the state is kept: the fence holds it");
     for (const id of [a, b]) {
@@ -154,7 +164,7 @@ test("deleted agents get a fresh done deprovision record, so no deprovision pass
   const { a, dead, registry, manifest, plan } = fixture();
   const { root, store, restoreDir, fenceDir } = await host();
   try {
-    await importHostStore({ copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir });
+    await importHostStore({ uid: UID, copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir });
     const r = registry.agents[dead];
     assert.deepEqual(store.deprovision.record(dead), { life: r.life, gen: r.gen, uid: r.uid, gid: r.uid, policy: "archive", steps_done: [...STEPS], identities: {}, done: true });
     assert.deepEqual(store.deprovision.pending(), [], "recovery's deprovision lane has nothing to do");
@@ -167,7 +177,7 @@ test("deleted agents get a fresh done deprovision record, so no deprovision pass
   const h = await host();
   try {
     h.store.deprovision.restoredDone(dead, { ...registry.agents[dead], life: registry.agents[dead].life + 1 });
-    await rejects(importHostStore({ copy: copyOf(registry), store: h.store, root: h.root, plan, manifest, restoreDir: h.restoreDir, fenceDir: h.fenceDir }), "not_granted");
+    await rejects(importHostStore({ uid: UID, copy: copyOf(registry), store: h.store, root: h.root, plan, manifest, restoreDir: h.restoreDir, fenceDir: h.fenceDir }), "not_granted");
     assert.deepEqual(h.store.registry.ids(), []);
   } finally { await h.store.close(); }
 });
@@ -178,12 +188,12 @@ test("a crash after the fences and records, before the registry: the retry compl
   try {
     const real = store.registry.importRestored.bind(store.registry);
     store.registry.importRestored = () => { throw Object.assign(new Error("crash"), { code: "EIO" }); };
-    await assert.rejects(importHostStore({ copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir }), /crash/);
+    await assert.rejects(importHostStore({ uid: UID, copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir }), /crash/);
     assert.deepEqual(store.registry.ids(), []);
     assert.deepEqual([fenced(a, { dir: fenceDir }), fenced(b, { dir: fenceDir }), store.deprovision.record(dead).done], [true, true, true]);
     assert.equal(existsSync(join(restoreDir, "provenance")), false, "nothing after the registry ran");
     store.registry.importRestored = real;
-    const r = await importHostStore({ copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir });
+    const r = await importHostStore({ uid: UID, copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir });
     assert.equal(r.entries.registry, "restored");
     assert.deepEqual(store.registry.ids(), [a, b, dead].sort());
   } finally { await store.close(); }
@@ -222,7 +232,7 @@ test("a deleted agent's done record visible but not durable: the retry makes it 
   const depDir = join(root, "deprovision"), depFile = join(depDir, "deprovision.json"), regFile = join(root, "registry", "registry.json");
   const run = async (io) => {
     const store = await HostStore.open(root, io ? { io } : {});
-    try { return await importHostStore({ copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir }); } finally { await store.close(); }
+    try { return await importHostStore({ uid: UID, copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir }); } finally { await store.close(); }
   };
   const look = async () => {
     const store = await HostStore.open(root);
@@ -254,7 +264,7 @@ test("the registry visible but not durable: the identical retry makes it durable
   const regDir = join(root, "registry"), regFile = join(regDir, "registry.json");
   const run = async (io, restoreDir) => {
     const store = await HostStore.open(root, io ? { io } : {});
-    try { return await importHostStore({ copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir }); } finally { await store.close(); }
+    try { return await importHostStore({ uid: UID, copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir }); } finally { await store.close(); }
   };
   const r1 = join(tmp(), "restore");
   const first = faultIo({ failAfter: [regDir, 2] });
@@ -282,7 +292,7 @@ test("the report's words for what isn't restored: exactly these three lines", as
   for (const [entry, line] of [["state", BY_RULE], ["config", PER_HOST], ["harness-sessions", NOT_RESTORED], ["harness-turns", NOT_RESTORED]]) {
     const { root, store, restoreDir, fenceDir } = await host();
     try {
-      const r = await importHostStore({ copy: copyOf(registry, { entries: ["registry", entry] }), store, root, plan, manifest, restoreDir, fenceDir });
+      const r = await importHostStore({ uid: UID, copy: copyOf(registry, { entries: ["registry", entry] }), store, root, plan, manifest, restoreDir, fenceDir });
       assert.deepEqual(r.entries, { registry: "restored", [entry]: line }, entry);
       assert.equal(existsSync(join(root, entry, "x.json")), false, `${entry}: nothing of it reaches the host`);
     } finally { await store.close(); }
@@ -290,7 +300,7 @@ test("the report's words for what isn't restored: exactly these three lines", as
   // An absent entry isn't reported.
   const { root, store, restoreDir, fenceDir } = await host();
   try {
-    assert.deepEqual((await importHostStore({ copy: copyOf(registry, { entries: ["registry"] }), store, root, plan, manifest, restoreDir, fenceDir })).entries, { registry: "restored" });
+    assert.deepEqual((await importHostStore({ uid: UID, copy: copyOf(registry, { entries: ["registry"] }), store, root, plan, manifest, restoreDir, fenceDir })).entries, { registry: "restored" });
   } finally { await store.close(); }
 });
 
@@ -303,12 +313,16 @@ test("only the manifest's registry is imported, registry first: a refusal leaves
     ["no registry entry", () => copyOf(registry, { entries: ["grant", "audit"] }), "not_found", {}],
     ["no registry file", () => { const c = copyOf(registry); writeFileSync(join(c, "registry", "other.json"), "{}"); rmSync(join(c, "registry", "registry.json")); return c; }, "not_found", {}],
     ["an entry the backup never copies", () => { const c = copyOf(registry); mkdirSync(join(c, "profiles")); return c; }, "bad_form", {}],
+    // (read only through handles, exact modes: a link or a widened mode is refused, never read as "missing")
+    ["the registry file a link", () => { const c = copyOf(registry); rmSync(join(c, "registry", "registry.json")); symlinkSync("/etc/passwd", join(c, "registry", "registry.json")); return c; }, "not_granted", {}],
+    ["the registry file 0644", () => { const c = copyOf(registry); chmodSync(join(c, "registry", "registry.json"), 0o644); return c; }, "not_granted", {}],
+    ["the copy's top 0755", () => { const c = copyOf(registry); chmodSync(c, 0o755); return c; }, "not_granted", {}],
     ["not the plan's manifest", () => copyOf(registry), "not_granted", { manifest: { ...manifest, time: "2026-11-24T03:11:00.000Z" } }],
   ];
   for (const [why, make, code, over] of cases) {
     const { root, store, restoreDir, fenceDir } = await host();
     try {
-      await rejects(importHostStore({ copy: make(), store, root, plan, manifest, restoreDir, fenceDir, ...over }), code);
+      await rejects(importHostStore({ uid: UID, copy: make(), store, root, plan, manifest, restoreDir, fenceDir, ...over }), code);
       assert.deepEqual(store.registry.ids(), [], why);
       assert.equal(existsSync(join(restoreDir, "provenance")), false, why);
       assert.equal(existsSync(join(root, "audit")), false, why);
@@ -339,7 +353,7 @@ test("the registry importer: only onto a registry that never recorded anything, 
     try {
       prep(store);
       const before = { ids: store.registry.ids(), ...effects(root, fenceDir) };
-      await rejects(importHostStore({ copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir }), "not_granted");
+      await rejects(importHostStore({ uid: UID, copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir }), "not_granted");
       assert.deepEqual({ ids: store.registry.ids(), ...effects(root, fenceDir) }, before, `${why}: no fence, no record, no registry change`);
       assert.equal(existsSync(join(restoreDir, "provenance")), false, why);
     } finally { await store.close(); }
@@ -347,10 +361,10 @@ test("the registry importer: only onto a registry that never recorded anything, 
   // Another restore's registry onto a restored host: refused before any of ITS fences or records exist.
   const { root, store, restoreDir, fenceDir } = await host();
   try {
-    await importHostStore({ copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir });
+    await importHostStore({ uid: UID, copy: copyOf(registry), store, root, plan, manifest, restoreDir, fenceDir });
     const other = fixture();
     const before = { ids: store.registry.ids(), ...effects(root, fenceDir) };
-    await rejects(importHostStore({ copy: copyOf(other.registry), store, root, plan: other.plan, manifest: other.manifest, restoreDir, fenceDir }), "not_granted");
+    await rejects(importHostStore({ uid: UID, copy: copyOf(other.registry), store, root, plan: other.plan, manifest: other.manifest, restoreDir, fenceDir }), "not_granted");
     assert.deepEqual({ ids: store.registry.ids(), ...effects(root, fenceDir) }, before, "the other restore's agents aren't fenced, its deleted agent has no record");
     for (const id of [other.a, other.b]) assert.equal(fenced(id, { dir: fenceDir }), false, id);
     assert.equal(store.deprovision.record(other.dead), null);
@@ -384,31 +398,36 @@ test("the registry preflight: fresh, or exactly this import, and nothing else; i
 });
 
 test("read-only copies: whole or nothing, links and special files refused, a retry identical, a different copy refused", () => {
-  const src = join(tmp(), "src");
+  const top = join(tmp(), "top");
+  const src = join(top, "s");
   mkdirSync(join(src, "d"), { recursive: true });
   writeFileSync(join(src, "a"), "A");
   writeFileSync(join(src, "d", "b"), "B");
+  exactModes(top);
+  const from = (root) => ({ reader: copyReader(root, { uid: UID }), rel: "s" });
   const dst = join(tmp(), "out", "dst");
   // A leftover of an interrupted copy is removed and redone.
   mkdirSync(`${dst}.partial`, { recursive: true });
   writeFileSync(`${dst}.partial/stale`, "x");
-  assert.equal(copyReadOnly(src, dst), "copied");
+  assert.equal(copyReadOnly(from(top), dst), "copied");
   assert.equal(existsSync(`${dst}.partial`), false);
   assert.deepEqual(readdirSync(dst).sort(), ["a", "d"]);
   assert.equal(readFileSync(join(dst, "d", "b"), "utf8"), "B");
   assert.deepEqual([statSync(dst).mode & 0o777, statSync(join(dst, "d")).mode & 0o777, statSync(join(dst, "a")).mode & 0o777], [0o500, 0o500, 0o400]);
-  assert.equal(copyReadOnly(src, dst), "present", "a retry");
+  assert.equal(copyReadOnly(from(top), dst), "present", "a retry");
   writeFileSync(join(src, "a"), "changed");
-  refused(() => copyReadOnly(src, dst), "not_granted");
+  refused(() => copyReadOnly(from(top), dst), "not_granted");
   writeFileSync(join(src, "a"), "A");
-  writeFileSync(join(src, "extra"), "E");
-  refused(() => copyReadOnly(src, dst), "not_granted");
+  writeFileSync(join(src, "extra"), "E", { mode: 0o600 });
+  refused(() => copyReadOnly(from(top), dst), "not_granted");
   // Links are refused before anything is written.
-  const linked = join(tmp(), "linked");
-  mkdirSync(linked);
+  const ltop = join(tmp(), "ltop");
+  const linked = join(ltop, "s");
+  mkdirSync(linked, { recursive: true });
+  exactModes(ltop);
   symlinkSync("/etc/passwd", join(linked, "l"));
   const dst2 = join(tmp(), "dst2");
-  refused(() => copyReadOnly(linked, dst2), "bad_form");
+  refused(() => copyReadOnly(from(ltop), dst2), "not_granted");
   assert.equal(existsSync(dst2), false);
   assert.equal(existsSync(`${dst2}.partial`), false);
   assert.ok(DISPOSITION.registry === "restored");
@@ -431,12 +450,15 @@ function spyIo(fail = () => false) {
   };
 }
 
+/** A staged source subtree ("s" under a copy's top, exact modes), as copyReadOnly reads it: through a copyReader. */
 function srcTree() {
-  const src = join(tmp(), "src");
+  const top = join(tmp(), "srctop");
+  const src = join(top, "s");
   mkdirSync(join(src, "d"), { recursive: true });
   writeFileSync(join(src, "a"), "ABCDE");
   writeFileSync(join(src, "d", "b"), "B");
-  return src;
+  exactModes(top);
+  return { reader: copyReader(top, { uid: UID }), rel: "s" };
 }
 
 test("read-only copies write whole: a short write continues, a zero write throws and nothing is in place", () => {
@@ -502,7 +524,7 @@ test("the caller's lock guard runs before every effect: lost at any check, nothi
   const full = await host();
   const at = [];
   try {
-    await importHostStore({ copy: copyOf(registry), store: full.store, root: full.root, plan, manifest, restoreDir: full.restoreDir, fenceDir: full.fenceDir, guard: () => at.push(seen(full)) });
+    await importHostStore({ uid: UID, copy: copyOf(registry), store: full.store, root: full.root, plan, manifest, restoreDir: full.restoreDir, fenceDir: full.fenceDir, guard: () => at.push(seen(full)) });
   } finally { await full.store.close(); }
   assert.ok(at.length >= 6, `${at.length} guard checks`);
   // Lost at check k: refused there, and the disk is exactly as it was at that check in the whole run.
@@ -510,7 +532,7 @@ test("the caller's lock guard runs before every effect: lost at any check, nothi
     const h = await host();
     let n = 0;
     try {
-      await rejects(importHostStore({ copy: copyOf(registry), store: h.store, root: h.root, plan, manifest, restoreDir: h.restoreDir, fenceDir: h.fenceDir,
+      await rejects(importHostStore({ uid: UID, copy: copyOf(registry), store: h.store, root: h.root, plan, manifest, restoreDir: h.restoreDir, fenceDir: h.fenceDir,
         guard: () => { if (n++ === k) refuse("outcome_unknown", "lost"); } }), "outcome_unknown");
       assert.equal(seen(h), at[k], `lost at check ${k}: nothing after it`);
     } finally { await h.store.close(); }
@@ -547,7 +569,7 @@ test("the guard at each effect boundary, fixed independently of the import's own
   for (const [label, lost, want] of rows) {
     const h = await host();
     try {
-      await rejects(importHostStore({ copy: copyOf(registry), store: h.store, root: h.root, plan, manifest, restoreDir: h.restoreDir, fenceDir: h.fenceDir,
+      await rejects(importHostStore({ uid: UID, copy: copyOf(registry), store: h.store, root: h.root, plan, manifest, restoreDir: h.restoreDir, fenceDir: h.fenceDir,
         guard: () => { if (lost(disk(h))) refuse("outcome_unknown", "lost"); } }), "outcome_unknown");
       assert.deepEqual(disk(h), want, label);
     } finally { await h.store.close(); }
@@ -555,7 +577,7 @@ test("the guard at each effect boundary, fixed independently of the import's own
   // Without the grant, the audit's guard stands right after the registry.
   const h = await host();
   try {
-    await rejects(importHostStore({ copy: copyOf(registry, { entries: ["registry", "audit"] }), store: h.store, root: h.root, plan, manifest, restoreDir: h.restoreDir, fenceDir: h.fenceDir,
+    await rejects(importHostStore({ uid: UID, copy: copyOf(registry, { entries: ["registry", "audit"] }), store: h.store, root: h.root, plan, manifest, restoreDir: h.restoreDir, fenceDir: h.fenceDir,
       guard: () => { if (disk(h).registry > 0) refuse("outcome_unknown", "lost"); } }), "outcome_unknown");
     assert.deepEqual(disk(h), { fences: [live1, live2], done: [dead1, deadB], registry: 4, provenance: false, audit: 0 });
   } finally { await h.store.close(); }

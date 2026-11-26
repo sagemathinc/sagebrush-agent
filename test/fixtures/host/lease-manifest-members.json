@@ -78,6 +78,7 @@
   "lib/fleet/host/restore-adapters.mjs",
   "lib/fleet/host/restore-agent-imports.mjs",
   "lib/fleet/host/restore-begin.mjs",
+  "lib/fleet/host/restore-cli.mjs",
   "lib/fleet/host/restore-fill.mjs",
   "lib/fleet/host/restore-inputs.mjs",
   "lib/fleet/host/restore-plan.mjs",

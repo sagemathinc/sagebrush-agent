@@ -25,7 +25,9 @@ const me = typeof process.getuid === "function" ? process.getuid() : -1;
 function setupDir() {
   const dir = join(mkdtempSync(join(tmpdir(), "sb-sched-")), "backup");
   mkdirSync(dir, { mode: 0o700 }); chmodSync(dir, 0o700);
-  for (const f of ["dest.json", "enabled"]) { writeFileSync(join(dir, f), "{}", { mode: 0o600 }); chmodSync(join(dir, f), 0o600); }
+  // (dest.json in the binary's state directory, backup/state; the enabled flag in backup/ itself)
+  mkdirSync(join(dir, "state"), { mode: 0o700 }); chmodSync(join(dir, "state"), 0o700);
+  for (const f of ["state/dest.json", "enabled"]) { writeFileSync(join(dir, f), "{}", { mode: 0o600 }); chmodSync(join(dir, f), 0o600); }
   return dir;
 }
 
@@ -37,8 +39,30 @@ test("enabled only with a root 0700 directory holding a root-owned 0600 dest.jso
   { const d = setupDir(); chmodSync(join(d, "enabled"), 0o644); assert.equal(backupEnabled({ dir: d, rootUid: me }).enabled, false, "a group- or world-readable flag"); }
   { const d = setupDir(); chmodSync(d, 0o755); assert.equal(backupEnabled({ dir: d, rootUid: me }).enabled, false, "a readable directory"); }
   { const d = setupDir(); const t = join(d, "..", "flag"); writeFileSync(t, "x", { mode: 0o600 }); chmodSync(t, 0o600); rmSync(join(d, "enabled")); symlinkSync(t, join(d, "enabled")); assert.equal(backupEnabled({ dir: d, rootUid: me }).enabled, false, "a link is never the flag"); }
-  { const d = setupDir(); rmSync(join(d, "dest.json")); assert.deepEqual(backupEnabled({ dir: d, rootUid: me }), { enabled: false, why: "not set up" }); }
+  { const d = setupDir(); rmSync(join(d, "state", "dest.json")); assert.deepEqual(backupEnabled({ dir: d, rootUid: me }), { enabled: false, why: "not set up" }); }
   { const d = setupDir(); rmSync(join(d, "enabled")); mkdirSync(join(d, "enabled"), { mode: 0o600 }); chmodSync(join(d, "enabled"), 0o600); assert.equal(backupEnabled({ dir: d, rootUid: me }).enabled, false, "a 0600 directory is not the flag file"); }
+});
+
+test("dest.json counts only in the binary's state directory (backup/state), itself root's 0700 directory", async () => {
+  const { BACKUP_DIR, BACKUP_STATE_DIR } = await import("../lib/fleet/host/names.mjs");
+  assert.equal(BACKUP_STATE_DIR, join(BACKUP_DIR, "state"), "the default state directory is backup/state");
+  // The old place, backup/dest.json, set up with the flag: not enabled (there is no state directory).
+  { const d = setupDir(); writeFileSync(join(d, "dest.json"), "{}", { mode: 0o600 }); chmodSync(join(d, "dest.json"), 0o600); rmSync(join(d, "state"), { recursive: true });
+    assert.deepEqual(backupEnabled({ dir: d, rootUid: me }), { enabled: false, why: "not set up" }, "backup/dest.json alone"); }
+  // The state directory present but dest.json only in the old place: not enabled.
+  { const d = setupDir(); rmSync(join(d, "state", "dest.json")); writeFileSync(join(d, "dest.json"), "{}", { mode: 0o600 }); chmodSync(join(d, "dest.json"), 0o600);
+    assert.deepEqual(backupEnabled({ dir: d, rootUid: me }), { enabled: false, why: "not set up" }, "backup/dest.json beside an empty state/"); }
+  // dest.json in state/ but no flag: not enabled (attach's state: the binary reaches the store, backup stays off).
+  { const d = setupDir(); rmSync(join(d, "enabled")); assert.deepEqual(backupEnabled({ dir: d, rootUid: me }), { enabled: false, why: "not set up" }, "attached, not enabled"); }
+  // The state directory must be root's 0700 directory, never a link.
+  { const d = setupDir(); chmodSync(join(d, "state"), 0o755); assert.equal(backupEnabled({ dir: d, rootUid: me }).enabled, false, "a readable state directory"); }
+  { const d = setupDir(); const real = join(d, "..", "elsewhere"); mkdirSync(real, { mode: 0o700 }); chmodSync(real, 0o700);
+    writeFileSync(join(real, "dest.json"), "{}", { mode: 0o600 }); chmodSync(join(real, "dest.json"), 0o600);
+    rmSync(join(d, "state"), { recursive: true }); symlinkSync(real, join(d, "state"));
+    assert.equal(backupEnabled({ dir: d, rootUid: me }).enabled, false, "a linked state directory"); }
+  { const d = setupDir(); chmodSync(join(d, "state", "dest.json"), 0o644); assert.equal(backupEnabled({ dir: d, rootUid: me }).enabled, false, "a readable dest.json"); }
+  // An explicit stateDir is honoured.
+  { const d = setupDir(); assert.deepEqual(backupEnabled({ dir: d, stateDir: join(d, "state"), rootUid: me }), { enabled: true }); }
 });
 
 test("run ids: the UTC second and 8 base32 characters", () => {

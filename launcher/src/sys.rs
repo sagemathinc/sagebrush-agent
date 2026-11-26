@@ -150,10 +150,17 @@ pub fn umount2_detach(path: &CStr) -> io::Result<()> {
     if r != 0 { Err(last()) } else { Ok(()) }
 }
 
+/// The renameat2 system call itself: musl's static libc (the shipped build, lease-on r1.7 §2.2) has no wrapper for it,
+/// and glibc's wrapper is this same call. Returns the call's result (-1 with errno set on failure).
+unsafe fn renameat2(olddir: libc::c_int, old: *const libc::c_char, newdir: libc::c_int, new: *const libc::c_char, flags: libc::c_uint) -> libc::c_int {
+    // SAFETY: the caller's: both directory descriptors are open and both names NUL-terminated.
+    unsafe { libc::syscall(libc::SYS_renameat2, olddir, old, newdir, new, flags) as libc::c_int }
+}
+
 /// renameat2(dir, from, dir, to, RENAME_NOREPLACE).
 pub fn rename_noreplace(dir: &OwnedFd, from: &CStr, to: &CStr) -> io::Result<()> {
     // SAFETY: `dir` is open; both names are NUL-terminated.
-    let r = unsafe { libc::renameat2(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) };
+    let r = unsafe { renameat2(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) };
     if r != 0 { Err(last()) } else { Ok(()) }
 }
 
@@ -358,7 +365,8 @@ struct FsXattr {
 }
 const _: () = assert!(core::mem::size_of::<FsXattr>() == 28);
 /// _IOR('X', 31, struct fsxattr): not in libc 0.2.191.
-const FS_IOC_FSGETXATTR: libc::Ioctl = 0x801c_581f;
+// (from u32: musl's Ioctl is i32, where the request's top bit wraps to the same 32 bits the kernel reads as unsigned)
+const FS_IOC_FSGETXATTR: libc::Ioctl = 0x801c_581f_u32 as libc::Ioctl;
 const FS_XFLAG_PROJINHERIT: u32 = 0x0000_0200;
 
 /// ioctl(fd, FS_IOC_FSGETXATTR): (project id, project-inherit flag) (an O_RDONLY fd; A1 §1).
@@ -408,7 +416,7 @@ pub fn rmdirat(dir: &OwnedFd, name: &CStr) -> io::Result<()> {
 /// renameat2(from_dir, name, to_dir, name, RENAME_NOREPLACE): archive-home's move between two opened parents.
 pub fn rename_noreplace_between(from_dir: &OwnedFd, from: &CStr, to_dir: &OwnedFd, to: &CStr) -> io::Result<()> {
     // SAFETY: both directories are open; both names are NUL-terminated.
-    let r = unsafe { libc::renameat2(from_dir.as_raw_fd(), from.as_ptr(), to_dir.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) };
+    let r = unsafe { renameat2(from_dir.as_raw_fd(), from.as_ptr(), to_dir.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) };
     if r != 0 { Err(last()) } else { Ok(()) }
 }
 

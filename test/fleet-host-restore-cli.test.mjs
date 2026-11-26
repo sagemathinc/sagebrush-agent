@@ -148,6 +148,12 @@ test("retry's refusals, each with no effect: no begun restore, closed, not in th
   // Not a set of the plan; a bad key.
   const n = world();
   await rejects(restoreRetry(`archive-${newId()}`, opts(n)), "not_found");
+  // (one with a stopped record of its own, so only the plan check can refuse it)
+  const stray = newId();
+  writeRecord(reach("archive", stray, "failed"), { dir: n.dir });
+  const beforeStray = snapshotOf(n, `archive-${stray}`);
+  await rejects(restoreRetry(`archive-${stray}`, opts(n)), "not_found");
+  assert.equal(snapshotOf(n, `archive-${stray}`), beforeStray);
   await rejects(restoreRetry("nope", opts(n)), "bad_form");
   // A worker holding the set: busy, nothing changed.
   const h = world();

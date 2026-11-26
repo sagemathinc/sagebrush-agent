@@ -408,3 +408,15 @@ test("A1 in a left-over run's recovery: the run's lock lost right after ANY cgro
   }
   assert.ok(points >= 4, `every cgroup proof lost once (${points})`);
 });
+
+test("each live agent's config is proven from ITS set's committed snapshot (a kept, unchanged set's too), with the run's guard", async () => {
+  const f0 = fakes();
+  const state = { ...emptyState(), sets: { [`agent:${f0.a}`]: { fingerprint: { e: 1 }, snapshot: hex(5), tree: hex(55), since: null } } };
+  const f = fakes({ state, sets: f0.deps.sources() });
+  f.deps.snapshot = f0.deps.snapshot;
+  const seen = [];
+  f.deps.configHash = (id, snapshot, guard) => { seen.push([id, snapshot, typeof guard]); return "6".repeat(64); };
+  assert.equal((await runOnce(f.deps)).status, "ok");
+  const backedUp = f.deps.lastManifest.sets.find((s) => s.id === f0.b).snapshot;
+  assert.deepEqual(seen.sort(), [[f0.a, hex(5), "function"], [f0.b, backedUp, "function"]].sort(), "the kept set's snapshot for a, this run's for b");
+});

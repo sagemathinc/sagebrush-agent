@@ -42,8 +42,8 @@ function host({ sets, state = "done", noRequest = [], noInput = [], closed = fal
   const dir = join(base, "restore");
   mkdirSync(dir, { mode: 0o700 });
   writeFileSync(join(dir, BEGIN), JSON.stringify({ v: 1, snapshot: SNAP, manifest_sha256: hex("2"), run: RUN, state }) + "\n", { mode: 0o600 });
-  const plan = { v: 1, host: "old-host", manifest: hex("1"), sha256: hex("2"), hoststore: hex("3"),
-    sets: Object.fromEntries(Object.entries(sets).map(([k, run]) => [k, { run, snapshot: SNAP, tree: hex("4") }])) };
+  const plan = withConfig({ v: 1, host: "old-host", manifest: hex("1"), sha256: hex("2"), hoststore: hex("3"),
+    sets: Object.fromEntries(Object.entries(sets).map(([k, run]) => [k, { run, snapshot: SNAP, tree: hex("4") }])) });
   createPlan(plan, { dir });
   if (closed) closePlan(1795500001000, { dir });
   for (const [k, run] of Object.entries(sets)) if (!noRequest.includes(k)) writeRequest(k, run, { dir, uid: UID });
@@ -91,6 +91,8 @@ function killHolder(path) {
   }
   assert.ok(n > 0, `a holder of ${path} was found`);
 }
+/** A plan's config hashes for its agent sets (the manifest's, R4-d2b). */
+const withConfig = (p) => ({ ...p, config: Object.fromEntries(Object.keys(p.sets).filter((k) => k.startsWith("agent-")).map((k) => [k.slice(6), "5".repeat(64)])) });
 
 test("workerArgv: its own scope under the host's slice, never a shell; bad sets, runs and mains refused", () => {
   const id = newId();

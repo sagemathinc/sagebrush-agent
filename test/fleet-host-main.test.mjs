@@ -976,7 +976,7 @@ test("the restore worker seam: built over the open store and given to the execut
   const h = harness({ id });
   const timers = [];
   const seen = [];
-  h.d.restoreWorker = ({ store }) => { seen.push(store); return { hold: async () => null, dispatch: async () => ({ dispatched: null }) }; };
+  h.d.restoreWorker = ({ store }) => { seen.push(store); return { hold: async () => null, dispatch: async () => ({ dispatched: null }), imports: async () => ({ sets: {} }) }; };
   h.d.restoreDispatchMs = 30000;
   h.d.every = (fn, ms) => { const t = { fn, ms, cleared: false }; timers.push(t); h.log.push(`every:${ms}`); return t; };
   h.d.clearEvery = (t) => { t.cleared = true; h.log.push("clearEvery"); };
@@ -988,7 +988,8 @@ test("the restore worker seam: built over the open store and given to the execut
   const t = timers.find((x) => x.ms === 30000);
   assert.ok(t, "the dispatch timer");
   t.fn();
-  await until(() => h.log.includes("submit:restore-dispatch"));
+  await until(() => h.log.includes("submit:restore-dispatch") && h.log.includes("submit:restore-import"));
+  assert.ok(h.log.indexOf("submit:restore-dispatch") < h.log.indexOf("submit:restore-import"), "the dispatch, then the imports, by the same timer");
   h.term();
   assert.equal((await run).code, 0);
   assert.equal(t.cleared, true);
@@ -1132,11 +1133,13 @@ test("the host's own wiring asks leaseQualified with the release root alone: no 
 // ---- the restore resume's validation gate through hostRun (restore owner, #172 H1): requestResume records a NEW
 // transfer receipt durably before its helper runs, so a restore that isn't validated must refuse BEFORE the pair is read
 
+/** A plan's config hashes for its agent sets (the manifest's, R4-d2b). */
+const withConfig = (p) => ({ ...p, config: Object.fromEntries(Object.keys(p.sets).filter((k) => k.startsWith("agent-")).map((k) => [k.slice(6), "5".repeat(64)])) });
 /** A valid restore plan naming `agent` and its `tags`. */
 const RPLAN = (agent, tags) => {
   const hex = (c) => c.repeat(64), set = (c) => ({ run: "aaaaaaaaaaaaaaaa", snapshot: hex(c), tree: hex(c) });
-  return { v: 1, host: "h1", manifest: hex("1"), sha256: hex("2"), hoststore: hex("3"),
-    sets: Object.fromEntries([[`agent-${agent}`, set("4")], ...tags.map((t, i) => [`tag-${t}`, set(String(5 + i))])]) };
+  return withConfig({ v: 1, host: "h1", manifest: hex("1"), sha256: hex("2"), hoststore: hex("3"),
+    sets: Object.fromEntries([[`agent-${agent}`, set("4")], ...tags.map((t, i) => [`tag-${t}`, set(String(5 + i))])]) });
 };
 
 /**

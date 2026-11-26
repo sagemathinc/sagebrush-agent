@@ -78,7 +78,9 @@ function copySqlite(root, dir, skip = () => false) {
 const okStage = (digest) => `{"ok":true,"snapshot":"${SNAP}","skipped_special":0,"digests_sha256":"${digest}"}\n`;
 const okFill = (report = {}) => JSON.stringify({ placed: { dirs: 0, files: 1, symlinks: 0 }, refused: [], unexpected: [], truncated: false, ...report }) + "\n";
 
-const planOf = (kind, id, run = RUN) => ({ v: 1, host: "old-host", manifest: hex("1"), sha256: hex("2"), hoststore: hex("3"), sets: { [`${kind}-${id}`]: { run, snapshot: SNAP, tree: hex("4") } } });
+/** A plan's config hashes for its agent sets (the manifest's, R4-d2b). */
+const withConfig = (p) => ({ ...p, config: Object.fromEntries(Object.keys(p.sets).filter((k) => k.startsWith("agent-")).map((k) => [k.slice(6), "5".repeat(64)])) });
+const planOf = (kind, id, run = RUN) => withConfig({ v: 1, host: "old-host", manifest: hex("1"), sha256: hex("2"), hoststore: hex("3"), sets: { [`${kind}-${id}`]: { run, snapshot: SNAP, tree: hex("4") } } });
 
 /**
  * A fake launcher on a real tree. `script(op, cls, attempt)` returns an exit code (default 0); a non-zero restore-stage

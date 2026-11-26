@@ -153,7 +153,11 @@ test("the plan: every set of the chosen manifest bound to the restore's run, its
   const b = backup("old-host", RUN, "2026-11-24T03:10:00.000Z");
   const chosen = await chooseManifest(store([b]), b.mid);
   const p = newPlan(chosen, RRUN);
-  assert.deepEqual(Object.keys(p), ["v", "host", "manifest", "sha256", "hoststore", "sets"]);
+  assert.deepEqual(Object.keys(p), ["v", "host", "manifest", "sha256", "hoststore", "sets", "config"]);
+  // Each agent set's config hash, the manifest's; only the agents' (an archive's or a tag's has none).
+  const agents = b.m.sets.filter((s) => s.kind === "agent");
+  assert.ok(agents.length > 0);
+  assert.deepEqual(p.config, Object.fromEntries(agents.map((s) => [s.id, b.m.config[s.id]])));
   assert.deepEqual([p.host, p.manifest, p.sha256, p.hoststore], ["old-host", b.mid, b.sha, b.m.hoststore]);
   assert.deepEqual(p.sets, Object.fromEntries(b.m.sets.map((s) => [`${s.kind}-${s.id}`, { run: RRUN, snapshot: s.snapshot, tree: s.tree }])));
   assert.deepEqual(expectedOf(p), Object.fromEntries(b.m.sets.map((s) => [`${s.kind}-${s.id}`, { run: RRUN, snapshot: s.snapshot }])));
@@ -162,7 +166,8 @@ test("the plan: every set of the chosen manifest bound to the restore's run, its
   refused(() => checkPlan({ ...p, sets: Object.fromEntries(Object.entries(p.sets).map(([k, v]) => [k, { ...v, run: RUN }])) }), "bad_form");
   // A manifest with no sets still needs a valid run.
   const empty = { ...chosen, manifest: { ...chosen.manifest, sets: [] } };
-  assert.deepEqual(newPlan(empty, RRUN).sets, {});
+  assert.deepEqual([newPlan(empty, RRUN).sets, newPlan(empty, RRUN).config], [{}, {}]);
+  refused(() => newPlan({ ...chosen, manifest: { ...chosen.manifest, config: {} } }, RRUN), "bad_form"); // an agent with no hash
   refused(() => newPlan(empty, "x"), "bad_form");
   const k = Object.keys(p.sets)[0];
   for (const bad of [
@@ -170,6 +175,9 @@ test("the plan: every set of the chosen manifest bound to the restore's run, its
     { ...p, sets: [] }, { ...p, sets: null }, { ...p, sets: { ...p.sets, "host-x": p.sets[k] } }, { ...p, sets: { ...p.sets, [`agent-nope`]: p.sets[k] } },
     { ...p, sets: { ...p.sets, [k]: { ...p.sets[k], run: "x" } } }, { ...p, sets: { ...p.sets, [k]: { ...p.sets[k], snapshot: "x" } } },
     { ...p, sets: { ...p.sets, [k]: { ...p.sets[k], tree: undefined } } }, { ...p, sets: { ...p.sets, [k]: { ...p.sets[k], extra: 1 } } },
+    (({ config, ...rest }) => rest)(p), { ...p, config: null }, { ...p, config: [] }, { ...p, config: {} },
+    { ...p, config: { ...p.config, [newId()]: hex() } }, { ...p, config: Object.fromEntries(Object.keys(p.config).map((id) => [id, "A".repeat(64)])) },
+    { ...p, config: Object.fromEntries(Object.keys(p.config).map((id) => [id, null])) },
   ]) refused(() => checkPlan(bad), "bad_form");
 });
 
@@ -261,13 +269,15 @@ test("the plan on disk: created once (0600, exclusive; the same plan again is fi
     { ...step3, sets: { ...step3.sets, [k2]: { ...step3.sets[k2], tree: hex() } } },
   ];
   // The same millisecond, or a run whose string sorts higher but whose time is older, is not newer.
+  const extra = newId();
   const sameMs = { ...p2, sets: { ...p2.sets, [k]: { ...p2.sets[k], run: rrun(3600000, () => Buffer.alloc(6, 5)) } } };
   for (const bad of [
     two, ...alsoChanged, sameMs,
     p, // backwards
     { ...p2, manifest: hex() }, { ...p2, sha256: hex() }, { ...p2, hoststore: hex() }, { ...p2, host: "elsewhere" },
     { ...p2, sets: { ...p2.sets, [k]: { ...p2.sets[k], snapshot: hex() } } }, { ...p2, sets: { ...p2.sets, [k]: { ...p2.sets[k], tree: hex() } } },
-    { ...p2, sets: Object.fromEntries(Object.entries(p2.sets).slice(1)) }, { ...p2, sets: { ...p2.sets, [`agent-${newId()}`]: p2.sets[k] } },
+    { ...p2, sets: Object.fromEntries(Object.entries(p2.sets).filter(([x]) => x !== k2)), config: Object.fromEntries(Object.entries(p2.config).filter(([id]) => `agent-${id}` !== k2)) }, { ...p2, sets: { ...p2.sets, [`agent-${extra}`]: p2.sets[k] }, config: { ...p2.config, [extra]: hex() } },
+    { ...p2, config: Object.fromEntries(Object.keys(p2.config).map((id) => [id, hex()])) },
   ]) refused(() => updatePlan(bad, { dir }), "not_granted");
   assert.deepEqual(readPlan({ dir }), p2);
   // The next single request is fine, including a later one whose string sorts lower.

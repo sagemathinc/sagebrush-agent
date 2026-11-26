@@ -24,7 +24,7 @@ function chosenOf({ sha256 = hex("2"), snapshot = SNAP } = {}) {
   const a = newId(), d = newId(), t = newId();
   const manifest = { host: "old-host", time: "2026-11-24T03:10:00.000Z", hoststore: hex("3"), registry: { hash: hex("4") },
     sets: [{ kind: "agent", id: a, snapshot: hex("5"), tree: hex("6") }, { kind: "archive", id: d, snapshot: hex("7"), tree: hex("8") },
-      { kind: "tag", id: t, snapshot: hex("9"), tree: hex("a") }] };
+      { kind: "tag", id: t, snapshot: hex("9"), tree: hex("a") }], config: { [a]: hex("b") } };
   return { chosen: { manifest, snapshot, sha256 }, a, d, t };
 }
 

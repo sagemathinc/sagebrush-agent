@@ -363,7 +363,7 @@ test("row 6, a crash mid-swap is finished in the journal's direction; host.key i
 test("row 7, shown: an interrupt before confirmation shows the SAME code next time; a wrong group asks again", async () => {
   const w = world();
   w.tty.answers.push("wrong", null);
-  await rejects(init(input(), w.deps, w.opts()), "aborted");
+  await rejects(init(input(), w.deps, w.opts()), "in_progress");
   assert.deepEqual(journal(w), { v: 1, phase: "shown" });
   assert.equal(w.tty.asks, 2, "a wrong group asked again");
   assert.match(w.tty.text, /doesn't match/);
@@ -486,7 +486,7 @@ test("the command line: argument errors are 2; not root refused; a resume reads 
     const resumed = await backupInitCommand(["init"], cmdDeps(w, { stdin: async () => Buffer.alloc(0) }));
     lines = [first, resumed];
   } finally { process.stdout.write = o; process.stderr.write = e; }
-  assert.deepEqual(lines, [{ code: 1, line: { v: 1, refused: "aborted" } }, { code: 0, line: { v: 1, initialized: true } }]);
+  assert.deepEqual(lines, [{ code: 1, line: { v: 1, refused: "in_progress" } }, { code: 0, line: { v: 1, initialized: true } }]);
   for (const s of [CODE, ...groupsOf(CODE), HOSTPW, "s3cr3t-value", "AKIDEXAMPLE", w.base]) {
     assert.equal(JSON.stringify(lines).includes(s), false, "not in a line");
     assert.equal(printed.join("").includes(s), false, "not on stdout or stderr");
@@ -695,7 +695,7 @@ test("row 10, through a real pseudo-terminal: the code only on the terminal, a C
   // exclusion's flock holder (the guard then sees the lock lost). Whichever is seen first names the refusal; either way
   // the code wasn't confirmed and the journal stays `shown`.
   assert.equal(first.exit, 1, first.stderr);
-  assert.match(first.stdout, /^\{"v":1,"refused":"(aborted|outcome_unknown)"\}\n$/);
+  assert.match(first.stdout, /^\{"v":1,"refused":"(in_progress|outcome_unknown)"\}\n$/);
   const code = shownCode(first.tty);
   assert.match(code ?? "", /^[A-Z2-7]{26}$/, "the code was shown on the terminal");
   assert.equal(JSON.parse(readFileSync(join(base, "backup", "state", JOURNAL), "utf8")).phase, "shown");

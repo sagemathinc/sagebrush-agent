@@ -9,9 +9,11 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFile
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
-import { b64, hostFingerprint, keyFromSeed, replayChain, seal, sha256b64 } from "../lib/fleet/index.mjs";
+import { b64, hostFingerprint, keyFromSeed, newId, replayChain, seal, sha256b64 } from "../lib/fleet/index.mjs";
 import { classify, firstBoot, hostPaths } from "../lib/fleet/host/identity.mjs";
-import { ADAPTERS, CONFIG_MAX, CONTAIN_RETRY_MS, INITIAL_SYNC_MS, LEASE_QUALIFIED, brokerAccount, hostResetIdentity, hostRun, readHostConfig, realContainSys, supervisorUnit } from "../lib/fleet/host/host-main.mjs";
+import { ADAPTERS, CONFIG_MAX, CONTAIN_RETRY_MS, INITIAL_SYNC_MS, RESUME_BASE_KEYS, brokerAccount, hostResetIdentity, hostRun, readHostConfig, realContainSys, resumeBase, resumeRequester, supervisorUnit } from "../lib/fleet/host/host-main.mjs";
+import { RESUME_HELPER_MS, requestResume } from "../lib/fleet/host/restore-resume.mjs";
+import { expectedOf } from "../lib/fleet/host/restore-plan.mjs";
 import { QUALIFIED_MAJOR } from "../lib/fleet/host/host-preflight.mjs";
 import { HEALTH_REASONS, hostState } from "../lib/fleet/host/host-state.mjs";
 import { Supervisor } from "../lib/fleet/host/executor.mjs";
@@ -105,6 +107,15 @@ function harness(o = {}) {
     dropOrphans: () => ev("dropOrphans"),
     chownBroker: () => () => {},
     readConfig: () => { ev("config"); if (o.config instanceof Error) throw o.config; return o.config ?? { lease: "off" }; },
+    // the lease's qualification (lease-on r1.7 §2): unqualified (no record) unless a row says otherwise
+    leaseQualified: async () => { ev("leaseQualified"); if (o.qualified instanceof Error) throw o.qualified; return o.qualified ?? { ok: false, why: "record" }; },
+    makeLease: (x) => { ev("lease"); made.leaseOpts = x; made.lease = { live: () => null, due: () => {}, voidAll: () => {} }; return made.lease; },
+    readPlan: () => null,
+    restoreReady: () => "validated",
+    pairOf: () => null,
+    runHelper: async (argv) => { ev("runHelper"); made.helperArgv = argv; return { code: 0, stdout: "" }; },
+    resumeMain: "/opt/sagebrush/release/lib/fleet/host/restore-resume-main.mjs",
+    requestResume: async (agent, opts) => { ev("requestResume"); (made.resumeCalls ??= []).push({ agent, opts }); return { resumed: false, reason: "no_receipt" }; },
     adapters,
     unmaskBroker: async () => ev("unmask"),
     openStore: async () => { ev("store"); return { grants: { highwater: { gen: 0 } }, close: async () => ev("storeClose") }; },
@@ -120,7 +131,7 @@ function harness(o = {}) {
     makeSync: (x) => {
       ev("syncMade");
       made.sync = x;
-      return { sync: () => { ev("sync"); return o.sync ?? Promise.resolve({ status: "current" }); }, snapshot: () => x.snapshot,
+      return { sync: () => { ev("sync"); return o.sync ?? Promise.resolve({ status: "current" }); }, snapshot: () => made.snapshot ?? x.snapshot,
         start: (s) => ev("syncStart", s.first), stop: () => ev("syncStop") };
     },
     host: { release: "/opt/sagebrush/release" },
@@ -314,10 +325,9 @@ test("PAIRED: orphans, config, adapters, unmask, store, the executor (lease off)
 
 test("PAIRED gates: bad_config, lease_unqualified and each missing adapter refuse after the proven containment, with no unmask, store or start", async () => {
   const { id } = await paired();
-  assert.equal(LEASE_QUALIFIED, false);
   const cases = [
     [{ config: Object.assign(new Error("bad"), { config: true }) }, "bad_config", ["config"]],
-    [{ config: { lease: "on" } }, "lease_unqualified", ["config"]],
+    [{ config: { lease: "on" } }, "lease_unqualified", ["config", "leaseQualified"]],
     ...ADAPTERS.map((k) => [{ adapters: Object.fromEntries(ADAPTERS.filter((x) => x !== k).map((x) => [x, () => {}])) }, "preflight_missing", ["config"]]),
     [{ adapters: { ...Object.fromEntries(ADAPTERS.map((x) => [x, () => {}])), audit: "not a function" } }, "preflight_missing", ["config"]],
   ];
@@ -330,7 +340,7 @@ test("PAIRED gates: bad_config, lease_unqualified and each missing adapter refus
   // Unproven before the refusal: the retry, then the refusal once proven.
   const h = harness({ id, config: { lease: "on" }, contain: [false, true] });
   assert.equal((await hostRun(h.d)).code, 3);
-  assert.deepEqual(h.lines, [{ v: 1, containment: "unproven" }, { v: 1, refused: "lease_unqualified" }]);
+  assert.deepEqual(h.lines, [{ v: 1, containment: "unproven" }, { v: 1, refused: "lease_unqualified", item: "record" }]);
 });
 
 test("the initial sync gates serving: nothing is served until it completes, fails, or reaches its deadline", async () => {
@@ -799,7 +809,7 @@ test("the broker's account: from /etc/passwd by name; absent or malformed is non
 
 test("the unit as shipped: the release's host run as root, refusals (status 3) not restarted, a crash restarted, no ExecStop", () => {
   const u = supervisorUnit("/opt/sagebrush/r1");
-  for (const l of ["ExecStart=/opt/sagebrush/r1/bin/sagebrush-agent host run", "User=root", "Type=simple", "Restart=on-failure", "RestartSec=10s",
+  for (const l of ["ExecStartPre=/usr/lib/sagebrush/release-trust /opt/sagebrush/r1", "ExecStart=/usr/bin/node /opt/sagebrush/r1/bin/sagebrush-agent.mjs host run", "User=root", "Type=simple", "Restart=on-failure", "RestartSec=10s",
     "RestartPreventExitStatus=3", "TimeoutStopSec=30s", "WantedBy=multi-user.target"]) assert.ok(u.split("\n").includes(l), l);
   assert.ok(!/ExecStop/.test(u) && !u.includes("@RELEASE@"));
   for (const bad of ["rel", "/a b", "/a$x", "/a%n", "/a\"b", null]) assert.throws(() => supervisorUnit(bad), (e) => e.code === "bad_form", String(bad));
@@ -995,4 +1005,191 @@ test("the restore worker seam: built over the open store and given to the execut
   assert.ok(!gt.includes(30000));
   g.term();
   await run2;
+});
+
+// ---- lease on (lease-on r1.7 §1): the qualification, the lease machine, the restore resume's base and its C1 wrapper
+
+test("lease on and UNQUALIFIED: each failing item is named in the refusal, after the proven containment, with no unmask, store or start; a throwing check is unreadable", async () => {
+  const { id } = await paired();
+  for (const why of ["record", "manifest", "launcher", "layout", "sleep_hook", "systemd_major", "node_major", "kernel_series", "cgroup", "uptime"]) {
+    const h = harness({ id, config: { lease: "on" }, qualified: { ok: false, why } });
+    const out = await Promise.race([hostRun(h.d), new Promise((r) => setTimeout(() => r("SERVING"), 2000))]);
+    if (out === "SERVING") { h.term(); assert.fail(`${why}: served instead of refusing`); }
+    assert.equal(out.code, 3, why);
+    assert.deepEqual(h.lines, [{ v: 1, refused: "lease_unqualified", item: why }], why);
+    assert.deepEqual(h.log, ["lock", "systemd", "classify", "dropOrphans", "config", "leaseQualified", ...CONTAIN, "release"], why);
+  }
+  for (const qualified of [new Error("boom"), { ok: "yes" }, null, { ok: true, why: 1 }.why]) {
+    const h = harness({ id, config: { lease: "on" }, qualified: qualified ?? { ok: 0 } });
+    assert.equal((await hostRun(h.d)).code, 3);
+    assert.deepEqual(refusal(h.lines), ["lease_unqualified"]);
+    assert.ok(!h.log.includes("unmask") && !h.log.includes("store"));
+  }
+  // lease off never asks
+  const off = harness({ id });
+  const run = hostRun(off.d);
+  await until(() => off.lines.some((l) => l.serving));
+  assert.ok(!off.log.includes("leaseQualified"));
+  off.term();
+  await run;
+});
+
+test("lease on and QUALIFIED: asked once, before the unmask; a LeaseMachine from the certified key, the pin's audience and fleet and the live chain, and the restore resume, reach the Supervisor", async () => {
+  const { id } = await paired();
+  const h = harness({ id, config: { lease: "on" }, qualified: { ok: true } });
+  const run = hostRun(h.d);
+  await until(() => h.lines.some((l) => l.serving));
+  assert.equal(h.log.filter((x) => x === "leaseQualified").length, 1);
+  assert.ok(h.log.indexOf("leaseQualified") < h.log.indexOf("unmask"));
+  assert.ok(h.log.indexOf("lease") > h.log.indexOf("syncMade") && h.log.indexOf("lease") < h.log.indexOf("supervisor"));
+  assert.equal(h.made.supervisor.lease, h.made.lease);
+  assert.deepEqual(Object.keys(h.made.leaseOpts).sort(), ["context", "send", "sign", "submit", "verify"]);
+  const c = h.made.leaseOpts.context();
+  assert.deepEqual([c.aud, c.fleet, c.host], [id.pin.aud, id.pin.fleet, id.cert.body.host]);
+  assert.equal(c.chain, h.made.sync.snapshot, "the chain the sync holds, read at the use");
+  assert.equal(typeof h.made.supervisor.restoreResume.request, "function");
+  assert.ok(Object.isFrozen(h.made.supervisor.restoreResume));
+  h.term();
+  assert.equal((await run).code, 0);
+});
+
+test("the restore resume through hostRun's wiring: exactly the base keys plus the per-call liveLease and verifyCtx; pairOf is null, so a real request refuses no_receipt and launches nothing", async () => {
+  const { id } = await paired();
+  const h = harness({ id, config: { lease: "on" }, qualified: { ok: true } });
+  const run = hostRun(h.d);
+  await until(() => h.lines.some((l) => l.serving));
+  const A = newId();
+  const live = async () => ({ lease_id: "L", lg: 3, gen: 1, expiry_tick: 1 });
+  await h.made.supervisor.restoreResume.request(A, { liveLease: live });
+  const { opts } = h.made.resumeCalls[0];
+  assert.deepEqual(Object.keys(opts).sort(), [...RESUME_BASE_KEYS, "liveLease", "verifyCtx"].sort());
+  assert.equal(opts.liveLease, live, "the executor's, untouched");
+  assert.deepEqual(Object.keys(opts.verifyCtx).sort(), ["aud", "chain", "fleet"]);
+  assert.deepEqual([opts.verifyCtx.aud, opts.verifyCtx.fleet, opts.verifyCtx.chain], [id.pin.aud, id.pin.fleet, h.made.sync.snapshot]);
+  assert.deepEqual([opts.aud, opts.fleet, opts.ms, opts.node, opts.main], [id.pin.aud, id.pin.fleet, RESUME_HELPER_MS, process.execPath, h.d.resumeMain]);
+  assert.equal(typeof opts.host.entryGen, "function");
+  assert.equal(opts.pairOf(A), null);
+  // H2(a): the chain is read per call: a rotation between two requests reaches the second, the first's untouched
+  const rotated = { rotated: true };
+  h.made.snapshot = rotated;
+  await h.made.supervisor.restoreResume.request(A, { liveLease: live });
+  assert.equal(h.made.resumeCalls[1].opts.verifyCtx.chain, rotated);
+  assert.equal(opts.verifyCtx.chain, h.made.sync.snapshot);
+  // the real requestResume over that wiring: no pair, no launch
+  const r = await requestResume(A, { ...opts, restoreState: () => "validated", verifyTransferReceipt: async () => { throw new Error("never"); } });
+  assert.deepEqual(r, { resumed: false, reason: "no_receipt" });
+  assert.ok(!h.log.includes("runHelper"));
+  h.term();
+  await run;
+});
+
+const BASE = () => ({ restoreState: () => "validated", tagsOf: () => [], pairOf: () => null, verifyTransferReceipt: async () => ({}), checkTransferForHost: () => ({}),
+  aud: "https://a", fleet: "F", host: { entryGen: () => 1, recordTransfer: () => {} }, run: async () => ({}), node: "/n", main: "/m", ms: RESUME_HELPER_MS });
+
+test("resumeBase: exactly its keys, frozen; a liveLease, a verifyCtx, an unknown or a missing key refuses (bad_form)", () => {
+  const b = resumeBase(BASE());
+  assert.ok(Object.isFrozen(b));
+  assert.deepEqual(Object.keys(b).sort(), [...RESUME_BASE_KEYS].sort());
+  for (const [why, o] of [
+    ["liveLease", { ...BASE(), liveLease: () => null }], ["verifyCtx", { ...BASE(), verifyCtx: {} }], ["unknown", { ...BASE(), chain: {} }],
+    ["a symbol", { ...BASE(), [Symbol("x")]: 1 }], ["null", null], ["a string", "x"],
+    ...RESUME_BASE_KEYS.map((k) => [`missing ${k}`, (() => { const o = BASE(); delete o[k]; return o; })()]),
+    ...RESUME_BASE_KEYS.map((k) => [`liveLease instead of ${k}`, (() => { const o = BASE(); delete o[k]; o.liveLease = () => null; return o; })()]),
+  ]) assert.throws(() => resumeBase(o), (e) => e.code === "bad_form", why);
+});
+
+test("C1: the wrapper takes EXACTLY liveLease per call: every base key, verifyCtx, anything else, or a non-function refuses before any effect; extra is never spread over the base", async () => {
+  const calls = [];
+  let chain = { v: 1 };
+  const rr = resumeRequester(resumeBase(BASE()), () => chain, async (agent, opts) => { calls.push(opts); return { resumed: false, reason: "x" }; });
+  const live = () => null;
+  const bad = [
+    ...RESUME_BASE_KEYS.map((k) => [`with ${k}`, { liveLease: live, [k]: BASE()[k] }]),
+    ...RESUME_BASE_KEYS.map((k) => [`${k} alone`, { [k]: BASE()[k] }]),
+    ["verifyCtx", { liveLease: live, verifyCtx: { chain: { forged: true } } }], ["verifyCtx alone", { verifyCtx: {} }],
+    ["unknown", { liveLease: live, extra: 1 }], ["empty", {}], ["null", null], ["undefined", undefined], ["a string", "liveLease"],
+    ["not a function", { liveLease: { live: 1 } }], ["a symbol beside", { liveLease: live, [Symbol("s")]: 1 }],
+  ];
+  for (const [why, extra] of bad) await assert.rejects(rr.request("A", extra), (e) => e.code === "bad_form", why);
+  assert.equal(calls.length, 0, "nothing reached the resume");
+  // H2(a): the chain is read per call; an earlier call's context isn't mutated by a rotation
+  await rr.request("A", { liveLease: live });
+  chain = { v: 2 };
+  await rr.request("A", { liveLease: live });
+  assert.deepEqual([calls[0].verifyCtx.chain, calls[1].verifyCtx.chain], [{ v: 1 }, { v: 2 }]);
+  assert.equal(calls[0].liveLease, live);
+  assert.ok(calls.every((c) => Object.keys(c).length === RESUME_BASE_KEYS.length + 2));
+  assert.throws(() => resumeRequester({ ...BASE() }, () => chain), (e) => e.code === "bad_form", "an unfrozen base");
+});
+
+test("the host's own wiring asks leaseQualified with the release root alone: no test seam (rootUid, fsx, hook path) reaches production", () => {
+  const src = readFileSync(new URL("../lib/fleet/host/host-main.mjs", import.meta.url), "utf8");
+  const args = [...src.matchAll(/leaseQualified\(([^)]*)\)/g)].map((m) => m[1]);
+  assert.ok(args.includes("release") && args.every((a) => a === "" || a === "release"), JSON.stringify(args));
+  assert.match(src, /\n    leaseQualified: \(\) => leaseQualified\(release\),\n/);
+});
+
+// ---- the restore resume's validation gate through hostRun (restore owner, #172 H1): requestResume records a NEW
+// transfer receipt durably before its helper runs, so a restore that isn't validated must refuse BEFORE the pair is read
+
+/** A valid restore plan naming `agent` and its `tags`. */
+const RPLAN = (agent, tags) => {
+  const hex = (c) => c.repeat(64), set = (c) => ({ run: "aaaaaaaaaaaaaaaa", snapshot: hex(c), tree: hex(c) });
+  return { v: 1, host: "h1", manifest: hex("1"), sha256: hex("2"), hoststore: hex("3"),
+    sets: Object.fromEntries([[`agent-${agent}`, set("4")], ...tags.map((t, i) => [`tag-${t}`, set(String(5 + i))])]) };
+};
+
+/**
+ * One resume request through hostRun (lease on, qualified) with the REAL requestResume and the base hostRun builds,
+ * over a store whose registry lists the agent with two tags. `plan`: false for none, true for one naming the agent
+ * and its tags. Spies: restoreReady (answering `verdict`), pairOf (a pair, counted), the transfer record, the helper.
+ */
+async function resumeGate({ plan, verdict = "validated" }) {
+  const { id } = await paired();
+  const agent = newId(), tags = [newId(), newId()];
+  const p = plan ? RPLAN(agent, tags) : null;
+  const s = { readyCalls: [], pairCalls: 0, recorded: [], helper: 0 };
+  const h = harness({ id, config: { lease: "on" }, qualified: { ok: true } });
+  h.d.openStore = async () => ({
+    grants: { highwater: { gen: 0 }, record: () => null },
+    registry: { agent: (x) => (x === agent ? { tags: [...tags] } : null) },
+    transfers: { record: (...a) => { s.recorded.push(a); } },
+    close: async () => {},
+  });
+  h.d.readPlan = () => p;
+  h.d.restoreReady = (...a) => { s.readyCalls.push(a); return verdict; };
+  h.d.pairOf = () => { s.pairCalls++; return { transfer: "T", receipt: "R" }; };
+  h.d.runHelper = async () => { s.helper++; return { code: 0, stdout: "" }; };
+  h.d.requestResume = requestResume;
+  const run = hostRun(h.d);
+  await until(() => h.lines.some((l) => l.serving));
+  const r = await h.made.supervisor.restoreResume.request(agent, { liveLease: async () => ({ lease_id: "L", lg: 3, gen: 1, expiry_tick: 1 }) });
+  h.term();
+  await run;
+  return { r, s, agent, tags, plan: p };
+}
+
+test("the resume gate (a): no restore plan: not_validated; restoreReady never asked; no pair read, nothing recorded, no helper", async () => {
+  const { r, s } = await resumeGate({ plan: false });
+  assert.deepEqual(r, { resumed: false, reason: "not_validated" });
+  assert.deepEqual([s.readyCalls.length, s.pairCalls, s.recorded.length, s.helper], [0, 0, 0, 0]);
+});
+
+test("the resume gate (b): a plan: restoreReady gets exactly (the agent, its registry tags, expectedOf(plan)); every non-validated verdict refuses before the pair is read", async () => {
+  for (const verdict of ["none", "importing", "files_validated", "abandoned", "failed"]) {
+    const { r, s, agent, tags, plan } = await resumeGate({ plan: true, verdict });
+    assert.deepEqual(r, { resumed: false, reason: "not_validated" }, verdict);
+    assert.equal(s.readyCalls.length, 1, verdict);
+    assert.deepEqual(s.readyCalls[0], [agent, tags, expectedOf(plan)], `${verdict}: the agent, its registry tags (not []), expectedOf(plan)`);
+    assert.deepEqual([s.pairCalls, s.recorded.length, s.helper], [0, 0, 0], `${verdict}: nothing read, recorded or launched`);
+  }
+});
+
+test("the resume gate (c): validated: the request passes the gate and reaches the receipt checks (the pair read and verified)", async () => {
+  const { r, s, agent, tags, plan } = await resumeGate({ plan: true, verdict: "validated" });
+  assert.deepEqual(s.readyCalls, [[agent, tags, expectedOf(plan)]]);
+  assert.equal(s.pairCalls, 1, "the pair is read only after the gate");
+  assert.equal(r.resumed, false);
+  assert.equal(r.reason, "receipt", "the real verifier refused the fake pair: the receipt checks ran");
+  assert.deepEqual([s.recorded.length, s.helper], [0, 0]);
 });

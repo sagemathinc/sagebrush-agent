@@ -996,4 +996,3 @@ test("the restore worker seam: built over the open store and given to the execut
   g.term();
   await run2;
 });
-

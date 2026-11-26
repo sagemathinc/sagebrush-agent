@@ -95,10 +95,13 @@ snaptree() {
   find "$1" -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null
 }
 snaptext() {
-  { for d in /etc/systemd/system /run/systemd/system /run/systemd/system.control /run/systemd/transient /run/systemd/generator \
+  { for d in /etc/systemd/system /run/systemd/system /run/systemd/system.control /run/systemd/generator \
        /usr/lib/systemd/system /usr/lib/systemd/system-sleep /usr/lib/sagebrush "$P"; do
       snaptree "$d"
     done
+    # (/run/systemd/transient holds units the host makes on its own at any time, a CI runner's log collection among
+    #  them: only its sagebrush entries, each recursively)
+    for e in /run/systemd/transient/sagebrush-*; do snaptree "$e"; done
     # (of /usr/lib, only the sagebrush entry: package updates may change the rest at any time)
     find /usr/lib -maxdepth 1 -name 'sagebrush*' -printf '%y %p %u %g %m %s %T@ ->%l\n' 2>/dev/null
     systemctl list-units --all --plain --no-legend 2>/dev/null | grep sagebrush-

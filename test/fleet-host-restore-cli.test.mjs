@@ -280,7 +280,7 @@ test("the real ops: begin refuses while the supervisor's unit is active (or unsu
   for (const [what, run] of [["active", async () => ({ code: 0 })], ["unsure", async () => { throw new Error("no systemctl"); }]]) {
     const w = world();
     const hostStore = join(w.base, "store");
-    const ops = realRestoreOps({ release: "/nonexistent-release", run, hostStore });
+    const ops = realRestoreOps({ release: "/nonexistent-release", run, hostStore, enabled: () => false });
     await rejects(ops.begin(hex("9"), { dir: join(w.base, "fresh-restore"), exclusion: w.exclusion }), "in_progress");
     // The store's lock was released: it opens again.
     const s = await HostStore.open(hostStore);
@@ -290,7 +290,7 @@ test("the real ops: begin refuses while the supervisor's unit is active (or unsu
   // Inactive: begin goes on to choose the manifest over the binary, which isn't installed here: refused, nothing begun.
   const w = world();
   const fresh = join(w.base, "fresh-restore");
-  const ops = realRestoreOps({ release: "/nonexistent-release", run: async () => ({ code: 3 }), hostStore: join(w.base, "store") });
-  await assert.rejects(ops.begin(hex("9"), { dir: fresh, exclusion: w.exclusion }), (e) => e instanceof FleetError);
+  const ops = realRestoreOps({ release: "/nonexistent-release", run: async () => ({ code: 3 }), hostStore: join(w.base, "store"), enabled: () => false });
+  await rejects(ops.begin(hex("9"), { dir: fresh, exclusion: w.exclusion }), "not_granted"); // (the manifest can't be chosen)
   assert.equal(existsSync(join(fresh, BEGIN)), false, "nothing begun");
 });

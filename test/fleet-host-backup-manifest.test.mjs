@@ -271,6 +271,42 @@ test("a snapshot's time as the binary prints it (RFC 9557: nanoseconds, an offse
   }
 });
 
+test("a snapshot time's fields are each in range, never normalized: impossible ones are NaN, each beside its valid twin", () => {
+  for (const [bad, twin] of [
+    ["2026-02-30T19:14:23.438876374+00:00[Etc/UTC]", "2026-02-28T19:14:23.438876374+00:00[Etc/UTC]"], // (Feb 30 isn't Mar 2)
+    ["2026-02-29T00:00:00Z", "2028-02-29T00:00:00Z"], // (2026 isn't a leap year; 2028 is)
+    ["2026-04-31T00:00:00Z", "2026-04-30T00:00:00Z"],
+    ["2026-13-01T00:00:00Z", "2026-12-01T00:00:00Z"],
+    ["2026-00-10T00:00:00Z", "2026-01-10T00:00:00Z"],
+    ["2026-11-00T00:00:00Z", "2026-11-01T00:00:00Z"],
+    ["2026-11-26T24:00:00+00:00[Etc/UTC]", "2026-11-26T23:00:00+00:00[Etc/UTC]"], // (hour 24 isn't the next midnight)
+    ["2026-11-26T19:60:00Z", "2026-11-26T19:59:00Z"],
+    ["2026-11-26T19:14:60Z", "2026-11-26T19:14:59Z"],
+    ["2026-11-26T19:14:23+24:00", "2026-11-26T19:14:23+23:00"],
+    ["2026-11-26T19:14:23+05:60", "2026-11-26T19:14:23+05:59"],
+    ["0099-11-26T19:14:23Z", "2026-11-26T19:14:23Z"],
+  ]) {
+    assert.ok(Number.isNaN(snapshotTime(bad)), `${bad} refused`);
+    assert.ok(Number.isFinite(snapshotTime(twin)), `${twin} accepted`);
+  }
+  assert.equal(snapshotTime("2028-02-29T00:00:00Z"), Date.parse("2028-02-29T00:00:00Z"));
+  assert.equal(snapshotTime("2026-11-26T19:14:23.1+05:30[Asia/Kolkata]"), Date.parse("2026-11-26T13:44:23.100Z"));
+  assert.equal(snapshotTime("2026-11-26T19:14:23.12-03:30"), Date.parse("2026-11-26T22:44:23.120Z"));
+});
+
+for (const [time, twin] of [["2026-02-30T19:14:23.438876374+00:00[Etc/UTC]", "2026-02-28T19:14:23.438876374+00:00[Etc/UTC]"], ["2026-11-20T24:00:00+00:00[Etc/UTC]", "2026-11-20T23:00:00+00:00[Etc/UTC]"]]) {
+  test(`an impossible listing time stops the pass before any forget (${time}); its valid twin is forgotten as usual`, async () => {
+    const at = (x) => ({ ...listed(hex(6), T0 - 2 * DAY, T("agent", "good", "20261101T030000Z-dddddddd")), time: x });
+    const { binary } = committedStore([at(time)]);
+    const r = await pass(binary);
+    assert.equal(r.error, "bad_result");
+    assert.equal(binary.calls.filter((c) => c.op === "forget").length, 0);
+    const ok = committedStore([at(twin)]);
+    const r2 = await pass(ok.binary);
+    assert.deepEqual(r2.forgotten, [hex(6)], "the twin: an ordinary stale snapshot, forgotten");
+  });
+}
+
 test("a listing time the binary wouldn't print stops the pass (bad_result), nothing forgotten", async () => {
   const { binary } = committedStore([{ ...listed(hex(6), T0 - 2 * DAY, T("agent", "good", "20261101T030000Z-dddddddd")), time: "yesterday" }]);
   const r = await pass(binary);

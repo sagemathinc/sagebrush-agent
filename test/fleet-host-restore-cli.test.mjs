@@ -271,7 +271,8 @@ test("list and begin (R6b): through the store and launcher ops; their lines carr
 });
 
 test("the real ops: begin refuses unless the supervisor's unit is definitely not active (exit 3, printing inactive or failed), and opens and releases the host store; the binary's context is the launcher's", async () => {
-  const { realRestoreOps, BACKUP_STATE_DIR, HOST_SECRETS_DIR, BACKUP_CACHE_DIR } = await import("../lib/fleet/host/restore-cli.mjs");
+  const { realRestoreOps } = await import("../lib/fleet/host/restore-cli.mjs");
+  const { BACKUP_STATE_DIR, HOST_SECRETS_DIR, BACKUP_CACHE_DIR } = await import("../lib/fleet/host/names.mjs");
   const { HostStore } = await import("../lib/fleet/host/host-store.mjs");
   const src = readFileSync(fileURLToPath(new URL("../launcher/src/restore.rs", import.meta.url)), "utf8");
   for (const [name, v] of [["STATE", BACKUP_STATE_DIR], ["SECRETS", HOST_SECRETS_DIR], ["CACHE", BACKUP_CACHE_DIR]]) {

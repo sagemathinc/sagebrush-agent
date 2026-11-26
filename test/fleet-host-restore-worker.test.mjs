@@ -314,7 +314,7 @@ test("dispatch: only a begun, open restore with the gate open; one worker per ho
   const mk = (over = {}) => host({ sets: Object.fromEntries(keys.map((k) => [k, RUN])), ...over });
   const run = async (h, over = {}) => {
     const started = [];
-    const out = await dispatchOnce({ gateOpen: async () => true, admitted: async () => true, start: async (argv) => { started.push(argv); }, main: "/opt/m.mjs", node: "/n", newNonce: () => NONCE, inputOf: async (k, i, r, n) => inputOf(k, i, r, n), ...over }, { dir: h.dir, uid: UID });
+    const out = await dispatchOnce({ gateOpen: async () => true, anyWorker: async () => false, admitted: async () => true, start: async (argv) => { started.push(argv); }, main: "/opt/m.mjs", node: "/n", newNonce: () => NONCE, inputOf: async (k, i, r, n) => inputOf(k, i, r, n), ...over }, { dir: h.dir, uid: UID });
     return { out, started };
   };
   // The happy one: the first key.
@@ -332,7 +332,7 @@ test("dispatch: only a begun, open restore with the gate open; one worker per ho
     assert.deepEqual([out, started], [{ dispatched: null, why }, []], why);
   }
   const empty = mkdtempSync(join(tmpdir(), "sb-worker-none-"));
-  out = await dispatchOnce({ gateOpen: async () => true }, { dir: empty, uid: UID });
+  out = await dispatchOnce({ gateOpen: async () => true, anyWorker: async () => false }, { dir: empty, uid: UID });
   assert.deepEqual(out, { dispatched: null, why: "no_restore" });
   // A live worker for any set: none started.
   h = mk();
@@ -422,7 +422,7 @@ test("dispatch writes its input durably BEFORE the start, with the argv's nonce;
   let atStart = null;
   const nonces = [newId(), newId()];
   const deps = {
-    gateOpen: async () => true, admitted: async () => true, main: "/opt/m.mjs", node: "/n", newNonce: () => nonces.shift(),
+    gateOpen: async () => true, anyWorker: async () => false, admitted: async () => true, main: "/opt/m.mjs", node: "/n", newNonce: () => nonces.shift(),
     inputOf: async (k, i, r, n) => inputOf(k, i, r, n),
     start: async (argv) => { atStart = { argv, input: readInput("agent", a, { dir: h.dir, uid: UID }), mode: statSync(join(h.dir, INPUTS, `${key}.json`)).mode & 0o777 }; },
   };
@@ -456,7 +456,7 @@ test("a write that can't be made durable starts nothing; a settled set's input i
   mkdirSync(other, { mode: 0o700 });
   symlinkSync(other, join(h.dir, INPUTS));
   let started = 0;
-  const deps = { gateOpen: async () => true, admitted: async () => true, main: "/opt/m.mjs", newNonce: () => NONCE, inputOf: async (k, i, r, n) => inputOf(k, i, r, n), start: async () => { started++; } };
+  const deps = { gateOpen: async () => true, anyWorker: async () => false, admitted: async () => true, main: "/opt/m.mjs", newNonce: () => NONCE, inputOf: async (k, i, r, n) => inputOf(k, i, r, n), start: async () => { started++; } };
   await rejects(dispatchOnce(deps, { dir: h.dir, uid: UID }), "not_granted");
   assert.deepEqual([started, readdirSync(other)], [0, []]);
   // Settled (failed here): the next dispatch removes its input, and starts nothing for it.
@@ -498,4 +498,12 @@ test("an input of another run is refused even with the right nonce", async () =>
   const f = filler();
   await rejects(runWorker("archive", id, RUN, NONCE, deps(f), { dir: h.dir, uid: UID }), "not_granted");
   assert.deepEqual([f.calls, readRecord("archive", id, { dir: h.dir })], [[], null]);
+});
+
+test("dispatch requires the host-wide worker check: without it, refused before anything", async () => {
+  const id = newId(), key = `agent-${id}`;
+  const h = host({ sets: { [key]: RUN } });
+  let started = 0;
+  await rejects(dispatchOnce({ gateOpen: async () => true, admitted: async () => true, inputOf: async () => { throw new Error("never"); }, start: async () => { started++; }, main: "/m" }, { dir: h.dir, uid: UID }), "bad_form");
+  assert.equal(started, 0);
 });

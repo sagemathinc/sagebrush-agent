@@ -193,3 +193,35 @@ test("an archive's owner uids are capped too (no member equality bounds them)", 
   x.classes.archive.owners.uids = Array.from({ length: MAX_MEMBERS + 1 }, (_, i) => 71000 + i);
   refused(() => checkInput(x), "bad_form");
 });
+
+test("raw bytes: a repeated key (at the root, nested, or escaped) refuses; only the writer's exact bytes are an input", () => {
+  const w = world();
+  const dir = dirOf();
+  const x = build(w, "agent", w.a);
+  writeInput(x, { dir, uid: UID });
+  const p = join(dir, INPUTS, `agent-${w.a}.json`);
+  const good = readFileSync(p, "utf8");
+  assert.deepEqual(readInput("agent", w.a, { dir, uid: UID }), x, "the writer's bytes read back");
+  const put = (text) => writeFileSync(p, text);
+  const cases = {
+    "a root key repeated": good.replace('{"v":1,', '{"v":1,"v":1,'),
+    "a root key repeated, escaped": good.replace('{"v":1,', '{"\\u0076":1,"v":1,'),
+    "an escaped key alone": good.replace('{"v":1,', '{"\\u0076":1,'),
+    "a nested key repeated (owners.gid)": good.replace('"gid":70003,', '"gid":1,"gid":70003,'),
+    "a nested key repeated, last wins differently": good.replace('"gid":70003,', '"gid":70003,"gid":70003,'),
+    "other spacing": good.replace('{"v":1,', '{ "v": 1,'),
+    "no final newline": good.slice(0, -1),
+    "a second line": good + good,
+  };
+  for (const [what, text] of Object.entries(cases)) {
+    assert.notEqual(text, good, `${what}: (the case differs)`);
+    put(text);
+    refused(() => readInput("agent", w.a, { dir, uid: UID }), "bad_form");
+  }
+  // Bytes that aren't UTF-8 inside a string: refused.
+  writeFileSync(p, Buffer.concat([Buffer.from(good.slice(0, 10)), Buffer.from([0xff]), Buffer.from(good.slice(10))]));
+  refused(() => readInput("agent", w.a, { dir, uid: UID }), "bad_form");
+  put(good);
+  assert.deepEqual(readInput("agent", w.a, { dir, uid: UID }), x);
+});
+

@@ -8,7 +8,8 @@ import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { lockFile } from "../lib/fleet/host/store.mjs";
-import { CLASSES, newRecord, newRestoreRun, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
+import { CLASSES, newRecord, newRestoreRun, readRecord, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
+import { attestationName, attestationText, intentName } from "../lib/fleet/host/restore-sidecars.mjs";
 import { PLAN, closePlan, newPlan, readPlan, replanSet, updatePlan } from "../lib/fleet/host/restore-plan.mjs";
 import { ABANDON, BEGIN, CLOSED, HOSTSTORE_COPY, REQUESTS, begin, close, closeBlockers, readBegin, removeBeneath, restoreOpen, withExclusion } from "../lib/fleet/host/restore-begin.mjs";
 
@@ -247,7 +248,19 @@ function records(h, states) {
     if (r.imports !== null) for (const which of ["config", "context"]) for (const phase of ["pending", "done"]) r = step(r, "import", { which, phase, sha256: hex("c") });
     return step(r, "validated");
   };
-  for (const [kind, id] of [["agent", h.m.a], ["archive", h.m.d], ["tag", h.m.t]]) writeRecord(reach(kind, id, states[kind]), { dir: h.dir });
+  for (const [kind, id] of [["agent", h.m.a], ["archive", h.m.d], ["tag", h.m.t]]) {
+    const r = reach(kind, id, states[kind]);
+    writeRecord(r, { dir: h.dir });
+    if (r.state === "abandoned") abandonSidecars(h, r);
+  }
+}
+/** An abandoned set's audit pair, as the abandon op and its finish write them (R5-d2 §3.8). */
+function abandonSidecars(h, r, { attestation = true } = {}) {
+  mkdirSync(join(h.dir, ABANDON), { recursive: true, mode: 0o700 });
+  const intent = { v: 1, kind: r.kind, id: r.id, restore_run: RUN, set_run: r.run, set_snapshot: r.snapshot, account: newId(), person: newId(),
+    by: "device-1", at: 1795500000000, reason: "given up", envelope_sha256: hex("e"), nonce: Buffer.alloc(16, 7).toString("base64url") };
+  writeFileSync(join(h.dir, ABANDON, intentName(r.kind, r.id)), JSON.stringify(intent) + "\n", { mode: 0o600 });
+  if (attestation) writeFileSync(join(h.dir, ABANDON, attestationName(r.kind, r.id)), attestationText(r, 1795500001000), { mode: 0o600 });
 }
 
 test("close: every set terminal-for-close, per kind; anything else refuses, naming each set; nothing is written", async () => {
@@ -272,14 +285,36 @@ test("close: every set terminal-for-close, per kind; anything else refuses, nami
   writeFileSync(join(h.dir, ABANDON, `tag-${h.m.t}.json`), "{}");
   assert.deepEqual(closeBlockers(readPlan({ dir: h.dir }), { dir: h.dir, restoreRaised, uid: UID }), [`tag-${h.m.t}: abandoning`]);
   await rejects(attempt(), "not_granted");
-  // Abandoned: closes. Requests and the host store's copy are removed; restoreOpen is false; the archive is read-only.
+  // Abandoned, but its audit pair incomplete or mismatching: corrupt, refused (R5-d2 §3.8).
   records(h, { agent: "validated", archive: "validated", tag: "abandoned" });
+  const tagRec = readRecord("tag", h.m.t, { dir: h.dir });
+  const aPath = join(h.dir, ABANDON, attestationName("tag", h.m.t)), iPath = join(h.dir, ABANDON, intentName("tag", h.m.t));
+  const good = { a: readFileSync(aPath), i: readFileSync(iPath) };
+  for (const [what, mutate] of [
+    ["no attestation", () => rmSync(aPath)],
+    ["no intent", () => rmSync(iPath)],
+    ["a malformed attestation", () => writeFileSync(aPath, "{}\n")],
+    ["an attestation of another attempt", () => writeFileSync(aPath, attestationText({ ...tagRec, attempt: 2 }, 1))],
+    ["an attestation of another destination", () => writeFileSync(aPath, attestationText({ ...tagRec, dest: { tag: { dev: "1", ino: "99", uid: 70000, gid: 70000, mode: 0o700, projid: 70000 } } }, 1))],
+    ["an intent of another set run", () => writeFileSync(iPath, JSON.stringify({ ...JSON.parse(good.i), set_run: RUN2 }) + "\n")],
+    ["a non-canonical intent", () => writeFileSync(iPath, JSON.stringify(JSON.parse(good.i), null, 1) + "\n")],
+  ]) {
+    mutate();
+    const blockers = closeBlockers(readPlan({ dir: h.dir }), { dir: h.dir, restoreRaised, uid: UID });
+    assert.ok(blockers.length === 1 && blockers[0].startsWith(`tag-${h.m.t}: abandoned, but corrupt`), `${what}: ${blockers}`);
+    await rejects(attempt(), "not_granted");
+    writeFileSync(aPath, good.a); writeFileSync(iPath, good.i);
+  }
+  // Abandoned with its audit pair: closes. Requests and the host store's copy are removed; restoreOpen is false; the
+  // archive is read-only, the intent and the attestation copied byte-identically, the originals kept.
   assert.deepEqual(await attempt(), { closed: 7 });
   assert.equal(restoreOpen({ dir: h.dir }), false);
   assert.ok(!existsSync(join(h.dir, REQUESTS)) && !existsSync(join(h.dir, HOSTSTORE_COPY)));
   const into = join(h.dir, CLOSED, RUN);
   const archived = readdirSync(into).sort();
   assert.ok(archived.includes(PLAN) && archived.includes(BEGIN) && archived.includes(`tag-${h.m.t}.json`) && archived.includes(`tag-${h.m.t}.abandon.json`));
+  assert.ok(readFileSync(join(into, `tag-${h.m.t}.abandon.json`)).equals(good.i) && readFileSync(join(into, `tag-${h.m.t}.abandon.cleaned`)).equals(good.a));
+  assert.ok(existsSync(iPath) && existsSync(aPath), "the originals stay");
   for (const f of archived) assert.equal(statSync(join(into, f)).mode & 0o777, 0o400, f);
   assert.deepEqual(readFileSync(join(into, PLAN)), readFileSync(join(h.dir, PLAN)));
   // Closing again: the same, nothing changed.

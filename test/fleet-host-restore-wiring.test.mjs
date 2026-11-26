@@ -409,3 +409,76 @@ test("the seam's imports, composed: an agent set at files_validated, its live tr
     }
   }
 });
+
+test("the seam's abandons, composed: an archive's accepted intent finished by the launcher (kill, identify, remove-tree --contents, staging and copies removed, the live re-proof), then abandoned", async () => {
+  const { newRecord, step, writeRecord, readRecord } = await import("../lib/fleet/host/restore-record.mjs");
+  const { destOf } = await import("../lib/fleet/host/restore-fill.mjs");
+  const { chmodSync, rmSync, readdirSync } = await import("node:fs");
+  for (const mode of ["ok", "another-object", "swapped-after-clean"]) {
+    const d = newId(), key = `archive-${d}`;
+    const base = mkdtempSync(join(tmpdir(), "sb-wiring-ab-"));
+    chmodSync(base, 0o700);
+    const dir = join(base, "restore"), staging = join(base, "staging"), expectDir = join(base, "expect"), lib = join(base, "lib");
+    for (const x of [dir, staging, expectDir, lib]) mkdirSync(x, { mode: 0o700 });
+    writeFileSync(join(dir, BEGIN), JSON.stringify({ v: 1, snapshot: hex("1"), manifest_sha256: hex("2"), run: RUN, state: "done" }) + "\n", { mode: 0o600 });
+    createPlan({ v: 1, host: "old", manifest: hex("1"), sha256: hex("2"), hoststore: hex("3"), sets: { [key]: { run: RUN, snapshot: hex("1"), tree: hex("4") } }, config: {} }, { dir });
+    const objs = { archive: obj({ ino: 4301 }), "archive-config": obj({ ino: 4302, uid: 0, gid: 0 }) };
+    const dest = Object.fromEntries(Object.entries(objs).map(([c, o]) => [c, destOf(o)]));
+    let r = step(newRecord({ kind: "archive", id: d, run: RUN, snapshot: hex("1") }), "bind", { dest });
+    for (const cls of ["archive", "archive-config"]) r = step(r, "digest", { cls, sha256: hex("5") });
+    // (published: a live state, whose current attempt a fill would keep; an abandon discards it too)
+    r = step(step(step(r, "staged"), "filling", { dest }), "published");
+    writeRecord(r, { dir });
+    mkdirSync(join(dir, "abandon"), { mode: 0o700 });
+    writeFileSync(join(dir, "abandon", `${key}.json`), JSON.stringify({ v: 1, kind: "archive", id: d, restore_run: RUN, set_run: RUN, set_snapshot: hex("1"), account: newId(), person: newId(),
+      by: "device-1", at: 1, reason: "", envelope_sha256: hex("e"), nonce: Buffer.alloc(16, 9).toString("base64url") }) + "\n", { mode: 0o600 });
+    mkdirSync(join(staging, RUN, `a-${d}`, "archive", "1"), { recursive: true, mode: 0o700 });
+    // The restored registry: the archive's agent deleted (its owners' source).
+    const registry = { v: 1, next_uid: 70010, next_gid: 80010, agents: { [d]: { uid: 70000, state: "deleted", life: 1, gen: 1, tags: [], start_failed: null } }, tags: {} };
+    const store = { registry: { agent: (x) => registry.agents[x] ?? null, tag: () => null, snapshot: () => structuredClone(registry) }, provisioned: { record: () => null } };
+    const calls = [], killed = [];
+    let cleaned = 0;
+    const launch = async (args) => {
+      calls.push(args.slice(0, 5).join(" "));
+      if (args[0] === "identify") {
+        const anchor = args[args.indexOf("--anchor") + 1];
+        if (anchor === staging) {
+          const name = args[args.indexOf("--name") + 1];
+          return { code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, object: existsSync(join(staging, name)) ? obj({ uid: 0, gid: 0, ino: 9 }) : null }) };
+        }
+        if (anchor === "/var/lib/sagebrush/validate") return { code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, object: null }) };
+        const cls = anchor.endsWith("archive-config") ? "archive-config" : "archive";
+        // (swapped-after-clean: the archive's object is another one once both classes were emptied, at the re-proof)
+        const other = (mode === "another-object" || (mode === "swapped-after-clean" && cleaned === 2)) && cls === "archive";
+        return { code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, object: other ? obj({ ino: 9999 }) : objs[cls] }) };
+      }
+      if (args[0] === "remove-tree") {
+        const anchor = args[args.indexOf("--anchor") + 1];
+        if (anchor === staging) rmSync(join(staging, args[args.indexOf("--name") + 1]), { recursive: true });
+        if (args[1] === "--contents") cleaned++;
+        return { code: 0, stdout: "" };
+      }
+      if (args[0] === "tree-digest") return { code: 0, stdout: EMPTY_LISTING };
+      return { code: 0, stdout: "" };
+    };
+    const seam = restoreWorkerSeam({ store, launch, mount: "/srv/quota", main: "/opt/r/restore-worker-main.mjs", isActive: async () => true,
+      isGone: async () => true, killUnit: async (u) => { killed.push(u); }, anyWorker: async () => false,
+      dir, uid: UID, gid: process.getgid(), staging, expectDir, exclusion: { path: join(lib, "x.lock"), waitMs: 0, uid: UID }, now: () => 5 });
+    const out = await seam.abandons(1000, new AbortController().signal);
+    if (mode === "ok") {
+      assert.deepEqual(out, { sets: { [key]: { status: "abandoned" } } });
+      assert.equal(readRecord("archive", d, { dir }).state, "abandoned");
+      assert.deepEqual(killed, [`sagebrush-restore-${key}.scope`]);
+      assert.ok(calls.includes(`remove-tree --contents --anchor /srv/sagebrush/archive --name`) && calls.includes(`remove-tree --contents --anchor /srv/sagebrush/archive-config --name`), "both classes emptied");
+      assert.deepEqual(readdirSync(join(staging, RUN, `a-${d}`, "archive")), [], "the staging attempt removed");
+      assert.ok(calls.some((c) => c.startsWith("tree-digest")), "the live re-proof");
+    } else if (mode === "swapped-after-clean") {
+      assert.deepEqual(out, { sets: { [key]: { status: "reproof_failed" } } }, "the re-proof checks the recorded identity, not any empty directory");
+      assert.equal(readRecord("archive", d, { dir }).state, "published");
+    } else {
+      assert.deepEqual(out, { sets: { [key]: { status: "refused", reason: "not_granted" } } }, "another object at the destination: nothing removed");
+      assert.ok(!calls.some((c) => c.startsWith("remove-tree --contents")));
+      assert.equal(readRecord("archive", d, { dir }).state, "published");
+    }
+  }
+});

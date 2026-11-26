@@ -48,6 +48,9 @@ test("built from the registry: owners per class, members the set's live agents w
   assert.deepEqual(tg.members, [{ agent: w.b, uid: 70001 }, { agent: w.a, uid: 70003 }], "sorted by uid");
   const ar = build(w, "archive", w.c);
   assert.deepEqual([ar.classes.archive.owners, ar.members], [{ uids: [70002], gid: 70002, projid: 70002 }, []]);
+  // An archive's config archive is root's alone, in the set's project (A2 r3.13): never the deleted agent's uid.
+  assert.deepEqual(Object.keys(ar.classes), ["archive", "archive-config"]);
+  assert.deepEqual(ar.classes["archive-config"].owners, { uids: [0], gid: 0, projid: 70002 });
   // The recorded identity is what goes in, never anything else.
   const seen = [];
   build(w, "agent", w.a, { destOf: (k, i, cls) => { seen.push([k, i, cls]); return dest({ ino: cls === "home" ? 1 : 2 }); } });

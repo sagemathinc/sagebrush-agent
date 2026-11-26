@@ -27,6 +27,9 @@ sha2 = "0.11.1"
 # Tests only: allows an `http` endpoint on a loopback address (the SeaweedFS test server). Never in a release build:
 # without it, any endpoint that isn't https is refused.
 test-loopback-http = []
+# Tests only: SB_TEST_PAUSE_MS pauses before the parent check, so a test can kill the parent first (parent.rs). Never in
+# a release build: backup-build.sh enables no feature, and CI checks the pinned build holds no trace of it.
+test-pause-before-start = []
 
 [profile.release]
 lto = true

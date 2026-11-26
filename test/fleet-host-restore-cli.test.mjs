@@ -336,3 +336,96 @@ test("the real ops: begin refuses unless the supervisor's unit is definitely not
     assert.equal(existsSync(join(fresh, BEGIN)), false, "nothing begun");
   }
 });
+
+// ---- the console command's signal reaches every child it runs (init/run d3 §5.2), not only the backup binary ----
+
+/** A release whose launcher, run by the real pinned runner over the real runArgv (no signal passed), logs its pid and
+ * argv and then blocks with a grandchild; a setquota stand-in that does the same (or exits 0 at once with `quick`). */
+async function childWorld({ quickSetquota = false } = {}) {
+  const { createHash } = await import("node:crypto");
+  const base = mkdtempSync(join(tmpdir(), "sb-csig-"));
+  const log = join(base, "log"), kids = join(base, "kids");
+  const blocking = (what) => Buffer.from(`#!/bin/sh\necho "$$ ${what} $*" >> ${log}\nsleep 60 &\necho $! >> ${kids}\nwait\n`);
+  const r = join(base, "release");
+  for (const d of ["", "bin", "lib", "lib/fleet", "lib/fleet/host"]) { mkdirSync(join(r, d), { recursive: true, mode: 0o755 }); chmodSync(join(r, d), 0o755); }
+  const { LAUNCHER, LAUNCHER_PIN } = await import("../lib/fleet/host/restore-adapters.mjs");
+  const bytes = blocking("launcher");
+  writeFileSync(join(r, LAUNCHER), bytes);
+  chmodSync(join(r, LAUNCHER), 0o755);
+  writeFileSync(join(r, LAUNCHER_PIN), `${createHash("sha256").update(bytes).digest("hex")}  sagebrush-agent-launch\n`);
+  chmodSync(join(r, LAUNCHER_PIN), 0o644);
+  const setquota = join(base, "setquota");
+  writeFileSync(setquota, quickSetquota ? `#!/bin/sh\necho "$$ setquota $*" >> ${log}\n` : blocking("setquota"));
+  chmodSync(setquota, 0o755);
+  const lines = () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : []);
+  const pids = () => [...lines().map((l) => Number(l.split(" ")[0])), ...(existsSync(kids) ? readFileSync(kids, "utf8").split("\n").filter(Boolean).map(Number) : [])];
+  return { base, release: r, setquota, lines, pids };
+}
+const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
+async function until(f, ms = 5000) { const t0 = Date.now(); while (!f() && Date.now() - t0 < ms) await sleep(20); return f(); }
+const exited = (pid) => { try { return /\) [ZX] /.test(readFileSync(`/proc/${pid}/stat`, "utf8")); } catch { return true; } };
+/** `p` settles within `ms`, else the row fails (a child that ignores the signal would run on for a minute). */
+const within = (p, ms = 5000) => Promise.race([p.then((v) => ({ v }), (e) => ({ e })), sleep(ms).then(() => ({ timeout: true }))]);
+
+test("a signal to `restore close` kills the launcher op in flight with its group, starts no later removal, and exits nonzero", async () => {
+  const { EventEmitter } = await import("node:events");
+  const { installCommandSignals } = await import("../lib/fleet/host/backup-binary.mjs");
+  const { runArgv } = await import("../lib/fleet/host/effects.mjs");
+  const { anchorRemover, pinnedLauncherRunner } = await import("../lib/fleet/host/restore-adapters.mjs");
+  const { removeHostStage } = await import("../lib/fleet/host/restore-hoststage.mjs");
+  const w = world();
+  for (const [kind, id] of [["agent", w.a], ["archive", w.d], ["tag", w.t]]) writeRecord(reach(kind, id, "validated"), { dir: w.dir });
+  const x = await childWorld();
+  const staging = private_(join(x.base, "staging"));
+  for (const n of ["1", "2"]) private_(join(staging, RUN, "host", "hoststore", n));
+  // realRestoreOps' removal exactly (its runner the real runArgv, given no signal), the pin's owner this test's uid.
+  const removeUnder = anchorRemover({ launch: pinnedLauncherRunner({ run: runArgv, release: x.release, rootUid: UID }), expect: () => join(x.base, "expect") });
+  const proc = new EventEmitter();
+  const remove = installCommandSignals(new AbortController(), proc);
+  try {
+    const p = restoreCommand(["close"], { dir: w.dir, exclusion: w.exclusion, uid: () => UID, rootUid: UID, now: () => T0 + 3600000, restoreRaised: () => false,
+      removeHostStage: (run) => removeHostStage(run, { staging }, { removeUnder }) });
+    assert.ok(await until(() => x.pids().length === 2), "the launcher's first op is running");
+    const ran = x.pids();
+    proc.emit("SIGTERM");
+    const out = await within(p);
+    assert.ok(!out.timeout, "close ended at the signal, not at the launcher's own end");
+    assert.equal(out.v.code, 1);
+    assert.deepEqual(x.lines().map((l) => l.split(" ").slice(1, 3).join(" ")), ["launcher identify"], "exactly one launcher op: no remove-tree, no second attempt's");
+    for (const pid of ran) assert.ok(await until(() => exited(pid), 3000), `pid ${pid} gone with its group`);
+  } finally { remove(); }
+});
+
+test("a signal during begin's host-store stage kills setquota or the launcher's restore-stage with its group; no later child starts", async () => {
+  const { EventEmitter } = await import("node:events");
+  const { installCommandSignals } = await import("../lib/fleet/host/backup-binary.mjs");
+  const { runArgv } = await import("../lib/fleet/host/effects.mjs");
+  const { anchorRemover, pinnedLauncherRunner } = await import("../lib/fleet/host/restore-adapters.mjs");
+  const { stageHostStore } = await import("../lib/fleet/host/restore-hoststage.mjs");
+  const snapshot = hex("3");
+  const binary = async (req) => (req.op === "snapshots"
+    ? { ok: true, value: { snapshots: [{ id: snapshot, paths: ["/var/lib/sagebrush/store"] }] } }
+    : { ok: true, value: { snapshot, entries: 2, inodes: 2, blocks_upper: 2, peak_inodes: 3, peak_blocks_upper: 3, block_size: 4096 } });
+  for (const during of ["setquota", "launcher"]) {
+    const x = await childWorld({ quickSetquota: during === "launcher" });
+    const staging = private_(join(x.base, "staging"));
+    const launch = pinnedLauncherRunner({ run: runArgv, release: x.release, rootUid: UID });
+    // realRestoreOps' stage deps exactly: setquota through the real runArgv with no signal of its own.
+    const deps = { binary, launch, mount: "/", setquota: (argv) => runArgv([x.setquota, ...argv.slice(1)], { ms: 15_000 }),
+      removeUnder: anchorRemover({ launch, expect: () => join(x.base, "expect") }) };
+    const proc = new EventEmitter();
+    const remove = installCommandSignals(new AbortController(), proc);
+    try {
+      const p = stageHostStore({ manifest: { hoststore: snapshot } }, { run: RUN, staging, uid: UID }, deps);
+      assert.ok(await until(() => x.lines().some((l) => l.split(" ")[1] === during) && x.pids().length >= (during === "launcher" ? 3 : 2)), `${during} is running`);
+      const ran = x.pids();
+      proc.emit("SIGTERM");
+      const out = await within(p);
+      assert.ok(!out.timeout, `${during}: the stage ended at the signal`);
+      assert.ok(out.e, `${during}: the stage failed`);
+      const who = x.lines().map((l) => l.split(" ")[1]);
+      assert.deepEqual(who, during === "setquota" ? ["setquota"] : ["setquota", "launcher"], `${during}: no child started after the signal (the failed stage's own removal included)`);
+      for (const pid of ran) assert.ok(await until(() => exited(pid), 3000), `${during}: pid ${pid} gone with its group`);
+    } finally { remove(); }
+  }
+});

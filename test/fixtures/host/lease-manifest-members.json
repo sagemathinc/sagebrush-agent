@@ -8,6 +8,7 @@
   "backup/src/logcap.rs",
   "backup/src/main.rs",
   "backup/src/ops.rs",
+  "backup/src/parent.rs",
   "backup/src/s3.rs",
   "bin/sagebrush-agent.mjs",
   "launcher/Cargo.lock",

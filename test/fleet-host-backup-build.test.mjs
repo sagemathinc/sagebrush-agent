@@ -106,3 +106,20 @@ test("a cargo config file anywhere cargo would read one refuses before cargo", (
     assert.equal(existsSync(x.log), false, `${where}: cargo never ran`);
   }
 });
+
+test("a relative <out> is taken from the caller's directory, not the source root the build runs in", () => {
+  const x = world();
+  // A mock cargo that "builds": it writes the binary where the recipe's CARGO_TARGET_DIR says.
+  exe(join(x.cargoHome, "bin/cargo"), 'mkdir -p "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release" && printf built > "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/sagebrush-agent-backup"');
+  const caller = join(x.w, "caller");
+  mkdirSync(caller);
+  const env = { PATH: process.env.PATH, HOME: x.home, CARGO_HOME: x.cargoHome, RUSTUP_HOME: join(x.home, ".rustup") };
+  const r = spawnSync("sh", [join(x.root, "scripts/backup-build.sh"), "out/bin"], { env, cwd: caller, encoding: "utf8" });
+  assert.equal(r.status, 1, "out/ doesn't exist yet: cp fails, nothing written in the source root");
+  assert.equal(existsSync(join(x.root, "out")), false);
+  mkdirSync(join(caller, "out"));
+  const ok = spawnSync("sh", [join(x.root, "scripts/backup-build.sh"), "out/bin"], { env, cwd: caller, encoding: "utf8" });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(readFileSync(join(caller, "out/bin"), "utf8"), "built");
+  assert.equal(existsSync(join(x.root, "out/bin")), false, "never in the source root");
+});

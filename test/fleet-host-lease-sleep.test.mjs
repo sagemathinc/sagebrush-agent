@@ -341,10 +341,13 @@ test("C8b: stuck at pre past its budget plus 5 minutes (strictly), by CLOCK_BOOT
   assert.deepEqual(withGateHealth({ state: "ok", reasons: [] }, []), { state: "ok", reasons: [] });
 });
 
-test("the hook's file: a two-line shim for pre or post only, rendered for a plain absolute release", () => {
+test("the hook's file: a shim for pre or post only, the trust boundary first, rendered for a plain absolute release", () => {
   const h = sleepHook("/opt/sagebrush/r1");
   assert.match(h, /^#!\/bin\/sh\n/);
-  assert.ok(h.includes('exec /usr/bin/env node "/opt/sagebrush/r1/lib/fleet/host/lease-main.mjs" lease-sleep "$1"'));
+  const check = h.indexOf('/usr/lib/sagebrush/release-trust "/opt/sagebrush/r1" || exit 1');
+  const run = h.indexOf('exec /usr/bin/node "/opt/sagebrush/r1/lib/fleet/host/lease-main.mjs" lease-sleep "$1"');
+  assert.ok(check > 0 && run > check, "the checker runs, and must pass, before node");
+  assert.ok(!h.includes("/usr/bin/env"), "no search path");
   assert.ok(h.includes("pre|post)") && h.trimEnd().endsWith("exit 0"));
   for (const bad of ["rel", "/a b", "/a$x", '/a"b', null]) assert.throws(() => sleepHook(bad), (e) => e.code === "bad_form", String(bad));
 });

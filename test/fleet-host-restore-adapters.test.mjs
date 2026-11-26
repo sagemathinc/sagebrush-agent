@@ -88,11 +88,18 @@ test("identifyDest: an agent's classes by inspect-home, an archive and a tag fol
     [{ code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, object: null }) }, "not_found"],
     [{ code: 66, stdout: "" }, "outcome_unknown"],
     [{ code: 0, stdout: "{}\n{}\n" }, "outcome_unknown"],
+    [{ code: 0, stdout: "\n" + line({ epoch: EPOCH, fsid: FSID, object: obj() }) }, "outcome_unknown"], // a valid object after a blank line
+    [{ code: 66, stdout: line({ epoch: EPOCH, fsid: FSID, object: obj() }) }, "outcome_unknown"], // a valid line from a failed run
     [{ code: 0, stdout: "not json\n" }, "outcome_unknown"],
     [{ code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, object: obj({ type: "file" }) }) }, "outcome_unknown"],
     [{ code: 0, stdout: line({ epoch: { boot_id: "x", mnt_id: 7 }, fsid: FSID, object: obj() }) }, "outcome_unknown"],
   ];
   for (const [out, code] of cases) { const s = setup("archive", { answer: () => out }); await rejects(s.a.identifyDest("archive", s.id, "archive"), code); }
+  // inspect-home's entry is checked like identify's object: not a directory's identity is unknown.
+  for (const entry of [obj({ type: "file" }), obj({ dev: [8] }), { ...obj(), extra: 1 }]) {
+    const bad = setup("agent", { answer: () => ({ code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, dir: obj(), entries: { home: entry, sessions: obj() } }) }) });
+    await rejects(bad.a.identifyDest("agent", bad.id, "home"), "outcome_unknown");
+  }
   const noSessions = setup("agent", { answer: () => ({ code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, dir: obj(), entries: { home: obj() } }) }) });
   await rejects(noSessions.a.identifyDest("agent", noSessions.id, "sessions"), "not_found");
 });

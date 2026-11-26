@@ -46,10 +46,12 @@ test("startDetached: spawned detached and unreferenced; resolves once the scope 
   assert.equal(asks, 3, "resolved at the first active answer; the child never exited");
   // The scope ended before it was active: refused.
   const g = fakeSpawn();
-  const p = startDetached(workerArgvFor(unit), unit, { spawn: g.spawn, isActive: async () => false, poll: 1 });
+  const p = startDetached(workerArgvFor(unit), unit, { spawn: g.spawn, isActive: async () => false, poll: 1, ms: 600_000 });
   await new Promise((r) => setImmediate(r));
   g.spawned[0].c.emit("exit", 1, null);
-  await rejects(p, "effect_failed");
+  // Refused at once on the exit, not at the (long) deadline.
+  const quick = await Promise.race([p.then(() => "resolved", (e) => e.code), new Promise((r) => setTimeout(() => r("stuck"), 500))]);
+  assert.equal(quick, "effect_failed");
   // Never active in time: refused.
   let t = 0;
   await rejects(startDetached(workerArgvFor(unit), unit, { spawn: fakeSpawn().spawn, isActive: async () => false, now: () => (t += 1000), ms: 3000, sleep: async () => {} }), "effect_failed");

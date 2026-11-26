@@ -430,3 +430,121 @@ test("the command holds the backup/restore exclusion: held by another, attach is
   assert.equal(existsSync(w.state), false);
   assert.deepEqual(w.repo.calls, []);
 });
+
+/** Kill the flock child holding `path` (the command's real exclusion), then let its death be seen. */
+function killHolder(path) {
+  let n = 0;
+  for (const pid of readdirSync("/proc").filter((p) => /^[0-9]+$/.test(p))) {
+    let cmd;
+    try { cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0"); } catch { continue; }
+    if (cmd[0].endsWith("flock") && cmd.includes(path)) { process.kill(Number(pid), "SIGKILL"); n += 1; }
+  }
+  assert.ok(n > 0, `a holder of ${path} was found`);
+}
+const settle = () => new Promise((r) => { setTimeout(r, 200); });
+
+// The exclusion lost INSIDE each awaited binary call (the call itself then answering normally): outcome_unknown, no
+// later binary call or effect, the journal kept at its phase; the next attach recovers to exactly one new slot.
+for (const [where, prepare, callIndex, phase] of [
+  ["the first open", () => {}, 0, "begun"],
+  ["add-key", () => {}, 1, "slot-pending"],
+  ["the probe", (w) => { w.repo.commitThenFail = true; }, 0, "probing"],
+  ["the final open", () => {}, 2, "promoting"],
+]) {
+  test(`the exclusion lost inside ${where}: outcome_unknown, nothing after it, the journal kept (${phase}); the next attach recovers`, async () => {
+    const w = world();
+    const exclusion = { path: join(w.base, "backup", "attach.lock"), uid: UID, waitMs: 0 };
+    const cmd = () => backupAttachCommand(["attach"], { uid: () => UID, rootUid: UID, state: w.state, secrets: w.secrets, rand,
+      stdin: async () => Buffer.from(JSON.stringify(input())), exclusion, ...w.deps });
+    prepare(w);
+    if (where === "the probe") assert.deepEqual(await cmd(), { code: 1, line: { v: 1, refused: "timed_out" } }); // (add-key committed, its answer lost)
+    const real = w.deps.binary;
+    let n = 0;
+    w.deps.binary = async (req, o) => {
+      const r = await real(req, o);
+      if (n++ === callIndex) { killHolder(exclusion.path); await settle(); }
+      return r;
+    };
+    w.repo.calls.length = 0;
+    const before = w.repo.slots.length;
+    assert.deepEqual(await cmd(), { code: 1, line: { v: 1, refused: "outcome_unknown" } });
+    assert.equal(w.repo.calls.length, callIndex + 1, `${where}: no binary call after it`);
+    assert.deepEqual(journal(w).phase, phase, `${where}: the journal kept at ${phase}`);
+    if (where === "the first open" || where === "add-key") assert.equal(w.repo.calls.filter((c) => c === "add-key").length, where === "add-key" ? 1 : 0);
+    assert.ok(w.repo.slots.length <= before + 1);
+    // A later attach (the exclusion free again) recovers, never adding a second slot.
+    w.deps.binary = real;
+    assert.deepEqual(await cmd(), { code: 0, line: { v: 1, attached: true } });
+    assertAttached(w);
+  });
+}
+
+test("each guard layer alone: after a binary call (a transient probe answer, no effect after it) and before an effect (a back swap's second rename)", async () => {
+  // The lock lost inside the probe, which answers destination_unavailable: no effect follows it, so only the check right
+  // after the binary call reports the loss (outcome_unknown, not the probe's code).
+  {
+    const w = world();
+    w.repo.commitThenFail = true;
+    await rejects(attach(input(), w.deps, w.opts()), "timed_out");
+    let lost = false;
+    const guard = () => { if (lost) throw new FleetError("outcome_unknown", "lost"); };
+    w.repo.faults.snapshots.push({ ok: false, code: "destination_unavailable" });
+    const real = w.deps.binary;
+    w.deps.binary = async (req, o) => { const r = await real(req, o); lost = true; return r; };
+    await rejects(attach(input(), w.deps, w.opts({ guard })), "outcome_unknown");
+    assert.deepEqual(journal(w), { v: 1, phase: "probing", swap: "forward" });
+  }
+  // The lock lost at the back swap's first rename (after an open_failed probe): the second rename and the journal's
+  // slot-pending never happen; the next run finishes the swap in the journal's direction and runs add-key once.
+  {
+    const w = world();
+    w.repo.faults["add-key"].push({ ok: false, code: "timed_out" });
+    await rejects(attach(input(), w.deps, w.opts()), "timed_out");
+    let lost = false, renames = 0;
+    const guard = () => { if (lost) throw new FleetError("outcome_unknown", "lost"); };
+    const io = { ...realIo, rename: (a, b) => { realIo.rename(a, b); if (b.endsWith(JOURNAL)) return; renames += 1; if (renames === 3) lost = true; } }; // (keys only: 2 forward, then the first back)
+    await rejects(attach(input(), w.deps, w.opts({ guard, io })), "outcome_unknown");
+    assert.equal(renames, 3, "no rename after the loss");
+    assert.deepEqual(journal(w), { v: 1, phase: "probing", swap: "back" });
+    w.repo.calls.length = 0;
+    assert.deepEqual(await attach(input(), w.deps, w.opts()), { attached: true });
+    assertAttached(w);
+    assert.deepEqual(w.repo.calls, ["add-key", "snapshots"]);
+  }
+});
+
+test("each effect checks the lock first: lost right after the previous effect, nothing more is written or removed", async () => {
+  const lostGuard = () => { const g = { lost: false }; g.guard = () => { if (g.lost) throw new FleetError("outcome_unknown", "lost"); }; return g; };
+  // A journal write: lost at the back swap's second rename; the journal stays `probing` (back), never slot-pending.
+  {
+    const w = world();
+    w.repo.faults["add-key"].push({ ok: false, code: "timed_out" });
+    await rejects(attach(input(), w.deps, w.opts()), "timed_out");
+    const g = lostGuard();
+    let renames = 0;
+    const io = { ...realIo, rename: (a, b) => { realIo.rename(a, b); if (b.endsWith(JOURNAL)) return; renames += 1; if (renames === 4) g.lost = true; } };
+    await rejects(attach(input(), w.deps, w.opts({ guard: g.guard, io })), "outcome_unknown");
+    assert.deepEqual(journal(w), { v: 1, phase: "probing", swap: "back" });
+  }
+  // An exclusive write: lost once `begun` is durable; no destination, credential or key is written.
+  {
+    const w = world();
+    const g = lostGuard();
+    const io = { ...realIo, rename: (a, b) => { realIo.rename(a, b); if (b.endsWith(JOURNAL)) g.lost = true; } };
+    await rejects(attach(input(), w.deps, w.opts({ guard: g.guard, io })), "outcome_unknown");
+    assert.deepEqual(Object.keys(files(w)), [`state/${JOURNAL}`]);
+    assert.deepEqual(w.repo.calls, []);
+  }
+  // A removal: a wrong code's cleanup, lost after its first removal; the journal and the rest stay for the next run.
+  {
+    const w = world();
+    w.repo.faults.snapshots.push({ ok: false, code: "open_failed" });
+    const g = lostGuard();
+    const fsx = { ...fs, unlinkSync: (p) => { fs.unlinkSync(p); g.lost = true; } };
+    await rejects(attach(input(), w.deps, w.opts({ guard: g.guard, fsx })), "outcome_unknown");
+    assert.deepEqual(Object.keys(files(w)), [`state/${JOURNAL}`, `state/${DEST}`, `secrets/${HANDLE}`]);
+    assert.deepEqual(journal(w), { v: 1, phase: "begun" });
+    assert.deepEqual(await attach(input(), w.deps, w.opts()), { attached: true });
+    assertAttached(w);
+  }
+});

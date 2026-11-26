@@ -40,7 +40,9 @@ async function host({ continuity = ["projects"], quota = { mount: "/srv" }, seed
     lstatSync: (p, o) => {
       const st = fs.lstatSync(p, o);
       const own = owners.get(rel(p)), ino = inoOf.get(rel(p));
-      if (own || ino !== undefined) return Object.assign(Object.create(Object.getPrototypeOf(st)), st, own ? { uid: own[0], gid: own[1] } : {}, ino !== undefined ? { ino } : {});
+      // (the test's own uid stands in for root, so its files stand in for root:root, whatever the user's own group is)
+      const asRoot = !own && st.uid === ME && st.gid !== ME ? { gid: ME } : {};
+      if (own || ino !== undefined || asRoot.gid !== undefined) return Object.assign(Object.create(Object.getPrototypeOf(st)), st, asRoot, own ? { uid: own[0], gid: own[1] } : {}, ino !== undefined ? { ino } : {});
       return st;
     },
   };

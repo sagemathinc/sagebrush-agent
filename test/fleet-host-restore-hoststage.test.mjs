@@ -145,3 +145,36 @@ test("close's removal: every hoststore attempt of the run by its exact name; beg
   assert.equal(existsSync(join(dir, "plan.json")), false);
   void newId;
 });
+
+test("isolation: every set's staging discard (the fill's, and the abandon finish's `all`) and its gone-proof never list or remove host/, which stays byte-identical", async () => {
+  const { readdirSync, readFileSync, rmSync, lstatSync } = await import("node:fs");
+  const { stagingRemover } = await import("../lib/fleet/host/restore-adapters.mjs");
+  const { STAGED, ownerOf } = await import("../lib/fleet/host/restore-record.mjs");
+  const tree = (p) => (lstatSync(p).isDirectory()
+    ? Object.fromEntries(readdirSync(p).sort().map((n) => [n, tree(join(p, n))]))
+    : readFileSync(p).toString("base64"));
+  for (const kind of ["agent", "archive", "tag"]) {
+    for (const all of [false, true]) {
+      const staging = private_(join(mkdtempSync(join(tmpdir(), "sb-hs-iso-")), "staging"));
+      plantAttempt(staging, 1);
+      plantAttempt(staging, 2, { marked: false });
+      const id = newId();
+      const owner = ownerOf(kind, id);
+      for (const cls of STAGED[kind]) for (const n of ["1", "2"]) private_(join(staging, RUN, owner, cls, n));
+      const host = tree(join(staging, RUN, "host"));
+      const named = [];
+      const launch = async (args) => {
+        const name = args[args.indexOf("--name") + 1];
+        named.push(name);
+        if (args[0] === "identify") return { code: 0, stdout: `${JSON.stringify({ epoch: "e", fsid: "f", object: { dev: "1", ino: "2" } })}\n` };
+        rmSync(join(staging, name), { recursive: true });
+        return { code: 0 };
+      };
+      const { discardStaging, stagingGone } = stagingRemover(kind, id, { launch, staging, expect: () => "/x" });
+      await discardStaging({ state: "failed", run: RUN, attempt: 1 }, { all });
+      assert.ok(named.length > 0 && named.every((n) => n.startsWith(`${RUN}/${owner}/`)), `${kind}: only the set's own names`);
+      assert.equal(stagingGone(), true, `${kind}: the set's staging is gone`);
+      assert.deepEqual(tree(join(staging, RUN, "host")), host, `${kind} (all ${all}): host/ byte-identical`);
+    }
+  }
+});

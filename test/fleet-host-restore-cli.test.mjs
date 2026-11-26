@@ -270,18 +270,25 @@ test("list and begin (R6b): through the store and launcher ops; their lines carr
   assert.deepEqual(seen.at(-1), ["removed", RUN]);
 });
 
-test("the real ops: begin refuses while the supervisor's unit is active (or unsure), and opens and releases the host store; the binary's context is the launcher's", async () => {
+test("the real ops: begin refuses unless the supervisor's unit is definitely not active (exit 3, printing inactive or failed), and opens and releases the host store; the binary's context is the launcher's", async () => {
   const { realRestoreOps, BACKUP_STATE_DIR, HOST_SECRETS_DIR, BACKUP_CACHE_DIR } = await import("../lib/fleet/host/restore-cli.mjs");
   const { HostStore } = await import("../lib/fleet/host/host-store.mjs");
   const src = readFileSync(fileURLToPath(new URL("../launcher/src/restore.rs", import.meta.url)), "utf8");
   for (const [name, v] of [["STATE", BACKUP_STATE_DIR], ["SECRETS", HOST_SECRETS_DIR], ["CACHE", BACKUP_CACHE_DIR]]) {
     assert.ok(src.includes(`pub const ${name}: &str = "${v}";`), `${name} pinned equal to the launcher's`);
   }
-  for (const [what, run] of [["active", async () => ({ code: 0 })], ["unsure", async () => { throw new Error("no systemctl"); }]]) {
+  const unsure = [["active", async () => ({ code: 0 })], ["thrown", async () => { throw new Error("no systemctl"); }],
+    ["an error exit", async () => ({ code: 1 })], ["no such unit (4)", async () => ({ code: 4 })], ["a signal", async () => ({ code: null, signal: "SIGKILL" })],
+    ["no code", async () => ({})], ["null", async () => null], ["a string code", async () => ({ code: "3", stdout: "inactive\n" })],
+    ["3 with no output", async () => ({ code: 3 })], ["3 printing another state", async () => ({ code: 3, stdout: "activating\n" })],
+    ["3 printing more", async () => ({ code: 3, stdout: "inactive\ninactive\n" })], ["0 printing inactive", async () => ({ code: 0, stdout: "inactive\n" })]];
+  for (const [what, run] of unsure) {
     const w = world();
     const hostStore = join(w.base, "store");
-    const ops = realRestoreOps({ release: "/nonexistent-release", run, hostStore, enabled: () => ({ enabled: false, why: "not set up" }) });
+    let enabledCalls = 0;
+    const ops = realRestoreOps({ release: "/nonexistent-release", run, hostStore, enabled: () => { enabledCalls += 1; return { enabled: false, why: "not set up" }; } });
     await rejects(ops.begin(hex("9"), { dir: join(w.base, "fresh-restore"), exclusion: w.exclusion }), "in_progress");
+    assert.equal(enabledCalls, 0, `${what}: refused at the supervisor check, before anything after it`);
     // The store's lock was released: it opens again.
     const s = await HostStore.open(hostStore);
     await s.close();
@@ -290,16 +297,32 @@ test("the real ops: begin refuses while the supervisor's unit is active (or unsu
   // Inactive: begin goes on to choose the manifest over the binary, which isn't installed here: refused, nothing begun.
   const w = world();
   const fresh = join(w.base, "fresh-restore");
-  const ops = realRestoreOps({ release: "/nonexistent-release", run: async () => ({ code: 3 }), hostStore: join(w.base, "store"), enabled: () => ({ enabled: false, why: "not set up" }) });
+  const asked = [];
+  const ops = realRestoreOps({ release: "/nonexistent-release", run: async (argv) => { asked.push(argv); return { code: 3, stdout: "inactive\n" }; }, hostStore: join(w.base, "store"), enabled: () => ({ enabled: false, why: "not set up" }) });
   await rejects(ops.begin(hex("9"), { dir: fresh, exclusion: w.exclusion }), "not_granted"); // (the manifest can't be chosen)
   assert.equal(existsSync(join(fresh, BEGIN)), false, "nothing begun");
-  // backupEnabled's own answer, over a backup directory that isn't set up: not enabled, so begin goes on (as above).
+  assert.deepEqual(asked, [["systemctl", "is-active", "sagebrush-supervisor.service"]], "is-active, printing its state");
+  assert.ok(existsSync(join(w.base, "store", "registry")), "the control: with the locks free, begin opened the host store");
+  // The exclusion held (a backup or close): busy, and the loser does no I/O: no systemctl, no host store, no restore.
+  {
+    const x = world();
+    const store = join(x.base, "store-absent");
+    const calls = [];
+    const held = realRestoreOps({ release: "/nonexistent-release", run: async (argv) => { calls.push(argv); return { code: 3, stdout: "inactive\n" }; }, hostStore: store, enabled: () => { calls.push("enabled"); return { enabled: false }; } });
+    const { withExclusion } = await import("../lib/fleet/host/restore-begin.mjs");
+    await withExclusion(async () => { await rejects(held.begin(hex("9"), { dir: join(x.base, "fresh-restore"), exclusion: x.exclusion }), "in_progress"); }, x.exclusion);
+    assert.equal(existsSync(store), false, "the host store root stays absent");
+    assert.deepEqual(calls, [], "nothing run");
+    assert.equal(existsSync(join(x.base, "fresh-restore", BEGIN)), false);
+  }
+  // A failed unit is stopped too; and backupEnabled's own answer, over a backup directory that isn't set up: not enabled,
+  // so begin goes on (as above).
   const { backupEnabled } = await import("../lib/fleet/host/backup-scheduler.mjs");
-  const notSetUp = realRestoreOps({ release: "/nonexistent-release", run: async () => ({ code: 3 }), hostStore: join(w.base, "store"), enabled: () => backupEnabled({ dir: join(w.base, "no-backup") }) });
+  const notSetUp = realRestoreOps({ release: "/nonexistent-release", run: async () => ({ code: 3, stdout: "failed\n" }), hostStore: join(w.base, "store"), enabled: () => backupEnabled({ dir: join(w.base, "no-backup") }) });
   await rejects(notSetUp.begin(hex("9"), { dir: fresh, exclusion: w.exclusion }), "not_granted");
   // Enabled (or an answer that isn't a plain no): refused before anything else, nothing begun.
   for (const answer of [{ enabled: true }, {}, true]) {
-    const on = realRestoreOps({ release: "/nonexistent-release", run: async () => ({ code: 3 }), hostStore: join(w.base, "store"), enabled: () => answer });
+    const on = realRestoreOps({ release: "/nonexistent-release", run: async () => ({ code: 3, stdout: "inactive\n" }), hostStore: join(w.base, "store"), enabled: () => answer });
     await rejects(on.begin(hex("9"), { dir: fresh, exclusion: w.exclusion }), "in_progress");
     assert.equal(existsSync(join(fresh, BEGIN)), false, "nothing begun");
   }

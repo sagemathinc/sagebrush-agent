@@ -85,3 +85,19 @@ test("bounds: more entries or more bytes than an import takes refuse (limit)", (
   assert.equal(copyReader(c, { uid: UID, maxFiles: 3, maxBytes: 9 }).walk("audit").length, 3, "at the bounds");
   refused(() => copyReader(c, { uid: UID, maxBytes: 2 }).read("registry/registry.json"), "not_granted"); // (a file over the bound)
 });
+
+test("the root is pinned at the first open: a copy root replaced between calls (same owner and mode) refuses every later call", () => {
+  const c = copy();
+  const r = copyReader(c, { uid: UID });
+  assert.deepEqual(r.list(""), ["audit", "registry"]);
+  const other = copy();
+  renameSync(c, `${c}.old`);
+  renameSync(other, c);
+  refused(() => r.list(""), "not_granted");
+  refused(() => r.read("registry/registry.json"), "not_granted");
+  refused(() => r.walk(""), "not_granted");
+  // Put back, the pinned root reads again.
+  renameSync(c, other);
+  renameSync(`${c}.old`, c);
+  assert.equal(r.read("registry/registry.json").toString(), "{}\n");
+});

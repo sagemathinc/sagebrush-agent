@@ -30,6 +30,12 @@ test-loopback-http = []
 # Tests only: SB_TEST_PAUSE_MS pauses before the parent check, so a test can kill the parent first (parent.rs). Never in
 # a release build: backup-build.sh enables no feature, and CI checks the pinned build holds no trace of it.
 test-pause-before-start = []
+# Tests only: the `tree` op also reports the file-content bytes it read for the page (content_bytes_read), so a test can
+# show a resumed page reads no contents before its index. Never in a release build, like the features above.
+test-tree-counters = []
+# Tests only: SB_TEST_SANITIZED_GATE (a gate between the sources' canonicalization and the walk) and SB_TEST_NONSTRICT
+# (one non-strict, unmarked snapshot), for the strict-backup rows (ops.rs backup). Never in a release build, like the above.
+test-walk-hooks = []
 
 [profile.release]
 lto = true

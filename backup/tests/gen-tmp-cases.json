@@ -1,0 +1,133 @@
+{
+ "comment": "agent-config's leftover generation name, .gen-<n>.tmp: backup/src/ops.rs is_gen_tmp and lib/fleet/host/agent-config.mjs GEN_TMP must agree on every case.",
+ "cases": [
+  {
+   "name": ".gen-0.tmp",
+   "leftover": true
+  },
+  {
+   "name": ".gen-1.tmp",
+   "leftover": true
+  },
+  {
+   "name": ".gen-9.tmp",
+   "leftover": true
+  },
+  {
+   "name": ".gen-10.tmp",
+   "leftover": true
+  },
+  {
+   "name": ".gen-12345678.tmp",
+   "leftover": true
+  },
+  {
+   "name": ".gen-99999999.tmp",
+   "leftover": true
+  },
+  {
+   "name": ".gen-123456789.tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen-00.tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen-01.tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen-.tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen--1.tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen-+1.tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen-1a.tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen-a.tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen- 1.tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen-1 .tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen-1.tmp.tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen-1.tmpx",
+   "leftover": false
+  },
+  {
+   "name": "x.gen-1.tmp",
+   "leftover": false
+  },
+  {
+   "name": "gen-1.tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen-1",
+   "leftover": false
+  },
+  {
+   "name": ".gen-1.TMP",
+   "leftover": false
+  },
+  {
+   "name": ".GEN-1.tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen-1.tmp/",
+   "leftover": false
+  },
+  {
+   "name": ".gen-1\n.tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen-1.tmp\n",
+   "leftover": false
+  },
+  {
+   "name": "\n.gen-1.tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen-\u0661.tmp",
+   "leftover": false
+  },
+  {
+   "name": ".gen-\uff11.tmp",
+   "leftover": false
+  },
+  {
+   "name": "gen-1",
+   "leftover": false
+  },
+  {
+   "name": ".current.tmp",
+   "leftover": false
+  },
+  {
+   "name": "",
+   "leftover": false
+  }
+ ]
+}

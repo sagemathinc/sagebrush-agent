@@ -86,11 +86,14 @@ jobs:
       # binary's first check (the feature is never in a release build: see the no-trace check below).
       - run: cargo test --locked --manifest-path backup/Cargo.toml --features test-pause-before-start --test parent
       - run: scripts/fetch-test-s3.sh "$RUNNER_TEMP/weed"
-      - run: cargo test --locked --manifest-path backup/Cargo.toml --features test-loopback-http
+      - run: cargo test --locked --manifest-path backup/Cargo.toml --features test-loopback-http,test-tree-counters,test-walk-hooks
         env:
           SB_TEST_WEED: ${{ runner.temp }}/weed/bin/weed
           SB_TEST_REQUIRE_WEED: "1"
           SB_TEST_REQUIRE_NOPROC: "1"
+      # The hook check's positive control: a build WITH every test-only hook holds every name the script lists.
+      - run: cargo build --locked --manifest-path backup/Cargo.toml --features test-pause-before-start,test-walk-hooks
+      - run: scripts/backup-hook-trace.sh backup/target/debug/sagebrush-agent-backup present
       # The shipped build (init/run d3 §4.1): scripts/backup-build.sh, static musl, run from two different directories,
       # must produce byte-identical binaries, equal to the pin the root installer and the pinned runner accept
       # (lib/fleet/host/backup.sha256), and checked to name no dynamic loader (the launcher refuses one that does).
@@ -109,7 +112,8 @@ jobs:
       # the compilers that made it, as recorded in the binary (the pinned gcc, and Rust's own musl objects)
       - run: readelf -p .comment "$RUNNER_TEMP/backup-1" | grep -F "13.3.0-6ubuntu2~24.04.1"
       # the pinned build holds no trace of the test-only pause (its environment variable is named only in that code)
-      - run: "! grep -aq SB_TEST_PAUSE_MS \"$RUNNER_TEMP/backup-1\""
+      # (the strict-backup rows' hooks too; the hook names are listed once, in the script)
+      - run: scripts/backup-hook-trace.sh "$RUNNER_TEMP/backup-1" absent
 
   # The launcher (launcher/, sagebrush-agent-launch, root-run and security-critical): its unit and CLI tests, then
   # the shipped release build. Its Landlock rows need the kernel's ABI 4; SB_TEST_REQUIRE_LANDLOCK makes a runner

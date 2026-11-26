@@ -1,5 +1,5 @@
-//! The operations: init, add-key, backup, readback, check-data, snapshots, dump, restore, forget, prune and
-//! usage. The host supervisor decides when; this binary only does each one exactly, and refuses what the design
+//! The operations: init, add-key, backup, readback, check-data, snapshots, dump, restore, forget, prune, usage and
+//! tree. The host supervisor decides when; this binary only does each one exactly, and refuses what the design
 //! forbids: it never initializes a repository except on `init`, never skips the ctime or inode comparison, and never
 //! restores with CAP_SYS_RESOURCE.
 
@@ -18,6 +18,7 @@ use rustic_core::{
     SparseRestore,
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
 
 use crate::{
@@ -78,6 +79,12 @@ pub enum Request {
         snapshot: String,
         #[serde(default)]
         path: Option<String>,
+    },
+    Tree {
+        snapshot: String,
+        path: String,
+        #[serde(default)]
+        cursor: Option<String>,
     },
 }
 
@@ -147,6 +154,7 @@ pub fn run(ctx: &Ctx, req: Request) -> Result<Value> {
         Request::Forget { snapshots } => forget(ctx, &snapshots),
         Request::Prune {} => prune(ctx),
         Request::Usage { snapshot, path } => usage(ctx, &snapshot, path.as_deref()),
+        Request::Tree { snapshot, path, cursor } => tree(ctx, &snapshot, &path, cursor.as_deref()),
     }
 }
 
@@ -171,8 +179,16 @@ fn add_key(ctx: &Ctx, path: &Path) -> Result<Value> {
 }
 
 /// A tag is `name=value` of [A-Za-z0-9._:-] (no comma: rustic splits tag lists on commas).
+/// The tag this binary adds to every snapshot it makes, all of them strict (config tree d2r8): any error while walking
+/// a source fails the backup with no snapshot, so a source in a marked snapshot's `paths` but absent from its tree was
+/// empty. Never a caller's: a request tag starting `sagebrush.walk=` is refused.
+pub(crate) const STRICT_MARK: &str = "sagebrush.walk=strict";
+/// A request's tags, at most: the mark makes one more, and a snapshot carries at most 64.
+const MAX_TAGS: usize = 63;
+
 fn check_tag(t: &str) -> Result<()> {
-    let ok = !t.is_empty() && t.len() <= 128 && t.contains('=') && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:=-".contains(&b));
+    let ok = !t.is_empty() && t.len() <= 128 && t.contains('=') && !t.starts_with("sagebrush.walk=")
+        && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:=-".contains(&b));
     if ok {
         Ok(())
     } else {
@@ -187,8 +203,21 @@ fn backup(ctx: &Ctx, sources: &[PathBuf], host: &str, tags: &[String], parent: O
     if host.is_empty() || host.len() > 64 || !host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
         return Err(Fail::new("request_invalid", "host must be 1-64 of [A-Za-z0-9-]"));
     }
+    if tags.len() > MAX_TAGS {
+        return Err(Fail::new("request_invalid", "at most 63 tags"));
+    }
     for t in tags {
         check_tag(t)?;
+    }
+    // Tests only (never in a release build: backup-build.sh enables no feature, and CI checks the pinned build holds no
+    // trace of these names): one non-strict, unmarked snapshot, for the rows that show such a snapshot proves nothing.
+    #[cfg(feature = "test-walk-hooks")]
+    let strict = std::env::var("SB_TEST_NONSTRICT").as_deref() != Ok("1");
+    #[cfg(not(feature = "test-walk-hooks"))]
+    let strict = true;
+    let mut tags = tags.to_vec();
+    if strict {
+        tags.push(STRICT_MARK.to_string());
     }
     if let Some(p) = parent {
         check_id(p)?;
@@ -210,10 +239,24 @@ fn backup(ctx: &Ctx, sources: &[PathBuf], host: &str, tags: &[String], parent: O
     let mut ex = Excludes::default();
     ex.globs = excludes.iter().map(|g| format!("!{g}")).collect();
     let mut opts = BackupOptions::default();
+    // Strict, always (d2r8): any error from the source walk, the size scan or a file's processing fails the backup
+    // before its snapshot is written (rustic_core archiver.rs), so a source is never silently left out.
+    opts.strict = strict;
     opts.parent_opts = parent_opts;
     opts.ignore_filter_opts = filter;
     opts.excludes = ex;
     let source = sources.iter().cloned().collect::<PathList>().sanitize().map_err(|e| Fail::new("request_invalid", e.to_string()))?;
+    // Tests only, like the above: a gate between the sources' canonicalization and the walk, so a row can change a
+    // source there deterministically (`<dir>/ready` written, then at most 60 s for `<dir>/go`).
+    #[cfg(feature = "test-walk-hooks")]
+    if let Ok(dir) = std::env::var("SB_TEST_SANITIZED_GATE") {
+        let dir = PathBuf::from(dir);
+        let _ = fs::write(dir.join("ready"), b"");
+        let t0 = std::time::Instant::now();
+        while !dir.join("go").exists() && t0.elapsed() < std::time::Duration::from_secs(60) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
     let made = repo.backup(&opts, &source, snap).map_err(lib("backup_failed"))?;
     Ok(json!({ "snapshot": snapshot_json(&made), "cache_full": logcap::cache_full() }))
 }
@@ -428,6 +471,177 @@ fn usage(ctx: &Ctx, snapshot: &str, path: Option<&str>) -> Result<Value> {
     }))
 }
 
+/// Bounds of one `tree` page (config tree design d2r1 §0.3): a page ends before the entry that would pass any of them,
+/// and always holds at least one entry, so every page stays far under the host runner's output cap.
+const TREE_PAGE_ENTRIES: usize = 2048;
+const TREE_PAGE_BYTES: usize = 4 * 1024 * 1024;
+const TREE_PAGE_HASH_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Is `name` agent-config's leftover generation, `.gen-<n>.tmp` (n canonical decimal, at most 8 digits)? The same rule
+/// as agent-config.mjs GEN_TMP (`^\.gen-(0|[1-9][0-9]{0,7})\.tmp$`); a census row keeps the two equal.
+fn is_gen_tmp(name: &str) -> bool {
+    let Some(n) = name.strip_prefix(".gen-").and_then(|r| r.strip_suffix(".tmp")) else { return false };
+    n == "0" || (!n.is_empty() && n.len() <= 8 && !n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A stored mode (Go's encoding, as the archiver saves it) as the POSIX permission and special bits the restore sets:
+/// the low 9 bits, and setuid, setgid and sticky from Go's high bits (never dropped, so a setuid file is never 0600).
+fn posix_mode(go: u32) -> u32 {
+    let mut m = go & 0o777;
+    if go & (1 << 23) != 0 { m |= 0o4000; }
+    if go & (1 << 22) != 0 { m |= 0o2000; }
+    if go & (1 << 20) != 0 { m |= 0o1000; }
+    m
+}
+
+/// The requested path isn't in the snapshot (d2r7): structural, and distinct, because an EMPTY source is never stored
+/// (the archiver keeps no node for it), which a strict snapshot naming the source in its `paths` proves (d2r8).
+fn absent() -> Fail {
+    Fail::new("tree_absent", "tree: the path isn't in the snapshot")
+}
+
+/// A structural answer about this snapshot and request (design d2r5 E2): the backup run reads it as "not provable".
+fn refused(why: &str) -> Fail {
+    Fail::new("tree_refused", why)
+}
+
+/// `tree`: the BACKUP RUN'S CONFIG PROOF's listing of a saved subtree (config tree design d2r1, d2r2, d2r5), one page at
+/// a time. It is that proof's op, not a general listing: it never descends into a DIRECT child of `path` named
+/// `.gen-<n>.tmp`, because the restore's reader of agent-config never reads inside one (it emits that node only).
+/// - The walk: `path`'s own node first (index 0, path ""), then depth first, each directory's nodes in stored order.
+///   Stored metadata only; a regular file's contents are read (and hashed) only for the entries of the page served,
+///   never for the entries skipped to reach a cursor's index (N1: hashing over a whole tree is linear).
+/// - The cursor: `<snapshot id>:<sha256(path) hex>:<index>`, refused (`tree_refused`) for another snapshot or path.
+/// - `tree_failed`: a read failure while serving (transient). `tree_absent`: the path isn't in the snapshot (d2r7).
+///   `tree_refused`: a non-UTF-8 name in a walked part, a foreign or malformed cursor, an index past the end.
+fn tree(ctx: &Ctx, snapshot: &str, path: &str, cursor: Option<&str>) -> Result<Value> {
+    if path.is_empty() || path.starts_with('/') || path.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
+        return Err(Fail::new("request_invalid", "tree: the path must be relative and normalized"));
+    }
+    let repo = ctx.open(false)?;
+    let snap = one_snapshot(&repo, snapshot)?;
+    let snap_id = full(*snap.id);
+    let digest = crate::digests::hex(&Sha256::digest(path.as_bytes()));
+    let start: u64 = match cursor {
+        None => 0,
+        Some(c) => {
+            let parts: Vec<&str> = c.split(':').collect();
+            let canonical = |i: &str| !i.is_empty() && i.len() <= 19 && (i == "0" || !i.starts_with('0')) && i.bytes().all(|b| b.is_ascii_digit());
+            if parts.len() != 3 || parts[0] != snap_id || parts[1] != digest || !canonical(parts[2]) {
+                return Err(refused("tree: the cursor isn't this snapshot's and path's"));
+            }
+            parts[2].parse().map_err(|_| refused("tree: a malformed cursor"))?
+        }
+    };
+    let repo = repo.to_indexed().map_err(lib("index_failed"))?;
+    // The path, resolved component by component: a component missing from a tree that WAS read is structural; a
+    // tree that can't be read is a read failure.
+    let mut node: Option<Node> = None;
+    let mut subtree = Some(snap.tree);
+    for comp in path.split('/') {
+        let id = subtree.ok_or_else(absent)?;
+        let t = repo.get_tree(&id).map_err(lib("tree_failed"))?;
+        let found = t.nodes.into_iter().find(|n| n.name().as_bytes() == comp.as_bytes()).ok_or_else(absent)?;
+        subtree = found.subtree;
+        node = Some(found);
+    }
+    let root = node.ok_or_else(absent)?;
+
+    // The walk: (relative path, depth, node), depth first. A stack of (a directory's relative path, its children's
+    // depth, its remaining nodes). The requested path's own node is depth 0; its direct children are depth 1.
+    let mut stack: Vec<(String, usize, std::vec::IntoIter<Node>)> = Vec::new();
+    let mut cur: Option<(String, usize, Node)> = Some((String::new(), 0, root));
+    let mut index: u64 = 0;
+    let mut entries: Vec<Value> = Vec::new();
+    let (mut page_bytes, mut page_hash) = (0usize, 0u64);
+    let mut next: Option<u64> = None;
+    #[cfg(feature = "test-tree-counters")]
+    let mut content_bytes_read: u64 = 0;
+    while let Some((rel, depth, n)) = cur.take() {
+        let this = index;
+        index += 1;
+        if this >= start {
+            let is_file = matches!(n.node_type, NodeType::File);
+            if entries.len() >= TREE_PAGE_ENTRIES || (is_file && !entries.is_empty() && page_hash + n.meta.size > TREE_PAGE_HASH_BYTES) {
+                next = Some(this);
+                break;
+            }
+            let sha = if is_file {
+                let mut h = HashWriter(Sha256::new(), 0);
+                repo.dump(&n, &mut h).map_err(lib("tree_failed"))?;
+                // The restore writes the contents, so the listed size is theirs: a stored size that differs is refused.
+                if h.1 != n.meta.size {
+                    return Err(refused("tree: a file's contents aren't its stored size"));
+                }
+                page_hash += h.1;
+                #[cfg(feature = "test-tree-counters")]
+                {
+                    content_bytes_read += h.1;
+                }
+                Value::String(crate::digests::hex(&h.0.finalize()))
+            } else {
+                Value::Null
+            };
+            let kind = match n.node_type { NodeType::Dir => "dir", NodeType::File => "file", NodeType::Symlink { .. } => "symlink", _ => "other" };
+            let entry = json!({
+                "index": this, "path": rel, "type": kind, "mode": n.meta.mode.map(posix_mode), "uid": n.meta.uid, "gid": n.meta.gid,
+                "nlink": if n.meta.links == 0 { Value::Null } else { json!(n.meta.links) }, "size": n.meta.size, "sha256": sha,
+            });
+            let len = entry.to_string().len() + 1;
+            if !entries.is_empty() && page_bytes + len > TREE_PAGE_BYTES {
+                next = Some(this);
+                break;
+            }
+            page_bytes += len;
+            entries.push(entry);
+        }
+        // Descend (metadata only), never into a direct child `.gen-<n>.tmp` of the requested path.
+        let leftover = depth == 1 && is_gen_tmp(rel.rsplit('/').next().unwrap_or(""));
+        if n.is_dir() && !leftover {
+            if let Some(id) = n.subtree {
+                let t = repo.get_tree(&id).map_err(lib("tree_failed"))?;
+                stack.push((rel.clone(), depth + 1, t.nodes.into_iter()));
+            }
+        }
+        // The next entry in walk order.
+        cur = loop {
+            let Some((prefix, d, it)) = stack.last_mut() else { break None };
+            match it.next() {
+                Some(child) => {
+                    let name = child.name();
+                    let name = name.to_str().ok_or_else(|| refused("tree: a name isn't UTF-8"))?;
+                    let rel = if prefix.is_empty() { name.to_string() } else { format!("{prefix}/{name}") };
+                    break Some((rel, *d, child));
+                }
+                None => {
+                    stack.pop();
+                }
+            }
+        };
+    }
+    if start > 0 && start >= index && entries.is_empty() {
+        return Err(refused("tree: the cursor's index is past the end"));
+    }
+    let next = next.map(|i| format!("{snap_id}:{digest}:{i}"));
+    #[cfg(feature = "test-tree-counters")]
+    return Ok(json!({ "entries": entries, "next": next, "content_bytes_read": content_bytes_read }));
+    #[cfg(not(feature = "test-tree-counters"))]
+    Ok(json!({ "entries": entries, "next": next }))
+}
+
+/// A `Write` that only hashes and counts (a file's contents, read through the repository).
+struct HashWriter(Sha256, u64);
+impl std::io::Write for HashWriter {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.update(b);
+        self.1 += b.len() as u64;
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// ext4's block size here (the quota filesystem is made with 4 KiB blocks).
 const BLOCK: u64 = 4096;
 /// The longest initialized ext4 extent, in blocks (128 MiB of 4 KiB blocks).
@@ -559,7 +773,7 @@ mod tests {
     fn tags() {
         assert!(check_tag("sb-state=good").is_ok());
         assert!(check_tag("agent=abc123").is_ok());
-        for bad in ["", "nokey", "a=b,c=d", "a=b c", "a=b\n"] {
+        for bad in ["", "nokey", "a=b,c=d", "a=b c", "a=b\n", STRICT_MARK, "sagebrush.walk=lax", "sagebrush.walk="] {
             assert!(check_tag(bad).is_err(), "{bad:?}");
         }
     }
@@ -743,4 +957,24 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
 
+    #[test]
+    fn the_leftover_name_is_agent_configs() {
+        // The census shared with agent-config.mjs's GEN_TMP (a JS row reads the same table).
+        let t: Value = serde_json::from_str(include_str!("../tests/gen-tmp-cases.json")).unwrap();
+        let cases = t["cases"].as_array().unwrap();
+        assert!(cases.len() >= 30);
+        for c in cases {
+            let name = c["name"].as_str().unwrap();
+            assert_eq!(is_gen_tmp(name), c["leftover"].as_bool().unwrap(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_stored_mode_keeps_its_special_bits() {
+        assert_eq!(posix_mode(0o600), 0o600);
+        assert_eq!(posix_mode((1 << 31) | 0o755), 0o755, "the type bits aren't permissions");
+        assert_eq!(posix_mode((1 << 23) | 0o600), 0o4600);
+        assert_eq!(posix_mode((1 << 22) | 0o700), 0o2700);
+        assert_eq!(posix_mode((1 << 31) | (1 << 20) | 0o700), 0o1700);
+    }
 }

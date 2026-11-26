@@ -1960,6 +1960,34 @@ test("restore-import: the host's op only, with an imports seam; owned under its 
   await late.close();
 });
 
+test("the restore tick is coalesced: a held import and ten more ticks queue no duplicate; a later normal input waits for at most one of each", async () => {
+  const { restoreTicker } = await import("../lib/fleet/host/restore-wiring.mjs");
+  const order = [];
+  let release, imports = 0, dispatches = 0;
+  const restoreWorker = { hold: async () => ({ release: async () => {}, invalidate: () => {} }),
+    dispatch: async () => { dispatches++; order.push("dispatch"); return { dispatched: null, why: "idle" }; },
+    imports: async () => { imports++; order.push("import"); if (imports === 1) await new Promise((r) => { release = r; }); return { sets: {} }; } };
+  const { sup, close } = await setup({ restoreWorker });
+  const tick = restoreTicker((x) => sup.submit(x));
+  tick();
+  for (let i = 0; i < 50 && release === undefined; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.ok(release, "the first import is running, held");
+  for (let i = 0; i < 10; i++) { tick(); await new Promise((r) => setImmediate(r)); }
+  const later = sup.submit({ kind: "resume-all", authority: "person" }).then((x) => { order.push("later"); return x; });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual([dispatches, imports], [1, 1], "ten ticks during the held import ran nothing more");
+  release();
+  await later;
+  // (the first dispatch settled at once, so ONE more was queued behind the held import; no second import was)
+  assert.deepEqual(order, ["dispatch", "import", "dispatch", "later"], "the later input waited for at most one of each");
+  // Once both settled, the next tick submits each again, once.
+  tick();
+  for (let i = 0; i < 50 && imports < 2; i++) await new Promise((r) => setTimeout(r, 5));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual([dispatches, imports], [3, 2]);
+  await close();
+});
+
 /**
  * An open restore on a real temporary directory whose plan has `keys` (each with its request), and the executor's
  * restore seam over it with REAL set locks (holdSets). `probe(kind, id)` asks whether a worker could take a set now:

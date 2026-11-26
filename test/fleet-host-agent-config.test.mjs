@@ -4,7 +4,8 @@
 // their crash points and substitutes. Real temporary trees, owned by the test's uid in place of root.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -232,5 +233,50 @@ test("setCurrent's crash points (after the write, after its fsync, after the ren
     setCurrent(t.root, "2", O);
     const r = readConfigTree(t.root, O);
     assert.deepEqual([r.current, r.leftovers.current], ["2", false], point);
+  }
+});
+
+test("a substitute root never takes a write: swapped before the open, the recorded identity refuses with nothing written; swapped after it, every write goes through the one handle to the recorded tree", () => {
+  const idOf = (p) => {
+    const st = statSync(p);
+    const major = Number((BigInt(st.dev) >> 8n) & 0xfffn) | Number((BigInt(st.dev) >> 32n) & ~0xfffn);
+    const minor = Number(BigInt(st.dev) & 0xffn) | Number((BigInt(st.dev) >> 12n) & ~0xffn);
+    return { dev: [major, minor], ino: st.ino };
+  };
+  for (const writer of ["generation", "current"]) {
+    for (const when of ["before-open", "after-open"]) {
+      const t = tree();
+      const src = join(t.base, "src");
+      mkdirSync(src, { mode: 0o700 }); chmodSync(src, 0o700);
+      writeGen(join(src, "gen-1"), GEN);
+      const other = join(t.base, "other");
+      mkdirSync(other, { mode: 0o700 }); chmodSync(other, 0o700);
+      if (writer === "current") { writeGen(join(t.root, "gen-1"), GEN); writeGen(join(other, "gen-1"), GEN); }
+      const identity = idOf(t.root);
+      const moved = join(t.base, "original");
+      let swapped = false;
+      const swap = () => { if (!swapped) { swapped = true; renameSync(t.root, moved); renameSync(other, t.root); } };
+      const fsx = when === "before-open"
+        // (between the root's lstat and its open: the handle is the substitute's)
+        ? { ...fs, openSync: (p, ...a) => { if (p === t.root) swap(); return fs.openSync(p, ...a); } }
+        // (just after the root is opened: the handle is the recorded tree's, the path now the substitute's)
+        : { ...fs, openSync: (p, ...a) => { const fd = fs.openSync(p, ...a); if (p === t.root) swap(); return fd; } };
+      let err = null;
+      try {
+        if (writer === "generation") importGeneration(t.root, "1", join(src, "gen-1"), { ...O, identity, fsx });
+        else setCurrent(t.root, "1", { ...O, identity, fsx });
+      } catch (e) { err = e; }
+      const label = `${writer} ${when}`;
+      assert.ok(swapped, `${label}: the swap happened`);
+      const sub = readdirSync(t.root).sort(), orig = readdirSync(moved).sort();
+      if (when === "before-open") {
+        assert.ok(err instanceof FleetError && err.code === "not_granted", `${label}: refused`);
+        assert.deepEqual([sub, orig], writer === "generation" ? [[], []] : [["gen-1"], ["gen-1"]], `${label}: nothing written anywhere`);
+      } else {
+        assert.equal(err, null, `${label}: the recorded tree written`);
+        assert.deepEqual(sub, writer === "generation" ? [] : ["gen-1"], `${label}: the substitute untouched`);
+        assert.deepEqual(orig, writer === "generation" ? ["gen-1"] : ["current", "gen-1"], `${label}: written through the handle`);
+      }
+    }
   }
 });

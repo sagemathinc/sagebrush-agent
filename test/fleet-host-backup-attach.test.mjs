@@ -548,3 +548,81 @@ test("each effect checks the lock first: lost right after the previous effect, n
     assertAttached(w);
   }
 });
+
+/** Kill the flock child holding `path` and wait (synchronously) until it is dead: for a loss inside a synchronous step. */
+function killHolderNow(path) {
+  const pids = [];
+  for (const pid of readdirSync("/proc").filter((p) => /^[0-9]+$/.test(p))) {
+    let cmd;
+    try { cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0"); } catch { continue; }
+    if (cmd[0].endsWith("flock") && cmd.includes(path)) { process.kill(Number(pid), "SIGKILL"); pids.push(pid); }
+  }
+  assert.ok(pids.length > 0, `a holder of ${path} was found`);
+  const dead = (pid) => { try { const s = readFileSync(`/proc/${pid}/stat`, "utf8"); return /\) [ZX] /.test(s); } catch { return true; } };
+  const until = Date.now() + 5000;
+  while (!pids.every(dead)) if (Date.now() > until) assert.fail("the holder didn't die");
+}
+
+// The exclusion lost INSIDE each admission (answering "not enabled" / "no restore"): outcome_unknown, no binary call,
+// and nothing created: no backup directory, state or secrets.
+for (const inside of ["enabled", "restoreOpen"]) {
+  test(`the exclusion lost inside ${inside}: outcome_unknown, nothing inspected or created`, async () => {
+    const w = world();
+    fs.rmdirSync(join(w.base, "backup")); // (a fresh host: backup's own directory doesn't exist yet)
+    const exclusion = { path: join(w.base, "attach.lock"), uid: UID, waitMs: 0 };
+    const calls = [];
+    const deps = { ...w.deps,
+      enabled: () => { calls.push("enabled"); if (inside === "enabled") killHolderNow(exclusion.path); return false; },
+      restoreOpen: () => { calls.push("restoreOpen"); if (inside === "restoreOpen") killHolderNow(exclusion.path); return false; } };
+    const out = await backupAttachCommand(["attach"], { uid: () => UID, rootUid: UID, state: w.state, secrets: w.secrets, rand,
+      stdin: async () => Buffer.from(JSON.stringify(input())), exclusion, ...deps });
+    assert.deepEqual(out, { code: 1, line: { v: 1, refused: "outcome_unknown" } });
+    assert.deepEqual(calls, inside === "enabled" ? ["enabled"] : ["enabled", "restoreOpen"], "nothing after the admission");
+    assert.deepEqual(w.repo.calls, []);
+    for (const p of [join(w.base, "backup"), w.state, w.secrets]) assert.equal(existsSync(p), false, `${p} not created`);
+  });
+}
+
+test("the lock checked on entry and around each directory's creation: lost on entry, nothing runs; lost after a mkdir, no chmod and no further directory", async () => {
+  const lost = () => { throw new FleetError("outcome_unknown", "lost"); };
+  // On entry: no admission is even asked.
+  {
+    const w = world();
+    const calls = [];
+    const deps = { ...w.deps, enabled: () => { calls.push("enabled"); return false; } };
+    await rejects(attach(input(), deps, w.opts({ guard: lost })), "outcome_unknown");
+    assert.deepEqual(calls, []);
+  }
+  // Lost right after backup's own directory is made (before its chmod), and after its chmod (before state's mkdir).
+  for (const after of ["mkdir", "chmod"]) {
+    const w = world();
+    fs.rmdirSync(join(w.base, "backup"));
+    let isLost = false;
+    const ops = [];
+    const fsx = { ...fs,
+      mkdirSync: (p, o) => { fs.mkdirSync(p, o); ops.push(["mkdir", p]); if (after === "mkdir") isLost = true; },
+      chmodSync: (p, m) => { fs.chmodSync(p, m); ops.push(["chmod", p]); if (after === "chmod") isLost = true; } };
+    const guard = () => { if (isLost) throw new FleetError("outcome_unknown", "lost"); };
+    await rejects(attach(input(), w.deps, w.opts({ guard, fsx })), "outcome_unknown");
+    const parent = join(w.base, "backup");
+    assert.deepEqual(ops, after === "mkdir" ? [["mkdir", parent]] : [["mkdir", parent], ["chmod", parent]], `lost after ${after}`);
+    assert.equal(existsSync(w.state), false);
+    assert.equal(existsSync(w.secrets), false);
+  }
+});
+
+for (const inside of ["enabled", "restoreOpen"]) {
+  test(`the exclusion lost inside ${inside}, the directories present: outcome_unknown before any state is read (a malformed journal isn't reached)`, async () => {
+    const w = world();
+    for (const d of [w.state, w.secrets]) { mkdirSync(d, { mode: 0o700 }); chmodSync(d, 0o700); }
+    writeFileSync(join(w.state, JOURNAL), "{", { mode: 0o600 });
+    const exclusion = { path: join(w.base, "attach.lock"), uid: UID, waitMs: 0 };
+    const deps = { ...w.deps,
+      enabled: () => { if (inside === "enabled") killHolderNow(exclusion.path); return false; },
+      restoreOpen: () => { if (inside === "restoreOpen") killHolderNow(exclusion.path); return false; } };
+    const out = await backupAttachCommand(["attach"], { uid: () => UID, rootUid: UID, state: w.state, secrets: w.secrets, rand,
+      stdin: async () => Buffer.from(JSON.stringify(input())), exclusion, ...deps });
+    assert.deepEqual(out, { code: 1, line: { v: 1, refused: "outcome_unknown" } });
+    assert.deepEqual(w.repo.calls, []);
+  });
+}

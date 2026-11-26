@@ -351,6 +351,20 @@ test("H1: an already-abandoned set is a finish success only with its audit pair 
     const out = await finishOnce(() => model(x.w, x.r0).deps, opts(x.w));
     assert.equal(out.sets[`archive-${x.w.d}`]?.status, "corrupt", `${what}: reported by the tick, never skipped`);
   }
+  // The intent missing (the attestation intact), and the whole abandon directory missing: the tick reports corrupt and
+  // still finishes another set.
+  for (const what of ["the intent deleted", "the abandon directory removed"]) {
+    const x = await finished();
+    writeRecord(reach("tag", x.w.t, "failed"), { dir: x.w.dir });
+    if (what === "the intent deleted") {
+      rmSync(x.iPath);
+      writeIntent(x.w, "tag", x.w.t);
+    } else rmSync(join(x.w.dir, ABANDON), { recursive: true });
+    const out = await finishOnce((kind, id) => model(x.w, reach(kind, id, "failed")).deps, opts(x.w));
+    assert.deepEqual(out.sets[`archive-${x.w.d}`], { status: "corrupt", reason: "not_granted" }, what);
+    if (what === "the intent deleted") assert.deepEqual(out.sets[`tag-${x.w.t}`], { status: "abandoned" }, "another set still finished");
+    await rejects(finishAbandon("archive", x.w.d, model(x.w, x.r0).deps, opts(x.w)), "not_found");
+  }
   // A complete pair: the finish is a success, the tick lists nothing.
   const ok = await finished();
   assert.deepEqual(await finishAbandon("archive", ok.w.d, model(ok.w, ok.r0).deps, opts(ok.w)), { status: "abandoned" });

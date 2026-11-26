@@ -952,7 +952,7 @@ fn tree_lists_a_saved_tree() {
     // The structural refusals.
     let tree = |path: &str, cursor: Value| run(&h, json!({ "op": "tree", "snapshot": snap, "path": path, "cursor": cursor }));
     assert_eq!(code(&tree("no/such/path", Value::Null)), "tree_absent", "a path not in the snapshot: its own code (d2r7)");
-    assert_eq!(code(&tree(&format!("{path}/f644/below"), Value::Null)), "tree_absent", "a component beneath a file");
+    assert_eq!(code(&tree(&format!("{path}/f644/below"), Value::Null)), "tree_refused", "a component beneath a file: structural, never absent");
     let digest = sha2_hex(path.as_bytes());
     assert_eq!(code(&tree(&path, json!(format!("{snap}:{digest}:99")))), "tree_refused", "an index past the end");
     assert_eq!(code(&tree(&path, json!(format!("{}:{digest}:1", "0".repeat(64))))), "tree_refused", "another snapshot");
@@ -1106,7 +1106,11 @@ fn tree_proof_matches_the_restore() {
         let r = run(&h, json!({ "op": "restore", "snapshot": snap, "path": rel, "dest": restored, "digests": data.join("digests.json") }));
         let first: Value = serde_json::from_str(pages["null"].as_str().unwrap()).unwrap();
         if code(&first) == "tree_absent" {
-            assert_eq!(code(&r), "restore_failed", "{tag}: the binary can't restore an absent path: {r}");
+            // An empty source (restore empty-source d1): from a strict snapshot naming it, nothing written and the empty
+            // list; from any other, restore_absent. Either way the stage's directory stays as it is.
+            let strict = record["tags"].as_array().unwrap().contains(&json!("sagebrush.walk=strict"));
+            if strict { assert_eq!(r["ok"], true, "{tag}: {r}") } else { assert_eq!(code(&r), "restore_absent", "{tag}: {r}") }
+            assert_eq!(fs::read_dir(&restored).unwrap().count(), 0, "{tag}: nothing written");
         } else {
             assert_eq!(r["ok"], true, "{tag}: {r}");
         }
@@ -1370,4 +1374,82 @@ fn a_parent_never_hides_a_rewrite() {
     let r = run(&h, json!({ "op": "restore", "snapshot": snapshot_id(&b), "path": rel, "dest": dest, "digests": data.join("digests.json") }));
     assert_eq!(r["ok"], true, "{r}");
     assert_eq!(fs::read(dest.join("f")).unwrap(), b"new content\n");
+}
+
+/// Restore of an empty source (restore empty-source d1, with SEC S1/S2 and TESTS T1/T2): an empty source isn't stored,
+/// so the binary restores it as nothing written into the stage's own fresh directory (mode untouched) and the empty
+/// digest list, ONLY from a strict snapshot (the binary's mark) whose `paths` names exactly that source. Anything
+/// else absent is `restore_absent`; an ancestor that isn't a directory too; a tree that can't be read stays
+/// `restore_failed`.
+#[test]
+fn restore_an_empty_source() {
+    let Some(bin) = weed() else { return };
+    let w = start_weed(&bin);
+    let h = host(&w, "restore-empty");
+    assert_eq!(run(&h, json!({ "op": "init" }))["ok"], true);
+    let set = |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+    let rel = |p: &Path| p.to_str().unwrap()[1..].to_string();
+    let base = tmpdir("re-src");
+    let empty = base.join("cfg");
+    fs::create_dir(&empty).unwrap();
+    let full = base.join("home");
+    fs::create_dir(&full).unwrap();
+    fs::write(full.join("notes"), b"n").unwrap();
+    let file = base.join("solo");
+    fs::write(&file, b"f").unwrap();
+    // The restore as the launcher's stage requests it: into its own fresh, empty 0700 directory.
+    let restore = |snap: &str, path: &str, tag: &str| -> (Value, PathBuf, PathBuf) {
+        let (data, _) = staged(tag);
+        let dest = data.join("d");
+        fs::create_dir(&dest).unwrap();
+        set(&dest, 0o700);
+        let dig = data.join("digests.json");
+        (run(&h, json!({ "op": "restore", "snapshot": snap, "path": path, "dest": dest, "digests": dig })), dest, dig)
+    };
+    let b = run(&h, json!({ "op": "backup", "sources": [empty, full, file], "host": "h1" }));
+    assert_eq!(b["ok"], true, "{b}");
+    let snap = snapshot_id(&b);
+
+    // Marked, and `paths` names it exactly: ok, nothing written, the directory still 0700, the empty digest list.
+    let (r, dest, dig) = restore(&snap, &rel(&empty), "re-empty");
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["skipped_special"], 0);
+    assert_eq!(fs::read_dir(&dest).unwrap().count(), 0, "nothing written");
+    assert_eq!(fs::symlink_metadata(&dest).unwrap().permissions().mode() & 0o7777, 0o700, "the stage's mode untouched");
+    let bytes = fs::read(&dig).unwrap();
+    assert_eq!(bytes, b"{\"v\":1}\n{\"count\":0,\"total_bytes\":0}\n");
+    assert_eq!(r["digests_sha256"], sha2_hex(&bytes), "bound to the list");
+    // T1: a descendant of the empty source, its name with a suffix, a sibling that never existed: each absent and
+    // named by no `paths` entry, so restore_absent (a prefix match would wrongly read them as empty).
+    for (what, p) in [("a descendant", format!("{}/child", rel(&empty))), ("a suffix", format!("{}x", rel(&empty))), ("a sibling", rel(&base.join("never")))] {
+        let (r, dest, dig) = restore(&snap, &p, &format!("re-{}", what.replace(' ', "-")));
+        assert_eq!(code(&r), "restore_absent", "{what}: {r}");
+        assert_eq!(fs::read_dir(&dest).unwrap().count(), 0, "{what}: nothing written");
+        assert!(!dig.exists(), "{what}: no digest list");
+    }
+    // S1: an ancestor that's a file: structural, never the empty success.
+    let (r, _, _) = restore(&snap, &format!("{}/below", rel(&file)), "re-file");
+    assert_eq!(code(&r), "restore_absent", "{r}");
+    // A present source is restored as before.
+    let (r, dest, _) = restore(&snap, &rel(&full), "re-full");
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(fs::read(dest.join("notes")).unwrap(), b"n");
+    // The same empty source from a non-strict snapshot (the test-only hook): nothing proves it was empty.
+    let lax = run_env(&h, json!({ "op": "backup", "sources": [empty, full], "host": "h1" }), &[("SB_TEST_NONSTRICT", "1")]);
+    assert_eq!(lax["ok"], true, "{lax}");
+    let (r, dest, _) = restore(&snapshot_id(&lax), &rel(&empty), "re-lax");
+    assert_eq!(code(&r), "restore_absent", "{r}");
+    assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
+    // T2: a marked snapshot naming the path, its trees unreadable (every pack gone, the cache emptied): restore_failed,
+    // never the empty success.
+    for pack in pack_entries(&w, &h.prefix) {
+        assert_eq!(http_status(w.filer, "DELETE", &format!("/buckets/qual/{}/data/{}/{}", h.prefix, &pack[..2], pack)), Some(204));
+    }
+    for e in fs::read_dir(&h.cache).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() { fs::remove_dir_all(&p).unwrap() } else { fs::remove_file(&p).unwrap() }
+    }
+    let (r, dest, _) = restore(&snap, &rel(&empty), "re-lost");
+    assert_eq!(code(&r), "restore_failed", "{r}");
+    assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
 }

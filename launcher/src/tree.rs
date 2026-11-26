@@ -48,6 +48,8 @@ pub const TAGS: &str = "/srv/sagebrush/tags";
 /// The live agents' parent: only `--contents` reaches into it (an agent's `home` or `sessions`, §5a).
 pub const AGENTS: &str = "/srv/sagebrush/agents";
 const ARCHIVE: &str = "/srv/sagebrush/archive";
+/// A deleted agent's config archive (A2 r3.13): `--contents` empties a restore destination there, and keeps it.
+const ARCHIVE_CONFIG: &str = "/srv/sagebrush/archive-config";
 
 /// Whether `name` is `<id><suffix>` for the anchor's suffix; beneath A2's `.restore`, `<run>/<owner>/<class>/<attempt>`.
 pub fn anchor_name_ok(anchor: &str, name: &str) -> bool {
@@ -1051,7 +1053,7 @@ fn contents_target(anchor: &str, name: &str) -> Option<(Option<String>, String)>
             let (id, leaf) = name.split_once('/')?;
             (is_id(id) && (leaf == "home" || leaf == "sessions")).then(|| (Some(id.to_string()), leaf.to_string()))
         }
-        TAGS | ARCHIVE => is_id(name).then(|| (None, name.to_string())),
+        TAGS | ARCHIVE | ARCHIVE_CONFIG => is_id(name).then(|| (None, name.to_string())),
         _ => None,
     }
 }
@@ -2071,7 +2073,7 @@ pub(crate) mod tests {
         let mut f = Fake::new();
         let _ = destinations(&mut f);
         let x = expect_file(&mut f, "x.json", "{}".into());
-        for (anchor, name) in [(AGENTS, format!("{A}/var-tmp")), (AGENTS, A.to_string()), (AGENTS, format!("{A}/home/x")), ("/srv/sagebrush/archive-config", A.to_string()), (crate::restore::RESTORE, "a/b/c/1".to_string()), (TAGS, "x".to_string()), ("/srv/sagebrush/claude-profiles", A.to_string())] {
+        for (anchor, name) in [(AGENTS, format!("{A}/var-tmp")), (AGENTS, A.to_string()), (AGENTS, format!("{A}/home/x")), (crate::restore::RESTORE, "a/b/c/1".to_string()), (TAGS, "x".to_string()), ("/srv/sagebrush/claude-profiles", A.to_string())] {
             f.counts.clear();
             assert_eq!(code(remove_contents(&mut f, anchor, &name, &x)), 64, "{anchor} {name}");
             assert_eq!(f.count("at"), 0);

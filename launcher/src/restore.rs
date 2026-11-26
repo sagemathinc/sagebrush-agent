@@ -59,6 +59,17 @@ pub enum Class {
     Sessions,
     Archive,
     Tag,
+    /// An agent's config tree (A2 r3.13): staged only, never filled (the supervisor's config import reads it).
+    Config,
+    /// A deleted agent's config archive (A2 r3.13): filled, root-owned, exact modes.
+    ArchiveConfig,
+}
+
+impl Class {
+    /// The root-owned classes (A2 r3.13 §2): their only owner is root, and their modes are exact (0700, 0600).
+    pub fn root_owned(self) -> bool {
+        matches!(self, Class::Config | Class::ArchiveConfig)
+    }
 }
 
 /// One attempt's name: `<run>/<owner>/<class>/<attempt>`, every part validated.
@@ -87,6 +98,8 @@ impl Name {
             ("sessions", true) => Class::Sessions,
             ("archive", true) => Class::Archive,
             ("tag", false) => Class::Tag,
+            ("config", true) => Class::Config,
+            ("archive-config", true) => Class::ArchiveConfig,
             _ => return None,
         };
         if attempt.is_empty() || attempt.len() > 6 || attempt.starts_with('0') || !attempt.bytes().all(|b| b.is_ascii_digit()) {
@@ -100,6 +113,8 @@ impl Name {
             Class::Sessions => "sessions",
             Class::Archive => "archive",
             Class::Tag => "tag",
+            Class::Config => "config",
+            Class::ArchiveConfig => "archive-config",
         }
     }
     /// The name beneath the anchor, and the marker's exact content.
@@ -618,10 +633,21 @@ pub(crate) fn dest_anchor(c: Class) -> &'static str {
         Class::Home | Class::Sessions => "/srv/sagebrush/agents",
         Class::Archive => "/srv/sagebrush/archive",
         Class::Tag => "/srv/sagebrush/tags",
+        Class::ArchiveConfig => "/srv/sagebrush/archive-config",
+        // (never a destination: fill-home and tree-digest refuse `config` before they look for one)
+        Class::Config => "/srv/sagebrush/agent-config",
     }
 }
 
+/// The expect's owners for the class (A2 r3.13 §2): a root-owned class's are exactly root ([0] and gid 0); every
+/// other class's never include root (uid 0 or gid 0), so no other class ever places a root-owned entry.
+pub(crate) fn owners_ok(c: Class, uids: &[u32], gid: u32) -> bool {
+    if c.root_owned() { uids == [0] && gid == 0 } else { !uids.contains(&0) && gid != 0 }
+}
+
 struct Fill {
+    /// A root-owned class (A2 r3.13): only 0700 directories and 0600 files are placed, no symlink.
+    root_owned: bool,
     uids: Vec<u32>,
     gid: u32,
     projid: u32,
@@ -779,7 +805,14 @@ fn walk_round<O: RestoreOps>(o: &mut O, w: &mut Fill, src: &O::H, dst: &O::H, re
                 kept.insert(name);
                 continue;
             };
-            if !(w.uids.contains(&id.uid) && id.gid == w.gid) {
+            // A root-owned class: a directory exactly 0700, a file exactly 0600, no symlink; anything else is refused
+            // like another owner (A2 r3.13 §2: a root-owned writable entry from the snapshot never lands in a root tree).
+            let exact = !w.root_owned || match kind {
+                Kind::Dir => id.mode & 0o7777 == 0o700,
+                Kind::File => id.mode & 0o7777 == 0o600,
+                Kind::Symlink => false,
+            };
+            if !(w.uids.contains(&id.uid) && id.gid == w.gid) || !exact {
                 // Not placed; a refused directory's whole subtree is neither walked nor placed, reported once. Its
                 // `entries` counts the refused object itself plus, for a directory, everything beneath it (A2 r3.9):
                 // exactly the listing entries validation removes for it.
@@ -875,7 +908,8 @@ pub fn fill_home<O: RestoreOps>(o: &mut O, a: &FillArgs) -> Result<String> {
 
 fn fill_limited<O: RestoreOps>(o: &mut O, a: &FillArgs, limit: usize) -> Result<String> {
     let n = &a.name;
-    if !a.source.starts_with("data/") || !rel_ok(a.source) {
+    // `config` is staged only (A2 r3.13 §4): never filled, refused before anything, the marker untouched.
+    if n.class == Class::Config || !a.source.starts_with("data/") || !rel_ok(a.source) {
         return Err(err(Fail::Usage, "bad arguments"));
     }
     let root = o.root().map_err(|_| pre("the root can't be opened"))?;
@@ -885,7 +919,7 @@ fn fill_limited<O: RestoreOps>(o: &mut O, a: &FillArgs, limit: usize) -> Result<
     let (e_epoch, e_fsid, e_dest) = (tree::epoch_of(f[0])?, tree::fsid_of(f[1])?, obj_of(f[2])?);
     let uids = f[3].arr().filter(|u| !u.is_empty() && u.len() <= MAX_UIDS).ok_or(tree::bad_expect())?.iter().map(tree::u32_of).collect::<Result<Vec<u32>>>()?;
     let (gid, projid) = (tree::u32_of(f[4])?, tree::u32_of(f[5])?);
-    if (n.class != Class::Tag && uids.len() != 1) || !n.projid_ok(projid) {
+    if (n.class != Class::Tag && uids.len() != 1) || !n.projid_ok(projid) || !owners_ok(n.class, &uids, gid) {
         return Err(tree::bad_expect());
     }
     let _ = tree::parse_mount(a.mount)?;
@@ -935,11 +969,11 @@ fn fill_limited<O: RestoreOps>(o: &mut O, a: &FillArgs, limit: usize) -> Result<
     let leaf: &str = match n.class {
         Class::Home => "home",
         Class::Sessions => "sessions",
-        Class::Archive | Class::Tag => &n.id,
+        Class::Archive | Class::Tag | Class::ArchiveConfig | Class::Config => &n.id,
     };
     let dest_parent = match n.class {
         Class::Home | Class::Sessions => tchild(o, &da, &n.id, mnt)?.and_then(|(_, h)| h).ok_or(identity("no agent directory"))?,
-        Class::Archive | Class::Tag => da,
+        Class::Archive | Class::Tag | Class::ArchiveConfig | Class::Config => da,
     };
     let (dx, probe) = tchild(o, &dest_parent, leaf, mnt)?.ok_or(identity("no destination"))?;
     if dx != e_dest {
@@ -960,7 +994,7 @@ fn fill_limited<O: RestoreOps>(o: &mut O, a: &FillArgs, limit: usize) -> Result<
     }
 
     // The source: data/... beneath the attempt, every component a directory on the mount.
-    let mut w = Fill { uids, gid, projid, mnt, limit, effects: 0, dirs: 0, files: 0, symlinks: 0, refused: vec![], unexpected: vec![], truncated: false };
+    let mut w = Fill { root_owned: n.class.root_owned(), uids, gid, projid, mnt, limit, effects: 0, dirs: 0, files: 0, symlinks: 0, refused: vec![], unexpected: vec![], truncated: false };
     let mut src = None;
     for part in a.source.split('/') {
         let parent = src.as_ref().unwrap_or(&att);
@@ -1375,7 +1409,9 @@ mod tests {
             (RUN, A, "home", "1"),
             (RUN, a.as_str(), "tag", "1"),
             (RUN, t.as_str(), "home", "1"),
-            (RUN, a.as_str(), "config", "1"),
+            (RUN, t.as_str(), "config", "1"),
+            (RUN, t.as_str(), "archive-config", "1"),
+            (RUN, a.as_str(), "configs", "1"),
             (RUN, a.as_str(), "home", "0"),
             (RUN, a.as_str(), "home", "01"),
             (RUN, a.as_str(), "home", "1000000"),
@@ -2464,5 +2500,141 @@ mod tests {
         let ex2 = expect_file(&mut f, "rm2.json", other);
         assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex2)), 65);
         assert_eq!(f.count("unlink"), 0);
+    }
+
+    // ---- A2 r3.13: the stage-only `config` class and the root-owned `archive-config` fill class
+
+    #[test]
+    fn r313_the_two_classes_parse_for_an_agent_owner_only() {
+        let a = owner();
+        let t = format!("t-{TAG}");
+        for class in ["config", "archive-config"] {
+            let n = Name::parse(RUN, &a, class, "1").expect(class);
+            assert_eq!(name_of(&n.path()), Some(n.clone()), "{class} round-trips");
+            assert!(n.projid_ok(70000) && !n.projid_ok(80000), "{class}: the agent's project range");
+            assert!(Name::parse(RUN, &t, class, "1").is_none(), "{class} isn't a tag's");
+        }
+        assert!(Class::Config.root_owned() && Class::ArchiveConfig.root_owned());
+        for c in [Class::Home, Class::Sessions, Class::Archive, Class::Tag] {
+            assert!(!c.root_owned());
+        }
+    }
+
+    #[test]
+    fn r313_owners_root_only_in_the_root_classes_and_never_root_in_any_other() {
+        for c in [Class::Config, Class::ArchiveConfig] {
+            assert!(owners_ok(c, &[0], 0));
+            for (uids, gid) in [(vec![UID], UID), (vec![0], UID), (vec![UID], 0), (vec![0, UID], 0)] {
+                assert!(!owners_ok(c, &uids, gid), "{c:?} {uids:?} {gid}");
+            }
+        }
+        // Every other class keeps its owners, and never root: a uid 0 or a gid 0 in its expect refuses.
+        for c in [Class::Home, Class::Sessions, Class::Archive, Class::Tag] {
+            assert!(owners_ok(c, &[UID], UID), "{c:?}");
+            for (uids, gid) in [(vec![0], 0), (vec![0], UID), (vec![UID], 0), (vec![UID, 0], UID)] {
+                assert!(!owners_ok(c, &uids, gid), "{c:?} {uids:?} {gid}");
+            }
+        }
+    }
+
+    #[test]
+    fn r313_fill_home_of_config_is_usage_before_anything() {
+        let (mut f, _src) = staged("home");
+        // (a well-formed, readable expect, so only the class can refuse: not the expect's path or shape)
+        let x = fill_expect(&mut f, "home");
+        let before = f.log.len();
+        let out = fill_home(&mut f, &FillArgs { mount: "/srv/sagebrush", name: name("config"), source: "data/home", expect: Box::leak(x.into_boxed_str()) });
+        assert_eq!(out.map(|_| 0).unwrap_or_else(|e| e.fail.code()), 64);
+        assert_eq!(f.log.len(), before, "no effect, no read");
+    }
+
+    #[test]
+    fn r313_the_cleanup_table_gains_archive_config() {
+        assert!(tree::contents_ok("/srv/sagebrush/archive-config", A));
+        assert!(!tree::contents_ok("/srv/sagebrush/archive-config", &format!("{A}/x")));
+        assert!(!tree::contents_ok("/srv/sagebrush/agent-config", A), "a live config tree is never emptied by the restore");
+    }
+
+    /// A staged `archive-config` attempt with root-owned entries of every mode, and its destination.
+    fn staged_archive_config() -> (Fake, String) {
+        let mut f = host();
+        restore_stage(&mut f, &mut exited(ok_reply()), &StageArgs { projid: UID, ..stage_args("archive-config") });
+        let att = attempt_path("archive-config");
+        let src = format!("{att}/data/{}", leaf(stage_args("archive-config").path));
+        let put = |f: &mut Fake, rel: &str, mode: u16, uid: u32| {
+            let path = format!("{src}/{rel}");
+            f.add(&path, mode, uid, uid);
+            let n = f.node(&path);
+            n.proj = UID;
+            n.inherit = true;
+        };
+        put(&mut f, "manifest.json", S_IFREG | 0o600, 0);
+        put(&mut f, "gen", S_IFDIR | 0o700, 0);
+        put(&mut f, "gen/ok.md", S_IFREG | 0o600, 0);
+        put(&mut f, "gen/wide.md", S_IFREG | 0o666, 0); // nested: a 0666 file
+        put(&mut f, "gen/deep", S_IFDIR | 0o700, 0);
+        put(&mut f, "gen/deep/bad.md", S_IFREG | 0o644, 0); // nested twice: a 0644 file
+        put(&mut f, "open", S_IFDIR | 0o777, 0); // a root-owned 0777 directory, with its subtree
+        put(&mut f, "open/x", S_IFREG | 0o600, 0);
+        put(&mut f, "exec", S_IFREG | 0o700, 0);
+        put(&mut f, "link", S_IFLNK | 0o777, 0);
+        put(&mut f, "agent.txt", S_IFREG | 0o600, UID); // another owner than root
+        f.dir("srv/sagebrush/archive-config", 0, 0o755);
+        let d = format!("srv/sagebrush/archive-config/{A}");
+        f.dir(&d, 0, 0o700);
+        let x = f.node(&d);
+        x.proj = UID;
+        x.inherit = true;
+        (f, src)
+    }
+    fn archive_config_expect(f: &mut Fake, uids: &str, gid: u32) -> String {
+        let root = f.root().unwrap();
+        let ac = f.dir_from_root(&root, "srv/sagebrush/archive-config").unwrap();
+        let (x, _) = crate::tree::child(f, &ac, A, MNT).unwrap().unwrap();
+        expect_file(f, "fill.json", format!("{{\"epoch\":{{\"boot_id\":\"{BOOT}\",\"mnt_id\":{MNT}}},\"fsid\":\"0000abcd00001234\",\"dest\":{},\"uids\":[{uids}],\"gid\":{gid},\"projid\":{UID}}}", obj_json(&x)))
+    }
+
+    #[test]
+    fn r313_fill_of_archive_config_places_only_roots_exact_entries_and_refuses_the_rest_at_every_depth() {
+        let (mut f, _src) = staged_archive_config();
+        let x = archive_config_expect(&mut f, "0", 0);
+        let out = fill_home(&mut f, &FillArgs { mount: "/srv/sagebrush", name: name("archive-config"), source: "data/home", expect: Box::leak(x.into_boxed_str()) }).unwrap();
+        let dest = format!("srv/sagebrush/archive-config/{A}");
+        for placed in ["manifest.json", "gen", "gen/ok.md", "gen/deep"] {
+            assert!(f.nodes.contains_key(&format!("{dest}/{placed}")), "{placed} placed");
+        }
+        for refused in ["gen/wide.md", "gen/deep/bad.md", "open", "open/x", "exec", "link", "agent.txt"] {
+            assert!(!f.nodes.contains_key(&format!("{dest}/{refused}")), "{refused} not placed");
+        }
+        assert_eq!(f.nodes[&format!("{dest}/gen")].id.mode & 0o7777, 0o700);
+        assert_eq!(f.nodes[&format!("{dest}/manifest.json")].id.mode & 0o7777, 0o600);
+        // Each refusal reported like a refused owner; the open directory with its whole subtree (2 entries).
+        for want in ["{\"path\":\"gen/wide.md\",\"uid\":0,\"gid\":0,\"entries\":1}", "{\"path\":\"gen/deep/bad.md\",\"uid\":0,\"gid\":0,\"entries\":1}",
+            "{\"path\":\"open\",\"uid\":0,\"gid\":0,\"entries\":2}", "{\"path\":\"exec\",\"uid\":0,\"gid\":0,\"entries\":1}",
+            "{\"path\":\"link\",\"uid\":0,\"gid\":0,\"entries\":1}"] {
+            assert!(out.contains(want), "{want} in {out}");
+        }
+        assert!(out.contains(&format!("{{\"path\":\"agent.txt\",\"uid\":{UID},\"gid\":{UID},\"entries\":1}}")), "{out}");
+        assert!(out.starts_with("{\"placed\":{\"dirs\":2,\"files\":2,\"symlinks\":0}"), "{out}");
+    }
+
+    #[test]
+    fn r313_fill_of_archive_config_with_other_owners_in_its_expect_is_refused_before_anything() {
+        for (uids, gid) in [(UID.to_string(), UID), ("0".to_string(), UID), (UID.to_string(), 0)] {
+            let (mut f, _src) = staged_archive_config();
+            let x = archive_config_expect(&mut f, &uids, gid);
+            let marker = format!("{}/{MARKER}", attempt_path("archive-config"));
+            let r = fill_home(&mut f, &FillArgs { mount: "/srv/sagebrush", name: name("archive-config"), source: "data/home", expect: Box::leak(x.into_boxed_str()) });
+            assert_eq!(r.map(|_| 0).unwrap_or_else(|e| e.fail.code()), Fail::Contract.code(), "{uids} {gid}");
+            assert!(f.nodes.contains_key(&marker), "{uids} {gid}: the marker untouched");
+        }
+        // And root in an ordinary class's expect: refused before anything too (no other class places a root entry).
+        let (mut f, _src) = staged("home");
+        let root = f.root().unwrap();
+        let ag = f.dir_from_root(&root, &format!("srv/sagebrush/agents/{A}")).unwrap();
+        let (hx, _) = crate::tree::child(&mut f, &ag, "home", MNT).unwrap().unwrap();
+        let x = expect_file(&mut f, "fill.json", format!("{{\"epoch\":{{\"boot_id\":\"{BOOT}\",\"mnt_id\":{MNT}}},\"fsid\":\"0000abcd00001234\",\"dest\":{},\"uids\":[0],\"gid\":0,\"projid\":{UID}}}", obj_json(&hx)));
+        let r = fill_home(&mut f, &fill_args("home", x));
+        assert_eq!(r.map(|_| 0).unwrap_or_else(|e| e.fail.code()), Fail::Contract.code());
     }
 }

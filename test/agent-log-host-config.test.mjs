@@ -157,6 +157,25 @@ test("the bounds and forms of each field", () => {
     assert.deepEqual(parsed(d), { v: 1, type: "sb.host-config.v1", host: "h", ...dense });
   }
   assert.equal(one({ tags: [, "a"] }).notes[0].field, "tags", "a hole first");
+  // (an index inherited from Array.prototype fills a hole for `in` and for reads, but isn't the array's own: still a
+  // misfit, for each of the three arrays)
+  for (const [field, filler, input] of [
+    ["tags", "t", { tags: Array(1) }],
+    ["backup.sources", "/p", { backup: { sources: Array(1) } }],
+    ["agents", { id: "a", name: "A" }, { agents: Array(1) }],
+  ]) {
+    Object.defineProperty(Array.prototype, 0, { value: filler, configurable: true, writable: true });
+    let r;
+    try {
+      assert.equal(0 in Array(1), true, "the filler is visible to `in`");
+      r = one(input);
+    } finally {
+      delete Array.prototype[0];
+    }
+    assert.equal(0 in Array(1), false);
+    assert.deepEqual(r.notes.map((n) => n.field), [field], `${field} inherited`);
+    assert.deepEqual(parsed(r), { v: 1, type: "sb.host-config.v1", host: "h" });
+  }
   // (an absent field: no note; an inherited one isn't read)
   assert.deepEqual(one({}).notes, []);
   assert.equal(parsed(hostConfigExport(Object.assign(Object.create({ name: S }), { host: "h" }))).name, undefined);

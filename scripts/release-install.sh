@@ -140,8 +140,18 @@ empty_trace() {
 case "$0" in /*) ;; *) no "run this script by its absolute, root-owned path (see the header)" ;; esac
 chain "$0" f
 
+# The unit runs /usr/bin/node: it must exist and resolve, through root-owned directories, to a root-owned file. A
+# node installed only under a user's directory (as on some images) is refused with what to do, never adopted.
+node_ok() {
+  if [ ! -e /usr/bin/node ] && [ ! -L /usr/bin/node ]; then
+    no "/usr/bin/node is missing: the supervisor runs it. Install Node.js 20 or later there, root-owned (a distribution package, or: install -o root -g root -m 0755 <a node binary you trust> /usr/bin/node)"
+  fi
+  ( tool /usr/bin/node ) || no "/usr/bin/node must resolve, through root-owned directories with no group or other write, to a root-owned node binary (see the line above)"
+}
+
 prove_all() {
-  for t in /bin/sh "$STAT" "$FIND" "$READLINK" /usr/bin/node "$SYSTEMCTL" "$BUSCTL" "$ANALYZE" "$SHA256SUM" "$GIT" "$TAR"; do tool "$t"; done
+  node_ok
+  for t in /bin/sh "$STAT" "$FIND" "$READLINK" "$SYSTEMCTL" "$BUSCTL" "$ANALYZE" "$SHA256SUM" "$GIT" "$TAR"; do tool "$t"; done
   chain "$(dirname "$DEST")" d
   chain /usr/lib d
   chain "$ETC" d

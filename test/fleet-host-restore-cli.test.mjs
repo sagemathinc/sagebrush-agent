@@ -127,6 +127,31 @@ test("retry: a stopped set gets a newer run, the plan re-planned, then its reque
   assert.equal(readPlan({ dir: c.dir }).sets[`archive-${c.d}`].run, RUN2);
 });
 
+test("retry holds the set lock through its writes: a worker is excluded until the new plan and request are published, and the old run is refused after", async () => {
+  const { runWorker } = await import("../lib/fleet/host/restore-worker.mjs");
+  const w = world();
+  writeRecord(reach("archive", w.d, "failed"), { dir: w.dir });
+  const tries = {};
+  const workerTry = async (name) => {
+    try { const h = await lockFile(setLockPath(w.dir, "archive", w.d), { waitMs: 0 }); await h.release(); tries[name] = "took"; } catch (e) { tries[name] = e.code; }
+  };
+  // (the worker's own take of the set lock, at each window: before the re-plan, and between the plan and the request)
+  const out = await restoreRetry(`archive-${w.d}`, opts(w, { onStep: workerTry }));
+  assert.deepEqual(tries, { locked: "in_progress", replanned: "in_progress" }, "no worker can start mid-retry");
+  // Released after: a worker takes it, and one started for the OLD run (its dispatch's input) is refused before anything.
+  await workerTry("after");
+  assert.equal(tries.after, "took");
+  await rejects(runWorker("archive", w.d, RUN, newId(), {}, { dir: w.dir, uid: UID }), "not_granted");
+  assert.equal(readPlan({ dir: w.dir }).sets[`archive-${w.d}`].run, out.run);
+  // The crash-continuation branch holds it too.
+  const c = world();
+  writeRecord(reach("archive", c.d, "failed"), { dir: c.dir });
+  updatePlan(replanSet(readPlan({ dir: c.dir }), "archive", c.d, newRestoreRun(T0 + 1800000, () => Buffer.alloc(6, 4))), { dir: c.dir });
+  const ct = {};
+  await restoreRetry(`archive-${c.d}`, opts(c, { onStep: async (n) => { try { const h = await lockFile(setLockPath(c.dir, "archive", c.d), { waitMs: 0 }); await h.release(); ct[n] = "took"; } catch (e) { ct[n] = e.code; } } }));
+  assert.deepEqual(ct, { locked: "in_progress" });
+});
+
 test("retry's refusals, each with no effect: no begun restore, closed, not in the plan, an intent, no record, any other state, a held set", async () => {
   const cases = [
     ["begin not done", (w) => writeFileSync(join(w.dir, BEGIN), JSON.stringify({ v: 1, snapshot: hex("1"), manifest_sha256: hex("2"), run: RUN, state: "begun" }) + "\n"), "not_found"],

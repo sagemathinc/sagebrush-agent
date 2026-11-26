@@ -11,7 +11,7 @@ import { lockFile } from "../lib/fleet/host/store.mjs";
 import { CLASSES, newRecord, newRestoreRun, readRecord, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 import { attestationName, attestationText, intentName } from "../lib/fleet/host/restore-sidecars.mjs";
 import { PLAN, closePlan, newPlan, readPlan, replanSet, updatePlan } from "../lib/fleet/host/restore-plan.mjs";
-import { ABANDON, BEGIN, CLOSED, HOSTSTORE_COPY, REQUESTS, begin, close, closeBlockers, readBegin, removeBeneath, restoreOpen, withExclusion } from "../lib/fleet/host/restore-begin.mjs";
+import { ABANDON, BEGIN, CLOSED, REQUESTS, begin, close, closeBlockers, readBegin, removeBeneath, restoreOpen, withExclusion } from "../lib/fleet/host/restore-begin.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
@@ -29,6 +29,17 @@ function chosenOf({ sha256 = hex("2"), snapshot = SNAP } = {}) {
   return { chosen: { manifest, snapshot, sha256 }, a, d, t };
 }
 
+/** A fake host-store stage's copy: <root>/stage/<run>/copy, private, with its registry (a re-stage keeps the same one). */
+function fakeStage(root, run) {
+  const c = join(root, "stage", run, "copy");
+  mkdirSync(c, { recursive: true, mode: 0o700 });
+  writeFileSync(join(c, "registry.json"), "{}");
+  return c;
+}
+/** Every close's host-store stage removals, by run. */
+const removedStages = [];
+const removeHostStage = async (run) => { removedStages.push(run); };
+
 /** A host: a private lock directory, a restore directory, and fakes that record every outside effect. */
 function host(over = {}) {
   const root = mkdtempSync(join(tmpdir(), "sb-begin-"));
@@ -41,7 +52,8 @@ function host(over = {}) {
     supervisorStopped: () => true, registryFresh: () => true, backupEnabled: () => false,
     choose: async (snapshot) => { calls.push(["choose", snapshot]); return snapshot === m.chosen.snapshot ? m.chosen : { error: "not_found" }; },
     newRun: () => RUN,
-    restoreHostStore: async (chosen, into) => { calls.push(["restoreHostStore", into]); writeFileSync(join(into, "registry.json"), "{}"); },
+    // (the launcher's stage, faked: a private copy holding the registry, returned in place)
+    stageHostStore: async (chosen, { run }) => { calls.push(["stageHostStore", run]); return fakeStage(root, run); },
     importHostStore: async ({ copy, plan, manifest }) => { calls.push(["importHostStore", copy, plan.sets, manifest.hoststore]); assert.ok(existsSync(join(copy, "registry.json")), "the copy is whole before the import"); },
     ...over.deps,
   };
@@ -66,8 +78,9 @@ test("begin: begin.json first, then the plan, the host store's copy and import, 
   assert.deepEqual(JSON.parse(s.plan), newPlan(h.m.chosen, RUN));
   assert.deepEqual(Object.keys(s.requests), [`agent-${h.m.a}`, `archive-${h.m.d}`, `tag-${h.m.t}`].sort());
   for (const v of Object.values(s.requests)) assert.equal(v, JSON.stringify({ run: RUN }) + "\n");
-  assert.deepEqual(h.calls.map((c) => c[0]), ["choose", "restoreHostStore", "importHostStore"]);
-  assert.equal(h.calls[1][1], join(h.dir, HOSTSTORE_COPY, RUN));
+  assert.deepEqual(h.calls.map((c) => c[0]), ["choose", "stageHostStore", "importHostStore"]);
+  assert.equal(h.calls[1][1], RUN, "staged for the restore's run");
+  assert.equal(h.calls[2][1], join(h.root, "stage", RUN, "copy"), "the import reads the stage's copy in place");
   // done: any later begin refuses, writing nothing.
   await rejects(h.run(), "in_progress");
   assert.deepEqual(state(h), s);
@@ -113,15 +126,13 @@ test("begin's continuation: a crash after each durable effect, each request incl
     if (at.plan) writeFileSync(join(h.dir, PLAN), want.plan);
     mkdirSync(join(h.dir, REQUESTS), { recursive: true, mode: 0o700 });
     for (const k of keys.slice(0, at.requests)) writeFileSync(join(h.dir, REQUESTS, k), want.requests[k]);
-    // A partial copy left by the crash is discarded first, never imported as it is.
-    mkdirSync(join(h.dir, HOSTSTORE_COPY, RUN), { recursive: true });
-    writeFileSync(join(h.dir, HOSTSTORE_COPY, RUN, "partial"), "x");
     // The continuation uses the RECORDED run, never a new one.
     h.deps.newRun = () => RUN2;
     await h.run();
     assert.deepEqual(state(h), want, label);
-    assert.ok(!existsSync(join(h.dir, HOSTSTORE_COPY, RUN, "partial")), `${label}: the partial copy was discarded`);
-    assert.deepEqual(h.calls.map((c) => c[0]), ["choose", "restoreHostStore", "importHostStore"], label);
+    // (a stage a crash left is the stage's own business: a marked attempt is re-imported, an unmarked one redone)
+    assert.deepEqual(h.calls.map((c) => c[0]), ["choose", "stageHostStore", "importHostStore"], label);
+    assert.equal(h.calls[1][1], RUN, `${label}: the RECORDED run`);
   }
 });
 
@@ -209,7 +220,7 @@ test("the exclusion: a held lock refuses begin and close (busy) before anything 
     await rejects(h.run(), "in_progress");
     assert.deepEqual(state(h), { begin: null, plan: null, requests: null });
     assert.equal(h.calls.length, 0, "nothing was asked of the store");
-    await rejects(close({ now: () => 1 }, { dir: h.dir, exclusion: h.exclusion }), "in_progress");
+    await rejects(close({ removeHostStage, now: () => 1 }, { dir: h.dir, exclusion: h.exclusion }), "in_progress");
   } finally { await held.release(); }
   await h.run(); // free again: it begins
   // The lock file: a private regular file in a private directory, else refused before it is tried.
@@ -268,7 +279,7 @@ test("close: every set terminal-for-close, per kind; anything else refuses, nami
   await h.run();
   const raised = new Set([h.m.a]);
   const restoreRaised = (id) => raised.has(id);
-  const attempt = () => close({ now: () => 7, restoreRaised }, { dir: h.dir, exclusion: h.exclusion });
+  const attempt = () => close({ removeHostStage, now: () => 7, restoreRaised }, { dir: h.dir, exclusion: h.exclusion });
   // No records yet: each set named.
   await assert.rejects(attempt(), (e) => e.code === "not_granted" && /agent-.*: none/.test(e.message) && /archive-.*: none/.test(e.message));
   // The agent validated but not resumed (its restore fence still up): refused.
@@ -309,7 +320,7 @@ test("close: every set terminal-for-close, per kind; anything else refuses, nami
   // archive is read-only, the intent and the attestation copied byte-identically, the originals kept.
   assert.deepEqual(await attempt(), { closed: 7 });
   assert.equal(restoreOpen({ dir: h.dir }), false);
-  assert.ok(!existsSync(join(h.dir, REQUESTS)) && !existsSync(join(h.dir, HOSTSTORE_COPY)));
+  assert.ok(!existsSync(join(h.dir, REQUESTS)) && removedStages.at(-1) === RUN);
   const into = join(h.dir, CLOSED, RUN);
   const archived = readdirSync(into).sort();
   assert.ok(archived.includes(PLAN) && archived.includes(BEGIN) && archived.includes(`tag-${h.m.t}.json`) && archived.includes(`tag-${h.m.t}.abandon.json`));
@@ -331,29 +342,29 @@ test("close: a crash after the commit, and after each archived file, is finished
   records(h, { agent: "validated", archive: "abandoned", tag: "validated" });
   const restoreRaised = () => false;
   // Before the commit (a refusal), nothing is closed.
-  await rejects(close({ now: () => 7, restoreRaised: () => true }, { dir: h.dir, exclusion: h.exclusion }), "not_granted");
+  await rejects(close({ removeHostStage, now: () => 7, restoreRaised: () => true }, { dir: h.dir, exclusion: h.exclusion }), "not_granted");
   assert.equal(restoreOpen({ dir: h.dir }), true);
   // The commit, then a crash: simulated by an archived file planted with other bytes, so close stops after its commit.
   const into = join(h.dir, CLOSED, RUN);
   mkdirSync(into, { recursive: true });
   writeFileSync(join(into, `agent-${h.m.a}.json`), "other");
-  await rejects(close({ now: () => 7, restoreRaised }, { dir: h.dir, exclusion: h.exclusion }), "not_granted");
+  await rejects(close({ removeHostStage, now: () => 7, restoreRaised }, { dir: h.dir, exclusion: h.exclusion }), "not_granted");
   assert.equal(restoreOpen({ dir: h.dir }), false, "the commit is durable: the restore is closed");
   assert.ok(existsSync(join(h.dir, REQUESTS)), "the cleanup didn't run yet");
   rmSync(join(into, `agent-${h.m.a}.json`));
   // Closing again finishes it, with the SAME close time (the commit isn't redone).
-  assert.deepEqual(await close({ now: () => 99, restoreRaised }, { dir: h.dir, exclusion: h.exclusion }), { closed: 7 });
+  assert.deepEqual(await close({ removeHostStage, now: () => 99, restoreRaised }, { dir: h.dir, exclusion: h.exclusion }), { closed: 7 });
   assert.ok(!existsSync(join(h.dir, REQUESTS)));
   assert.deepEqual(readFileSync(join(into, `agent-${h.m.a}.json`)), readFileSync(join(h.dir, `agent-${h.m.a}.json`)));
 });
 
 test("close refuses a restore whose begin hasn't finished, and a host with no restore", async () => {
   const h = host();
-  await rejects(close({ now: () => 1 }, { dir: h.dir, exclusion: h.exclusion }), "not_found");
+  await rejects(close({ removeHostStage, now: () => 1 }, { dir: h.dir, exclusion: h.exclusion }), "not_found");
   await h.run();
   const b = readBegin({ dir: h.dir });
   writeFileSync(join(h.dir, BEGIN), JSON.stringify({ ...b, state: "begun" }) + "\n");
-  await rejects(close({ now: () => 1, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion }), "in_progress");
+  await rejects(close({ removeHostStage, now: () => 1, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion }), "in_progress");
 });
 
 test("closePlan: the one commit point, durable and idempotent; a closed plan's shape", () => {
@@ -382,8 +393,8 @@ function outside(h, run = RUN) {
   return { ext, intact: () => readFileSync(join(ext, run, "keep"), "utf8") === "outside bytes" && readFileSync(join(ext, "keep"), "utf8") === "outside bytes" && readdirSync(ext).sort().join() === [run, "keep"].sort().join() };
 }
 
-test("begin never follows a link at the host store's copy or the requests: refused, the outside untouched", async () => {
-  for (const at of [HOSTSTORE_COPY, REQUESTS]) {
+test("begin never follows a link at the requests: refused, the outside untouched", async () => {
+  for (const at of [REQUESTS]) {
     const h = host();
     mkdirSync(h.dir, { recursive: true, mode: 0o700 });
     const o = outside(h);
@@ -391,7 +402,6 @@ test("begin never follows a link at the host store's copy or the requests: refus
     await rejects(h.run(), "not_granted");
     assert.ok(o.intact(), `${at}: the outside is byte-identical`);
     assert.ok(!existsSync(join(o.ext, `agent-${h.m.a}`)), `${at}: no request written outside`);
-    if (at === HOSTSTORE_COPY) assert.ok(!h.calls.some((c) => c[0] === "restoreHostStore"), "nothing restored");
   }
   // The restore directory itself a link: refused.
   const h = host();
@@ -401,17 +411,6 @@ test("begin never follows a link at the host store's copy or the requests: refus
   assert.ok(o.intact());
 });
 
-test("a partial copy holding a link to the outside: discarded link by link, the outside untouched, then begin completes", async () => {
-  const h = host();
-  mkdirSync(join(h.dir, HOSTSTORE_COPY, RUN, "sub"), { recursive: true, mode: 0o700 });
-  const o = outside(h);
-  symlinkSync(o.ext, join(h.dir, HOSTSTORE_COPY, RUN, "dirlink"));
-  symlinkSync(join(o.ext, "keep"), join(h.dir, HOSTSTORE_COPY, RUN, "sub", "filelink"));
-  await h.run();
-  assert.ok(o.intact(), "the links were unlinked, never followed");
-  assert.deepEqual(readdirSync(join(h.dir, HOSTSTORE_COPY, RUN)), ["registry.json"], "the copy is the fresh one");
-});
-
 test("close never follows a link: at closed/, at an archived entry, at abandon/, and its cleanup unlinks links in place", async () => {
   const ready = async () => {
     const h = host();
@@ -419,7 +418,7 @@ test("close never follows a link: at closed/, at an archived entry, at abandon/,
     records(h, { agent: "validated", archive: "validated", tag: "validated" });
     return h;
   };
-  const attempt = (h) => close({ now: () => 7, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID });
+  const attempt = (h) => close({ removeHostStage, now: () => 7, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID });
   // closed/ a link to the outside: refused after the commit, the outside untouched; once it is a real directory, close finishes.
   let h = await ready();
   let o = outside(h);
@@ -445,13 +444,15 @@ test("close never follows a link: at closed/, at an archived entry, at abandon/,
   await rejects(attempt(h), "not_granted");
   assert.equal(restoreOpen({ dir: h.dir }), true, "not committed");
   assert.ok(o.intact());
-  // The cleanup: a link planted inside requests/ and the copy is unlinked, never followed.
+  // The cleanup: a link planted inside requests/ is unlinked, never followed; the host-store stage is removed by its
+  // own (launcher) removal, for this run.
   h = await ready();
   o = outside(h);
   symlinkSync(o.ext, join(h.dir, REQUESTS, "zz-link"));
-  symlinkSync(join(o.ext, "keep"), join(h.dir, HOSTSTORE_COPY, RUN, "filelink"));
+  const before = removedStages.length;
   assert.deepEqual(await attempt(h), { closed: 7 });
-  assert.ok(o.intact() && !existsSync(join(h.dir, REQUESTS)) && !existsSync(join(h.dir, HOSTSTORE_COPY)));
+  assert.ok(o.intact() && !existsSync(join(h.dir, REQUESTS)));
+  assert.deepEqual(removedStages.slice(before), [RUN]);
 });
 
 // ---- The locks: losing either holder stops the operation at once; nothing more is done -----------------------------
@@ -482,7 +483,7 @@ test("begin: the exclusion's or the restore lock's holder killed at each step: o
       const i = steps.indexOf(step);
       if (i < 1) assert.equal(s.begin, null, label);
       if (i < 2) assert.equal(s.plan, null, label);
-      if (i < 4) assert.ok(!h.calls.some((c) => c[0] === "restoreHostStore"), label);
+      if (i < 4) assert.ok(!h.calls.some((c) => c[0] === "stageHostStore"), label);
       if (i < 5) assert.ok(!h.calls.some((c) => c[0] === "importHostStore"), label);
       if (i < 6) assert.ok(s.requests === null || Object.keys(s.requests).length === 0, label);
       assert.notEqual(s.begin === null ? null : JSON.parse(s.begin).state, "done", label);
@@ -504,12 +505,12 @@ test("close: a holder killed before the commit leaves the restore open; after it
     await h.run();
     records(h, { agent: "validated", archive: "validated", tag: "validated" });
     const onStep = async (name) => { if (name === step) { killHolder(h.exclusion.path); await settle(); } };
-    await rejects(close({ now: () => 7, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID, onStep }), "outcome_unknown");
+    await rejects(close({ removeHostStage, now: () => 7, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID, onStep }), "outcome_unknown");
     assert.equal(restoreOpen({ dir: h.dir }), !committed, step);
     assert.ok(existsSync(join(h.dir, REQUESTS)), `${step}: the requests weren't removed`);
     if (step !== "close:archived") assert.ok(!existsSync(join(h.dir, CLOSED, RUN, PLAN)), `${step}: nothing archived`);
     // Close again (the locks fresh): it finishes, with the first close time when it had committed.
-    assert.deepEqual(await close({ now: () => 9, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID }), { closed: committed ? 7 : 9 });
+    assert.deepEqual(await close({ removeHostStage, now: () => 9, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID }), { closed: committed ? 7 : 9 });
   }
 });
 
@@ -580,7 +581,7 @@ test("removeBeneath walks by handle: a nested directory replaced by a link befor
 });
 
 test("a lock lost INSIDE the host store's copy or import (the real holder killed mid-step): the step's next effect never happens", async () => {
-  for (const [which, inside] of [["exclusion", "restoreHostStore"], ["exclusion", "importHostStore"], ["restore", "restoreHostStore"], ["restore", "importHostStore"]]) {
+  for (const [which, inside] of [["exclusion", "stageHostStore"], ["exclusion", "importHostStore"], ["restore", "stageHostStore"], ["restore", "importHostStore"]]) {
     const effects = [];
     const h = host();
     const path = which === "exclusion" ? h.exclusion.path : join(h.dir, ".lock");
@@ -592,8 +593,8 @@ test("a lock lost INSIDE the host store's copy or import (the real holder killed
         if (i === 0) { killHolder(path); await settle(); }
       }
     };
-    h.deps[inside] = inside === "restoreHostStore"
-      ? async (chosen, into, { guard }) => { await step(guard); writeFileSync(join(into, "registry.json"), "{}"); }
+    h.deps[inside] = inside === "stageHostStore"
+      ? async (chosen, { run, guard }) => { await step(guard); return fakeStage(h.root, run); }
       : async ({ guard }) => { await step(guard); };
     await rejects(h.run(), "outcome_unknown");
     assert.deepEqual(effects, [0], `${which} lost inside ${inside}: only the first effect`);
@@ -601,15 +602,34 @@ test("a lock lost INSIDE the host store's copy or import (the real holder killed
   }
 });
 
+for (const which of ["exclusion", "restore"]) {
+  for (const inside of ["supervisorStopped", "registryFresh"]) {
+    test(`the ${which} lock lost INSIDE the awaited ${inside} (answering yes): nothing after it runs`, async () => {
+      const h = host();
+      const path = which === "exclusion" ? h.exclusion.path : join(h.dir, ".lock");
+      const after = [];
+      for (const k of ["registryFresh", "backupEnabled", "choose", "newRun", "stageHostStore", "importHostStore"]) {
+        if (k === inside) continue;
+        const f = h.deps[k];
+        h.deps[k] = (...a) => { after.push(k); return f(...a); };
+      }
+      h.deps[inside] = async () => { killHolder(path); await settle(); return true; };
+      await rejects(h.run(), "outcome_unknown");
+      assert.deepEqual(after, [], `${which} lost inside ${inside}: nothing after it`);
+      assert.equal(existsSync(join(h.dir, BEGIN)), false, `${which} lost inside ${inside}: nothing begun`);
+    });
+  }
+}
+
 test("close: the RESTORE lock's holder killed at each step, as the exclusion's: the same stop, and close again finishes", async () => {
   for (const [step, committed] of [["close:locked", false], ["close:checked", false], ["close:committed", true], ["close:archived", true]]) {
     const h = host();
     await h.run();
     records(h, { agent: "validated", archive: "validated", tag: "validated" });
     const onStep = async (name) => { if (name === step) { killHolder(join(h.dir, ".lock")); await settle(); } };
-    await rejects(close({ now: () => 7, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID, onStep }), "outcome_unknown");
+    await rejects(close({ removeHostStage, now: () => 7, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID, onStep }), "outcome_unknown");
     assert.equal(restoreOpen({ dir: h.dir }), !committed, step);
     assert.ok(existsSync(join(h.dir, REQUESTS)), `${step}: the requests weren't removed`);
-    assert.deepEqual(await close({ now: () => 9, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID }), { closed: committed ? 7 : 9 });
+    assert.deepEqual(await close({ removeHostStage, now: () => 9, restoreRaised: () => false }, { dir: h.dir, exclusion: h.exclusion, uid: UID }), { closed: committed ? 7 : 9 });
   }
 });

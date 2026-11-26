@@ -21,6 +21,17 @@ const regFile = (root) => join(root, "registry", "registry.json");
 /** Open the host store and return its registry view, with close() closing the store. */
 const Registry = { open: async (root, opts) => { const h = await HostStore.open(root, opts); const r = h.registry; r.close = () => h.close(); r.store = h; return r; } };
 
+test("fresh(): true only for a registry that has never recorded anything (no agent, no tag, both counters at their start)", async () => {
+  for (const add of ["agent", "tag"]) {
+    const r = await Registry.open(fresh());
+    try {
+      assert.equal(r.fresh(), true);
+      if (add === "agent") r.addAgent(newId(), 1); else r.addTag(newId());
+      assert.equal(r.fresh(), false, `after a ${add}`);
+    } finally { await r.close(); }
+  }
+});
+
 test("uids and gids come from their ranges, in order, and survive a reopen", async () => {
   const dir = fresh();
   const r = await Registry.open(dir);

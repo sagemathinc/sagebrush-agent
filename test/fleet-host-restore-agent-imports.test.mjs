@@ -9,7 +9,9 @@ import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { realIo, lockFile } from "../lib/fleet/host/store.mjs";
 import { EMPTY_CONFIG_HASH, configHash, readConfigTree } from "../lib/fleet/host/agent-config.mjs";
-import { BEGIN, HOSTSTORE_COPY, writeRequest } from "../lib/fleet/host/restore-begin.mjs";
+import { BEGIN, writeRequest } from "../lib/fleet/host/restore-begin.mjs";
+/** Where these rows keep the host store copy (the staged copy's path, given to harnessRecordsOf). */
+const HOSTSTORE_COPY = "hoststore-copy";
 import { closePlan, createPlan } from "../lib/fleet/host/restore-plan.mjs";
 import { newRecord, newRestoreRun, readRecord, stagingDir, stagingName, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 import { holdSets, setLockPath, workerLive } from "../lib/fleet/host/restore-worker.mjs";
@@ -102,7 +104,7 @@ function world({ staged = { gens: { 1: GEN1, 2: GEN2 }, current: "2" }, live = {
   const deps = (over = {}) => ({
     hold: () => holdSets(id, [], { dir, uid: UID }),
     liveConfig: async () => ({ root: liveRoot, identity: identityOf(liveRoot) }),
-    hasContext: async ({ run }) => harnessRecordsOf(id, { dir, uid: UID, run }),
+    hasContext: async ({ run }) => harnessRecordsOf(id, { copy: join(dir, HOSTSTORE_COPY, run), uid: UID }),
     discard: async (rec) => { discarded.push(rec.state); },
     ...over,
   });
@@ -165,7 +167,7 @@ test("a crash at every durable effect re-runs to the same tree and record; curre
 test("the step holds the set: a worker started during it finds the set busy; a held set is skipped, nothing touched", async () => {
   const w = world();
   let during = null;
-  await importAgentSet(w.id, w.deps({ hasContext: async ({ run }) => { during = await workerLive("agent", w.id, { dir: w.dir }); return harnessRecordsOf(w.id, { dir: w.dir, uid: UID, run }); } }), opts(w));
+  await importAgentSet(w.id, w.deps({ hasContext: async ({ run }) => { during = await workerLive("agent", w.id, { dir: w.dir }); return harnessRecordsOf(w.id, { copy: join(w.dir, HOSTSTORE_COPY, run), uid: UID }); } }), opts(w));
   assert.equal(during, true, "the set's lock is held through the step");
   assert.equal(await workerLive("agent", w.id, { dir: w.dir }), false, "and released after");
   // A worker holds it: busy, the record and the tree untouched.
@@ -320,7 +322,7 @@ test("context: no record of this agent is the import of nothing; any record of i
   const p = world();
   writeRecord(step(p.record(), "import", { which: "context", phase: "pending", sha256: expectedHash(EMPTY_CONTEXT) }), { dir: p.dir });
   private_(join(p.dir, HOSTSTORE_COPY, RUN, "harness-turns"));
-  writeFileSync(join(p.dir, HOSTSTORE_COPY, RUN, "harness-turns", `${p.id}.journal`), "x");
+  writeFileSync(join(p.dir, HOSTSTORE_COPY, RUN, "harness-turns", `${p.id}.journal`), "x", { mode: 0o600 });
   assert.deepEqual(await importAgentSet(p.id, p.deps(), opts(p)), { status: "failed", reason: "outcome_unknown" });
   // A pending import of nothing bound to another hash: failed.
   const q = world();
@@ -336,10 +338,7 @@ test("context: no record of this agent is the import of nothing; any record of i
   const cp = world();
   chmodSync(join(cp.dir, HOSTSTORE_COPY, RUN), 0o777);
   await rejects(importAgentSet(cp.id, cp.deps(), opts(cp)), "not_granted");
-  // Nor its parent: every level from the restore directory down is proven.
-  const pp = world({ harness: { "harness-sessions": [] } });
-  chmodSync(join(pp.dir, HOSTSTORE_COPY), 0o777);
-  await rejects(importAgentSet(pp.id, pp.deps(), opts(pp)), "not_granted");
+  // (the copy's ancestors are proven where the copy is found: restore-hoststage's stagedHostCopy, its own rows)
   // A harness directory that isn't a private directory refuses (never read through).
   const l = world({ harness: { "harness-sessions": [] } });
   chmodSync(join(l.dir, HOSTSTORE_COPY, RUN, "harness-sessions"), 0o777);

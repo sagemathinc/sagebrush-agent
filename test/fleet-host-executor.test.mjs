@@ -95,11 +95,11 @@ function fakeFx(over = {}) {
   return Object.assign(fx, over);
 }
 
-async function setup({ fx = fakeFx(), root = tmp("state"), fenceDir = tmp("fence"), deadlines = {}, barrier, restoreWorker } = {}) {
+async function setup({ fx = fakeFx(), root = tmp("state"), fenceDir = tmp("fence"), deadlines = {}, barrier, restoreWorker, backupSnapshot } = {}) {
   const store = await HostStore.open(root);
   fx.fenceDir = fenceDir;
   fx.store = store;
-  const sup = new Supervisor({ store, fx, verify, bodyOf, fenceDir, deadlines, barrier, ...(restoreWorker ? { restoreWorker } : {}) });
+  const sup = new Supervisor({ store, fx, verify, bodyOf, fenceDir, deadlines, barrier, ...(restoreWorker ? { restoreWorker } : {}), ...(backupSnapshot ? { backupSnapshot } : {}) });
   return { sup, store, fx, root, fenceDir, close: () => store.close() };
 }
 
@@ -2390,4 +2390,37 @@ test("a holder that can't invalidate the inputs isn't a hold: the op is refused 
   assert.equal(released, 1, "the locks it took are given back");
   await sup.close();
   await close();
+});
+
+// ---- a backup run's snapshot (wiring r0.4 §1.1): the daemon owns the store, so it serves the request
+
+test("backup-snapshot: the host's op only, with its seam; the real serveSnapshot under the executor's store: idle, served once, redone after a death mid-copy; a throw is a failed op", async () => {
+  const { serveSnapshot, readResult } = await import("../lib/fleet/host/backup-snapshot.mjs");
+  const none = await setup();
+  await rejects(none.sup.submit({ kind: "backup-snapshot", authority: "host" }), "bad_form");
+  await none.close();
+  const uid = process.getuid();
+  const dir = tmp("snapshot");
+  mkdirSync(dir, { mode: 0o700 });
+  chmodSync(dir, 0o700);
+  const root = tmp("state");
+  const s = await setup({ root, backupSnapshot: { serve: (store) => serveSnapshot(store, { dir, root, uid }) } });
+  for (const authority of ["person", "service", "local"]) await rejects(s.sup.submit({ kind: "backup-snapshot", authority }), "not_granted");
+  assert.deepEqual(await s.sup.submit({ kind: "backup-snapshot", authority: "host" }), { status: "idle" }, "no request");
+  const req = { run: "20261126T030000Z-abcdefgh", nonce: "N".repeat(22) };
+  writeFileSync(join(dir, "request.json"), JSON.stringify({ v: 1, ...req }) + "\n", { mode: 0o600 });
+  assert.deepEqual(await s.sup.submit({ kind: "backup-snapshot", authority: "host" }), { status: "served", run: req.run });
+  assert.ok(readResult(dir, req, { uid }) !== null);
+  assert.deepEqual(await s.sup.submit({ kind: "backup-snapshot", authority: "host" }), { status: "idle" }, "served once");
+  // A result an earlier serve left mid-copy (no done): removed and redone, never read.
+  const req2 = { run: "20261126T040000Z-abcdefgh", nonce: "M".repeat(22) };
+  writeFileSync(join(dir, "request.json"), JSON.stringify({ v: 1, ...req2 }) + "\n", { mode: 0o600 });
+  mkdirSync(join(dir, req2.run, "hoststore"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(dir, req2.run, "hoststore", "partial"), "x");
+  assert.deepEqual(await s.sup.submit({ kind: "backup-snapshot", authority: "host" }), { status: "served", run: req2.run });
+  assert.equal(existsSync(join(dir, req2.run, "hoststore", "partial")), false);
+  await s.close();
+  const bad = await setup({ backupSnapshot: { serve: () => { throw new FleetError("limit", "too large"); } } });
+  assert.deepEqual(await bad.sup.submit({ kind: "backup-snapshot", authority: "host" }), { status: "failed", reason: "limit" });
+  await bad.close();
 });

@@ -344,3 +344,71 @@ test("the worker scope: the binary runs in place under systemd-run --scope, in t
   assert.equal(seen[0][0], "/usr/bin/systemd-run"); assert.deepEqual(seen[0][2], { env: {} });
   assert.throws(() => scopedArgv("bad", "/b", []), (e) => e.code === "bad_form");
 });
+
+// ---- wiring r0.4 §4 Q1 and init-run d6 §6.1 A1 ----
+
+test("an explicitly absent turn-lease provider (lease: null): no wait at all, the pass is consistency=crash", async () => {
+  const { set, deps } = setup();
+  let slept = 0;
+  const r = await backupSet(set, RUN, { ...deps, lease: null, sleep: async (ms) => { slept += ms; deps.tick?.(ms); } });
+  assert.deepEqual([r.outcome, r.consistency], ["good", "crash"]);
+  assert.equal(slept, 0, "never waited for an idle that can't be proven");
+  // The control: a configured provider that fails still waits its bound, and is never an idle proof.
+  const c = setup(undefined, undefined, undefined, { activeTurns: async () => { throw new Error("down"); } });
+  let waited = 0;
+  const rc = await backupSet(c.set, RUN, { ...c.deps, sleep: async (ms) => { waited += ms; c.deps.tick?.(ms); }, limits: { idleMs: 3000, pollMs: 1000 } });
+  assert.equal(rc.consistency, "crash");
+  assert.ok(waited > 0, "a configured provider's failure is waited out");
+});
+
+test("A1: a lock lost at ANY guard point stops the pass there: lock_lost, no recovery, no later call, cgroup op, journal or fence change; a later recovery restores everything", async () => {
+  let points = 0;
+  for (let k = 1; ; k += 1) {
+    const { d, members: [a], groups, binary, set, deps } = setup();
+    let n = 0, lostAt = null;
+    const guard = () => { n += 1; if (n >= k) { lostAt ??= { calls: binary.calls.length, journal: readJournal({ dir: d.dir }), fenced: existsSync(join(d.fenceDir, "backup", a)), frozen: groups[agentSliceCgroup(a)].frozen }; throw Object.assign(new Error("lost"), { code: "lock_lost" }); } };
+    const cgOps = [];
+    const cg = Object.fromEntries(Object.entries(deps.cg).map(([op, f]) => [op, (...x) => { cgOps.push({ op, lost: lostAt !== null }); return f(...x); }]));
+    let out;
+    try { out = await backupSet(set, RUN, { ...deps, cg, guard }); } catch (e) { out = e; }
+    if (lostAt === null) { assert.equal(out.outcome, "good"); break; } // (k past the last guard point: the pass completes)
+    points += 1;
+    assert.equal(out?.code, "lock_lost", `k=${k}: rejects lock_lost (never an abandon through recovery)`);
+    assert.equal(binary.calls.length, lostAt.calls, `k=${k}: no binary call after the loss`);
+    assert.deepEqual(cgOps.filter((o) => o.lost), [], `k=${k}: no cgroup operation after the loss`);
+    assert.deepEqual(readJournal({ dir: d.dir }), lostAt.journal, `k=${k}: the journal kept as it stood`);
+    assert.equal(existsSync(join(d.fenceDir, "backup", a)), lostAt.fenced, `k=${k}: no fence change`);
+    // The next run's recovery (recoverLeftover's order) reaps, thaws and lowers.
+    if (lostAt.journal !== null) {
+      const rec = await recoverBackup(a, { dir: d.dir, fenceDir: d.fenceDir, cg: deps.cg, now: deps.now, sleep: deps.sleep });
+      assert.equal(rec.state, "released", `k=${k}`);
+      assert.equal(groups[agentSliceCgroup(a)].frozen, false);
+      assert.equal(existsSync(join(d.fenceDir, "backup", a)), false);
+    }
+  }
+  assert.ok(points >= 15, `every guard point lost once (${points})`);
+});
+
+test("A1: a lock lost right after ANY cgroup operation (a freeze, a thaw, a reap): the next cgroup operation never runs", async () => {
+  let points = 0;
+  for (let k = 1; ; k += 1) {
+    const { d, set, deps } = setup();
+    let ops = 0, isLost = false, after = 0;
+    const guard = () => { if (isLost) throw Object.assign(new Error("lost"), { code: "lock_lost" }); };
+    const cg = Object.fromEntries(Object.entries(deps.cg).map(([op, f]) => [op, (...x) => {
+      if (isLost) after += 1;
+      const r = f(...x);
+      ops += 1;
+      if (ops === k) isLost = true; // (lost while that operation ran: before the next one)
+      return r;
+    }]));
+    let out;
+    try { out = await backupSet(set, RUN, { ...deps, cg, guard }); } catch (e) { out = e; }
+    if (!isLost) { assert.equal(out.outcome, "good"); break; }
+    points += 1;
+    assert.equal(out?.code, "lock_lost", `k=${k}`);
+    assert.equal(after, 0, `k=${k}: no cgroup operation after the loss`);
+    assert.ok(readJournal({ dir: d.dir }) !== null || k === 0);
+  }
+  assert.ok(points >= 4, `every cgroup operation lost after once (${points})`);
+});

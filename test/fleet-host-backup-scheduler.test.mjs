@@ -130,13 +130,15 @@ function fakes({ enabled = { enabled: true }, free = 10 * ROOT_RESERVE, sets = n
   const calls = [];
   let written = null, n = 0;
   const deps = {
+    withExclusion: async (fn) => { calls.push("exclusion"); return fn(() => {}); },
+    restoreOpen: () => false,
     enabled: () => enabled,
-    withRunLock: async (fn) => { calls.push("lock"); return fn(); },
+    withRunLock: async (fn) => { calls.push("lock"); return fn({ held: () => true }); },
     freeBytes: () => free,
     ensureCache: async () => { calls.push("cache"); },
     trimCache: async () => { calls.push("trim"); },
     recoverLeftover: async () => { calls.push("recover"); },
-    registry: () => registry,
+    snapshot: async () => { calls.push("snapshot"); return { ok: true, registry, hoststore: "/var/lib/sagebrush/backup/snapshot/r/hoststore" }; },
     configHash: (id) => hex(500 + Object.keys(registry.agents).indexOf(id)),
     forbidden: () => ["/srv/sagebrush/claude-profiles"],
     sources: () => theSets,
@@ -148,7 +150,6 @@ function fakes({ enabled = { enabled: true }, free = 10 * ROOT_RESERVE, sets = n
       const o = outcomes[setKey(s)] ?? { outcome: "good", snapshot: hex(100 + n++) };
       return o;
     },
-    copyHostStore: async (staging) => { calls.push("hoststore-copy"); return staging; },
     binary: async (req) => {
       calls.push(`binary:${req.op}`);
       if (req.op === "snapshots") return { ok: true, value: { snapshots: Array.from({ length: 300 }, (_, i) => ({ id: hex(i), tree: hex(1000 + i) })) } };
@@ -162,7 +163,7 @@ function fakes({ enabled = { enabled: true }, free = 10 * ROOT_RESERVE, sets = n
     pruneDue: () => prunePast,
     checkDataPart: () => ({ part: 7, of: 30 }),
     state: { read: () => state, write: (s) => { calls.push("state"); written = s; } },
-    host: "h1", now: () => Date.parse("2026-11-24T03:00:00Z"), stagingDir: (name) => `/var/lib/sagebrush/backup/${name}`,
+    hostId: () => "h1", now: () => Date.parse("2026-11-24T03:00:00Z"), stagingDir: (name) => `/var/lib/sagebrush/backup/${name}`,
   };
   return { deps, calls, a, b, written: () => written };
 }
@@ -171,12 +172,12 @@ test("not set up, or the root reserve short: nothing runs", async () => {
   {
     const f = fakes({ enabled: { enabled: false, why: "not set up" } });
     assert.deepEqual(await runOnce(f.deps), { status: "not set up", why: "not set up" });
-    assert.deepEqual(f.calls, []);
+    assert.deepEqual(f.calls, ["exclusion"]);
   }
   {
     const f = fakes({ free: ROOT_RESERVE - 1 });
     assert.deepEqual(await runOnce(f.deps), { status: "skipped", why: "root_reserve" });
-    assert.deepEqual(f.calls, ["lock"]);
+    assert.deepEqual(f.calls, ["exclusion", "lock"]);
   }
 });
 
@@ -184,8 +185,8 @@ test("a full run: cache, a left-over run recovered, forbidden roots checked, eac
   const f = fakes();
   const r = await runOnce(f.deps);
   assert.equal(r.status, "ok"); assert.equal(r.manifest, hex(900));
-  assert.deepEqual(f.calls, ["lock", "cache", "recover", "forbidden", "state",
-    `backup:agent:${f.a}:none`, `backup:agent:${f.b}:none`, "hoststore-copy", "backup:hoststore:host:none",
+  assert.deepEqual(f.calls, ["exclusion", "lock", "cache", "recover", "snapshot", "forbidden", "state",
+    `backup:agent:${f.a}:none`, `backup:agent:${f.b}:none`, "backup:hoststore:host:none",
     "binary:snapshots", "build", "commit", "retention", "binary:prune", "binary:check-data", "state", "trim"]);
   const w = f.written();
   assert.equal(w.last_success, Date.parse("2026-11-24T03:00:00Z"));
@@ -199,7 +200,7 @@ test("change-aware: an unchanged set keeps its last good snapshot in the manifes
   const f0 = fakes();
   const state = { ...emptyState(), sets: { [`agent:${f0.a}`]: { fingerprint: { e: 1 }, snapshot: hex(5), tree: hex(55), since: null } } };
   const f = fakes({ state, sets: f0.deps.sources(), fingerprints: {} });
-  f.deps.registry = f0.deps.registry; f.a = f0.a; f.b = f0.b;
+  f.deps.snapshot = f0.deps.snapshot; f.a = f0.a; f.b = f0.b;
   const r = await runOnce(f.deps);
   assert.equal(r.status, "ok");
   assert.ok(!f.calls.includes(`backup:agent:${f0.a}:none`) && !f.calls.some((c) => c.startsWith(`backup:agent:${f0.a}`)), "the unchanged set isn't backed up");
@@ -210,10 +211,10 @@ test("change-aware: an unchanged set keeps its last good snapshot in the manifes
 test("a set that fails: no host store, no manifest; the state records the debt, not a success", async () => {
   const f0 = fakes();
   const f = fakes({ sets: f0.deps.sources(), outcomes: { [`agent:${f0.b}`]: { outcome: "abandoned", code: "cap" } } });
-  f.deps.registry = f0.deps.registry;
+  f.deps.snapshot = f0.deps.snapshot;
   const r = await runOnce(f.deps);
   assert.equal(r.status, "failed"); assert.deepEqual(r.failures, [{ key: `agent:${f0.b}`, code: "cap" }]);
-  assert.ok(!f.calls.includes("commit") && !f.calls.includes("hoststore-copy"));
+  assert.ok(!f.calls.includes("commit") && !f.calls.includes("backup:hoststore:host:none"));
   const w = f.written();
   assert.equal(w.last_success, null);
   assert.equal(w.sets[`agent:${f0.b}`].since, Date.parse("2026-11-24T03:00:00Z"));
@@ -244,7 +245,7 @@ test("the debt is written before any backup: a manifest that won't commit, a fai
     // a's change was copied (good) but b failed: a's change is still not in any manifest, so a keeps its debt
     const f0 = fakes();
     const f = fakes({ sets: f0.deps.sources(), outcomes: { [`agent:${f0.b}`]: { outcome: "abandoned", code: "cap" } } });
-    f.deps.registry = f0.deps.registry;
+    f.deps.snapshot = f0.deps.snapshot;
     await runOnce(f.deps);
     assert.equal(debtOf(f, f0.a).since, now, "a good but unmanifested copy is still debt");
     assert.equal(debtOf(f, f0.b).since, now);
@@ -254,7 +255,7 @@ test("the debt is written before any backup: a manifest that won't commit, a fai
     const f0 = fakes();
     const state = { ...emptyState(), sets: { [`agent:${f0.a}`]: { fingerprint: { e: 0 }, snapshot: hex(5), tree: hex(55), since: 42 } } };
     const f = fakes({ state, sets: f0.deps.sources(), commit: { ok: false, code: "readback_failed" } });
-    f.deps.registry = f0.deps.registry;
+    f.deps.snapshot = f0.deps.snapshot;
     await runOnce(f.deps);
     assert.deepEqual(debtOf(f, f0.a), { fingerprint: { e: 0 }, snapshot: hex(5), tree: hex(55), since: 42 });
   }
@@ -354,4 +355,21 @@ test("one run at a time: a second run while one holds the run lock is refused", 
   let second;
   await withRunLock(async () => { second = withRunLock(async () => "ran", { dir }); await assert.rejects(second, (e) => e.code === "in_progress"); }, { dir });
   assert.equal(await withRunLock(async () => "ran", { dir }), "ran", "free again afterwards");
+});
+
+test("a live agent's config not proven (until r0.4 §1.2): the run fails config_unbound for it, and no manifest is committed", async () => {
+  const f = fakes();
+  f.deps.configHash = (id) => { if (id === f.a) throw Object.assign(new Error("unbound"), { code: "config_unbound" }); return "5".repeat(64); };
+  const r = await runOnce(f.deps);
+  assert.deepEqual([r.status, r.failures], ["failed", [{ key: `config:${f.a}`, code: "config_unbound" }]]);
+  assert.ok(!f.calls.includes("build") && !f.calls.includes("commit"));
+});
+
+test("A1: every set's backupSet gets the run's guard (the live sets' and the host store's)", async () => {
+  const f = fakes();
+  const guards = [];
+  const real = f.deps.backupSet;
+  f.deps.backupSet = async (s, run, o) => { guards.push([setKey(s), typeof o.guard]); return real(s, run, o); };
+  assert.equal((await runOnce(f.deps)).status, "ok");
+  assert.deepEqual(guards.map((g) => g[1]), ["function", "function", "function"]);
 });

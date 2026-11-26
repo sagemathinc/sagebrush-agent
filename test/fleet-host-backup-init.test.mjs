@@ -522,6 +522,12 @@ function killHolderNow(path) {
     if (cmd[0].endsWith("flock") && cmd.includes(path)) { process.kill(Number(pid), "SIGKILL"); pids.push(pid); }
   }
   assert.ok(pids.length > 0, `a holder of ${path} was found`);
+  // (its child inherited the locked file: killed too, so the lock is really free once this returns)
+  for (const pid of readdirSync("/proc").filter((p) => /^[0-9]+$/.test(p))) {
+    let st;
+    try { st = readFileSync(`/proc/${pid}/stat`, "utf8"); } catch { continue; }
+    if (pids.includes(st.slice(st.lastIndexOf(")") + 2).split(" ")[1])) { try { process.kill(Number(pid), "SIGKILL"); pids.push(pid); } catch { /* gone */ } }
+  }
   const dead = (pid) => { try { return /\) [ZX] /.test(readFileSync(`/proc/${pid}/stat`, "utf8")); } catch { return true; } };
   const until = Date.now() + 5000;
   while (!pids.every(dead)) if (Date.now() > until) assert.fail("the holder didn't die");

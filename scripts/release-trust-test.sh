@@ -248,7 +248,7 @@ for step in 1m 2 3 4 5 6; do
   main=$(systemctl show $UNIT -p ExecMainStartTimestampMonotonic --value 2>/dev/null)
   if [ "${main:-0}" = 0 ]; then ok "cut after step $step: nothing starts"; else bad "cut after step $step: the unit started"; fi
   if [ "$step" = 6 ]; then
-    c=$(busctl get-property org.freedesktop.systemd1 "$(busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager GetUnit s $UNIT | sed -n 's/^o "\(.*\)"$/\1/p')" org.freedesktop.systemd1.Unit Conditions)
+    c=$(busctl get-property org.freedesktop.systemd1 "$(busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager LoadUnit s $UNIT | sed -n 's/^o "\(.*\)"$/\1/p')" org.freedesktop.systemd1.Unit Conditions)
     case "$c" in 'a(sbbsi) 1 "ConditionPathExists" false false "/nonexistent/sagebrush-closed" '*) ok "cut after step 6: the effective closed condition is in force";; *) bad "cut after step 6: conditions $c";; esac
   fi
   if [ "$step" = 1m ]; then

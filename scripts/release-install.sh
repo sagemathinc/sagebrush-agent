@@ -247,8 +247,9 @@ argv_of() { # the single command line of an Exec property, or nothing when there
   [ "$n" -eq 1 ] || return 0
   printf '%s' "$v" | sed -n 's/.*argv\[\]=\([^;]*\) ;.*/\1/p'
 }
+# (LoadUnit, not GetUnit: an inactive unit nothing references may be collected between calls; LoadUnit loads it)
 conditions() {
-  path=$("$BUSCTL" call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager GetUnit s "$UNIT" 2>/dev/null \
+  path=$("$BUSCTL" call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager LoadUnit s "$UNIT" 2>/dev/null \
     | sed -n 's/^o "\(.*\)"$/\1/p')
   [ -n "$path" ] || return 0
   "$BUSCTL" get-property org.freedesktop.systemd1 "$path" org.freedesktop.systemd1.Unit Conditions 2>/dev/null

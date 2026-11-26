@@ -15,7 +15,7 @@ import { newRecord, newRestoreRun, readRecord, stagingDir, stagingName, step, wr
 import { holdSets, setLockPath, workerLive } from "../lib/fleet/host/restore-worker.mjs";
 import { EMPTY_CONTEXT, IMPORTER_MISSING, configExpected, expectedHash, harnessRecordsOf, importAgentSet, importOnce } from "../lib/fleet/host/restore-agent-imports.mjs";
 
-const UID = process.getuid();
+const UID = typeof process.getuid === "function" ? process.getuid() : -1; // (Linux-only rows; off Linux the file only loads)
 const hex = (c) => c.repeat(64);
 const RUN = newRestoreRun(1795500000000, () => Buffer.alloc(6));
 const RUN2 = newRestoreRun(1795600000000, () => Buffer.alloc(6, 1));

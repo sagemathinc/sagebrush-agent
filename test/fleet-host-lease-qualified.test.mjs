@@ -13,7 +13,7 @@ import { test } from "./host-linux-only.mjs";
 import { canonText } from "../lib/fleet/core/canonical.mjs";
 import { QUALIFIED_MAJOR } from "../lib/fleet/host/host-preflight.mjs";
 import { sleepHook } from "../lib/fleet/host/lease.mjs";
-import { DECLARED, ROOTS, leaseManifest, lex, loadsOf } from "../lib/fleet/host/lease-manifest.mjs";
+import { DECLARED, EXPLICIT, ROOTS, leaseManifest, lex, loadsOf } from "../lib/fleet/host/lease-manifest.mjs";
 import { RECORD, argvOf, leaseQualified } from "../lib/fleet/host/lease-qualified.mjs";
 import { SUBCASES } from "../lib/fleet/host/lease-qual-subcases.mjs";
 
@@ -114,6 +114,31 @@ test("the generator: deterministic, and on this tree its member set equals the c
   for (const r of ROOTS) assert.ok(Object.hasOwn(a.files, r), r);
   assert.ok(!Object.hasOwn(a.files, "bin/sagebrush-agent-chat.mjs"), "the chat branch isn't followed");
   assert.ok(Object.keys(a.files).every((p) => !p.startsWith("test/")), "A2's machinery joins with A2");
+});
+
+/** The repo scripts a build recipe names (`$root/scripts/<f>` or a bare `scripts/<f>`): each is part of the recipe. */
+const scriptsNamedBy = (src) => [...new Set([...src.matchAll(/(?:\$\{?root\}?\/|(?<![\w./-]))scripts\/([A-Za-z0-9._-]+)/g)].map((m) => `scripts/${m[1]}`))].sort();
+/** Every scripts/*-build.sh is an explicit member, and so is every script it names; returns the missing ones. */
+function buildRecipeGaps(explicit, files) {
+  const gaps = [];
+  for (const [path, src] of files) {
+    if (!explicit.includes(path)) gaps.push(`${path} (a build recipe)`);
+    for (const s of scriptsNamedBy(src)) if (!explicit.includes(s)) gaps.push(`${s} (named by ${path})`);
+  }
+  return gaps;
+}
+
+test("the generator: every build recipe (scripts/*-build.sh) and every script it runs are explicit members", () => {
+  const builds = fs.readdirSync(join(REPO, "scripts")).filter((f) => f.endsWith("-build.sh")).sort().map((f) => `scripts/${f}`);
+  assert.ok(builds.includes("scripts/launcher-build.sh"), "the launcher's recipe is found by the scan");
+  const files = builds.map((p) => [p, fs.readFileSync(join(REPO, p), "utf8")]);
+  assert.ok(scriptsNamedBy(files.find(([p]) => p === "scripts/launcher-build.sh")[1]).includes("scripts/backup-static-check.sh"), "the scan sees the static check");
+  assert.deepEqual(buildRecipeGaps(EXPLICIT, files), []);
+  // Controls: the static check dropped from EXPLICIT, a recipe naming an unlisted script, and an unlisted recipe.
+  assert.deepEqual(buildRecipeGaps(EXPLICIT.filter((p) => p !== "scripts/backup-static-check.sh"), files),
+    files.filter(([, s]) => s.includes("scripts/backup-static-check.sh")).map(([p]) => `scripts/backup-static-check.sh (named by ${p})`));
+  assert.deepEqual(buildRecipeGaps(EXPLICIT, [["scripts/launcher-build.sh", 'bash "$root/scripts/other-check.sh" x\n']]), ["scripts/other-check.sh (named by scripts/launcher-build.sh)"]);
+  assert.deepEqual(buildRecipeGaps(EXPLICIT, [["scripts/new-build.sh", "true\n"]]), ["scripts/new-build.sh (a build recipe)"]);
 });
 
 test("the generator: each of the ten declarations matches exactly one flagged line of this tree", () => {

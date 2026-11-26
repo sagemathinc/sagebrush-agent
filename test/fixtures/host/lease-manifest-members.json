@@ -130,6 +130,7 @@
   "schema/fleet/host-config.schema.json",
   "schema/fleet/reasons.json",
   "scripts/backup-build.sh",
+  "scripts/backup-static-check.sh",
   "scripts/launcher-build.sh",
   "scripts/release-install.sh",
   "scripts/release-trust.sh"

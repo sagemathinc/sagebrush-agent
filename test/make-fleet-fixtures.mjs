@@ -7,7 +7,7 @@
 // Each case gives its inputs as exact bytes or JSON, and its expected result: "ok" or a reason code from
 // schema/fleet/reasons.json. Stateful cases carry everything a verifier needs (the chain entries, the context).
 
-import { b64, enc, idOfBytes, canonText, keyFromSeed, seal, sealAdd, signedBytes, FREEZE, hostFingerprint, preimageHash, sha256b64 } from "../lib/fleet/index.mjs";
+import { b64, enc, idOfBytes, canonText, keyFromSeed, seal, sealAdd, signedBytes, FREEZE, hostFingerprint, fleetFingerprint, showFingerprint, preimageHash, sha256b64 } from "../lib/fleet/index.mjs";
 
 const AUD = "https://dev.sagebrush.space";
 const NOW = 1_800_000_000_000;
@@ -396,6 +396,14 @@ export async function build() {
     { name: "an extra field", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ reason: "x" }), H)), expect: "bad_form" },
   ];
 
+  // ---- the fleet fingerprint (host pairing's trust anchor): over the fleet id and the genesis entry's exact bytes
+  const fp = async (name, f, genesis) => { const full = await fleetFingerprint(f, enc(genesis)); return { name, fleet: f, genesis, full: b64(full), shown: showFingerprint(full) }; };
+  const fingerprints = [
+    await fp("the honest chain's genesis", fleet, honest[0]),
+    await fp("the same genesis under another fleet id", id(59), honest[0]),
+    await fp("one byte more after the genesis's text: other bytes, another fingerprint", fleet, honest[0] + " "),
+  ];
+
   return {
     $comment: "Shared fleet-protocol vectors (agent-autonomous-schemas.md r2.5 §9, §3.7.5, §3.8.3). Built by test/make-fleet-fixtures.mjs; every implementation must agree with every case. Mock data only: no real key, device or host.",
     freeze: FREEZE.sha256,
@@ -408,6 +416,7 @@ export async function build() {
     leases: { chain: leased, host_cert: cert, host: host, host_key: certBody.fingerprint, requests: lease_requests, leases },
     objects: { chain: honest, host_cert: cert, grants, grant_acks, host_ops, approvals, envelopes },
     transfers: { chain: honest, chain_removed: removedChain, receipts: transfer_receipts, hosts: transfer_hosts },
+    fleet_fingerprints: fingerprints,
   };
 }
 

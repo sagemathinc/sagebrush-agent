@@ -55,6 +55,7 @@
   "lib/fleet/host/backup-attach.mjs",
   "lib/fleet/host/backup-binary.mjs",
   "lib/fleet/host/backup-hoststore.mjs",
+  "lib/fleet/host/backup-init.mjs",
   "lib/fleet/host/backup-journal.mjs",
   "lib/fleet/host/backup-manifest.mjs",
   "lib/fleet/host/backup-retention.mjs",

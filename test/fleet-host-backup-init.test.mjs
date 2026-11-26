@@ -72,7 +72,7 @@ function world() {
     return { ok: true, value: {} };
   };
   const systemctl = [];
-  const units = realUnits({ dir: unitDir, run: async (argv) => { systemctl.push(argv.join(" ")); return { code: 0 }; } });
+  const units = realUnits({ dir: unitDir, rootUid: UID, run: async (argv) => { systemctl.push(argv.join(" ")); return { code: 0 }; } });
   const tty = fakeTty();
   const deps = { binary, enabled: () => backupEnabled({ dir: backup, rootUid: UID }).enabled !== false, restoreOpen: () => false, tty, units };
   const opts = (more = {}) => ({ state, secrets, uid: UID, rand, release: RELEASE, ...more });
@@ -276,7 +276,7 @@ test("row 4, repo's probe: open_failed (a repository host.key doesn't open) refu
     for (let i = 0; i < 2; i += 1) {
       w.repo.faults.snapshots.push({ ok: false, code });
       w.repo.calls.length = 0;
-      await rejects(init(null, w.deps, w.opts()), code);
+      await rejects(init(null, w.deps, w.opts()), code === "aborted" ? "outcome_unknown" : code); // (a signal's `aborted`: reported unknown)
       assert.deepEqual(w.repo.calls, ["snapshots"], `${code}: no init`);
       assert.deepEqual(tree(w), before, `${code}: the phase and the keys kept`);
     }
@@ -673,7 +673,7 @@ const binary = async (req) => {
 installCommandSignals(new AbortController());
 const out = await backupInitCommand(["init"], { uid: () => uid, rootUid: uid, state, secrets: join(base, "host-secrets"), release: "${RELEASE}",
   exclusion: { path: join(base, "init.lock"), uid, waitMs: 0 }, binary, enabled: () => false, restoreOpen: () => false,
-  units: realUnits({ dir: join(base, "units"), run: async () => ({ code: 0 }) }) });
+  units: realUnits({ dir: join(base, "units"), rootUid: uid, run: async () => ({ code: 0 }) }) });
 process.stdout.write(JSON.stringify(out.line) + "\\n");
 process.exitCode = out.code;
 `;
@@ -710,3 +710,192 @@ test("row 10, through a real pseudo-terminal: the code only on the terminal, a C
   }
   assert.equal(existsSync(join(base, "backup", "state", CODE_KEY)), false);
 });
+
+// ---- the guard inside the units' installation (TESTS T1 on the init PR) ----
+
+test("row 9, the exclusion lost inside daemon-reload: no enable follows, the journal stays confirmed; the next init finishes", async () => {
+  const w = world();
+  const d = cmdDeps(w);
+  let first = true;
+  const units = realUnits({ dir: w.unitDir, rootUid: UID, run: async (argv) => {
+    w.systemctl.push(argv.join(" "));
+    if (argv[1] === "daemon-reload" && first) { first = false; killHolderNow(d.exclusion.path); }
+    return { code: 0 };
+  } });
+  assert.deepEqual(await backupInitCommand(["init"], { ...d, units }), { code: 1, line: { v: 1, refused: "outcome_unknown" } });
+  assert.deepEqual(w.systemctl, ["systemctl daemon-reload"], "no enable after the lost reload");
+  assert.deepEqual(journal(w), { v: 1, phase: "confirmed" });
+  assert.deepEqual(await backupInitCommand(["init"], { ...d, units }), { code: 0, line: { v: 1, initialized: true } });
+  assertInitialized(w);
+});
+
+test("the units' guard, each layer alone: lost after the service file is written (no timer file, no systemctl), after the timer file (no reload), inside the reload (no enable)", async () => {
+  const lostError = () => new FleetError("outcome_unknown", "lost");
+  const u = backupUnits(RELEASE);
+  for (const after of ["service written", "timer written", "inside reload"]) {
+    const dir = mkdtempSync(join(tmpdir(), "sb-units-"));
+    const calls = [];
+    let isLost = false;
+    const guard = () => { if (isLost) throw lostError(); };
+    const io = { ...realIo, rename: (a, b) => {
+      realIo.rename(a, b);
+      if ((after === "service written" && b.endsWith(u.names.service)) || (after === "timer written" && b.endsWith(u.names.timer))) isLost = true;
+    } };
+    const run = async (argv) => { calls.push(argv[1]); if (after === "inside reload") isLost = true; return { code: 0 }; };
+    await rejects(realUnits({ dir, run, io, rootUid: UID })(u, { guard }), "outcome_unknown");
+    assert.deepEqual(readdirSync(dir).sort(), after === "service written" ? [u.names.service] : [u.names.service, u.names.timer].sort(), after);
+    assert.deepEqual(calls, after === "inside reload" ? ["daemon-reload"] : [], after);
+  }
+  // The control: with the lock held throughout, both files and both calls.
+  const dir = mkdtempSync(join(tmpdir(), "sb-units-"));
+  const calls = [];
+  await realUnits({ dir, rootUid: UID, run: async (argv) => { calls.push(argv[1]); return { code: 0 }; } })(u, { guard: () => {} });
+  assert.deepEqual(calls, ["daemon-reload", "enable"]);
+  // Unchanged files aren't rewritten, and a failing call refuses with nothing after it.
+  const ino = lstatSync(join(dir, u.names.timer)).ino;
+  const failing = [];
+  await rejects(realUnits({ dir, rootUid: UID, run: async (argv) => { failing.push(argv[1]); return { code: 1 }; } })(u, {}), "outcome_unknown");
+  assert.equal(lstatSync(join(dir, u.names.timer)).ino, ino);
+  assert.deepEqual(failing, ["daemon-reload"]);
+  // A call that rejects (a spawn failure, its deadline, the command's signal): a registered refusal, nothing after it.
+  const thrown = [];
+  await rejects(realUnits({ dir, rootUid: UID, run: async (argv) => { thrown.push(argv[1]); throw Object.assign(new Error("x"), { code: "effect_failed" }); } })(u, {}), "outcome_unknown");
+  assert.deepEqual(thrown, ["daemon-reload"]);
+});
+
+test("an existing unit is skipped only when proven: a regular root 0644 file, byte-equal; same bytes with another mode, a link, or another owner never stays", async () => {
+  const u = backupUnits(RELEASE);
+  const setUp = () => {
+    const dir = mkdtempSync(join(tmpdir(), "sb-units-"));
+    const calls = [];
+    return { dir, calls, run: async (argv) => { calls.push(argv[1]); return { code: 0 }; } };
+  };
+  // Same bytes, mode 0777: rewritten at 0644 before the reload.
+  {
+    const x = setUp();
+    for (const [n, t] of [[u.names.service, u.service], [u.names.timer, u.timer]]) { writeFileSync(join(x.dir, n), t); chmodSync(join(x.dir, n), 0o777); }
+    await realUnits({ dir: x.dir, run: x.run, rootUid: UID })(u, {});
+    for (const n of [u.names.service, u.names.timer]) assert.equal(lstatSync(join(x.dir, n)).mode & 0o7777, 0o644, n);
+    assert.deepEqual(x.calls, ["daemon-reload", "enable"]);
+  }
+  // A link to a byte-equal file elsewhere: the link itself is replaced by a regular file; its target is untouched.
+  {
+    const x = setUp();
+    const outside = join(mkdtempSync(join(tmpdir(), "sb-units-outside-")), "service");
+    writeFileSync(outside, u.service, { mode: 0o644 });
+    chmodSync(outside, 0o644);
+    symlinkSync(outside, join(x.dir, u.names.service));
+    await realUnits({ dir: x.dir, run: x.run, rootUid: UID })(u, {});
+    const st = lstatSync(join(x.dir, u.names.service));
+    assert.ok(st.isFile() && !st.isSymbolicLink(), "a regular file now");
+    assert.equal(readFileSync(join(x.dir, u.names.service), "utf8"), u.service);
+    assert.equal(lstatSync(outside).mode & 0o7777, 0o644);
+    assert.equal(readFileSync(outside, "utf8"), u.service, "the link's target untouched");
+  }
+  // Another owner (the files are this test's uid, root is another): never proven, so the write's own proof refuses
+  // before any reload or enable.
+  {
+    const x = setUp();
+    for (const [n, t] of [[u.names.service, u.service], [u.names.timer, u.timer]]) { writeFileSync(join(x.dir, n), t); chmodSync(join(x.dir, n), 0o644); }
+    await rejects(realUnits({ dir: x.dir, run: x.run, rootUid: UID + 1 })(u, {}), "outcome_unknown");
+    assert.deepEqual(x.calls, [], "no reload or enable over a unit that isn't root's");
+  }
+  // The command: a pre-created byte-exact 0777 unit ends root 0644 (row 1's invariant).
+  {
+    const w = world();
+    writeFileSync(join(w.unitDir, u.names.timer), u.timer);
+    chmodSync(join(w.unitDir, u.names.timer), 0o777);
+    assert.deepEqual(await init(input(), w.deps, w.opts()), { initialized: true });
+    assertInitialized(w);
+  }
+});
+
+// ---- the console's signal (SEC H1, N1 on the init PR) ----
+
+test("a signal during a binary call: a registered refusal (outcome_unknown, never `aborted`), the journal kept, nothing after it; the next init recovers", async () => {
+  const { setCommandSignal } = await import("../lib/fleet/host/backup-binary.mjs");
+  for (const during of ["repository init", "code-slot's probe"]) {
+    const w = world();
+    const d = cmdDeps(w);
+    if (during === "code-slot's probe") {
+      w.repo.faults["add-key"].push({ ok: false, code: "destination_unavailable" });
+      assert.equal((await backupInitCommand(["init"], d)).line.refused, "destination_unavailable");
+    }
+    const controller = new AbortController();
+    setCommandSignal(controller.signal);
+    const real = w.deps.binary;
+    const op = during === "repository init" ? "init" : "snapshots";
+    // As runBackupOp answers a call the signal stopped: the effect may have happened (here it has), then `aborted`.
+    const stopped = async (req, o) => { const r = await real(req, o); if (req.op === op && !controller.signal.aborted) { controller.abort(); return { ok: false, code: "aborted" }; } return r; };
+    w.repo.calls.length = 0;
+    let out;
+    try { out = await backupInitCommand(["init"], { ...d, binary: stopped }); } finally { setCommandSignal(null); }
+    assert.deepEqual(out, { code: 1, line: { v: 1, refused: "outcome_unknown" } }, during);
+    assert.deepEqual(w.repo.calls, [op], `${during}: nothing after it`);
+    assert.deepEqual(journal(w).phase, during === "repository init" ? "repo" : "code-slot");
+    assert.equal(w.tty.text, "");
+    assert.deepEqual(await backupInitCommand(["init"], d), { code: 0, line: { v: 1, initialized: true } }, `${during}: recovered`);
+    assertInitialized(w);
+    assert.equal(ops(w, "init"), during === "repository init" ? 1 : 0, "init never repeated (the log counts from the signalled run)");
+  }
+});
+
+test("a signal that lands as the answer is typed: nothing after it (no confirmed, no enabled, no units); the next init finishes", async () => {
+  const { setCommandSignal } = await import("../lib/fleet/host/backup-binary.mjs");
+  const w = world();
+  const d = cmdDeps(w);
+  const controller = new AbortController();
+  const tty = { ...w.tty, ask: async (p) => { const a = await w.tty.ask(p); controller.abort(); return a; } };
+  setCommandSignal(controller.signal);
+  let out;
+  try { out = await backupInitCommand(["init"], { ...d, tty }); } finally { setCommandSignal(null); }
+  assert.deepEqual(out, { code: 1, line: { v: 1, refused: "outcome_unknown" } });
+  assert.deepEqual(journal(w), { v: 1, phase: "shown" });
+  assert.equal(existsSync(join(w.backup, "enabled")), false);
+  assert.deepEqual(w.systemctl, []);
+  assert.deepEqual(await backupInitCommand(["init"], d), { code: 0, line: { v: 1, initialized: true } });
+  assertInitialized(w);
+});
+
+/** A driver: the command as host-main runs it (the console's signals installed, the real stdin), over seams. */
+const stdinDriver = (repoUrl, which) => `import * as fs from "node:fs";
+import { join } from "node:path";
+import { installCommandSignals } from "${repoUrl}lib/fleet/host/backup-binary.mjs";
+const base = process.argv[2], uid = process.getuid();
+installCommandSignals(new AbortController());
+const binary = async (req) => { fs.appendFileSync(join(base, "calls"), req.op + "\\n"); return { ok: false, code: "destination_unavailable" }; };
+const deps = { uid: () => uid, rootUid: uid, state: join(base, "backup", "state"), secrets: join(base, "host-secrets"), release: "${RELEASE}",
+  exclusion: { path: join(base, "x.lock"), uid, waitMs: 0 }, binary, enabled: () => false, restoreOpen: () => false };
+const out = ${which === "init"
+  ? `await (await import("${repoUrl}lib/fleet/host/backup-init.mjs")).backupInitCommand(["init"], { ...deps, tty: { write() {}, ask: async () => null }, units: async () => {} });`
+  : `await (await import("${repoUrl}lib/fleet/host/backup-attach.mjs")).backupAttachCommand(["attach"], deps);`}
+process.stdout.write(JSON.stringify(out.line) + "\\n");
+process.exit(out.code);
+`;
+
+for (const which of ["init", "attach"]) {
+  test(`N1, ${which}: stdin held open, a SIGTERM ends the wait at once (a registered refusal, nothing read or written)`, async () => {
+    const { spawn } = await import("node:child_process");
+    const base = mkdtempSync(join(tmpdir(), "sb-stdin-"));
+    const helpers = mkdtempSync(join(tmpdir(), "sb-stdin-helpers-"));
+    writeFileSync(join(helpers, "driver.mjs"), stdinDriver(pathToFileURL(fileURLToPath(new URL("..", import.meta.url))).href.replace(/\/?$/, "/"), which));
+    const child = spawn(process.execPath, [join(helpers, "driver.mjs"), base], { stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "", stderr = "";
+    child.stdout.on("data", (b) => { stdout += b; });
+    child.stderr.on("data", (b) => { stderr += b; });
+    const exited = new Promise((r) => child.on("exit", (code) => r(code)));
+    child.stdin.write('{"v":1,'); // (part of an input, and the pipe stays open)
+    await new Promise((r) => { setTimeout(r, 300); });
+    const t0 = Date.now();
+    child.kill("SIGTERM");
+    const code = await Promise.race([exited, new Promise((r) => { setTimeout(() => r("still waiting"), 5000); })]);
+    if (code === "still waiting") child.kill("SIGKILL");
+    child.stdin.destroy();
+    assert.equal(code, 1, `${which}: ended by the signal (${stderr})`);
+    assert.ok(Date.now() - t0 < 5000);
+    assert.equal(stdout, '{"v":1,"refused":"bad_form"}\n');
+    assert.equal(existsSync(join(base, "calls")), false, "no binary call");
+    assert.equal(existsSync(join(base, "backup")), false, "nothing created");
+    assert.equal(existsSync(join(base, "host-secrets")), false);
+  });
+}

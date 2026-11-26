@@ -236,7 +236,7 @@ test("the probe: only open_failed runs add-key; every other code stays probing w
       for (let run = 0; run < 2; run += 1) {
         w.repo.faults.snapshots.push({ ok: false, code });
         w.repo.calls.length = 0;
-        await rejects(attach(input(), w.deps, w.opts()), code ?? "outcome_unknown");
+        await rejects(attach(input(), w.deps, w.opts()), code === undefined || code === "aborted" ? "outcome_unknown" : code); // (a signal's `aborted`: reported unknown)
         assert.deepEqual(w.repo.calls, ["snapshots"], `${code}: the probe only, no add-key`);
         assert.deepEqual(journal(w), { v: 1, phase: "probing", swap: "forward" });
         assert.equal(readFileSync(join(w.state, HOST_KEY), "utf8"), NEW, "the new key in host.key");
@@ -626,3 +626,25 @@ for (const inside of ["enabled", "restoreOpen"]) {
     assert.deepEqual(w.repo.calls, []);
   });
 }
+
+test("a console signal: a call it stopped (`aborted`) or one that finished as it landed is reported outcome_unknown, nothing after it; the next attach recovers", async () => {
+  const { setCommandSignal } = await import("../lib/fleet/host/backup-binary.mjs");
+  for (const answer of ["aborted", "ok"]) {
+    const w = world();
+    const exclusion = { path: join(w.base, "attach.lock"), uid: UID, waitMs: 0 };
+    const d = { uid: () => UID, rootUid: UID, state: w.state, secrets: w.secrets, rand, stdin: async () => Buffer.from(JSON.stringify(input())), exclusion, ...w.deps };
+    const controller = new AbortController();
+    const real = w.deps.binary;
+    // add-key commits, then the signal lands: the call answers `aborted` (stopped) or its own success (it finished).
+    const stopped = async (req, o) => { const r = await real(req, o); if (req.op === "add-key") { controller.abort(); return answer === "aborted" ? { ok: false, code: "aborted" } : r; } return r; };
+    setCommandSignal(controller.signal);
+    let out;
+    try { out = await backupAttachCommand(["attach"], { ...d, binary: stopped }); } finally { setCommandSignal(null); }
+    assert.deepEqual(out, { code: 1, line: { v: 1, refused: "outcome_unknown" } }, answer);
+    assert.deepEqual(w.repo.calls, ["snapshots", "add-key"], `${answer}: nothing after it`);
+    assert.deepEqual(journal(w), { v: 1, phase: "slot-pending" });
+    assert.deepEqual(await backupAttachCommand(["attach"], d), { code: 0, line: { v: 1, attached: true } });
+    assertAttached(w);
+    assert.equal(w.repo.calls.filter((c) => c === "add-key").length, 1, `${answer}: add-key never repeated after its commit`);
+  }
+});

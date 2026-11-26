@@ -389,25 +389,30 @@ test("A1: a lock lost at ANY guard point stops the pass there: lock_lost, no rec
   assert.ok(points >= 15, `every guard point lost once (${points})`);
 });
 
-test("A1: a lock lost right after ANY cgroup operation (a freeze, a thaw, a reap): the next cgroup operation never runs", async () => {
+for (const [flow, answers, end] of [["a pass that succeeds", {}, "good"], ["a pass that abandons (its good backup fails)", { good: { ok: false, code: "backup_failed" } }, "abandoned"]]) test(`A1: a lock lost right after ANY cgroup operation (a freeze, a thaw, a reap) in ${flow}: the next cgroup operation, fence change or journal write never runs`, async () => {
   let points = 0;
   for (let k = 1; ; k += 1) {
-    const { d, set, deps } = setup();
-    let ops = 0, isLost = false, after = 0;
+    const { d, set, deps } = setup("agent", 1, answers);
+    let ops = 0, isLost = false, after = 0, atLoss = null;
     const guard = () => { if (isLost) throw Object.assign(new Error("lost"), { code: "lock_lost" }); };
     const cg = Object.fromEntries(Object.entries(deps.cg).map(([op, f]) => [op, (...x) => {
       if (isLost) after += 1;
       const r = f(...x);
       ops += 1;
-      if (ops === k) isLost = true; // (lost while that operation ran: before the next one)
+      if (ops === k) { // (lost while that operation ran: before the next one)
+        isLost = true;
+        atLoss = { fence: existsSync(join(d.fenceDir, "backup", set.members[0])), journal: JSON.stringify(readJournal({ dir: d.dir })) };
+      }
       return r;
     }]));
     let out;
     try { out = await backupSet(set, RUN, { ...deps, cg, guard }); } catch (e) { out = e; }
-    if (!isLost) { assert.equal(out.outcome, "good"); break; }
+    if (!isLost) { assert.equal(out.outcome, end); break; }
     points += 1;
     assert.equal(out?.code, "lock_lost", `k=${k}`);
     assert.equal(after, 0, `k=${k}: no cgroup operation after the loss`);
+    assert.equal(existsSync(join(d.fenceDir, "backup", set.members[0])), atLoss.fence, `k=${k}: no fence change after the loss (the release's and an abandon's included)`);
+    assert.equal(JSON.stringify(readJournal({ dir: d.dir })), atLoss.journal, `k=${k}: no journal write after the loss`);
     assert.ok(readJournal({ dir: d.dir }) !== null || k === 0);
   }
   assert.ok(points >= 4, `every cgroup operation lost after once (${points})`);

@@ -373,3 +373,38 @@ test("A1: every set's backupSet gets the run's guard (the live sets' and the hos
   assert.equal((await runOnce(f.deps)).status, "ok");
   assert.deepEqual(guards.map((g) => g[1]), ["function", "function", "function"]);
 });
+
+test("A1 in a left-over run's recovery: the run's lock lost right after ANY cgroup proof (the last thaw proof included): no fence comes down and no journal write follows", async () => {
+  let points = 0;
+  for (let k = 1; ; k += 1) {
+    const root = mkdtempSync(join(tmpdir(), "sb-left-"));
+    const dir = join(root, "backup"), fenceDir = join(root, "fence");
+    mkdirSync(dir, { mode: 0o700 }); mkdirSync(fenceDir, { mode: 0o700 });
+    const a = newId(), run = "20261124T020000Z-abcdefgh";
+    writeJournal({ ...advance(advance(advance(newJournal(run, [a]), "fenced"), "idle"), "frozen"), warm: hex(77) }, { dir });
+    raiseFence("backup", a, { dir: fenceDir });
+    const groups = { [agentSliceCgroup(a)]: { frozen: true } };
+    let ops = 0, isLost = false, atLoss = null;
+    const guard = () => { if (isLost) throw Object.assign(new Error("lost"), { code: "lock_lost" }); };
+    const raw = { kill: () => {}, procs: () => 0, freeze: (p, on) => { groups[p].frozen = on; }, frozen: (p) => groups[p]?.frozen ?? false };
+    // As realRunDeps passes it: each cgroup operation behind the guard; the loss lands right after the k-th.
+    const cg = Object.fromEntries(Object.entries(raw).map(([op, f]) => [op, (...x) => {
+      guard();
+      const r = f(...x);
+      ops += 1;
+      if (ops === k) { isLost = true; atLoss = { fence: existsSync(join(fenceDir, "backup", a)), journal: JSON.stringify(readJournal({ dir })) }; }
+      return r;
+    }]));
+    const binary = async () => ({ ok: true, value: { forgotten: 1 } });
+    const clock = (() => { let t = 0; return { now: () => t, sleep: async (ms) => { t += ms; } }; })();
+    let out;
+    try { out = await recoverLeftover({ binary, dir, fenceDir, cg, guard, ...clock }); } catch (e) { out = e; }
+    if (!isLost) { assert.deepEqual(out, { ok: true, recovered: run }); break; }
+    points += 1;
+    assert.equal(out?.code, "lock_lost", `k=${k}`);
+    assert.equal(existsSync(join(fenceDir, "backup", a)), atLoss.fence, `k=${k}: no fence change after the loss`);
+    assert.equal(JSON.stringify(readJournal({ dir })), atLoss.journal, `k=${k}: no journal write after the loss`);
+    assert.equal(atLoss.fence, true, `k=${k}: the fence still up (it only comes down after every proof)`);
+  }
+  assert.ok(points >= 4, `every cgroup proof lost once (${points})`);
+});

@@ -1198,3 +1198,60 @@ test("the resume gate (c): validated: the request passes the gate and reaches th
   assert.equal(r.reason, "receipt", "the real verifier refused the fake pair: the receipt checks ran");
   assert.deepEqual([s.recorded.length, s.helper], [0, 0]);
 });
+
+// ---- a backup run's snapshot, served by the daemon (wiring r0.4 §1.1)
+
+test("the backup snapshot seam: built over the open store and given to the executor; checked every backupSnapshotMs, submitted only when pending, cleared at the drain", async () => {
+  const { id } = await paired();
+  const h = harness({ id });
+  const timers = [];
+  let pending = false;
+  const seen = [];
+  h.d.backupSnapshot = ({ store }) => { seen.push(store); return { pending: () => pending, serve: () => ({ status: "idle" }) }; };
+  h.d.backupSnapshotMs = 5000;
+  h.d.every = (fn, ms) => { const t = { fn, ms, cleared: false }; timers.push(t); return t; };
+  h.d.clearEvery = (t) => { t.cleared = true; h.log.push("clearEvery"); };
+  const run = hostRun(h.d);
+  await until(() => h.lines.some((l) => l.serving));
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0], h.made.supervisor.store);
+  assert.equal(typeof h.made.supervisor.backupSnapshot?.serve, "function");
+  const t = timers.find((x) => x.ms === 5000);
+  assert.ok(t, "the 5-second check");
+  t.fn();
+  await new Promise((r) => { setTimeout(r, 20); });
+  assert.ok(!h.log.includes("submit:backup-snapshot"), "nothing pending: no op");
+  pending = true;
+  t.fn();
+  await until(() => h.log.includes("submit:backup-snapshot"));
+  h.term();
+  assert.equal((await run).code, 0);
+  assert.equal(t.cleared, true);
+  // Without the seam: none for the executor, and no timer.
+  const g = harness({ id });
+  const gt = [];
+  g.d.backupSnapshotMs = 5000;
+  g.d.every = (fn, ms) => { gt.push(ms); return {}; };
+  g.d.clearEvery = () => {};
+  const run2 = hostRun(g.d);
+  await until(() => g.lines.some((l) => l.serving));
+  assert.equal(g.made.supervisor.backupSnapshot, undefined);
+  assert.ok(!gt.includes(5000));
+  g.term();
+  await run2;
+});
+
+test("the snapshot ticker coalesces: while one backup-snapshot op is queued or running, a tick submits nothing more", async () => {
+  const { snapshotTicker } = await import("../lib/fleet/host/host-main.mjs");
+  let release;
+  const submitted = [];
+  const tick = snapshotTicker(() => true, (op) => { submitted.push(op); return new Promise((r) => { release = r; }); });
+  tick(); tick(); tick();
+  await new Promise((r) => { setTimeout(r, 10); });
+  assert.deepEqual(submitted, [{ kind: "backup-snapshot", authority: "host" }]);
+  release();
+  await new Promise((r) => { setTimeout(r, 10); });
+  tick();
+  await new Promise((r) => { setTimeout(r, 10); });
+  assert.equal(submitted.length, 2, "the next after it settled");
+});

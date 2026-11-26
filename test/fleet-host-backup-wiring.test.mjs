@@ -81,8 +81,9 @@ function host() {
   const storeRoot = join(base, "store"), restoreDir = join(base, "restore");
   const exclusion = { path: join(private_(join(base, "lib")), "backup-restore.lock"), uid: UID };
   const store = fakeStore(join(base, "store.json"));
+  const fenceDir = private_(join(base, "fence"));
   const deps = (more = {}) => ({
-    ...realRunDeps({ dir, storeRoot, uid: UID, exclusion, restoreDir, binary: store, run: async () => ({ code: 0, stdout: "" }) }),
+    ...realRunDeps({ dir, storeRoot, uid: UID, exclusion, restoreDir, fenceDir, binary: store, run: async () => ({ code: 0, stdout: "" }) }),
     freeBytes: () => 64 * 1024 ** 3, ensureCache: async () => {}, trimCache: async () => {}, now: () => T0, ...more,
   });
   const cmd = (argv, more = {}) => backupCommand(argv, { uid: () => UID, rootUid: UID, dir, now: () => T0, run: deps(more) });
@@ -432,7 +433,7 @@ const [base, uid] = [process.argv[2], process.getuid()];
 const cfg = JSON.parse(fs.readFileSync(base + "/cfg.json", "utf8"));
 const { fakeStoreModule } = await import(base + "/store.mjs");
 const store = fakeStoreModule(base + "/store.json");
-const deps = realRunDeps({ dir: cfg.dir, storeRoot: cfg.storeRoot, uid, exclusion: cfg.exclusion, restoreDir: cfg.restoreDir, binary: store, run: async () => ({ code: 0, stdout: "" }) });
+const deps = realRunDeps({ dir: cfg.dir, storeRoot: cfg.storeRoot, uid, exclusion: cfg.exclusion, restoreDir: cfg.restoreDir, fenceDir: cfg.fenceDir, binary: store, run: async () => ({ code: 0, stdout: "" }) });
 const die = () => process.kill(process.pid, "SIGKILL");
 const run = { ...deps, freeBytes: () => 64 * 1024 ** 3, ensureCache: async () => {}, trimCache: async () => {}, now: () => ${T0},
   ${seam === "after the lock" ? "restoreOpen: () => { die(); }," : ""}
@@ -446,7 +447,7 @@ for (const seam of ["after the lock", "after the debt", "after the commit"]) {
     const h = host();
     const repo = pathToFileURL(fileURLToPath(new URL("..", import.meta.url))).href.replace(/\/?$/, "/");
     const helpers = mkdtempSync(join(tmpdir(), "sb-wiring-crash-"));
-    writeFileSync(join(h.base, "cfg.json"), JSON.stringify({ dir: h.dir, storeRoot: h.storeRoot, exclusion: h.exclusion, restoreDir: h.restoreDir }));
+    writeFileSync(join(h.base, "cfg.json"), JSON.stringify({ dir: h.dir, storeRoot: h.storeRoot, exclusion: h.exclusion, restoreDir: h.restoreDir, fenceDir: join(h.base, "fence") }));
     writeFileSync(join(h.base, "store.mjs"), `import * as fs from "node:fs";\nimport { existsSync, readFileSync } from "node:fs";\nimport { join } from "node:path";\nimport { createHash } from "node:crypto";\nconst T0 = ${T0};\nconst hex = (s) => createHash("sha256").update(String(s)).digest("hex");\nexport ${fakeStore.toString().replace("function fakeStore", "function fakeStoreModule")}\n`);
     writeFileSync(join(helpers, "driver.mjs"), crashDriver(repo, seam));
     const r = spawnSync(process.execPath, [join(helpers, "driver.mjs"), h.base], { encoding: "utf8", timeout: 60_000 });
@@ -482,4 +483,108 @@ test("a store owned by a live owner that doesn't serve: skipped snapshot_unavail
     assert.equal(existsSync(join(h.dir, "state.json")), false, "no debt written");
     assert.deepEqual(h.store.ops(), []);
   } finally { await owner.close(); }
+});
+
+// ---- T1 (r0.4 §5): a REAL live owner in another process serves the run's snapshot (the daemon's side, 4b) ----
+
+/**
+ * An owner process: it holds a real HostStore (the store's lock) and serves the snapshot request as the daemon does,
+ * through the real ticker and serveSnapshot in one queue. It answers "ping" on stdin with "pong" (a concurrent op on
+ * the owner). With `slow`, each file of the copy takes 400 ms (so a test can kill it mid-copy).
+ */
+const ownerScript = (repo) => `import * as fs from "node:fs";
+import { HostStore } from "${repo}lib/fleet/host/host-store.mjs";
+import { serveSnapshot, snapshotPending } from "${repo}lib/fleet/host/backup-snapshot.mjs";
+import { snapshotTicker } from "${repo}lib/fleet/host/host-main.mjs";
+const [root, dir, slow] = process.argv.slice(2);
+const uid = process.getuid();
+const store = await HostStore.open(root);
+const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const fsx = slow === "slow" ? { ...fs, readFileSync: (...a) => { pause(400); return fs.readFileSync(...a); } } : fs;
+let queue = Promise.resolve();
+const submit = () => (queue = queue.then(() => serveSnapshot(store, { dir, root, uid, fsx })).then((r) => { process.stdout.write(JSON.stringify(r) + "\\n"); return r; }));
+setInterval(snapshotTicker(() => snapshotPending(dir, { uid }), submit), 20);
+process.stdin.on("data", (b) => { for (const l of String(b).split("\\n")) if (l === "ping") queue = queue.then(() => process.stdout.write("pong\\n")); });
+process.stdout.write("ready\\n");
+`;
+
+async function owner(h, slow = "") {
+  const { spawn } = await import("node:child_process");
+  const repo = pathToFileURL(fileURLToPath(new URL("..", import.meta.url))).href.replace(/\/?$/, "/");
+  const helpers = mkdtempSync(join(tmpdir(), "sb-owner-"));
+  writeFileSync(join(helpers, "owner.mjs"), ownerScript(repo));
+  const child = spawn(process.execPath, [join(helpers, "owner.mjs"), h.storeRoot, join(h.dir, "snapshot"), slow], { stdio: ["pipe", "pipe", "pipe"] });
+  let out = "", err = "";
+  child.stdout.on("data", (b) => { out += b; });
+  child.stderr.on("data", (b) => { err += b; });
+  const exited = new Promise((r) => child.on("exit", r));
+  const waitFor = async (f, ms = 10_000) => { const t0 = Date.now(); while (!f() && Date.now() - t0 < ms) await new Promise((r) => { setTimeout(r, 10); }); return f(); };
+  assert.ok(await waitFor(() => out.includes("ready\n")), `the owner started (${err})`);
+  return { child, lines: () => out.split("\n").filter(Boolean), waitFor, kill: async () => { child.kill("SIGKILL"); await exited; }, stop: async () => { child.stdin.end(); child.kill("SIGTERM"); await exited; } };
+}
+
+test("T1: a live owner in another process serves the run's snapshot under its own lock, while it stays responsive; the run commits from it", async () => {
+  const h = host();
+  mkdirSync(join(h.dir, "snapshot"), { mode: 0o700 });
+  const o = await owner(h);
+  try {
+    // The runner can't open the store (the owner holds it): it asks, and waits for the owner's answer.
+    const run = h.cmd(["run"]);
+    o.child.stdin.write("ping\n");
+    assert.ok(await o.waitFor(() => o.lines().includes("pong")), "a concurrent op on the owner completes");
+    const out = await run;
+    assert.equal(out.line.status, "ok", JSON.stringify(out));
+    assert.ok(o.lines().some((l) => l.startsWith('{"status":"served"')), "served by the owner");
+    // The manifest's host store is the owner's copy, from the run's own snapshot.
+    const m = parseManifest(h.store.snaps().find((s) => s.id === out.line.manifest).text);
+    assert.ok(h.store.snaps().find((s) => s.id === m.hoststore).paths[0].startsWith(join(h.dir, "snapshot")));
+  } finally { await o.stop(); }
+});
+
+test("T1: the owner killed mid-copy: the run is skipped snapshot_unavailable with nothing written; the next run, with a new owner, succeeds and removes the stale result", async () => {
+  const h = host();
+  mkdirSync(join(h.dir, "snapshot"), { mode: 0o700 });
+  // A store with files to copy (each one slow in the owner); no agents (an unpaired host has none).
+  const s = await HostStore.open(h.storeRoot);
+  await s.close();
+  private_(join(h.storeRoot, "config"));
+  for (let i = 0; i < 4; i += 1) writeFileSync(join(h.storeRoot, "config", `f${i}`), "x", { mode: 0o600 });
+  const slow = await owner(h, "slow");
+  const killer = (async () => {
+    const snap = join(h.dir, "snapshot");
+    await slow.waitFor(() => existsSync(snap) && readdirSync(snap).some((n) => n !== "request.json" && existsSync(join(snap, n, "hoststore"))));
+    await slow.kill();
+  })();
+  let t = 0;
+  const first = await h.cmd(["run"], { snapshot: (run, g) => runSnapshot(run, { dir: join(h.dir, "snapshot"), root: h.storeRoot, openStore: () => HostStore.open(h.storeRoot), uid: UID, guard: g,
+    waitMs: 60_000, pollMs: 1000, now: () => t, sleep: async (ms) => { await killer; t += ms; } }) });
+  await killer;
+  assert.deepEqual(first, { code: 0, line: { v: 1, status: "skipped", why: "snapshot_unavailable" } });
+  assert.equal(existsSync(join(h.dir, "state.json")), false, "no debt");
+  assert.deepEqual(h.store.ops(), [], "nothing read from or written to the store");
+  const stale = readdirSync(join(h.dir, "snapshot")).filter((n) => n !== "request.json");
+  assert.equal(stale.length, 1, "the dead owner's partial result is there");
+  // The retry: a new owner (a restarted daemon), a new run.
+  const o = await owner(h);
+  try {
+    const next = await h.cmd(["run"]);
+    assert.equal(next.line.status, "ok", JSON.stringify(next));
+    assert.equal(existsSync(join(h.dir, "snapshot", stale[0])), false, "the stale result removed by the next run first");
+  } finally { await o.stop(); }
+});
+
+test("the daemon's 5-second check: pending only for a well-formed request with no done yet", async () => {
+  const { snapshotPending } = await import("../lib/fleet/host/backup-snapshot.mjs");
+  const h = host();
+  const dir = private_(join(h.dir, "snapshot"));
+  assert.equal(snapshotPending(dir, { uid: UID }), false, "no request");
+  writeFileSync(join(dir, "request.json"), "{", { mode: 0o600 });
+  assert.equal(snapshotPending(dir, { uid: UID }), false, "a malformed one is ignored");
+  const req = { run: "20261126T030000Z-abcdefgh", nonce: "N".repeat(22) };
+  writeFileSync(join(dir, "request.json"), JSON.stringify({ v: 1, ...req }) + "\n", { mode: 0o600 });
+  assert.equal(snapshotPending(dir, { uid: UID }), true);
+  const o = await HostStore.open(h.storeRoot);
+  try { takeSnapshot(o, req, { dir, root: h.storeRoot, uid: UID }); } finally { await o.close(); }
+  assert.equal(snapshotPending(dir, { uid: UID }), false, "served: not pending");
+  assert.equal(snapshotPending(join(h.base, "missing"), { uid: UID }), false, "no directory");
 });

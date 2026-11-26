@@ -27,6 +27,7 @@ set -eu
 
 [ "$#" -eq 1 ] || { echo "usage: scripts/backup-build.sh <out>" >&2; exit 2; }
 out=$1
+case "$out" in /*) ;; *) out=$(pwd -P)/$out ;; esac # (absolute before the cd into the source root below)
 root=$(cd "$(dirname "$0")/.." && pwd -P)
 target=x86_64-unknown-linux-musl
 TOOLS=/usr/bin

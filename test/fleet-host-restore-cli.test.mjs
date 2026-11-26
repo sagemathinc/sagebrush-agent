@@ -170,6 +170,20 @@ test("retry's refusals, each with no effect: no begun restore, closed, not in th
     await rejects(restoreRetry(`archive-${w.d}`, opts(w)), code);
     assert.equal(snapshotOf(w, `archive-${w.d}`), before, `${what}: nothing changed`);
   }
+  // In the crash continuation (the plan already re-planned past the stopped record), retry's own closed and intent
+  // checks are the only guards: no updatePlan runs there.
+  for (const [what, plant] of [
+    ["closed", (w) => { const p = readPlan({ dir: w.dir }); writeFileSync(join(w.dir, "plan.json"), JSON.stringify({ ...p, closed: { at: 1 } }) + "\n", { mode: 0o600 }); }],
+    ["an abandon intent", (w) => writeIntent(w, "archive", w.d, { set_run: readPlan({ dir: w.dir }).sets[`archive-${w.d}`].run })],
+  ]) {
+    const w = world();
+    writeRecord(reach("archive", w.d, "failed"), { dir: w.dir });
+    updatePlan(replanSet(readPlan({ dir: w.dir }), "archive", w.d, newRestoreRun(T0 + 1800000, () => Buffer.alloc(6, 4))), { dir: w.dir });
+    plant(w);
+    const before = snapshotOf(w, `archive-${w.d}`);
+    await rejects(restoreRetry(`archive-${w.d}`, opts(w)), "not_granted");
+    assert.equal(snapshotOf(w, `archive-${w.d}`), before, `continuation, ${what}: nothing changed`);
+  }
   // Not a set of the plan; a bad key.
   const n = world();
   await rejects(restoreRetry(`archive-${newId()}`, opts(n)), "not_found");

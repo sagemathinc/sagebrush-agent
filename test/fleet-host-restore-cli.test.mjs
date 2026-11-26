@@ -213,7 +213,8 @@ test("retry's refusals, each with no effect: no begun restore, closed, not in th
 test("the command line: argument errors are 2; not root is refused; each command's one line carries only codes", async () => {
   const w = world();
   writeRecord(reach("archive", w.d, "failed"), { dir: w.dir });
-  const deps = { dir: w.dir, fenceDir: w.fenceDir, exclusion: w.exclusion, uid: () => UID, rootUid: UID, now: () => T0 + 3600000 };
+  const removed = [];
+  const deps = { dir: w.dir, fenceDir: w.fenceDir, exclusion: w.exclusion, uid: () => UID, rootUid: UID, now: () => T0 + 3600000, removeHostStage: async (run) => { removed.push(run); } };
   for (const argv of [[], ["status", "x"], ["retry"], ["retry", "a", "b"], ["close", "now"], ["begin", hex("1")], ["list"], ["nope"]]) {
     const out = await restoreCommand(argv, deps);
     assert.equal(out.code, 2, JSON.stringify(argv));
@@ -234,6 +235,7 @@ test("the command line: argument errors are 2; not root is refused; each command
   for (const [kind, id] of [["agent", w.a], ["archive", w.d], ["tag", w.t]]) writeRecord(reach(kind, id, "validated"), { dir: w.dir });
   const closed = await restoreCommand(["close"], { ...deps, restoreRaised: () => false });
   assert.deepEqual(closed, { code: 0, line: { v: 1, closed: T0 + 3600000 } });
+  assert.deepEqual(removed, [RUN], "the host store's stage removed, for this restore's run");
   const after = restoreStatus({ dir: w.dir, uid: UID, fenceDir: w.fenceDir });
   assert.deepEqual([after.restore.open, after.restore.closed_at], [false, T0 + 3600000]);
 });

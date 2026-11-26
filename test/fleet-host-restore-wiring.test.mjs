@@ -366,7 +366,10 @@ test("the seam's imports, composed: an agent set at files_validated, its live tr
     writeFileSync(join(dir, BEGIN), JSON.stringify({ v: 1, snapshot: hex("1"), manifest_sha256: hex("2"), run: RUN, state: "done" }) + "\n", { mode: 0o600 });
     // The manifest says the agent was never configured.
     createPlan({ v: 1, host: "old", manifest: hex("1"), sha256: hex("2"), hoststore: hex("3"), sets: { [key]: { run: RUN, snapshot: hex("1"), tree: hex("4") } }, config: { [a]: EMPTY_CONFIG_HASH } }, { dir });
-    mkdirSync(join(dir, "hoststore-copy", RUN), { recursive: true, mode: 0o700 });
+    // The host store's stage, as the launcher leaves it: a marked hoststore attempt whose data/<leaf> is the copy.
+    const hatt = join(staging, RUN, "host", "hoststore", "1");
+    for (const p of [join(staging, RUN), join(staging, RUN, "host"), join(staging, RUN, "host", "hoststore"), hatt, join(hatt, "data"), join(hatt, "data", "run")]) mkdirSync(p, { recursive: true, mode: 0o700 });
+    writeFileSync(join(hatt, ".complete"), `${RUN}/host/hoststore/1`);
     const D = { dev: "2049", ino: "131", uid: 70000, gid: 70000, mode: 0o700, projid: 70000 };
     const dest = { home: D, sessions: { ...D, ino: "132" } };
     let r = step(newRecord({ kind: "agent", id: a, run: RUN, snapshot: hex("1") }), "bind", { dest });

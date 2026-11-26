@@ -184,3 +184,12 @@ test("removeInputs: by set key, missing fine, durable; a bad key refuses before 
   assert.ok(existsSync(join(dir, INPUTS, `tag-${w.t}.json`)), "only the named ones");
   assert.ok(readFileSync(join(dir, INPUTS, `tag-${w.t}.json`)).length > 0);
 });
+
+test("an archive's owner uids are capped too (no member equality bounds them)", () => {
+  const w = world();
+  const x = structuredClone(build(w, "archive", w.c));
+  x.classes.archive.owners.uids = Array.from({ length: MAX_MEMBERS }, (_, i) => 71000 + i);
+  checkInput(x);
+  x.classes.archive.owners.uids = Array.from({ length: MAX_MEMBERS + 1 }, (_, i) => 71000 + i);
+  refused(() => checkInput(x), "bad_form");
+});

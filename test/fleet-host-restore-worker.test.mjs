@@ -5,7 +5,7 @@
 // is admitted at the bind only as the provisioned identity, empty; a lost lock aborts. Dispatch is advisory: one
 // worker per host, while the gate is open, for the first eligible set.
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
@@ -67,6 +67,7 @@ function filler(body = async () => ({ state: "validated" })) {
   let hooks;
   return { calls, get hooks() { return hooks; }, filler: (h) => { hooks = h; return async (kind, id, plan, opts) => { calls.push([kind, id]); return body(h, kind, id, plan, opts); }; } };
 }
+const deps2 = (f, over = {}) => deps(f, over);
 const deps = (f, over = {}) => ({
   filler: f.filler, identifyDest: async () => ({ ...ID }), isEmpty: async () => true, ...over,
 });
@@ -411,4 +412,88 @@ test("stopWorker: kills the scope, then proves it gone, bounded", async () => {
   assert.equal(await stopWorker("agent", id, { sys: never, wait: async () => {}, tries: 3 }), false);
   const already = { killScope: async () => { throw new Error("no such unit"); }, scopeGone: async () => true };
   assert.equal(await stopWorker("agent", id, { sys: already, wait: async () => {} }), true);
+});
+
+test("dispatch writes its input durably BEFORE the start, with the argv's nonce; no trusted identity, no input and no worker", async () => {
+  const a = newId(), key = `agent-${a}`;
+  const h = host({ sets: { [key]: RUN }, noInput: [key] });
+  let atStart = null;
+  const nonces = [newId(), newId()];
+  const deps = {
+    gateOpen: async () => true, admitted: async () => true, main: "/opt/m.mjs", node: "/n", newNonce: () => nonces.shift(),
+    inputOf: async (k, i, r, n) => inputOf(k, i, r, n),
+    start: async (argv) => { atStart = { argv, input: readInput("agent", a, { dir: h.dir, uid: UID }), mode: statSync(join(h.dir, INPUTS, `${key}.json`)).mode & 0o777 }; },
+  };
+  const first = nonces[0];
+  assert.deepEqual(await dispatchOnce(deps, { dir: h.dir, uid: UID }), { dispatched: key });
+  assert.equal(atStart.argv.at(-1), first, "the argv carries the nonce");
+  assert.deepEqual([atStart.input.nonce, atStart.input.run, atStart.mode], [first, RUN, 0o600], "durable and private before the start");
+  // The worker of that dispatch admits its input; after a second dispatch, the first nonce refuses and the second admits.
+  const second = nonces[0];
+  await dispatchOnce(deps, { dir: h.dir, uid: UID });
+  assert.equal(atStart.argv.at(-1), second);
+  await rejects(runWorker("agent", a, RUN, first, deps2(filler()), { dir: h.dir, uid: UID }), "not_granted");
+  const f = filler(async () => ({ state: "files_validated" }));
+  assert.equal((await runWorker("agent", a, RUN, second, deps2(f), { dir: h.dir, uid: UID })).status, "files_validated");
+  // No trusted identity: no input written, nothing started, the set reported.
+  const b = newId(), kb = `agent-${b}`;
+  const hb = host({ sets: { [kb]: RUN }, noInput: [kb] });
+  let started = 0;
+  const out = await dispatchOnce({ ...deps, newNonce: () => newId(), inputOf: async () => null, start: async () => { started++; } }, { dir: hb.dir, uid: UID });
+  assert.deepEqual([out, started, existsSync(join(hb.dir, INPUTS, `${kb}.json`))], [{ dispatched: null, why: "idle", no_identity: [kb] }, 0, false]);
+  // An input for another set (or another nonce) is refused before anything is written or started.
+  await rejects(dispatchOnce({ ...deps, newNonce: () => newId(), inputOf: async (k, i, r) => inputOf(k, i, r, newId()), start: async () => { started++; } }, { dir: hb.dir, uid: UID }), "bad_form");
+  assert.deepEqual([started, existsSync(join(hb.dir, INPUTS, `${kb}.json`))], [0, false]);
+});
+
+test("a write that can't be made durable starts nothing; a settled set's input is removed by the dispatch, never by a worker", async () => {
+  const a = newId(), key = `agent-${a}`;
+  const h = host({ sets: { [key]: RUN }, noInput: [key] });
+  // The inputs directory a link elsewhere: the write refuses, and no worker is started.
+  const other = join(h.base, "other");
+  mkdirSync(other, { mode: 0o700 });
+  symlinkSync(other, join(h.dir, INPUTS));
+  let started = 0;
+  const deps = { gateOpen: async () => true, admitted: async () => true, main: "/opt/m.mjs", newNonce: () => NONCE, inputOf: async (k, i, r, n) => inputOf(k, i, r, n), start: async () => { started++; } };
+  await rejects(dispatchOnce(deps, { dir: h.dir, uid: UID }), "not_granted");
+  assert.deepEqual([started, readdirSync(other)], [0, []]);
+  // Settled (failed here): the next dispatch removes its input, and starts nothing for it.
+  const s = newId(), ks = `agent-${s}`;
+  const hs = host({ sets: { [ks]: RUN } });
+  assert.ok(existsSync(join(hs.dir, INPUTS, `${ks}.json`)));
+  writeRecord(step(bound("agent", s), "failed", { reason: "not_found" }), { dir: hs.dir });
+  const out = await dispatchOnce({ ...deps, start: async () => { started++; } }, { dir: hs.dir, uid: UID });
+  assert.deepEqual([out.dispatched, started, existsSync(join(hs.dir, INPUTS, `${ks}.json`))], [null, 0, false]);
+  // A worker that ends (here: refused on an intent) leaves the input where it is.
+  const v = newId(), kv = `agent-${v}`;
+  const hv = host({ sets: { [kv]: RUN } });
+  intent(hv.dir, kv);
+  assert.equal((await runWorker("agent", v, RUN, NONCE, deps2(filler()), { dir: hv.dir, uid: UID })).status, "abandoning");
+  assert.ok(existsSync(join(hv.dir, INPUTS, `${kv}.json`)), "the worker never removes an input");
+});
+
+test("the worker's trusted identities are its input's, of this epoch: another epoch or filesystem is refused at the bind", async () => {
+  for (const change of [{ epoch: { ...EPOCH, mnt_id: 8 } }, { epoch: { ...EPOCH, boot_id: "11111111-1111-4111-8111-111111111111" } }, { fsid: "fedcba9876543210" }]) {
+    const id = newId(), key = `archive-${id}`;
+    const h = host({ sets: { [key]: RUN } });
+    const got = [];
+    const f = filler(async (hooks) => {
+      const r = newRecord({ kind: "archive", id, run: RUN, snapshot: SNAP });
+      await rejects(hooks.admit(r, { archive: { ...ID, ...change } }, { archive: EXACT }), "not_granted");
+      await hooks.admit(r, { archive: { ...ID } }, { archive: EXACT }); // the same identity in this epoch admits
+      got.push("admitted");
+      return { state: "validated" };
+    });
+    await runWorker("archive", id, RUN, NONCE, deps(f), { dir: h.dir, uid: UID });
+    assert.deepEqual(got, ["admitted"], JSON.stringify(change));
+  }
+});
+
+test("an input of another run is refused even with the right nonce", async () => {
+  const id = newId(), key = `archive-${id}`;
+  const h = host({ sets: { [key]: RUN }, noInput: [key] });
+  writeInput(inputOf("archive", id, RUN2, NONCE), { dir: h.dir, uid: UID });
+  const f = filler();
+  await rejects(runWorker("archive", id, RUN, NONCE, deps(f), { dir: h.dir, uid: UID }), "not_granted");
+  assert.deepEqual([f.calls, readRecord("archive", id, { dir: h.dir })], [[], null]);
 });

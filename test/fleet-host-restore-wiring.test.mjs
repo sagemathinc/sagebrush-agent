@@ -109,6 +109,26 @@ test("a start that isn't active in time is ENDED before it is reported: the chil
   assert.ok(goneAsked >= 1, "the unit proven gone");
 });
 
+test("an active answer counts only if it arrives before the deadline: a query answering at 499 ms of 500 starts; at 500 or 501 ms it is ended", async () => {
+  const unit = workerScope("agent", newId());
+  for (const [at, want] of [[499, "resolved"], [500, "effect_failed"], [501, "effect_failed"]]) {
+    const f = fakeSpawn();
+    let t = 0;
+    const killed = [];
+    const p = startDetached(workerArgvFor(unit), unit, {
+      spawn: f.spawn, ms: 500, killMs: 1000, now: () => t, sleep: async (d) => { t += d; await new Promise((r) => setImmediate(r)); },
+      // The query itself takes until `at`, then answers active.
+      isActive: async () => { t = Math.max(t, at); return true; },
+      isGone: async () => true,
+      killGroup: () => { killed.push("group"); setImmediate(() => f.spawned[0].c.emit("exit", null, "SIGKILL")); },
+      killUnit: async () => { killed.push("unit"); },
+    });
+    f.spawned[0].c.pid = 5;
+    assert.equal(await p.then(() => "resolved", (e) => e.code), want, `answered at ${at} ms`);
+    assert.deepEqual(killed, want === "resolved" ? [] : ["group", "unit"], `${at} ms: ended exactly when late`);
+  }
+});
+
 test("a start cut short (the op's deadline or the supervisor's close aborts its signal) ends the child and the unit too", async () => {
   const unit = workerScope("tag", newId());
   const f = fakeSpawn();

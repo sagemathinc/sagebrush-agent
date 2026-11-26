@@ -104,8 +104,10 @@ snaptext() {
     for e in /run/systemd/transient/sagebrush-*; do snaptree "$e"; done
     # (of /usr/lib, only the sagebrush entry: package updates may change the rest at any time)
     find /usr/lib -maxdepth 1 -name 'sagebrush*' -printf '%y %p %u %g %m %s %T@ ->%l\n' 2>/dev/null
-    systemctl list-units --all --plain --no-legend 2>/dev/null | grep sagebrush-
-    systemctl list-unit-files --no-legend 2>/dev/null | grep sagebrush-
+    # (spaces squeezed: systemctl pads its columns to the longest name of ANY unit, so a runner's own unit coming or
+    #  going between two snapshots changes the padding of a sagebrush line whose fields are all the same)
+    systemctl list-units --all --plain --no-legend 2>/dev/null | grep sagebrush- | tr -s ' '
+    systemctl list-unit-files --no-legend 2>/dev/null | grep sagebrush- | tr -s ' '
     for u in $UNIT sagebrush-backup.service; do systemctl show "$u" -p LoadState -p ActiveState -p DropInPaths -p FragmentPath -p NeedDaemonReload 2>/dev/null; done
   }
 }

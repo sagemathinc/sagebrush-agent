@@ -613,3 +613,75 @@ test("T1, the stale copy and its replacement: a restarted owner copying a dead r
     assert.equal(existsSync(join(dir, "20261126T020000Z-aaaaaaaa")), false);
   } finally { await o.stop(); }
 });
+
+test("A1 in the cache's real effects: the exclusion's holder dies during findmnt: no truncate, chmod, mkfs, mkdir or mount follows; the control mounts", async () => {
+  for (const lose of [true, false]) {
+    const h = host();
+    const argvs = [];
+    const image = join(h.base, "cache.img"), mountpoint = join(h.base, "cache");
+    const run = async (argv) => {
+      const cmd = argv[0].split("/").pop();
+      argvs.push(cmd);
+      if (cmd === "findmnt") { if (lose) killHolderNow(h.exclusion.path); return { code: 1, stdout: "" }; }
+      if (cmd === "truncate") writeFileSync(image, "");
+      return { code: 0, stdout: "" };
+    };
+    const real = realRunDeps({ dir: h.dir, storeRoot: h.storeRoot, uid: UID, exclusion: h.exclusion, restoreDir: h.restoreDir, binary: h.store, run, cache: { image, mountpoint } });
+    const r = await runOnce({ ...h.deps(), withExclusion: real.withExclusion, ensureCache: real.ensureCache });
+    if (lose) {
+      assert.deepEqual(r, { status: "failed", why: "lock_lost" });
+      assert.deepEqual(argvs, ["findmnt"], "nothing after the loss");
+      assert.equal(existsSync(image), false);
+      assert.equal(existsSync(mountpoint), false, "no mkdir");
+      assert.deepEqual(h.store.ops(), []);
+    } else {
+      assert.equal(r.status, "ok");
+      assert.deepEqual(argvs, ["findmnt", "truncate", "mkfs.ext4", "mount"]);
+      assert.equal(lstatSync(image).mode & 0o7777, 0o600);
+      assert.ok(existsSync(mountpoint));
+    }
+  }
+});
+
+test("A1 in the cache trim: lost after the first removal, nothing more is removed", async () => {
+  const { cacheEffects } = await import("../lib/fleet/host/backup-scheduler.mjs");
+  const mountpoint = mkdtempSync(join(tmpdir(), "sb-trim-"));
+  for (let i = 0; i < 4; i += 1) writeFileSync(join(mountpoint, `f${i}`), Buffer.alloc(100));
+  let removed = 0;
+  const fsx = { ...fs, unlinkSync: (p) => { fs.unlinkSync(p); removed += 1; } };
+  const c = cacheEffects({ run: async () => ({ code: 0, stdout: "" }), fsx, mountpoint, trimTo: 0 });
+  await assert.rejects(c.trimCache(() => { if (removed >= 1) throw Object.assign(new Error("lost"), { code: "lock_lost" }); }), (e) => e.code === "lock_lost");
+  assert.equal(removed, 1);
+  assert.equal(readdirSync(mountpoint).length, 3);
+});
+
+test("A1 at the store's open: the exclusion lost just as HostStore.open returns: failed lock_lost, and the store's lock is released (a second open succeeds)", async () => {
+  const h = host();
+  const out = await h.cmd(["run"], { snapshot: (run, g) => runSnapshot(run, { dir: join(h.dir, "snapshot"), root: h.storeRoot, uid: UID, guard: g,
+    openStore: async () => { const s = await HostStore.open(h.storeRoot); killHolderNow(h.exclusion.path); return s; } }) });
+  assert.deepEqual(out.line, { v: 1, status: "failed", why: "lock_lost" });
+  const again = await HostStore.open(h.storeRoot);
+  await again.close();
+  assert.equal(existsSync(join(h.dir, "snapshot", readRequestRun(h))), false, "no copy was taken");
+});
+const readRequestRun = (h) => JSON.parse(readFileSync(join(h.dir, "snapshot", "request.json"), "utf8")).run;
+
+test("A1 in the cache, a loss during a synchronous step (the image's chmod): the next command (mkfs) never starts", async () => {
+  const h = host();
+  const argvs = [];
+  const image = join(h.base, "cache.img"), mountpoint = join(h.base, "cache");
+  const run = async (argv) => {
+    const cmd = argv[0].split("/").pop();
+    argvs.push(cmd);
+    if (cmd === "truncate") writeFileSync(image, "");
+    return { code: cmd === "findmnt" ? 1 : 0, stdout: "" };
+  };
+  const { cacheEffects } = await import("../lib/fleet/host/backup-scheduler.mjs");
+  const fsx = { ...fs, chmodSync: (p, m) => { fs.chmodSync(p, m); if (p === image) killHolderNow(h.exclusion.path); } };
+  const cache = cacheEffects({ run, fsx, image, mountpoint });
+  const real = realRunDeps({ dir: h.dir, storeRoot: h.storeRoot, uid: UID, exclusion: h.exclusion, restoreDir: h.restoreDir, binary: h.store, run });
+  const r = await runOnce({ ...h.deps(), withExclusion: real.withExclusion, ensureCache: (g) => cache.ensureCache(g) });
+  assert.deepEqual(r, { status: "failed", why: "lock_lost" });
+  assert.deepEqual(argvs, ["findmnt", "truncate"], "no mkfs, no mount");
+  assert.equal(existsSync(mountpoint), false);
+});

@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { lockFile } from "../lib/fleet/host/store.mjs";
-import { newRecord, newRestoreRun, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
+import { CLASSES, newRecord, newRestoreRun, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 import { PLAN, closePlan, newPlan, readPlan, replanSet, updatePlan } from "../lib/fleet/host/restore-plan.mjs";
 import { ABANDON, BEGIN, CLOSED, HOSTSTORE_COPY, REQUESTS, begin, close, closeBlockers, readBegin, removeBeneath, restoreOpen, withExclusion } from "../lib/fleet/host/restore-begin.mjs";
 
@@ -238,7 +238,7 @@ function records(h, states) {
     let r = newRecord({ kind, id, run: RUN, snapshot: SNAP });
     if (target === "staging") return r;
     if (target === "abandoned") return step(r, "abandoned");
-    const cls = { agent: ["home", "sessions"], archive: ["archive"], tag: ["tag"] }[kind];
+    const cls = CLASSES[kind];
     const dest = Object.fromEntries(cls.map((c, i) => [c, ident(String(10 + i))]));
     r = step(r, "bind", { dest });
     for (const c of cls) r = step(r, "digest", { cls: c, sha256: hex("d") });

@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
-import { newRestoreRun, newRecord, step } from "../lib/fleet/host/restore-record.mjs";
+import { CLASSES, newRestoreRun, newRecord, step } from "../lib/fleet/host/restore-record.mjs";
 import { destOf } from "../lib/fleet/host/restore-fill.mjs";
 import { checkInput } from "../lib/fleet/host/restore-inputs.mjs";
 import { EMPTY_LISTING, launcherRunner, restoreAdapters } from "../lib/fleet/host/restore-adapters.mjs";
@@ -21,8 +21,8 @@ const obj = (over = {}) => ({ type: "dir", mode: 0o700, uid: 70000, gid: 70000, 
 const line = (x) => JSON.stringify(x) + "\n";
 
 function inputOf(kind, id, { owners = { uids: [70000], gid: 70000, projid: 70000 }, members } = {}) {
-  const classes = Object.fromEntries({ agent: ["home", "sessions"], archive: ["archive"], tag: ["tag"] }[kind]
-    .map((c, i) => [c, { dest: { epoch: EPOCH, fsid: FSID, object: obj({ ino: 4242 + i }) }, owners, unrestorable: [`${c}/skipped`] }]));
+  const classes = Object.fromEntries(CLASSES[kind]
+    .map((c, i) => [c, { dest: { epoch: EPOCH, fsid: FSID, object: obj({ ino: 4242 + i }) }, owners: c === "archive-config" ? { uids: [0], gid: 0, projid: owners.projid } : owners, unrestorable: [`${c}/skipped`] }]));
   return checkInput({ v: 1, kind, id, run: RUN, nonce: newId(), classes, members: members ?? (kind === "agent" ? [{ agent: id, uid: 70000 }] : kind === "tag" ? [{ agent: newId(), uid: 70000 }] : []) });
 }
 
@@ -141,8 +141,19 @@ test("cleanDest: only the record's bound object, emptied and kept: identify, the
   const g = setup("tag");
   await g.a.cleanDest(step(newRecord({ kind: "tag", id: g.id, run: RUN, snapshot: SNAP }), "bind", { dest: { tag: destOf(g.idents.tag) } }));
   assert.deepEqual(g.calls.at(-1).args.slice(0, 6), ["remove-tree", "--contents", "--anchor", "/srv/sagebrush/tags", "--name", g.id]);
+  // An archive: both classes, each under its own anchor; the archive's configuration is root's alone.
+  const rootObj = obj({ uid: 0, gid: 0, ino: 4243 });
+  const c = setup("archive", { answer: (args) => ({ code: 0, stdout: args[0] === "identify" ? line({ epoch: EPOCH, fsid: FSID, object: args.includes("/srv/sagebrush/archive-config") ? rootObj : obj() }) : "" }) });
+  await c.a.cleanDest(step(newRecord({ kind: "archive", id: c.id, run: RUN, snapshot: SNAP }), "bind", { dest: { archive: destOf(obj()), "archive-config": destOf(rootObj) } }));
+  const crm = c.calls.filter((x) => x.args[0] === "remove-tree").map((x) => x.args);
+  assert.deepEqual(crm.map((x) => x.slice(0, 6)), [
+    ["remove-tree", "--contents", "--anchor", "/srv/sagebrush/archive", "--name", c.id],
+    ["remove-tree", "--contents", "--anchor", "/srv/sagebrush/archive-config", "--name", c.id],
+  ]);
+  assert.deepEqual(readExpect(flag(crm[0], "expect")).owners, [0, 70000]);
+  assert.deepEqual(readExpect(flag(crm[1], "expect")), { epoch: EPOCH, fsid: FSID, root: rootObj, owners: [0] });
   const f = setup("archive", { answer: (args) => (args[0] === "remove-tree" ? { code: 73, stdout: "" } : { code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, object: obj() }) }) });
-  await rejects(f.a.cleanDest(step(newRecord({ kind: "archive", id: f.id, run: RUN, snapshot: SNAP }), "bind", { dest: { archive: destOf(obj()) } })), "outcome_unknown");
+  await rejects(f.a.cleanDest(step(newRecord({ kind: "archive", id: f.id, run: RUN, snapshot: SNAP }), "bind", { dest: { archive: destOf(obj()), "archive-config": destOf(obj({ ino: 4244 })) } })), "outcome_unknown");
 });
 
 test("discardStaging: every attempt of the set under the staging anchor, any run, but the live one while staging or published; strangers left alone", async () => {

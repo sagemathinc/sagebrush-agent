@@ -12,7 +12,7 @@ import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { lockFile } from "../lib/fleet/host/store.mjs";
 import { createPlan, closePlan } from "../lib/fleet/host/restore-plan.mjs";
-import { newRecord, newRestoreRun, readRecord, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
+import { CLASSES, newRecord, newRestoreRun, readRecord, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 import { ABANDON, BEGIN, writeRequest } from "../lib/fleet/host/restore-begin.mjs";
 import { INPUTS, readInput, writeInput } from "../lib/fleet/host/restore-inputs.mjs";
 import {
@@ -52,7 +52,7 @@ function host({ sets, state = "done", noRequest = [], noInput = [], closed = fal
 }
 /** A set's input as a dispatch writes it: OBJ recorded for every class, owned by uid 70000. */
 function inputOf(kind, id, run, nonce) {
-  const classes = Object.fromEntries({ agent: ["home", "sessions"], archive: ["archive"], tag: ["tag"] }[kind]
+  const classes = Object.fromEntries(CLASSES[kind]
     .map((c) => [c, { dest: { ...ID }, owners: { uids: [70000], gid: 70000, projid: 70000 }, unrestorable: [] }]));
   const members = kind === "agent" ? [{ agent: id, uid: 70000 }] : kind === "tag" ? [{ agent: MEMBER, uid: 70000 }] : [];
   return { v: 1, kind, id, run, nonce, classes, members };
@@ -73,7 +73,7 @@ const deps = (f, over = {}) => ({
 });
 const bound = (kind, id, run = RUN, dest = { dev: String(8 * 2 ** 20 + 1), ino: "4242", ...PROV }) => {
   const r = newRecord({ kind, id, run, snapshot: SNAP });
-  const classes = { agent: ["home", "sessions"], archive: ["archive"], tag: ["tag"] }[kind];
+  const classes = CLASSES[kind];
   return step(r, "bind", { dest: Object.fromEntries(classes.map((c) => [c, dest])) });
 };
 const filesValidated = (kind, id) => {
@@ -266,19 +266,19 @@ test("the worker's hooks: admission through the provisioned deps; the veto reads
   const id = newId(), key = `archive-${id}`;
   const h = host({ sets: { [key]: RUN } });
   const r = newRecord({ kind: "archive", id, run: RUN, snapshot: SNAP });
-  const dest = { archive: EXACT };
+  const dest = { archive: EXACT, "archive-config": EXACT };
   const got = [];
   const f = filler(async (hooks) => {
-    await hooks.admit(r, { archive: { ...ID } }, dest);
+    await hooks.admit(r, { archive: { ...ID }, "archive-config": { ...ID } }, dest);
     got.push(await hooks.veto(r));
     intent(h.dir, key);
     got.push(await hooks.veto(r));
-    await rejects(hooks.admit(r, { archive: { ...ID } }, { archive: { ...dest.archive, uid: 0 } }), "not_granted");
+    await rejects(hooks.admit(r, { archive: { ...ID }, "archive-config": { ...ID } }, { ...dest, archive: { ...dest.archive, uid: 0 } }), "not_granted");
     return { state: "files_validated" };
   });
   await runWorker("archive", id, RUN, NONCE, deps(f), { dir: h.dir, uid: UID });
   assert.deepEqual(got, [false, true]);
-  const e = filler(async (hooks) => { await hooks.admit(r, { archive: { ...ID } }, dest); return { state: "validated" }; });
+  const e = filler(async (hooks) => { await hooks.admit(r, { archive: { ...ID }, "archive-config": { ...ID } }, dest); return { state: "validated" }; });
   const h2 = host({ sets: { [key]: RUN } });
   await rejects(runWorker("archive", id, RUN, NONCE, deps(e, { isEmpty: async () => false }), { dir: h2.dir, uid: UID }), "not_granted");
 });
@@ -481,8 +481,8 @@ test("the worker's trusted identities are its input's, of this epoch: another ep
     const got = [];
     const f = filler(async (hooks) => {
       const r = newRecord({ kind: "archive", id, run: RUN, snapshot: SNAP });
-      await rejects(hooks.admit(r, { archive: { ...ID, ...change } }, { archive: EXACT }), "not_granted");
-      await hooks.admit(r, { archive: { ...ID } }, { archive: EXACT }); // the same identity in this epoch admits
+      await rejects(hooks.admit(r, { archive: { ...ID, ...change }, "archive-config": { ...ID } }, { archive: EXACT, "archive-config": EXACT }), "not_granted");
+      await hooks.admit(r, { archive: { ...ID }, "archive-config": { ...ID } }, { archive: EXACT, "archive-config": EXACT }); // the same identity in this epoch admits
       got.push("admitted");
       return { state: "validated" };
     });

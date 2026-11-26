@@ -13,16 +13,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId, refuse } from "../lib/fleet/index.mjs";
-import { EXIT, classPaths, destOf, fillExpect, outcomeOf, ownersOf, restoreFiller, writeExpectFile } from "../lib/fleet/host/restore-fill.mjs";
+import { EXIT, classOwners, classPaths, destOf, fillExpect, outcomeOf, ownersOf, restoreFiller, writeExpectFile } from "../lib/fleet/host/restore-fill.mjs";
 import { realIo } from "../lib/fleet/host/store.mjs";
-import { MAX_ATTEMPTS, newRecord, newRestoreRun, ownerOf, readFillReport, readRecord, retryRecord, writeRecord } from "../lib/fleet/host/restore-record.mjs";
+import { STAGED, CLASSES, MAX_ATTEMPTS, newRecord, newRestoreRun, ownerOf, readFillReport, readRecord, retryRecord, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 import { copyKey, encodePath, quote } from "../lib/fleet/host/restore-validate.mjs";
 
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
 const RUN = newRestoreRun(1795500000000, () => Buffer.alloc(6)), RUN2 = newRestoreRun(1795600000000, () => Buffer.alloc(6));
 const SNAP = "a".repeat(64);
 const hex = (c) => c.repeat(64);
-const DATA = { home: { "a.txt": "A", "b.txt": "BB" }, sessions: { "s.db": "SSS" }, archive: { "old.txt": "O" }, tag: { "shared.txt": "T" } };
+const DATA = { home: { "a.txt": "A", "b.txt": "BB" }, sessions: { "s.db": "SSS" }, archive: { "old.txt": "O" }, tag: { "shared.txt": "T" },
+  // (A2 r3.13: an agent's config, staged only; a deleted agent's config archive, filled)
+  config: { "current": "gen-1\n" }, "archive-config": { "gen-1.txt": "G" } };
 const tree = (d) => (existsSync(d) ? Object.fromEntries(readdirSync(d).sort().map((k) => [k, readFileSync(join(d, k), "utf8")])) : null);
 
 const sha = (b) => createHash("sha256").update(b).digest("hex");
@@ -92,7 +94,7 @@ function world(kind, { script = () => 0, onCall = () => {}, failDiscards = 0, re
   const base = mkdtempSync(join(tmpdir(), "sb-fill-"));
   const stage = join(base, "staging"), dir = join(base, "restore");
   const dests = {};
-  for (const c of { agent: ["home", "sessions"], archive: ["archive"], tag: ["tag"] }[kind]) { dests[c] = join(base, "dest", c); mkdirSync(dests[c], { recursive: true }); }
+  for (const c of CLASSES[kind]) { dests[c] = join(base, "dest", c); mkdirSync(dests[c], { recursive: true }); }
   const calls = [], cleaned = [], discarded = [], copiesRemoved = [];
   const flag = (args, f) => args[args.indexOf(`--${f}`) + 1];
   const launch = async (args) => {
@@ -167,7 +169,9 @@ test("classPaths: the class directory itself is restored, landing at data/<leaf>
   assert.deepEqual(classPaths("agent", id, "sessions"), { path: `srv/sagebrush/agents/${id}/sessions`, source: "data/sessions" });
   assert.deepEqual(classPaths("archive", id, "archive"), { path: `srv/sagebrush/archive/${id}`, source: `data/${id}` });
   assert.deepEqual(classPaths("tag", id, "tag"), { path: `srv/sagebrush/tags/${id}`, source: `data/${id}` });
-  for (const [k, c] of [["agent", "tag"], ["tag", "home"], ["archive", "home"], ["agent", "x"]]) assert.throws(() => classPaths(k, id, c), (e) => e.code === "bad_form");
+  assert.deepEqual(classPaths("agent", id, "config"), { path: `srv/sagebrush/agent-config/${id}`, source: `data/${id}` });
+  assert.deepEqual(classPaths("archive", id, "archive-config"), { path: `srv/sagebrush/archive-config/${id}`, source: `data/${id}` });
+  for (const [k, c] of [["agent", "tag"], ["tag", "home"], ["archive", "home"], ["agent", "x"], ["agent", "archive-config"], ["archive", "config"], ["tag", "config"], ["tag", "archive-config"]]) assert.throws(() => classPaths(k, id, c), (e) => e.code === "bad_form");
   assert.throws(() => classPaths("agent", "nope", "home"), (e) => e.code === "bad_form");
   assert.deepEqual([0, 76, 77, 75, 74, 73, 72, 65, 64, 66, 1, -1].map(outcomeOf),
     ["ok", "not_fitting", "retry", "retry", "retry", "failed", "failed", "failed", "failed", "failed", "failed", "failed"]);
@@ -182,6 +186,8 @@ test("an agent restored: each class staged then filled, by exactly these launche
   assert.deepEqual(w.calls, [
     ["restore-stage", "--mount", "/srv/sagebrush", "--owner", `a-${id}`, "--class", "home", "--run", RUN, "--attempt", "1", "--projid", "70000", "--snapshot", SNAP, "--path", `srv/sagebrush/agents/${id}/home`],
     ["restore-stage", "--mount", "/srv/sagebrush", "--owner", `a-${id}`, "--class", "sessions", "--run", RUN, "--attempt", "1", "--projid", "70000", "--snapshot", SNAP, "--path", `srv/sagebrush/agents/${id}/sessions`],
+    // (A2 r3.13: the agent's config tree, staged for the config import, never filled or listed)
+    ["restore-stage", "--mount", "/srv/sagebrush", "--owner", `a-${id}`, "--class", "config", "--run", RUN, "--attempt", "1", "--projid", "70000", "--snapshot", SNAP, "--path", `srv/sagebrush/agent-config/${id}`],
     ["fill-home", "--mount", "/srv/sagebrush", "--owner", `a-${id}`, "--class", "home", "--run", RUN, "--attempt", "1", "--source", "data/home", "--expect", join(w.base, "expect", "home.json")],
     ["fill-home", "--mount", "/srv/sagebrush", "--owner", `a-${id}`, "--class", "sessions", "--run", RUN, "--attempt", "1", "--source", "data/sessions", "--expect", join(w.base, "expect", "sessions.json")],
     ["tree-digest", "--mount", "/srv/sagebrush", "--owner", `a-${id}`, "--class", "home", "--expect", join(w.base, "expect", "home.json")],
@@ -245,15 +251,16 @@ test("a destination that is no longer the bound one when filling starts fails th
   }
 });
 
-test("an archive and a tag folder: one class each, the a- and t- owners", async () => {
+test("an archive (its tree and its config archive) and a tag folder (one class), the a- and t- owners", async () => {
   for (const kind of ["archive", "tag"]) {
     const id = newId();
     const w = world(kind);
     const r = await w.fill(kind, id, planOf(kind, id));
     assert.equal(r.state, "validated", kind, "no imports: its files validated is the set validated");
     const o = `${kind === "tag" ? "t" : "a"}-${id}`;
-    assert.deepEqual(w.calls.map((a) => [a[0], a[4], a[6]]), [["restore-stage", o, kind], ["fill-home", o, kind], ["tree-digest", o, kind]]);
-    assert.deepEqual(tree(w.dests[kind]), DATA[kind]);
+    const classes = CLASSES[kind];
+    assert.deepEqual(w.calls.map((a) => [a[0], a[4], a[6]]), ["restore-stage", "fill-home", "tree-digest"].flatMap((op) => classes.map((c) => [op, o, c])));
+    for (const c of classes) assert.deepEqual(tree(w.dests[c]), DATA[c], c);
   }
 });
 
@@ -329,6 +336,15 @@ test("a staged attempt without every marker exactly its name is never filled: a 
   }
   const r = await w.fill("agent", id, planOf("agent", id));
   assert.deepEqual([r.state, r.attempt], ["files_validated", 2], "the torn attempt was retried");
+  // Only the stage-only config's attempt begun (no marker anywhere): begun all the same, so a new attempt, never a
+  // stage over attempt 1.
+  const id3 = newId();
+  const w3 = world("agent");
+  writeRecord({ v: 1, kind: "agent", id: id3, run: RUN, snapshot: SNAP, attempt: 1, state: "staging", dest: null, digests: null, dirty: false, reason: null, imports: { config: { state: "none" }, context: { state: "none" } } }, { dir: w3.dir });
+  mkdirSync(join(w3.stage, RUN, `a-${id3}`, "config", "1", "data"), { recursive: true });
+  const r3 = await w3.fill("agent", id3, planOf("agent", id3));
+  assert.deepEqual([r3.state, r3.attempt], ["files_validated", 2]);
+  assert.ok(!w3.calls.some((a) => a[0] === "restore-stage" && a[10] === "1"), "nothing staged in the begun attempt");
   assert.ok(!w.calls.some((a) => a[0] === "fill-home" && a[10] === "1"), "never filled");
   // And a launcher that exits 0 but leaves a wrong marker: checked before the record steps to staged.
   const id2 = newId();
@@ -429,6 +445,13 @@ test("ownersOf: from the restored registry; an agent's and an archive's uid, a t
   assert.deepEqual(ownersOf("agent", a, registry), { uids: [70005], gid: 70005, projid: 70005 });
   assert.deepEqual(ownersOf("archive", dead, registry), { uids: [70003], gid: 70003, projid: 70003 });
   assert.deepEqual(ownersOf("tag", t, registry), { uids: [70001, 70005], gid: 80001, projid: 80001 }, "live members only, sorted");
+  // A class's owners: root alone for an agent's config and an archive's config archive, in the set's project.
+  assert.deepEqual(classOwners("agent", a, "config", registry), { uids: [0], gid: 0, projid: 70005 });
+  assert.deepEqual(classOwners("archive", dead, "archive-config", registry), { uids: [0], gid: 0, projid: 70003 });
+  for (const cls of ["home", "sessions"]) assert.deepEqual(classOwners("agent", a, cls, registry), ownersOf("agent", a, registry));
+  assert.deepEqual(classOwners("archive", dead, "archive", registry), ownersOf("archive", dead, registry));
+  assert.deepEqual(classOwners("tag", t, "tag", registry), ownersOf("tag", t, registry));
+  assert.throws(() => classOwners("agent", dead, "config", registry), (e) => e.code === "not_found", "the set's owner still has to be known");
   for (const [kind, id, code] of [["agent", dead, "not_found"], ["archive", a, "not_found"], ["agent", newId(), "not_found"], ["tag", newId(), "not_found"], ["tag", lonely, "not_found"], ["agent", "nope", "bad_form"]]) {
     assert.throws(() => ownersOf(kind, id, registry), (e) => e.code === code, `${kind} ${id}`);
   }
@@ -540,13 +563,13 @@ test("a new attempt is staged only after every earlier one is discarded: two att
     script: (op, cls, attempt) => (op === "restore-stage" && cls === "home" && attempt === 1 ? EXIT.partial : 0),
     onCall: (args) => {
       if (args[0] === "restore-stage" && args[10] === "2") {
-        seen.push(["home", "sessions"].map((c) => existsSync(join(w.stage, RUN, `a-${id}`, c, "1"))));
+        seen.push(STAGED.agent.map((c) => existsSync(join(w.stage, RUN, `a-${id}`, c, "1"))));
       }
     },
   });
   const r = await w.fill("agent", id, planOf("agent", id));
   assert.deepEqual([r.state, r.attempt], ["files_validated", 2]);
-  assert.deepEqual(seen, [[false, false], [false, false]], "attempt 1's partial staging is gone before attempt 2 stages either class");
+  assert.deepEqual(seen, STAGED.agent.map(() => STAGED.agent.map(() => false)), "attempt 1's partial staging is gone before attempt 2 stages any class");
 });
 
 // ---- validation (A2 r3.8.3 / r3.9 §4a, §4b): the digest list bound by its recorded hash, the filled tree listed by
@@ -563,7 +586,7 @@ const attemptDir = (w, id, cls, attempt = 1) => join(w.stage, RUN, `a-${id}`, cl
 const failedAs = async (opts, reason, what) => {
   const { w, r, id } = await settle(opts);
   assert.deepEqual([r.state, r.reason], ["failed", reason], what);
-  assert.equal(w.calls.filter((a) => a[0] === "restore-stage").length, 2, `${what}: never re-staged`);
+  assert.equal(w.calls.filter((a) => a[0] === "restore-stage").length, STAGED.agent.length, `${what}: never re-staged`);
   // A failed validation stays failed: the next call makes no launcher call, and the attempt is discarded.
   const n = w.calls.length;
   assert.equal((await w.fill("agent", id, planOf("agent", id))).state, "failed", what);
@@ -796,7 +819,7 @@ test("validation: a crash at any point repeats it against the same recorded hash
     assert.ok(existsSync(join(attemptDir(w, id, "home"), "data", "digests.json")), `${at}: the lists survive until validated`);
     const r = await w.fill("agent", id, planOf("agent", id));
     assert.deepEqual([r.state, r.attempt, r.digests], ["files_validated", 1, mid.digests], at);
-    assert.equal(w.calls.filter((a) => a[0] === "restore-stage").length, 2, `${at}: not re-staged`);
+    assert.equal(w.calls.filter((a) => a[0] === "restore-stage").length, STAGED.agent.length, `${at}: not re-staged`);
   }
   // Killed right after published was written (before validation began): the same.
   let crash = true;

@@ -322,14 +322,15 @@ test("composed for real: runWorker -> workerDeps -> the fill driver -> the adapt
   for (const empty of [false, true]) {
     const a = newId(), key = `archive-${a}`;
     const w = world({ sets: [key] });
-    const dest = obj({ uid: 0, gid: 0, projid: 70000 });
+    const dest = obj({ uid: 0, gid: 0, projid: 70000 }), cdest = obj({ uid: 0, gid: 0, projid: 70000, ino: 4243 });
     const nonce = newId();
     writeInput({ v: 1, kind: "archive", id: a, run: RUN, nonce, members: [],
-      classes: { archive: { dest: { epoch: EPOCH, fsid: FSID, object: dest }, owners: { uids: [70000], gid: 70000, projid: 70000 }, unrestorable: [] } } }, { dir: w.dir, uid: UID });
+      classes: { archive: { dest: { epoch: EPOCH, fsid: FSID, object: dest }, owners: { uids: [70000], gid: 70000, projid: 70000 }, unrestorable: [] },
+        "archive-config": { dest: { epoch: EPOCH, fsid: FSID, object: cdest }, owners: { uids: [0], gid: 0, projid: 70000 }, unrestorable: [] } } }, { dir: w.dir, uid: UID });
     const calls = [];
     const launch = async (args) => {
       calls.push(args[0]);
-      if (args[0] === "identify") return { code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, object: args.includes("/srv/sagebrush/archive") ? dest : null }) };
+      if (args[0] === "identify") return { code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, object: args.includes("/srv/sagebrush/archive") ? dest : args.includes("/srv/sagebrush/archive-config") ? cdest : null }) };
       if (args[0] === "tree-digest") return { code: 0, stdout: empty ? EMPTY_LISTING : '{"v":1}\n{"path":"x","type":"file","size":1,"mode":420,"sha256":"' + "0".repeat(64) + '"}\n{"count":1,"total_bytes":1}\n' };
       if (args[0] === "restore-stage") return { code: 73, stdout: "" }; // stop at the first stage: a permanent failure
       return { code: 0, stdout: "" };

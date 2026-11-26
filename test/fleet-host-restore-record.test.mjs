@@ -13,7 +13,7 @@ import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { CAUSES, fenced, lowerFence, raiseFence, stop } from "../lib/fleet/host/fence.mjs";
 import { RESTORE_DIR, RESTORE_STAGING, fenceFiles } from "../lib/fleet/host/names.mjs";
 import { realIo } from "../lib/fleet/host/store.mjs";
-import {
+import { STAGED,
   CLASSES, FAILED_REASONS, IMPORTS, KINDS, MAX_ATTEMPTS, RESTORE_RUN, STATES, checkRecord, importsDone, markerPath, newRecord, newRestoreRun, ownerOf, sameDest,
   readMarker, readRecord, recordName, recoveryStep, restoreReady, retryRecord, runTime, stagingDir, stagingName, step as rawStep,
   writeRecord, digestsWhole, checkFillReport, readFillReport, writeFillReport, readRegular, MAX_RECORD_BYTES,
@@ -116,7 +116,8 @@ test("names: records under RESTORE_DIR by set; staging is the launcher's, one di
   for (const [r, c] of [[ag, "archive"], [ag, "tag"], [ar, "home"], [ar, "x"]]) refused(() => stagingName(r, c), "bad_form");
   for (const [kind, i] of [["agents", id], ["host", id], ["agent", "nope"], ["agent", "../x"]]) refused(() => recordName(kind, i), "bad_form");
   assert.deepEqual(KINDS, ["agent", "archive", "tag"]);
-  assert.deepEqual(CLASSES, { agent: ["home", "sessions"], archive: ["archive"], tag: ["tag"] });
+  assert.deepEqual(CLASSES, { agent: ["home", "sessions"], archive: ["archive", "archive-config"], tag: ["tag"] });
+  assert.deepEqual(STAGED, { agent: ["home", "sessions", "config"], archive: ["archive", "archive-config"], tag: ["tag"] });
 });
 
 test("restore runs: the launcher's 16 characters of [a-z2-7], ordered by their decoded time, never as strings", () => {
@@ -281,9 +282,9 @@ test("imports: an agent's, from files_validated: none, then pending bound to a h
   // An archive or a tag folder has none: files_validated goes to validated directly.
   for (const kind of ["archive", "tag"]) {
     let r = newRecord({ kind, id: newId(), run: RUN, snapshot: SNAP });
-    const dest = { [CLASSES[kind][0]]: DEST.home };
+    const dest = Object.fromEntries(CLASSES[kind].map((c, i) => [c, ID(String(141 + i))]));
     r = rawStep(r, "bind", { dest });
-    r = rawStep(rawStep(r, "digest", { cls: CLASSES[kind][0], sha256: HX("e") }), "staged");
+    r = rawStep(CLASSES[kind].reduce((x, c) => rawStep(x, "digest", { cls: c, sha256: HX("e") }), r), "staged");
     r = rawStep(rawStep(rawStep(rawStep(r, "filling", { dest }), "published"), "files_validated"), "validated");
     assert.deepEqual([r.state, r.imports], ["validated", null], kind);
   }
@@ -408,7 +409,7 @@ test("fill reports: bound to the run, attempt and class; paths in A2 §4b's code
 });
 
 test("recovery's first step: from every record state and every disk state, every class's marker exactly its name", () => {
-  const whole = (r) => Object.fromEntries(CLASSES[r.kind].map((c) => [c, stagingName(r, c)]));
+  const whole = (r) => Object.fromEntries(STAGED[r.kind].map((c) => [c, stagingName(r, c)]));
   assert.equal(recoveryStep(null, { markers: {}, begun: false }), "start");
   // Unbound (a crash between the record and its bind): bind first, whatever is on disk.
   const u = at("staging");
@@ -426,6 +427,7 @@ test("recovery's first step: from every record state and every disk state, every
   const other = step(s, "retry");
   for (const markers of [
     { home: whole(s).home }, { sessions: whole(s).sessions }, { home: whole(s).home, sessions: null },
+    { home: whole(s).home, sessions: whole(s).sessions }, { ...whole(s), config: null }, // (the stage-only config is staged too)
     { home: whole(s).sessions, sessions: whole(s).home }, { ...whole(s), home: whole(other).home },
     { ...whole(s), home: whole(s).home.replace(RUN, RUN2) }, { ...whole(s), home: whole(s).home.replace("a-", "t-") },
     { ...whole(s), home: whole(s).home.slice(0, -1) }, { ...whole(s), home: whole(s).home + "\n" },
@@ -436,6 +438,7 @@ test("recovery's first step: from every record state and every disk state, every
   const st = at("staged");
   assert.equal(recoveryStep(st, { markers: whole(st), begun: true }), "fill");
   assert.equal(recoveryStep(st, { markers: { home: whole(st).home }, begun: true }), "retry");
+  assert.equal(recoveryStep(st, { markers: { home: whole(st).home, sessions: whole(st).sessions }, begun: true }), "retry", "the config's marker too");
   // A filling record is never filled again, even with every marker still there (a crash before fill-home began).
   const f = at("filling");
   for (const markers of [{}, whole(f)]) for (const begun of [true, false]) assert.equal(recoveryStep(f, { markers, begun }), "retry");
@@ -632,7 +635,7 @@ function model(root, id, { crashAt = Infinity, quotaAt = null, crashOnMove = nul
   const effect = () => { if (++m.effects === crashAt) throw Object.assign(new Error("crash"), { crash: true }); };
   const save = (r) => { effect(); writeRecord(r, { dir }); return r; };
   const others = (r) => { // every other staging of the set, any run: <run>/<owner>/<class>/<attempt>
-    for (const run of readdirSync(stage)) for (const c of CLASSES.agent) {
+    for (const run of readdirSync(stage)) for (const c of STAGED.agent) {
       const cd = join(stage, run, ownerOf("agent", id), c);
       if (!existsSync(cd)) continue;
       for (const n of readdirSync(cd)) if (run !== r.run || n !== String(r.attempt)) { effect(); rmSync(join(cd, n), { recursive: true }); }
@@ -641,10 +644,10 @@ function model(root, id, { crashAt = Infinity, quotaAt = null, crashOnMove = nul
   const ops = {
     stage(r) {
       others(r);
-      for (const c of CLASSES.agent) {
+      for (const c of STAGED.agent) { // the config is staged too (its import, later, consumes it)
         const d = stagingDir(r, c, stage);
         effect(); mkdirSync(join(d, "data"), { recursive: true });
-        for (const [k, v] of Object.entries(SNAPSHOT[c])) { effect(); writeFileSync(join(d, "data", k), v); }
+        for (const [k, v] of Object.entries(STAGE_DATA[c])) { effect(); writeFileSync(join(d, "data", k), v); }
         effect(); writeFileSync(markerPath(r, c, stage), stagingName(r, c), { flag: "wx" }); // the launcher's marker
       }
       return save(step(r, "staged"));
@@ -666,7 +669,7 @@ function model(root, id, { crashAt = Infinity, quotaAt = null, crashOnMove = nul
     clean(r) {
       for (const c of CLASSES.agent) for (const e of readdirSync(into[c])) { effect(); rmSync(join(into[c], e)); }
       others(r);
-      if (r.state === "staging") for (const c of CLASSES.agent) { const d = stagingDir(r, c, stage); if (existsSync(d)) { effect(); rmSync(d, { recursive: true }); } }
+      if (r.state === "staging") for (const c of STAGED.agent) { const d = stagingDir(r, c, stage); if (existsSync(d)) { effect(); rmSync(d, { recursive: true }); } }
       return save(step(r, "clean"));
     },
     validate(r) {
@@ -678,8 +681,8 @@ function model(root, id, { crashAt = Infinity, quotaAt = null, crashOnMove = nul
     for (let guard = 0; guard < 50; guard++) {
       const r = readRecord("agent", id, { dir });
       const disk = r === null ? { markers: {}, begun: false } : {
-        markers: Object.fromEntries(CLASSES.agent.map((c) => [c, readMarker(r, c, { root: stage })])),
-        begun: CLASSES.agent.some((c) => existsSync(stagingDir(r, c, stage))),
+        markers: Object.fromEntries(STAGED.agent.map((c) => [c, readMarker(r, c, { root: stage })])),
+        begun: STAGED.agent.some((c) => existsSync(stagingDir(r, c, stage))),
       };
       const s = recoveryStep(r, disk);
       // (an agent's files_validated is settled for the files: its imports are another driver's)
@@ -698,6 +701,7 @@ function model(root, id, { crashAt = Infinity, quotaAt = null, crashOnMove = nul
   return m;
 }
 const SNAPSHOT = { home: { a: "1", b: "22", c: "333" }, sessions: { d: "4444", e: "55555" } };
+const STAGE_DATA = { ...SNAPSHOT, config: { "1": "{}" } };
 const tree = (d) => Object.fromEntries(readdirSync(d).sort().map((k) => [k, readFileSync(join(d, k), "utf8")]));
 const filled = (m) => ({ home: tree(m.home), sessions: tree(m.sessions) });
 const EMPTY = { home: {}, sessions: {} };

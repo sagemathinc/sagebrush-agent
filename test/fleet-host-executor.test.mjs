@@ -15,7 +15,7 @@ import { STATES } from "../lib/fleet/host/registry.mjs";
 import { STEPS } from "../lib/fleet/host/deprovision-record.mjs";
 import { lockFile } from "../lib/fleet/host/store.mjs";
 import { createPlan } from "../lib/fleet/host/restore-plan.mjs";
-import { newRestoreRun, readRecord } from "../lib/fleet/host/restore-record.mjs";
+import { CLASSES, newRestoreRun, readRecord } from "../lib/fleet/host/restore-record.mjs";
 import { BEGIN, writeRequest } from "../lib/fleet/host/restore-begin.mjs";
 import { holdSets, runWorker, setLockPath } from "../lib/fleet/host/restore-worker.mjs";
 import { INPUTS, buildInput, readInput, writeInput } from "../lib/fleet/host/restore-inputs.mjs";
@@ -1947,7 +1947,7 @@ function openRestore(keys) {
     object: { type: "dir", mode: 0o700, uid: 70000, gid: 70000, dev: [8, 1], ino: 4242, gen: 1, mnt_id: 7, projid: 70000, inherit: true } };
   const writeInputs = (nonce) => { for (const k of keys) {
     const [kind, id] = k.split("-");
-    const classes = Object.fromEntries({ agent: ["home", "sessions"], archive: ["archive"], tag: ["tag"] }[kind]
+    const classes = Object.fromEntries(CLASSES[kind]
       .map((c) => [c, { dest: ID, owners: { uids: [70000], gid: 70000, projid: 70000 }, unrestorable: [] }]));
     const members = kind === "agent" ? [{ agent: id, uid: 70000 }] : kind === "tag" ? [{ agent: newId(), uid: 70000 }] : [];
     writeInput({ v: 1, kind, id, run, nonce, classes, members }, { dir, uid: process.getuid() });

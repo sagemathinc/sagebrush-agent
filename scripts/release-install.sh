@@ -201,7 +201,15 @@ PIN=$(sed -n 's/^\([0-9a-f]\{64\}\)  sagebrush-agent-launch$/\1/p' "$STAGE/tree/
 case "$LAUNCHER" in /*) ;; *) no "<launcher> must be an absolute path" ;; esac
 [ -f "$LAUNCHER" ] && [ ! -L "$LAUNCHER" ] || no "<launcher> isn't a regular file"
 cp -- "$LAUNCHER" "$STAGE/launch"
-GOT=$("$SHA256SUM" < "$STAGE/launch" | cut -d' ' -f1)
+# digest <file>: its SHA-256 (no pipe, no redirection: the sum of the named file, its exit status checked)
+digest() {
+  sum=$("$SHA256SUM" -- "$1" 2>&1) || no "sha256sum failed on $1: $sum"
+  d=${sum%% *}
+  case "$d" in *[!0-9a-f]* | "") no "sha256sum gave no digest for $1: [$sum] ($(ls -la -- "$1" 2>&1))" ;; esac
+  [ "${#d}" -eq 64 ] || no "sha256sum gave no digest for $1: [$sum]"
+  printf '%s\n' "$d"
+}
+GOT=$(digest "$STAGE/launch")
 [ "$GOT" = "$PIN" ] || no "the launcher's digest isn't the pinned one (got $GOT, pinned $PIN)"
 fi
 CREATE=""
@@ -289,7 +297,7 @@ mkdir -m 0700 -- "$work/tree"
 igit --git-dir="$STAGE/repo.git" -c core.attributesFile=/dev/null archive --format=tar "$COMMIT" \
   | "$TAR" -x --no-same-owner --no-same-permissions -C "$work/tree"
 cp -- "$STAGE/launch" "$work/tree/bin/sagebrush-agent-launch"
-[ "$("$SHA256SUM" < "$work/tree/bin/sagebrush-agent-launch" | cut -d' ' -f1)" = "$PIN" ] || no "the staged launcher changed"
+[ "$(digest "$work/tree/bin/sagebrush-agent-launch")" = "$PIN" ] || no "the staged launcher changed"
 ln -s sagebrush-agent.mjs "$work/tree/bin/sagebrush-agent"
 chown -R -h 0:0 -- "$work/tree"
 chmod -R go-w -- "$work/tree"

@@ -98,13 +98,15 @@ test("workerArgv: its own scope under the host's slice, never a shell; bad sets,
   assert.equal(workerScope("agent", id), `sagebrush-restore-agent-${id}.scope`);
   assert.deepEqual(workerArgv("tag", id, RUN, NONCE, { node: "/usr/bin/node", main: "/opt/sagebrush/main.mjs" }), [
     "systemd-run", "--scope", "--quiet", "--collect", "--slice=sagebrush.slice", `--unit=sagebrush-restore-tag-${id}.scope`,
-    "--", "/usr/bin/node", "/opt/sagebrush/main.mjs", "restore-worker", "tag", id, RUN, NONCE,
+    "--", "/usr/bin/node", "/opt/sagebrush/main.mjs", "restore-worker", "tag", id, RUN, NONCE, "/",
   ]);
   refused(() => workerArgv("home", id, RUN, NONCE, { main: "/m" }), "bad_form");
   refused(() => workerArgv("agent", "nope", RUN, NONCE, { main: "/m" }), "bad_form");
   refused(() => workerArgv("agent", id, "x; rm -rf /", NONCE, { main: "/m" }), "bad_form");
   refused(() => workerArgv("agent", id, RUN, NONCE, { main: "rel/main.mjs" }), "bad_form");
   refused(() => workerArgv("agent", id, RUN, "nope", { main: "/m" }), "bad_form");
+  assert.equal(workerArgv("agent", id, RUN, NONCE, { main: "/m", mount: "/srv/quota" }).at(-1), "/srv/quota", "the quota mount, the supervisor's");
+  for (const mount of ["rel", "/a b", "/a;b", ""]) refused(() => workerArgv("agent", id, RUN, NONCE, { main: "/m", mount }), "bad_form");
   assert.equal(setLockPath("/r", "archive", id), `/r/archive-${id}.lock`);
 });
 
@@ -426,12 +428,12 @@ test("dispatch writes its input durably BEFORE the start, with the argv's nonce;
   };
   const first = nonces[0];
   assert.deepEqual(await dispatchOnce(deps, { dir: h.dir, uid: UID }), { dispatched: key });
-  assert.equal(atStart.argv.at(-1), first, "the argv carries the nonce");
+  assert.equal(atStart.argv.at(-2), first, "the argv carries the nonce");
   assert.deepEqual([atStart.input.nonce, atStart.input.run, atStart.mode], [first, RUN, 0o600], "durable and private before the start");
   // The worker of that dispatch admits its input; after a second dispatch, the first nonce refuses and the second admits.
   const second = nonces[0];
   await dispatchOnce(deps, { dir: h.dir, uid: UID });
-  assert.equal(atStart.argv.at(-1), second);
+  assert.equal(atStart.argv.at(-2), second);
   await rejects(runWorker("agent", a, RUN, first, deps2(filler()), { dir: h.dir, uid: UID }), "not_granted");
   const f = filler(async () => ({ state: "files_validated" }));
   assert.equal((await runWorker("agent", a, RUN, second, deps2(f), { dir: h.dir, uid: UID })).status, "files_validated");

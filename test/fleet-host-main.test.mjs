@@ -960,3 +960,40 @@ test("TESTS H2: SIGTERM while the FIRST reopen is held: the drain isn't held by 
   for (const e of ["syncStop", "inputsStop", "close"]) assert.ok(h.log.includes(e), e);
   assert.ok(h.log.indexOf("syncStop") < h.log.indexOf("close"));
 });
+
+test("the restore worker seam: built over the open store and given to the executor; its dispatch every restoreDispatchMs, cleared at the drain", async () => {
+  const { id } = await paired();
+  const h = harness({ id });
+  const timers = [];
+  const seen = [];
+  h.d.restoreWorker = ({ store }) => { seen.push(store); return { hold: async () => null, dispatch: async () => ({ dispatched: null }) }; };
+  h.d.restoreDispatchMs = 30000;
+  h.d.every = (fn, ms) => { const t = { fn, ms, cleared: false }; timers.push(t); h.log.push(`every:${ms}`); return t; };
+  h.d.clearEvery = (t) => { t.cleared = true; h.log.push("clearEvery"); };
+  const run = hostRun(h.d);
+  await until(() => h.lines.some((l) => l.serving));
+  assert.equal(seen.length, 1, "built once, over the store the executor gets");
+  assert.ok(h.made.supervisor.restoreWorker && typeof h.made.supervisor.restoreWorker.dispatch === "function");
+  assert.equal(seen[0], h.made.supervisor.store);
+  const t = timers.find((x) => x.ms === 30000);
+  assert.ok(t, "the dispatch timer");
+  t.fn();
+  await until(() => h.log.includes("submit:restore-dispatch"));
+  h.term();
+  assert.equal((await run).code, 0);
+  assert.equal(t.cleared, true);
+  assert.ok(h.log.lastIndexOf("clearEvery") < h.log.indexOf("close"), "cleared before the executor closes");
+  // Without the seam: no restoreWorker for the executor and no timer.
+  const g = harness({ id });
+  const gt = [];
+  g.d.restoreDispatchMs = 30000;
+  g.d.every = (fn, ms) => { gt.push(ms); return {}; };
+  g.d.clearEvery = () => {};
+  const run2 = hostRun(g.d);
+  await until(() => g.lines.some((l) => l.serving));
+  assert.equal(g.made.supervisor.restoreWorker, undefined);
+  assert.ok(!gt.includes(30000));
+  g.term();
+  await run2;
+});
+

@@ -14,6 +14,7 @@ import { lockFile } from "../lib/fleet/host/store.mjs";
 import { createPlan, closePlan } from "../lib/fleet/host/restore-plan.mjs";
 import { newRecord, newRestoreRun, readRecord, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 import { ABANDON, BEGIN, writeRequest } from "../lib/fleet/host/restore-begin.mjs";
+import { INPUTS, readInput, writeInput } from "../lib/fleet/host/restore-inputs.mjs";
 import {
   WORKER_SLICE, admitBind, dispatchOnce, holdSets, readIntent, runWorker, setLockPath, stopWorker, workerArgv, workerLive, workerScope,
 } from "../lib/fleet/host/restore-worker.mjs";
@@ -27,11 +28,16 @@ const SNAP = hex("1");
 const settle = () => new Promise((r) => setTimeout(r, 200));
 const OBJ = { type: "dir", mode: 0o700, uid: 70000, gid: 70000, dev: [8, 1], ino: 4242, gen: 1, mnt_id: 7, projid: 70000, inherit: true };
 const PROV = { uid: 70000, gid: 70000, mode: 0o700, projid: 70000 };
+const EPOCH = { boot_id: "00000000-0000-4000-8000-000000000000", mnt_id: 7 }, FSID = "0123456789abcdef";
+/** OBJ as the launcher identifies it now (this epoch). */
+const ID = { epoch: EPOCH, fsid: FSID, object: OBJ };
+/** Every input in this file is written with this nonce, and every worker started with it. */
+const NONCE = newId(), MEMBER = newId();
 /** OBJ's identity in the record's form: what the provisioning recorded for it. */
 const EXACT = { dev: String(8 * 2 ** 20 + 1), ino: "4242", ...PROV };
 
 /** A restore directory: begin.json (`state`), the plan of `sets` (key → run), each set's request (unless `noRequest`). */
-function host({ sets, state = "done", noRequest = [], closed = false } = {}) {
+function host({ sets, state = "done", noRequest = [], noInput = [], closed = false } = {}) {
   const base = mkdtempSync(join(tmpdir(), "sb-worker-"));
   const dir = join(base, "restore");
   mkdirSync(dir, { mode: 0o700 });
@@ -41,7 +47,15 @@ function host({ sets, state = "done", noRequest = [], closed = false } = {}) {
   createPlan(plan, { dir });
   if (closed) closePlan(1795500001000, { dir });
   for (const [k, run] of Object.entries(sets)) if (!noRequest.includes(k)) writeRequest(k, run, { dir, uid: UID });
+  for (const [k, run] of Object.entries(sets)) if (!noInput.includes(k)) { const [kind, id] = k.split("-"); writeInput(inputOf(kind, id, run, NONCE), { dir, uid: UID }); }
   return { base, dir, plan };
+}
+/** A set's input as a dispatch writes it: OBJ recorded for every class, owned by uid 70000. */
+function inputOf(kind, id, run, nonce) {
+  const classes = Object.fromEntries({ agent: ["home", "sessions"], archive: ["archive"], tag: ["tag"] }[kind]
+    .map((c) => [c, { dest: { ...ID }, owners: { uids: [70000], gid: 70000, projid: 70000 }, unrestorable: [] }]));
+  const members = kind === "agent" ? [{ agent: id, uid: 70000 }] : kind === "tag" ? [{ agent: MEMBER, uid: 70000 }] : [];
+  return { v: 1, kind, id, run, nonce, classes, members };
 }
 const intent = (dir, key) => {
   mkdirSync(join(dir, ABANDON), { mode: 0o700, recursive: true });
@@ -54,7 +68,7 @@ function filler(body = async () => ({ state: "validated" })) {
   return { calls, get hooks() { return hooks; }, filler: (h) => { hooks = h; return async (kind, id, plan, opts) => { calls.push([kind, id]); return body(h, kind, id, plan, opts); }; } };
 }
 const deps = (f, over = {}) => ({
-  filler: f.filler, identifyDest: async () => ({ object: OBJ }), provisioned: async () => EXACT, isEmpty: async () => true, ...over,
+  filler: f.filler, identifyDest: async () => ({ ...ID }), isEmpty: async () => true, ...over,
 });
 const bound = (kind, id, run = RUN, dest = { dev: String(8 * 2 ** 20 + 1), ino: "4242", ...PROV }) => {
   const r = newRecord({ kind, id, run, snapshot: SNAP });
@@ -81,14 +95,15 @@ test("workerArgv: its own scope under the host's slice, never a shell; bad sets,
   const id = newId();
   assert.equal(WORKER_SLICE, "sagebrush.slice");
   assert.equal(workerScope("agent", id), `sagebrush-restore-agent-${id}.scope`);
-  assert.deepEqual(workerArgv("tag", id, RUN, { node: "/usr/bin/node", main: "/opt/sagebrush/main.mjs" }), [
+  assert.deepEqual(workerArgv("tag", id, RUN, NONCE, { node: "/usr/bin/node", main: "/opt/sagebrush/main.mjs" }), [
     "systemd-run", "--scope", "--quiet", "--collect", "--slice=sagebrush.slice", `--unit=sagebrush-restore-tag-${id}.scope`,
-    "--", "/usr/bin/node", "/opt/sagebrush/main.mjs", "restore-worker", "tag", id, RUN,
+    "--", "/usr/bin/node", "/opt/sagebrush/main.mjs", "restore-worker", "tag", id, RUN, NONCE,
   ]);
-  refused(() => workerArgv("home", id, RUN, { main: "/m" }), "bad_form");
-  refused(() => workerArgv("agent", "nope", RUN, { main: "/m" }), "bad_form");
-  refused(() => workerArgv("agent", id, "x; rm -rf /", { main: "/m" }), "bad_form");
-  refused(() => workerArgv("agent", id, RUN, { main: "rel/main.mjs" }), "bad_form");
+  refused(() => workerArgv("home", id, RUN, NONCE, { main: "/m" }), "bad_form");
+  refused(() => workerArgv("agent", "nope", RUN, NONCE, { main: "/m" }), "bad_form");
+  refused(() => workerArgv("agent", id, "x; rm -rf /", NONCE, { main: "/m" }), "bad_form");
+  refused(() => workerArgv("agent", id, RUN, NONCE, { main: "rel/main.mjs" }), "bad_form");
+  refused(() => workerArgv("agent", id, RUN, "nope", { main: "/m" }), "bad_form");
   assert.equal(setLockPath("/r", "archive", id), `/r/archive-${id}.lock`);
 });
 
@@ -98,17 +113,17 @@ test("a worker holds its set's lock for its whole life: live while it runs, a se
   const seen = [];
   const f = filler(async () => {
     seen.push(await workerLive("agent", id, { dir: h.dir }));
-    await rejects(runWorker("agent", id, RUN, deps(filler()), { dir: h.dir, uid: UID, waitMs: 0 }), "in_progress");
+    await rejects(runWorker("agent", id, RUN, NONCE, deps(filler()), { dir: h.dir, uid: UID, waitMs: 0 }), "in_progress");
     return { state: "files_validated" };
   });
   assert.equal(await workerLive("agent", id, { dir: h.dir }), false);
   assert.equal(existsSync(setLockPath(h.dir, "agent", id)), false, "asking leaves no lock file");
-  const out = await runWorker("agent", id, RUN, deps(f), { dir: h.dir, uid: UID });
+  const out = await runWorker("agent", id, RUN, NONCE, deps(f), { dir: h.dir, uid: UID });
   assert.deepEqual([out.status, seen, f.calls], ["files_validated", [true], [["agent", id]]]);
   assert.equal(await workerLive("agent", id, { dir: h.dir }), false, "released at the end");
   // Released on a refusal too.
   const g = filler(async () => { throw new FleetError("outcome_unknown", "boom"); });
-  await rejects(runWorker("agent", id, RUN, deps(g), { dir: h.dir, uid: UID }), "outcome_unknown");
+  await rejects(runWorker("agent", id, RUN, NONCE, deps(g), { dir: h.dir, uid: UID }), "outcome_unknown");
   assert.equal(await workerLive("agent", id, { dir: h.dir }), false);
 });
 
@@ -127,12 +142,12 @@ test("a worker runs only for a begun, open restore, exactly its set's run and re
     const f = filler();
     if (label === "no begin") {
       // An empty begin.json is malformed (bad_form); a missing one is not_found.
-      await rejects(runWorker("archive", id, RUN, deps(f), { dir: h.dir, uid: UID }), "bad_form");
+      await rejects(runWorker("archive", id, RUN, NONCE, deps(f), { dir: h.dir, uid: UID }), "bad_form");
       const { rmSync } = await import("node:fs");
       rmSync(join(h.dir, BEGIN));
-      await rejects(runWorker("archive", id, RUN, deps(f), { dir: h.dir, uid: UID }), "not_found");
+      await rejects(runWorker("archive", id, RUN, NONCE, deps(f), { dir: h.dir, uid: UID }), "not_found");
     } else {
-      await rejects(runWorker("archive", id, RUN, deps(f), { dir: h.dir, uid: UID }), code);
+      await rejects(runWorker("archive", id, RUN, NONCE, deps(f), { dir: h.dir, uid: UID }), code);
     }
     assert.deepEqual(f.calls, [], `${label}: nothing filled`);
     assert.equal(readRecord("archive", id, { dir: h.dir }), null, `${label}: nothing recorded`);
@@ -140,17 +155,17 @@ test("a worker runs only for a begun, open restore, exactly its set's run and re
   // A request of another run (rewritten under the plan's back) is refused too.
   const h = host({ sets: { [key]: RUN } });
   writeFileSync(join(h.dir, "requests", key), JSON.stringify({ run: RUN2 }) + "\n");
-  await rejects(runWorker("archive", id, RUN, deps(filler()), { dir: h.dir, uid: UID }), "not_granted");
+  await rejects(runWorker("archive", id, RUN, NONCE, deps(filler()), { dir: h.dir, uid: UID }), "not_granted");
   // The request says this worker's run but the plan's set is another run's: refused on the plan alone.
   const hp = host({ sets: { [key]: RUN2 }, noRequest: [key] });
   writeRequest(key, RUN, { dir: hp.dir, uid: UID });
   const fp = filler();
-  await rejects(runWorker("archive", id, RUN, deps(fp), { dir: hp.dir, uid: UID }), "not_granted");
+  await rejects(runWorker("archive", id, RUN, NONCE, deps(fp), { dir: hp.dir, uid: UID }), "not_granted");
   assert.deepEqual(fp.calls, []);
   // A restore directory that isn't private is refused before any lock file is made in it.
   const p = host({ sets: { [key]: RUN } });
   chmodSync(p.dir, 0o777);
-  await rejects(runWorker("archive", id, RUN, deps(filler()), { dir: p.dir, uid: UID }), "not_granted");
+  await rejects(runWorker("archive", id, RUN, NONCE, deps(filler()), { dir: p.dir, uid: UID }), "not_granted");
   assert.equal(existsSync(setLockPath(p.dir, "archive", id)), false);
 });
 
@@ -163,7 +178,7 @@ test("an abandon intent ends the worker before anything: no fill, the record unt
     intent(h.dir, key);
     const f = filler();
     let identified = 0;
-    const out = await runWorker("agent", id, RUN, deps(f, { identifyDest: async () => { identified += 1; return { object: OBJ }; } }), { dir: h.dir, uid: UID });
+    const out = await runWorker("agent", id, RUN, NONCE, deps(f, { identifyDest: async () => { identified += 1; return { ...ID }; } }), { dir: h.dir, uid: UID });
     assert.equal(out.status, "abandoning");
     assert.deepEqual([f.calls, identified], [[], 0]);
     assert.equal(withRecord ? readFileSync(join(h.dir, `agent-${id}.json`), "utf8") : readRecord("agent", id, { dir: h.dir }), before);
@@ -175,7 +190,7 @@ test("an abandon intent ends the worker before anything: no fill, the record unt
   mkdirSync(elsewhere, { mode: 0o700 });
   writeFileSync(join(elsewhere, `${key}.json`), "{}\n");
   symlinkSync(elsewhere, join(h.dir, ABANDON));
-  await rejects(runWorker("agent", id, RUN, deps(filler()), { dir: h.dir, uid: UID }), "not_granted");
+  await rejects(runWorker("agent", id, RUN, NONCE, deps(filler()), { dir: h.dir, uid: UID }), "not_granted");
   refused(() => readIntent("agent", id, { dir: h.dir, uid: UID }), "not_granted");
 });
 
@@ -186,7 +201,7 @@ test("a bound destination must still be exactly its identity: any field changed 
     writeRecord(bound("agent", id), { dir: h.dir });
     const obj = field === null ? OBJ : { ...OBJ, [field]: field === "dev" ? [8, 2] : field === "mode" ? 0o755 : OBJ[field] + 1 };
     const f = filler(async () => ({ state: "files_validated" }));
-    const out = await runWorker("agent", id, RUN, deps(f, { identifyDest: async (k, i, cls) => ({ object: cls === "sessions" ? obj : OBJ }) }), { dir: h.dir, uid: UID });
+    const out = await runWorker("agent", id, RUN, NONCE, deps(f, { identifyDest: async (k, i, cls) => ({ ...ID, object: cls === "sessions" ? obj : OBJ }) }), { dir: h.dir, uid: UID });
     const r = readRecord("agent", id, { dir: h.dir });
     if (field === null) {
       assert.deepEqual([out.status, f.calls.length, r.state], ["files_validated", 1, "staging"], "unchanged: the fill runs");
@@ -200,7 +215,7 @@ test("admission at the bind: EXACTLY the provisioned object (every identity fiel
   const id = newId();
   const r = newRecord({ kind: "agent", id, run: RUN, snapshot: SNAP });
   const dest = { home: { dev: "1", ino: "2", ...PROV }, sessions: { dev: "1", ino: "3", ...PROV } };
-  const ids = { home: { object: OBJ }, sessions: { object: OBJ } };
+  const ids = { home: { ...ID }, sessions: { ...ID } };
   const provisioned = async (k, i, cls) => ({ ...dest[cls] });
   await admitBind(r, ids, dest, { provisioned, isEmpty: async () => true });
   // Each field changed alone, in either class: device and inode (another directory with the same owner and mode),
@@ -233,11 +248,11 @@ test("through the real fill driver: the destination replaced by another EMPTY di
       launch: async (args) => { launched.push(args); throw new Error("no launch"); },
       mount: "/srv/sagebrush", root: join(h.base, "staging"), dir: h.dir,
       // Identified now: another inode than the provisioned one, every other field the same.
-      identifyDest: async () => ({ object: { ...OBJ, ino: OBJ.ino + 1 } }),
+      identifyDest: async () => ({ ...ID, object: { ...OBJ, ino: OBJ.ino + 1 } }),
       expectOf: never("expectOf"), projidOf: () => 70000, cleanDest: never("cleanDest"), discardStaging: never("discardStaging"),
       stopped: never("stopped"), unrestorableOf: () => [], removeCopies: never("removeCopies"), ...hooks,
     });
-    await rejects(runWorker(kind, id, RUN, { ...deps(filler()), filler: real }, { dir: h.dir, uid: UID }), "not_granted");
+    await rejects(runWorker(kind, id, RUN, NONCE, { ...deps(filler()), filler: real }, { dir: h.dir, uid: UID }), "not_granted");
     const r = readRecord(kind, id, { dir: h.dir });
     assert.deepEqual([r.state, r.dest, r.attempt], ["staging", null, 1], `${kind}: nothing bound`);
     assert.deepEqual([launched, touched], [[], []], `${kind}: nothing launched, cleaned or discarded`);
@@ -251,18 +266,18 @@ test("the worker's hooks: admission through the provisioned deps; the veto reads
   const dest = { archive: EXACT };
   const got = [];
   const f = filler(async (hooks) => {
-    await hooks.admit(r, { archive: { object: OBJ } }, dest);
+    await hooks.admit(r, { archive: { ...ID } }, dest);
     got.push(await hooks.veto(r));
     intent(h.dir, key);
     got.push(await hooks.veto(r));
-    await rejects(hooks.admit(r, { archive: { object: OBJ } }, { archive: { ...dest.archive, uid: 0 } }), "not_granted");
+    await rejects(hooks.admit(r, { archive: { ...ID } }, { archive: { ...dest.archive, uid: 0 } }), "not_granted");
     return { state: "files_validated" };
   });
-  await runWorker("archive", id, RUN, deps(f), { dir: h.dir, uid: UID });
+  await runWorker("archive", id, RUN, NONCE, deps(f), { dir: h.dir, uid: UID });
   assert.deepEqual(got, [false, true]);
-  const e = filler(async (hooks) => { await hooks.admit(r, { archive: { object: OBJ } }, dest); return { state: "validated" }; });
+  const e = filler(async (hooks) => { await hooks.admit(r, { archive: { ...ID } }, dest); return { state: "validated" }; });
   const h2 = host({ sets: { [key]: RUN } });
-  await rejects(runWorker("archive", id, RUN, deps(e, { isEmpty: async () => false }), { dir: h2.dir, uid: UID }), "not_granted");
+  await rejects(runWorker("archive", id, RUN, NONCE, deps(e, { isEmpty: async () => false }), { dir: h2.dir, uid: UID }), "not_granted");
 });
 
 test("a lost set lock aborts the fill and refuses outcome_unknown; the hooks refuse once it is gone", async () => {
@@ -278,7 +293,7 @@ test("a lost set lock aborts the fill and refuses outcome_unknown; the hooks ref
     await rejects(hooks.admit(newRecord({ kind: "agent", id, run: RUN, snapshot: SNAP }), {}, {}), "outcome_unknown");
     return { state: "files_validated" };
   });
-  await rejects(runWorker("agent", id, RUN, deps(f), { dir: h.dir, uid: UID, pollMs: 50 }), "outcome_unknown");
+  await rejects(runWorker("agent", id, RUN, NONCE, deps(f), { dir: h.dir, uid: UID, pollMs: 50 }), "outcome_unknown");
   assert.equal(aborted, true, "the fill's signal was aborted");
   // Lost while a bound destination is checked: nothing is written.
   const h2 = host({ sets: { [key]: RUN } });
@@ -286,7 +301,7 @@ test("a lost set lock aborts the fill and refuses outcome_unknown; the hooks ref
   const before = readFileSync(join(h2.dir, `agent-${id}.json`), "utf8");
   let killed = false;
   const kill = async () => { if (!killed) { killed = true; killHolder(setLockPath(h2.dir, "agent", id)); await settle(); } return { object: { ...OBJ, uid: 1 } }; };
-  await rejects(runWorker("agent", id, RUN, deps(filler(), { identifyDest: kill }), { dir: h2.dir, uid: UID }), "outcome_unknown");
+  await rejects(runWorker("agent", id, RUN, NONCE, deps(filler(), { identifyDest: kill }), { dir: h2.dir, uid: UID }), "outcome_unknown");
   assert.equal(readFileSync(join(h2.dir, `agent-${id}.json`), "utf8"), before, "no failed written after the loss");
 });
 
@@ -296,14 +311,14 @@ test("dispatch: only a begun, open restore with the gate open; one worker per ho
   const mk = (over = {}) => host({ sets: Object.fromEntries(keys.map((k) => [k, RUN])), ...over });
   const run = async (h, over = {}) => {
     const started = [];
-    const out = await dispatchOnce({ gateOpen: async () => true, admitted: async () => true, start: async (argv) => { started.push(argv); }, main: "/opt/m.mjs", node: "/n", ...over }, { dir: h.dir, uid: UID });
+    const out = await dispatchOnce({ gateOpen: async () => true, admitted: async () => true, start: async (argv) => { started.push(argv); }, main: "/opt/m.mjs", node: "/n", newNonce: () => NONCE, inputOf: async (k, i, r, n) => inputOf(k, i, r, n), ...over }, { dir: h.dir, uid: UID });
     return { out, started };
   };
   // The happy one: the first key.
   let h = mk();
   let { out, started } = await run(h);
   assert.deepEqual(out, { dispatched: keys[0] });
-  assert.deepEqual(started, [workerArgv("agent", a, RUN, { node: "/n", main: "/opt/m.mjs" })]);
+  assert.deepEqual(started, [workerArgv("agent", a, RUN, NONCE, { node: "/n", main: "/opt/m.mjs" })]);
   // Refusals, nothing started.
   for (const [why, hh, over] of [
     ["begun", mk({ state: "begun" }), {}],
@@ -349,7 +364,7 @@ test("holdSets: every lock of an agent's sets in an OPEN plan, held until releas
     await rejects(lockFile(setLockPath(h.dir, kind, id), { waitMs: 0 }), "in_progress");
     // A worker for that set can't start: it exits busy, filling nothing.
     const f = filler();
-    await rejects(runWorker(kind, id, RUN, deps(f), { dir: h.dir, uid: UID }), "in_progress");
+    await rejects(runWorker(kind, id, RUN, NONCE, deps(f), { dir: h.dir, uid: UID }), "in_progress");
     assert.deepEqual(f.calls, [], `${kind}: nothing filled`);
   }
   await free("agent", other); // another agent's set isn't held

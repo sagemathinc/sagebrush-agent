@@ -990,6 +990,8 @@ test("the restore worker seam: built over the open store and given to the execut
   t.fn();
   await until(() => h.log.includes("submit:restore-dispatch") && h.log.includes("submit:restore-import"));
   assert.ok(h.log.indexOf("submit:restore-dispatch") < h.log.indexOf("submit:restore-import"), "the dispatch, then the imports, by the same timer");
+  await until(() => h.log.includes("submit:restore-abandon-finish"));
+  assert.ok(h.log.indexOf("submit:restore-import") < h.log.indexOf("submit:restore-abandon-finish"), "then the abandons' finish");
   h.term();
   assert.equal((await run).code, 0);
   assert.equal(t.cleared, true);

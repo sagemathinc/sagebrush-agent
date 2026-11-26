@@ -157,6 +157,11 @@ test("T2: a stale, malformed or wrong-set intent refuses before the kill, with n
     ["malformed", (w) => writeIntent(w, "archive", w.d, {}, { raw: "{}\n" })],
     ["non-canonical", (w) => writeIntent(w, "archive", w.d, {}, { raw: JSON.stringify(intentOf("archive", w.d), null, 1) + "\n" })],
     ["a record of another run", (w) => { writeIntent(w, "archive", w.d); writeRecord(reach("archive", w.d, "failed", RUN2), { dir: w.dir }); }],
+    ["the plan's set snapshot moved (the intent and the record agree)", (w) => {
+      writeIntent(w, "archive", w.d);
+      const p = readPlan({ dir: w.dir });
+      writeFileSync(join(w.dir, "plan.json"), JSON.stringify({ ...p, sets: { ...p.sets, [`archive-${w.d}`]: { ...p.sets[`archive-${w.d}`], snapshot: hex("b") } } }) + "\n", { mode: 0o600 });
+    }],
   ];
   for (const [what, plant] of cases) {
     const w = world();

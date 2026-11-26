@@ -414,7 +414,7 @@ test("the seam's abandons, composed: an archive's accepted intent finished by th
   const { newRecord, step, writeRecord, readRecord } = await import("../lib/fleet/host/restore-record.mjs");
   const { destOf } = await import("../lib/fleet/host/restore-fill.mjs");
   const { chmodSync, rmSync, readdirSync } = await import("node:fs");
-  for (const mode of ["ok", "another-object"]) {
+  for (const mode of ["ok", "another-object", "swapped-after-clean"]) {
     const d = newId(), key = `archive-${d}`;
     const base = mkdtempSync(join(tmpdir(), "sb-wiring-ab-"));
     chmodSync(base, 0o700);
@@ -426,7 +426,8 @@ test("the seam's abandons, composed: an archive's accepted intent finished by th
     const dest = Object.fromEntries(Object.entries(objs).map(([c, o]) => [c, destOf(o)]));
     let r = step(newRecord({ kind: "archive", id: d, run: RUN, snapshot: hex("1") }), "bind", { dest });
     for (const cls of ["archive", "archive-config"]) r = step(r, "digest", { cls, sha256: hex("5") });
-    r = step(step(step(r, "staged"), "filling", { dest }), "failed", { reason: "outcome_unknown" });
+    // (published: a live state, whose current attempt a fill would keep; an abandon discards it too)
+    r = step(step(step(r, "staged"), "filling", { dest }), "published");
     writeRecord(r, { dir });
     mkdirSync(join(dir, "abandon"), { mode: 0o700 });
     writeFileSync(join(dir, "abandon", `${key}.json`), JSON.stringify({ v: 1, kind: "archive", id: d, restore_run: RUN, set_run: RUN, set_snapshot: hex("1"), account: newId(), person: newId(),
@@ -436,6 +437,7 @@ test("the seam's abandons, composed: an archive's accepted intent finished by th
     const registry = { v: 1, next_uid: 70010, next_gid: 80010, agents: { [d]: { uid: 70000, state: "deleted", life: 1, gen: 1, tags: [], start_failed: null } }, tags: {} };
     const store = { registry: { agent: (x) => registry.agents[x] ?? null, tag: () => null, snapshot: () => structuredClone(registry) }, provisioned: { record: () => null } };
     const calls = [], killed = [];
+    let cleaned = 0;
     const launch = async (args) => {
       calls.push(args.slice(0, 5).join(" "));
       if (args[0] === "identify") {
@@ -446,11 +448,14 @@ test("the seam's abandons, composed: an archive's accepted intent finished by th
         }
         if (anchor === "/var/lib/sagebrush/validate") return { code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, object: null }) };
         const cls = anchor.endsWith("archive-config") ? "archive-config" : "archive";
-        return { code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, object: mode === "another-object" && cls === "archive" ? obj({ ino: 9999 }) : objs[cls] }) };
+        // (swapped-after-clean: the archive's object is another one once both classes were emptied, at the re-proof)
+        const other = (mode === "another-object" || (mode === "swapped-after-clean" && cleaned === 2)) && cls === "archive";
+        return { code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, object: other ? obj({ ino: 9999 }) : objs[cls] }) };
       }
       if (args[0] === "remove-tree") {
         const anchor = args[args.indexOf("--anchor") + 1];
         if (anchor === staging) rmSync(join(staging, args[args.indexOf("--name") + 1]), { recursive: true });
+        if (args[1] === "--contents") cleaned++;
         return { code: 0, stdout: "" };
       }
       if (args[0] === "tree-digest") return { code: 0, stdout: EMPTY_LISTING };
@@ -467,10 +472,13 @@ test("the seam's abandons, composed: an archive's accepted intent finished by th
       assert.ok(calls.includes(`remove-tree --contents --anchor /srv/sagebrush/archive --name`) && calls.includes(`remove-tree --contents --anchor /srv/sagebrush/archive-config --name`), "both classes emptied");
       assert.deepEqual(readdirSync(join(staging, RUN, `a-${d}`, "archive")), [], "the staging attempt removed");
       assert.ok(calls.some((c) => c.startsWith("tree-digest")), "the live re-proof");
+    } else if (mode === "swapped-after-clean") {
+      assert.deepEqual(out, { sets: { [key]: { status: "reproof_failed" } } }, "the re-proof checks the recorded identity, not any empty directory");
+      assert.equal(readRecord("archive", d, { dir }).state, "published");
     } else {
       assert.deepEqual(out, { sets: { [key]: { status: "refused", reason: "not_granted" } } }, "another object at the destination: nothing removed");
       assert.ok(!calls.some((c) => c.startsWith("remove-tree --contents")));
-      assert.equal(readRecord("archive", d, { dir }).state, "failed");
+      assert.equal(readRecord("archive", d, { dir }).state, "published");
     }
   }
 });

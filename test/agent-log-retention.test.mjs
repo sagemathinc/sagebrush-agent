@@ -39,14 +39,14 @@ function versionStore({ seam = async () => {} } = {}) {
   return st;
 }
 
-/** A durable, create-only witness. `seam(op)` runs before each operation. */
+/** A durable, create-only witness with a conditional removal. `seam(op)` runs before each operation. */
 function witnessStore({ seam = async () => {} } = {}) {
   const slots = new Map();
   return {
     slots,
     get: async (k) => { await seam("get", k); return slots.has(k) ? structuredClone(slots.get(k)) : null; },
     create: async (k, r) => { await seam("create", k); if (slots.has(k)) return { exists: true }; slots.set(k, structuredClone(r)); return { ok: true }; },
-    remove: async (k) => { await seam("remove", k); slots.delete(k); },
+    removeIf: async (k, id) => { await seam("remove", k); if (slots.get(k)?.id === id) slots.delete(k); },
   };
 }
 
@@ -255,7 +255,7 @@ test("a resume follows the witnessed plan exactly, never a new one, and never re
   const st = versionStore(), w = witnessStore(), path = "transcript/6.jsonl";
   rewrites(st, path, Array.from({ length: 12 }, () => T0));
   // (an interrupted compaction's record: 1 and 2 planned)
-  await w.create(`compact:${path}`, { path, kind: "open", finalCseq: null, release: [1, 2], anomalies: [] });
+  await w.create(`compact:${path}`, { id: "r1", path, kind: "open", finalCseq: null, release: [1, 2], anomalies: [] });
   // (meanwhile more turns: a fresh plan would release 1..5)
   for (let c = 13; c <= 15; c++) st.put(path, c, T0, cat(st.bytes(path, 12), frame([line(`t${c}`, 1, `turn ${c}`)])));
   const r = await compact(st, w, path, "open", { now_ms: T0 });
@@ -266,7 +266,7 @@ test("a resume follows the witnessed plan exactly, never a new one, and never re
   assert.deepEqual((await compact(st, w, path, "open", { now_ms: T0 })).released, [3, 4, 5]);
 
   // (a record naming the current version, or a closed final, never releases it)
-  await w.create(`compact:${path}`, { path, kind: "closed", finalCseq: 14, release: [6, 14, 15], anomalies: [] });
+  await w.create(`compact:${path}`, { id: "r2", path, kind: "closed", finalCseq: 14, release: [6, 14, 15], anomalies: [] });
   assert.deepEqual((await compact(st, w, path, "open", { now_ms: T0 })).released, [6]);
   assert.ok(st.cseqs(path).includes(14) && st.cseqs(path).includes(15));
 });
@@ -275,13 +275,95 @@ test("a compactor that loses the witness race follows the record already there",
   const st = versionStore(), path = "transcript/7.jsonl";
   rewrites(st, path, Array.from({ length: 13 }, () => T0));
   const w = witnessStore();
-  const theirs = { path, kind: "open", finalCseq: null, release: [1], anomalies: [] };
+  const theirs = { id: "theirs", path, kind: "open", finalCseq: null, release: [1], anomalies: [] };
   const realGet = w.get;
   let first = true;
   w.get = async (k) => { if (first) { first = false; await w.create(k, theirs); return null; } return realGet(k); };
   const r = await compact(st, w, path, "open", { now_ms: T0 });
   assert.deepEqual(r.released, [1]);
   assert.deepEqual(st.cseqs(path)[0], 2);
+});
+
+/**
+ * Three overlapping compactors of one context file. A releases 1..4 and its acknowledgement is held; B resumes A's
+ * record and finishes it; versions 15..18 arrive; C plans 5..8 and is held at `holdC` ("create", "before" or
+ * "after" its release, or "remove"). Then A's old acknowledgement arrives. (Each row has a timeout: a run that never
+ * reaches its gate fails the row rather than waiting forever.)
+ */
+async function overlap(holdC, { crashC = false } = {}) {
+  const gate = () => { let open; const p = new Promise((r) => { open = r; }); return { p, open }; };
+  const aAck = gate(), aIn = gate(), cHeld = gate(), cGo = gate();
+  let phase = "A", w;
+  const hold = async (op) => {
+    if (phase === "A" && op === "after") { phase = "B"; aIn.open(); await aAck.p; }
+    else if (phase === "C" && op === holdC) {
+      phase = "done"; cHeld.open(); await cGo.p;
+      if (crashC) throw new Error(`crash: C at ${op}`);
+    }
+  };
+  const st = versionStore({ seam: hold }), path = "context.md";
+  w = witnessStore({ seam: hold });
+  for (let c = 1; c <= 14; c++) st.put(path, c, T0, te.encode(`context ${c}`));
+  const a = compact(st, w, path, "context", { now_ms: T0 });
+  await aIn.p;
+  const idA = w.slots.get(`compact:${path}`).id;
+  const b = await compact(st, w, path, "context", { now_ms: T0 });
+  assert.equal(b.resumed, true);
+  assert.equal(w.slots.size, 0);
+  for (let c = 15; c <= 18; c++) st.put(path, c, T0, te.encode(`context ${c}`));
+  phase = "C";
+  const c = compact(st, w, path, "context", { now_ms: T0 }).then((r) => r, (e) => e);
+  await cHeld.p;
+  aAck.open();
+  assert.deepEqual((await a).released, [1, 2, 3, 4]);
+  return { st, w, path, idA, c, cGo };
+}
+
+for (const holdC of ["create", "before", "after", "remove"]) {
+  test(`overlapping compactors: a late acknowledgement never removes a newer run's witness (C held at ${holdC})`, { timeout: 10_000 }, async () => {
+    const { st, w, path, idA, c, cGo } = await overlap(holdC);
+    const key = `compact:${path}`;
+    if (holdC !== "create") {
+      assert.ok(w.slots.has(key), "C's witness survives A's late acknowledgement");
+      assert.notEqual(w.slots.get(key).id, idA);
+      assert.deepEqual(w.slots.get(key).release, [5, 6, 7, 8]);
+    }
+    cGo.open();
+    const r = await c;
+    assert.deepEqual(r.released, [5, 6, 7, 8]);
+    assert.deepEqual(st.cseqs(path), [9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
+    assert.equal(w.slots.size, 0);
+  });
+
+  test(`overlapping compactors: C crashing at ${holdC} after A's late acknowledgement resumes its own record exactly`, { timeout: 10_000 }, async () => {
+    const { st, w, path, c, cGo } = await overlap(holdC, { crashC: true });
+    const key = `compact:${path}`;
+    cGo.open();
+    assert.match(String((await c).message), /crash/);
+    if (holdC === "create") {
+      // (C crashed before its witness: nothing of 5..8 was released, and the retry plans them afresh)
+      assert.equal(w.slots.size, 0);
+      assert.ok(st.cseqs(path).includes(5));
+    } else {
+      assert.deepEqual(w.slots.get(key).release, [5, 6, 7, 8], "C's record is there for the retry");
+    }
+    const retry = await compact(st, w, path, "context", { now_ms: T0 });
+    assert.equal(retry.resumed, holdC !== "create");
+    assert.deepEqual(retry.released, [5, 6, 7, 8]);
+    assert.deepEqual(st.cseqs(path), [9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
+    assert.equal(w.slots.size, 0);
+  });
+}
+
+test("a witness record removed under a racing run's feet: the losing run releases nothing and the next run replans", async () => {
+  const st = versionStore(), path = "transcript/8.jsonl";
+  rewrites(st, path, Array.from({ length: 12 }, () => T0));
+  const w = witnessStore();
+  w.create = async () => ({ exists: true }); // (another run's record was there, and is gone by the read)
+  const r = await compact(st, w, path, "open", { now_ms: T0 });
+  assert.deepEqual(r.released, []);
+  assert.deepEqual(st.cseqs(path).length, 12);
+  assert.deepEqual((await compact(st, witnessStore(), path, "open", { now_ms: T0 })).released, [1, 2]);
 });
 
 test("compact refuses an unknown kind, and writes no witness when there is nothing to release", async () => {
@@ -381,6 +463,12 @@ test("row 7: the incremental index equals a fresh rebuild through every kind of 
   const b1 = seg(["u1", 1, "alpha"]);
   const forged = cat(b1, frame([encodeLine({ closed: true, lines: 1, bytes: b1.length, sha256: "0".repeat(64) })]));
   await step(B, 1, forged, { closed: false, footerBad: true });
+  // (a checked footer followed by anything is not closed: an unfinished line after it, then a whole one)
+  const C = "transcript/3.jsonl", c1 = seg(["v1", 1, "echo"]);
+  const cClosed = cat(c1, frame([await footerLine(c1)]));
+  await step(C, 1, cat(cClosed, te.encode('{"turn":"v2","i')), { closed: false, footerBad: true, indexed: 1 });
+  await step(C, 2, cat(cClosed, seg(["v2", 1, "delta"])), { closed: false, indexed: 1 });
+  await step(C, 3, cClosed, { closed: true, footerBad: false, rebuilt: true });
   // (deletion, then reappearance with other bytes)
   await removeSegment(idx, B);
   live.delete(B);

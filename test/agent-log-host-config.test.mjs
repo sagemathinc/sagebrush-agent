@@ -71,12 +71,14 @@ test("a proxy without a credential is its scheme, host and port only", () => {
     ["https://p.example", { scheme: "https", host: "p.example", port: 443 }],
     ["http://p.example", { scheme: "http", host: "p.example", port: 80 }],
     ["socks5://10.0.0.2:1080", { scheme: "socks5", host: "10.0.0.2", port: 1080 }],
+    ["socks5://proxy.example", { scheme: "socks5", host: "proxy.example", port: 1080 }],
+    ["socks5://Proxy.Example:9050/", { scheme: "socks5", host: "Proxy.Example", port: 9050 }],
     ["http://[fd00::1]:8080", { scheme: "http", host: "[fd00::1]", port: 8080 }],
     [{ url: "http://p.example:9" }, { scheme: "http", host: "p.example", port: 9 }],
   ];
   for (const [proxy, want] of cases) assert.deepEqual(parsed(hostConfigExport({ host: "h", network: { proxy } })).network, { proxy: want }, JSON.stringify(proxy));
   // (what doesn't fit is left out, with a note that doesn't echo it)
-  for (const proxy of [`ftp://p.example/${S}`, "ftp://p.example:2121", "ws://p.example:8080", "gopher://p.example:7070", "file:///etc/x", `http://p.example/${S}`, `http://p.example#${S}`, "http://p.example:0", "not a url", 5, null, { headers: {} }, { url: 7 },
+  for (const proxy of ["socks5:", "socks5://", "socks5:///", "http://:3128", `ftp://p.example/${S}`, "ftp://p.example:2121", "ws://p.example:8080", "gopher://p.example:7070", "file:///etc/x", `http://p.example/${S}`, `http://p.example#${S}`, "http://p.example:0", "not a url", 5, null, { headers: {} }, { url: 7 },
     `http://p.example/\u0007`]) {
     const r = hostConfigExport({ host: "h", network: { proxy } });
     assert.equal(parsed(r).network, undefined, JSON.stringify(proxy));
@@ -140,6 +142,21 @@ test("the bounds and forms of each field", () => {
   assert.equal(parsed(one({ agents: ags(257) })).agents, undefined);
   assert.equal(parsed(one({ agents: [{ id: "a" }] })).agents, undefined);
   assert.equal(parsed(one({ agents: [{ id: "a", name: "A" }, { id: "a", name: "B" }] })).agents, undefined, "a repeated agent id");
+  // (a sparse array is a misfit with its note, never a hole in the export; a dense one of the same length passes)
+  for (const [field, input, dense] of [
+    ["tags", { tags: Array(1) }, { tags: ["t"] }],
+    ["backup.sources", { backup: { sources: Array(1) } }, { backup: { sources: ["/p"] } }],
+    ["agents", { agents: Array(1) }, { agents: [{ id: "a", name: "A" }] }],
+    ["tags", { tags: Object.assign(["a", "b"], { length: 3 }) }, { tags: ["a", "b", "c"] }],
+  ]) {
+    const r = one(input);
+    assert.deepEqual(r.notes.map((n) => n.field), [field], `${field} sparse`);
+    assert.deepEqual(parsed(r), { v: 1, type: "sb.host-config.v1", host: "h" });
+    const d = one(dense);
+    assert.deepEqual(d.notes, [], `${field} dense`);
+    assert.deepEqual(parsed(d), { v: 1, type: "sb.host-config.v1", host: "h", ...dense });
+  }
+  assert.equal(one({ tags: [, "a"] }).notes[0].field, "tags", "a hole first");
   // (an absent field: no note; an inherited one isn't read)
   assert.deepEqual(one({}).notes, []);
   assert.equal(parsed(hostConfigExport(Object.assign(Object.create({ name: S }), { host: "h" }))).name, undefined);

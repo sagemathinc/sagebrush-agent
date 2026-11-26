@@ -88,9 +88,11 @@ clean() {
 snap() { snaptext | md5sum; }
 snaptext() {
   { for d in /etc/systemd/system /run/systemd/system /run/systemd/system.control /run/systemd/transient /run/systemd/generator \
-       /usr/lib/systemd/system /usr/lib/systemd/system-sleep /usr/lib "$P"; do
+       /usr/lib/systemd/system /usr/lib/systemd/system-sleep /usr/lib/sagebrush "$P"; do
       [ -d "$d" ] && find "$d" -maxdepth 2 -printf '%p %u %m %s %T@\n' 2>/dev/null | sort
     done
+    # (of /usr/lib, only the sagebrush entry: package updates may change the rest at any time)
+    find /usr/lib -maxdepth 1 -name 'sagebrush*' -printf '%p %u %m %s %T@\n' 2>/dev/null
     systemctl list-units --all --plain --no-legend 2>/dev/null | grep sagebrush-
     systemctl list-unit-files --no-legend 2>/dev/null | grep sagebrush-
     for u in $UNIT sagebrush-backup.service; do systemctl show "$u" -p LoadState -p ActiveState -p DropInPaths -p FragmentPath -p NeedDaemonReload 2>/dev/null; done
@@ -198,14 +200,45 @@ for f in cargo rustc bash rustup cc; do printf '#!/bin/sh\ntouch /run/sb-tool-%s
 printf '#!/bin/sh\ntouch /run/sb-tool-wrapper-ran\nexec "$@"\n' > /tmp/sb-tool/wrap; chmod 755 /tmp/sb-tool/wrap
 printf '[build]\nrustc-wrapper = "/tmp/sb-tool/wrap"\n' > /tmp/sb-tool/cargo/config.toml
 printf '#!/bin/sh\ntouch /run/sb-tool-filter-ran\ncat\n' > /tmp/sb-tool/smudge; chmod 755 /tmp/sb-tool/smudge
+printf '#!/bin/sh\ntouch /run/sb-tool-tar-ran\n' > /tmp/sb-tool/tarmark; chmod 755 /tmp/sb-tool/tarmark
 mkdir -p "$REPO/.git/info" 2>/dev/null; gitdir=$(git -c safe.directory='*' -C "$REPO" rev-parse --git-common-dir)
 cp "$gitdir/config" /tmp/sb-tool/config.bak; printf '* filter=evil\n' >> "$gitdir/info/attributes"
 git -c safe.directory='*' -C "$REPO" config filter.evil.smudge /tmp/sb-tool/smudge
-out=$(cd "$REPO" && env PATH=/tmp/sb-tool/bin:$PATH CARGO_HOME=/tmp/sb-tool/cargo RUSTC_WRAPPER=/tmp/sb-tool/wrap "$INSTALL" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
-if [ "$r" = 0 ] && ! ls /run/sb-tool-*-ran >/dev/null 2>&1; then ok "toolchain: the caller's cargo, rustc, bash, wrapper, Cargo config and git filter never run; the pinned launcher installs"
+# both tar extractions (the staging one in the preflight, and the release's in step 3) with a TAR_OPTIONS checkpoint
+# action: first a cut right after the preflight (only the staging extraction ran), then the whole install
+TOOLENV=(PATH=/tmp/sb-tool/bin:$PATH CARGO_HOME=/tmp/sb-tool/cargo RUSTC_WRAPPER=/tmp/sb-tool/wrap "TAR_OPTIONS=--checkpoint=1 --checkpoint-action=exec=/tmp/sb-tool/tarmark")
+out=$(cd "$REPO" && env "${TOOLENV[@]}" SB_RELEASE_INSTALL_CUT=1 "$INSTALL" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
+if [ "$r" = 9 ] && ! ls /run/sb-tool-*-ran >/dev/null 2>&1; then ok "toolchain: the staging extraction ran with TAR_OPTIONS set, and nothing of the caller's ran"
+else bad "toolchain (staging extraction): exit $r, ran: $(ls /run/sb-tool-*-ran 2>/dev/null | tr '\n' ' ') ${out:0:300}"; fi
+clean
+out=$(cd "$REPO" && env "${TOOLENV[@]}" "$INSTALL" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
+if [ "$r" = 0 ] && ! ls /run/sb-tool-*-ran >/dev/null 2>&1; then ok "toolchain: the caller's cargo, rustc, bash, wrapper, Cargo config, git filter and TAR_OPTIONS never act (both extractions); the pinned launcher installs"
 else bad "toolchain: exit $r, ran: $(ls /run/sb-tool-*-ran 2>/dev/null | tr '\n' ' ') ${out:0:300}"; fi
 [ "$(sha256sum < "$D/bin/sagebrush-agent-launch" | cut -d' ' -f1)" = "$(cut -d' ' -f1 "$REPO/lib/fleet/host/launcher.sha256")" ] && ok "toolchain: the installed launcher is the pinned bytes" || bad "toolchain: the installed launcher isn't the pinned bytes"
 cp /tmp/sb-tool/config.bak "$gitdir/config"; sed -i '/^\* filter=evil$/d' "$gitdir/info/attributes"; rm -rf /tmp/sb-tool /run/sb-tool-*-ran
+# One hostile environment (SEC on #172): the installer re-execs itself under env -i, so nothing below acts
+clean; mkdir -p /tmp/sb-env
+printf '#!/bin/sh\ntouch /run/sb-env-%s-ran\n' tar > /tmp/sb-env/tar; printf '#!/bin/sh\ntouch /run/sb-env-bashenv-ran\n' > /tmp/sb-env/bashenv
+printf '#!/bin/sh\ntouch /run/sb-env-fsmonitor-ran\n' > /tmp/sb-env/fsmon; chmod 755 /tmp/sb-env/tar /tmp/sb-env/bashenv /tmp/sb-env/fsmon
+# the preload library records every process that loads it, by name: only the ones that start the installer (env,
+# and the script itself before its re-exec) may appear, never a tool the installer runs
+cat > /tmp/sb-env/p.c <<'EOF_C'
+#include <stdio.h>
+#include <string.h>
+__attribute__((constructor)) static void m(void) {
+  char c[64] = "", p[128]; FILE *f = fopen("/proc/self/comm", "r");
+  if (f) { if (fgets(c, sizeof c, f)) c[strcspn(c, "\n")] = 0; fclose(f); }
+  snprintf(p, sizeof p, "/run/sb-env-preload-%s", c); f = fopen(p, "w"); if (f) fclose(f);
+}
+EOF_C
+cc -shared -fPIC -o /tmp/sb-env/p.so /tmp/sb-env/p.c 2>/dev/null || echo "     (no cc: the LD_PRELOAD library is absent; the variable is still set)"
+out=$(cd "$REPO" && env "TAR_OPTIONS=--checkpoint=1 --checkpoint-action=exec=/tmp/sb-env/tar" \
+  "GIT_CONFIG_PARAMETERS='core.fsmonitor=/tmp/sb-env/fsmon'" LD_PRELOAD=/tmp/sb-env/p.so BASH_ENV=/tmp/sb-env/bashenv ENV=/tmp/sb-env/bashenv \
+  "$INSTALL" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
+m=$(ls /run/sb-env-* 2>/dev/null | grep -v -e '^/run/sb-env-preload-env$' -e '^/run/sb-env-preload-sh$' -e '^/run/sb-env-preload-dash$' -e '^/run/sb-env-preload-release-install$' | tr '\n' ' ')
+if [ "$r" = 0 ] && [ -z "$m" ] && rc_v=$(cd "$REPO" && "$INSTALL" --verify "$D" 2>&1); then ok "hostile environment (TAR_OPTIONS, GIT_CONFIG_PARAMETERS, LD_PRELOAD, BASH_ENV, ENV): nothing acts; the install is the normal one"
+else bad "hostile environment: exit $r, ran: $m ${out:0:300}"; fi
+rm -rf /tmp/sb-env /run/sb-env-*
 # C6: cuts. After each, nothing starts; after the mkdirs only, a retry completes
 for step in 1m 2 3 4 5 6; do
   clean

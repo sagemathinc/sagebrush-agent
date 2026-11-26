@@ -28,6 +28,18 @@
 #   5  daemon-reload.  6  the EFFECTIVE unit verified, still closed.  7  open: the drop-in removed, reload, verified.
 # A cut at any point leaves nothing startable: before step 4 there is no unit; from step 2 to 7 the unit is closed.
 set -eu
+# Nothing of the caller's environment reaches any tool (TAR_OPTIONS, GIT_*, locale, pagers, ...): unless the
+# environment is already exactly PATH=/usr/bin:/bin (plus what sh itself sets, and the tests' cut step), start again
+# in an empty one.
+clean_env=1
+while IFS= read -r line; do
+  case "$line" in PATH=/usr/bin:/bin | PWD=* | OLDPWD=* | SHLVL=* | _=* | SB_RELEASE_INSTALL_CUT=*) ;; *) clean_env=0 ;; esac
+done <<EOF_ENV
+$(env)
+EOF_ENV
+if [ "$clean_env" != 1 ]; then
+  exec /usr/bin/env -i PATH=/usr/bin:/bin ${SB_RELEASE_INSTALL_CUT:+SB_RELEASE_INSTALL_CUT="$SB_RELEASE_INSTALL_CUT"} /bin/sh "$0" "$@"
+fi
 PATH=/usr/bin:/bin
 export PATH
 STAT=/usr/bin/stat
@@ -162,13 +174,24 @@ NeedDaemonReload=no"
   [ "$(printf '%s\n' "$s" | sort)" = "$(printf '%s\n' "$want" | sort)" ] || no "systemd's state for $u isn't absent (not a fresh host)"
 done
 prove_all
-# The commit, through an isolated bare copy (a plain object copy: no config, hooks or attributes of the clone come
-# along, so no filter or hook can run), archived into a root-only staging directory; then the launcher's bytes,
-# copied in once and verified against the reviewed tree's pin. /run is outside every install area.
+# The commit, through an isolated bare repository holding a COPY of the clone's object store only (no config, hooks,
+# attributes or refs of the clone come along, and no git command runs in the clone itself, so no filter or hook can
+# run), archived into a root-only staging directory; then the launcher's bytes, copied in once and verified against
+# the reviewed tree's pin. /run is outside every install area.
 STAGE=$(mktemp -d /run/sb-release-install.XXXXXX) || no "can't create a staging directory"
 trap 'rm -rf -- "$STAGE"' EXIT
-# (safe.directory on the command line, a protected scope, only for reading the caller's clone as root)
-igit -c safe.directory="*" clone -q --bare --no-hardlinks --template= -- "$REPO" "$STAGE/repo.git" 2>/dev/null || no "can't read the clone"
+# the clone's common git directory, read from disk: .git, or a linked worktree's .git file naming its gitdir, whose
+# commondir file names the common one
+gd=$REPO/.git
+if [ -f "$gd" ]; then
+  gd=$(sed -n 's/^gitdir: //p' "$gd"); case "$gd" in /*) ;; *) gd=$REPO/$gd ;; esac
+  if [ -f "$gd/commondir" ]; then c=$(cat "$gd/commondir"); case "$c" in /*) gd=$c ;; *) gd=$gd/$c ;; esac; fi
+fi
+[ -d "$gd/objects" ] || no "can't find the clone's objects"
+igit init -q --bare --template= "$STAGE/repo.git" || no "can't create the staging repository"
+rm -rf -- "$STAGE/repo.git/objects"
+cp -R -- "$gd/objects" "$STAGE/repo.git/objects" || no "can't copy the clone's objects"
+if [ -f "$gd/shallow" ]; then cp -- "$gd/shallow" "$STAGE/repo.git/shallow"; fi
 igit --git-dir="$STAGE/repo.git" rev-parse --verify --quiet "$COMMIT^{commit}" >/dev/null || no "no such commit"
 mkdir -m 0700 "$STAGE/tree"
 igit --git-dir="$STAGE/repo.git" -c core.attributesFile=/dev/null archive --format=tar "$COMMIT" \

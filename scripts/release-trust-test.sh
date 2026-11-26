@@ -12,6 +12,7 @@ set -uo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd -P)
 CHECK="$REPO/scripts/release-trust.sh"
 INSTALL="$REPO/scripts/release-install.sh"
+SBIN=/usr/local/sbin/sagebrush-release-install      # the supported entrypoint: a root-owned copy (lease-on r1.13)
 UNIT=sagebrush-supervisor.service
 FAILS=0
 ok() { echo "ok   $1"; }
@@ -98,7 +99,9 @@ snaptext() {
     for u in $UNIT sagebrush-backup.service; do systemctl show "$u" -p LoadState -p ActiveState -p DropInPaths -p FragmentPath -p NeedDaemonReload 2>/dev/null; done
   }
 }
-inst() { (cd "$REPO" && "$INSTALL" "$COMMIT" "$D" "$LAUNCH"); }
+# ri <args>: the ONLY supported invocation: an absolute env -i on the root-owned copy (the cut, in tests, explicitly)
+ri() { (cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin ${CUT:+SB_RELEASE_INSTALL_CUT=$CUT} /bin/sh "$SBIN" "$@"); }
+inst() { ri "$COMMIT" "$D" "$LAUNCH"; }
 markers() { ls /run/sb-*-ran 2>/dev/null | wc -l; }
 # refuses <label> <setup cmd> <expected message part>: the install refuses FOR THAT REASON, snapshots identical, no new
 # marker
@@ -114,11 +117,12 @@ refuses() {
 }
 unitfile() { printf '[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/sh -c "touch /run/sb-%s-ran"\n' "$1"; }
 
+install -o root -g root -m 0755 "$INSTALL" "$SBIN"
 clean
 # C1: the clean positive, and the start goes through release-trust before node
 out=$(inst 2>&1); r=$?
 if [ "$r" = 0 ]; then ok "install: a clean host installs"; else bad "install: a clean host (exit $r: ${out:0:400})"; fi
-rc "install: --verify passes" 0 bash -c "cd '$REPO' && '$INSTALL' --verify '$D'"
+rc "install: --verify passes" 0 ri --verify "$D"
 rc "install: the installed release's manifest equals the checkout's" 0 /usr/bin/node --input-type=module -e "
   const { leaseManifest } = await import('$REPO/lib/fleet/host/lease-manifest.mjs');
   process.exit(JSON.stringify(leaseManifest('$REPO')) === JSON.stringify(leaseManifest('$D')) ? 0 : 1);"
@@ -140,15 +144,15 @@ cp /tmp/sb-dispatcher.bak "$D/bin/sagebrush-agent.mjs"; chmod 755 "$D/lib"; rm -
 systemctl reset-failed $UNIT 2>/dev/null
 # C8: --verify against a changed effective unit (each refuses; removed, it passes)
 mkdir -p /run/systemd/system/$UNIT.d; printf '[Service]\nExecStartPre=\nExecStart=\nExecStart=/bin/true\n' > /run/systemd/system/$UNIT.d/override.conf; systemctl daemon-reload
-rc "verify: an overriding drop-in refuses" 1 bash -c "cd '$REPO' && '$INSTALL' --verify '$D'"
+rc "verify: an overriding drop-in refuses" 1 ri --verify "$D"
 rm -rf /run/systemd/system/$UNIT.d; systemctl daemon-reload
 echo "# changed" >> /etc/systemd/system/$UNIT
-rc "verify: a changed file not reloaded refuses" 1 bash -c "cd '$REPO' && '$INSTALL' --verify '$D'"
+rc "verify: a changed file not reloaded refuses" 1 ri --verify "$D"
 sed -i '$d' /etc/systemd/system/$UNIT; systemctl daemon-reload
 mkdir -p /run/systemd/system.control; printf '[Service]\nExecStart=/bin/true\n' > /run/systemd/system.control/$UNIT; systemctl daemon-reload
-rc "verify: an outranking fragment refuses" 1 bash -c "cd '$REPO' && '$INSTALL' --verify '$D'"
+rc "verify: an outranking fragment refuses" 1 ri --verify "$D"
 rm -f /run/systemd/system.control/$UNIT; systemctl daemon-reload
-rc "verify: restored, it passes" 0 bash -c "cd '$REPO' && '$INSTALL' --verify '$D'"
+rc "verify: restored, it passes" 0 ri --verify "$D"
 # reinstalling over it is refused (fresh only)
 refuses "an existing install (fresh only)" "inst >/dev/null 2>&1" "<dest> exists"
 
@@ -186,7 +190,7 @@ refuses "node through a writable directory" "mkdir -p /tmp/sb-node && cp \"\$(re
 clean; mkdir -p /tmp/sb-fake
 for f in find stat readlink sh node systemctl busctl systemd-analyze; do printf '#!/bin/sh\ntouch /run/sb-fake-%s-ran\nexit 0\n' "$f" > /tmp/sb-fake/$f; chmod 755 /tmp/sb-fake/$f; done
 unitfile sup > /etc/systemd/system/$UNIT
-out=$(cd "$REPO" && PATH=/tmp/sb-fake:$PATH "$INSTALL" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
+out=$(cd "$REPO" && /usr/bin/env -i PATH=/tmp/sb-fake:/usr/bin:/bin /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
 mkdir -p "$T/rel/lib" && chmod 775 "$T/rel/lib"
 PATH=/tmp/sb-fake:$PATH /bin/sh "$CHECK" "$T/rel" >/dev/null 2>&1; r2=$?
 if [ "$r" != 0 ] && [ "$r2" != 0 ] && ! ls /run/sb-fake-*-ran >/dev/null 2>&1; then ok "PATH: fakes first on PATH never run; the installer and the checker still refuse"; else bad "PATH: a fake ran or a refusal changed ($r $r2; $(ls /run/sb-fake-*-ran 2>/dev/null))"; fi
@@ -204,19 +208,20 @@ printf '#!/bin/sh\ntouch /run/sb-tool-tar-ran\n' > /tmp/sb-tool/tarmark; chmod 7
 mkdir -p "$REPO/.git/info" 2>/dev/null; gitdir=$(git -c safe.directory='*' -C "$REPO" rev-parse --git-common-dir)
 cp "$gitdir/config" /tmp/sb-tool/config.bak; printf '* filter=evil\n' >> "$gitdir/info/attributes"
 git -c safe.directory='*' -C "$REPO" config filter.evil.smudge /tmp/sb-tool/smudge
-# both tar extractions (the staging one in the preflight, and the release's in step 3) with a TAR_OPTIONS checkpoint
-# action: first a cut right after the preflight (only the staging extraction ran), then the whole install
-TOOLENV=(PATH=/tmp/sb-tool/bin:$PATH CARGO_HOME=/tmp/sb-tool/cargo RUSTC_WRAPPER=/tmp/sb-tool/wrap "TAR_OPTIONS=--checkpoint=1 --checkpoint-action=exec=/tmp/sb-tool/tarmark")
-out=$(cd "$REPO" && env "${TOOLENV[@]}" SB_RELEASE_INSTALL_CUT=1 "$INSTALL" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
-if [ "$r" = 9 ] && ! ls /run/sb-tool-*-ran >/dev/null 2>&1; then ok "toolchain: the staging extraction ran with TAR_OPTIONS set, and nothing of the caller's ran"
-else bad "toolchain (staging extraction): exit $r, ran: $(ls /run/sb-tool-*-ran 2>/dev/null | tr '\n' ' ') ${out:0:300}"; fi
+# The caller's environment can't reach the installer: a dirty one (fakes first on PATH, a Cargo home and wrapper,
+# TAR_OPTIONS) refuses at entry, before any tool runs; the clean supported invocation, with a git filter configured
+# in the clone, installs the pinned launcher and runs no filter
+out=$(cd "$REPO" && /usr/bin/env -i PATH=/tmp/sb-tool/bin:/usr/bin:/bin CARGO_HOME=/tmp/sb-tool/cargo RUSTC_WRAPPER=/tmp/sb-tool/wrap \
+  "TAR_OPTIONS=--checkpoint=1 --checkpoint-action=exec=/tmp/sb-tool/tarmark" /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
+if [ "$r" = 1 ] && [[ "$out" == *"isn't the supported one"* ]] && ! ls /run/sb-tool-*-ran >/dev/null 2>&1 && [ ! -e "$D" ]; then ok "toolchain: a dirty environment (PATH fakes, Cargo home and wrapper, TAR_OPTIONS) refuses at entry; nothing of it ran"
+else bad "toolchain (dirty environment): exit $r, ran: $(ls /run/sb-tool-*-ran 2>/dev/null | tr '\n' ' ') ${out:0:300}"; fi
 clean
-out=$(cd "$REPO" && env "${TOOLENV[@]}" "$INSTALL" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
-if [ "$r" = 0 ] && ! ls /run/sb-tool-*-ran >/dev/null 2>&1; then ok "toolchain: the caller's cargo, rustc, bash, wrapper, Cargo config, git filter and TAR_OPTIONS never act (both extractions); the pinned launcher installs"
+out=$(inst 2>&1); r=$?
+if [ "$r" = 0 ] && ! ls /run/sb-tool-*-ran >/dev/null 2>&1; then ok "toolchain: the clean invocation installs with a git filter configured in the clone; the filter never runs"
 else bad "toolchain: exit $r, ran: $(ls /run/sb-tool-*-ran 2>/dev/null | tr '\n' ' ') ${out:0:300}"; fi
 [ "$(sha256sum < "$D/bin/sagebrush-agent-launch" | cut -d' ' -f1)" = "$(cut -d' ' -f1 "$REPO/lib/fleet/host/launcher.sha256")" ] && ok "toolchain: the installed launcher is the pinned bytes" || bad "toolchain: the installed launcher isn't the pinned bytes"
 cp /tmp/sb-tool/config.bak "$gitdir/config"; sed -i '/^\* filter=evil$/d' "$gitdir/info/attributes"; rm -rf /tmp/sb-tool /run/sb-tool-*-ran
-# One hostile environment (SEC on #172): the installer re-execs itself under env -i, so nothing below acts
+# One hostile environment inside env -i (SEC on #172): the installer refuses at entry, and nothing it would run acts
 clean; mkdir -p /tmp/sb-env
 printf '#!/bin/sh\ntouch /run/sb-env-%s-ran\n' tar > /tmp/sb-env/tar; printf '#!/bin/sh\ntouch /run/sb-env-bashenv-ran\n' > /tmp/sb-env/bashenv
 printf '#!/bin/sh\ntouch /run/sb-env-fsmonitor-ran\n' > /tmp/sb-env/fsmon; chmod 755 /tmp/sb-env/tar /tmp/sb-env/bashenv /tmp/sb-env/fsmon
@@ -232,17 +237,44 @@ __attribute__((constructor)) static void m(void) {
 }
 EOF_C
 cc -shared -fPIC -o /tmp/sb-env/p.so /tmp/sb-env/p.c 2>/dev/null || echo "     (no cc: the LD_PRELOAD library is absent; the variable is still set)"
-out=$(cd "$REPO" && env "TAR_OPTIONS=--checkpoint=1 --checkpoint-action=exec=/tmp/sb-env/tar" \
+snaptext > /tmp/sb-snap-before
+out=$(cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin "TAR_OPTIONS=--checkpoint=1 --checkpoint-action=exec=/tmp/sb-env/tar" \
   "GIT_CONFIG_PARAMETERS='core.fsmonitor=/tmp/sb-env/fsmon'" LD_PRELOAD=/tmp/sb-env/p.so BASH_ENV=/tmp/sb-env/bashenv ENV=/tmp/sb-env/bashenv \
-  "$INSTALL" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
+  /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
+snaptext > /tmp/sb-snap-after
 m=$(ls /run/sb-env-* 2>/dev/null | grep -v -e '^/run/sb-env-preload-env$' -e '^/run/sb-env-preload-sh$' -e '^/run/sb-env-preload-dash$' -e '^/run/sb-env-preload-release-install$' | tr '\n' ' ')
-if [ "$r" = 0 ] && [ -z "$m" ] && rc_v=$(cd "$REPO" && "$INSTALL" --verify "$D" 2>&1); then ok "hostile environment (TAR_OPTIONS, GIT_CONFIG_PARAMETERS, LD_PRELOAD, BASH_ENV, ENV): nothing acts; the install is the normal one"
+# (an LD_PRELOAD given to the interpreter itself acts before any script line: that is the launcher's to prevent, and
+#  sudo's env_reset does; what the installer does is refuse, and run nothing)
+if [ "$r" = 1 ] && [[ "$out" == *"isn't the supported one"* ]] && [ -z "$m" ] && cmp -s /tmp/sb-snap-before /tmp/sb-snap-after; then ok "hostile environment (TAR_OPTIONS, GIT_CONFIG_PARAMETERS, LD_PRELOAD, BASH_ENV, ENV) inside env -i: refused at entry; no tool ran; nothing changed"
 else bad "hostile environment: exit $r, ran: $m ${out:0:300}"; fi
 rm -rf /tmp/sb-env /run/sb-env-*
+# C11: the entrypoint contract (lease-on r1.13): only a root-owned script path, only the exact environment, only a
+# self-contained object store
+clean
+r=0; out=$(cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh "$INSTALL" "$COMMIT" "$D" "$LAUNCH" 2>&1) || r=$?
+if [ "$(stat -c %u "$INSTALL")" != 0 ]; then
+  [ "$r" = 1 ] && [[ "$out" == *"not owned by root"* ]] && [ ! -e "$D" ] && ok "entrypoint: the caller's own (non-root) copy refuses" || bad "entrypoint: the caller's copy ran ($r: ${out:0:200})"
+fi
+mkdir -p /var/lib/sb-inst-w && chmod 0777 /var/lib/sb-inst-w && install -o root -g root -m 0755 "$INSTALL" /var/lib/sb-inst-w/ri
+r=0; out=$(cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh /var/lib/sb-inst-w/ri "$COMMIT" "$D" "$LAUNCH" 2>&1) || r=$?
+[ "$r" = 1 ] && [[ "$out" == *"group- or other-writable: /var/lib/sb-inst-w"* ]] && [ ! -e "$D" ] && ok "entrypoint: a root-owned copy in a writable directory refuses" || bad "entrypoint: a writable parent ran ($r: ${out:0:200})"
+rm -rf /var/lib/sb-inst-w
+r=0; out=$(cd /usr/local/sbin && /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh sagebrush-release-install "$COMMIT" "$D" "$LAUNCH" 2>&1) || r=$?
+[ "$r" = 1 ] && [[ "$out" == *"absolute, root-owned path"* ]] && ok "entrypoint: a relative script path refuses" || bad "entrypoint: a relative path ran ($r: ${out:0:200})"
+r=0; out=$(cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin SB_EXTRA=1 /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" 2>&1) || r=$?
+[ "$r" = 1 ] && [[ "$out" == *"isn't the supported one"* ]] && [ ! -e "$D" ] && ok "entrypoint: one extra variable refuses" || bad "entrypoint: an extra variable ran ($r: ${out:0:200})"
+for kind in alternates http-alternates; do
+  clean; rm -rf /var/lib/sb-alt
+  if [ "$kind" = alternates ]; then git -c safe.directory='*' clone -q --shared "$REPO" /var/lib/sb-alt
+  else git -c safe.directory='*' clone -q --no-hardlinks "$REPO" /var/lib/sb-alt && echo "https://example.invalid/objects" > /var/lib/sb-alt/.git/objects/info/http-alternates; fi
+  r=0; out=$(cd /var/lib/sb-alt && /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" 2>&1) || r=$?
+  [ "$r" = 1 ] && [[ "$out" == *"uses alternates"* ]] && [ ! -e "$D" ] && ok "entrypoint: a clone with $kind refuses" || bad "entrypoint: $kind didn't refuse ($r: ${out:0:200})"
+done
+rm -rf /var/lib/sb-alt
 # C6: cuts. After each, nothing starts; after the mkdirs only, a retry completes
 for step in 1m 2 3 4 5 6; do
   clean
-  out=$(cd "$REPO" && SB_RELEASE_INSTALL_CUT=$step "$INSTALL" "$COMMIT" "$D" "$LAUNCH" 2>&1); r=$?
+  out=$(CUT=$step inst 2>&1); r=$?
   [ "$r" = 9 ] && ok "cut after step $step: the install reached it" || bad "cut after step $step: didn't reach the cut (exit $r: ${out:0:300})"
   systemctl start $UNIT >/dev/null 2>&1; sleep 1
   main=$(systemctl show $UNIT -p ExecMainStartTimestampMonotonic --value 2>/dev/null)
@@ -260,5 +292,6 @@ for step in 1m 2 3 4 5 6; do
   fi
 done
 clean
+rm -f "$SBIN"
 echo "release-trust-test: $FAILS failure(s)"
 [ "$FAILS" = 0 ]

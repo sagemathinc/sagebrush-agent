@@ -2,10 +2,18 @@
 # A qualified release's FRESH install (lease-on design r1.12 §2.5, §2.6), and a bound member of the lease
 # qualification:
 #
-#   scripts/release-install.sh <commit> <dest> <launcher>   (as root, in a clone holding <commit>, systemd running)
-#   scripts/release-install.sh --verify <dest>         (read-only: the effective unit is exactly the installed one)
+# THE ONLY SUPPORTED ENTRYPOINT (lease-on r1.13). First install this script root-owned, e.g.:
+#   sudo install -o root -g root -m 0755 scripts/release-install.sh /usr/local/sbin/sagebrush-release-install
+# then run it, from inside a clone holding <commit>, with systemd running:
+#   sudo /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh /usr/local/sbin/sagebrush-release-install <commit> <dest> <launcher>
+#   sudo /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh /usr/local/sbin/sagebrush-release-install --verify <dest>
+# (Tests only: SB_RELEASE_INSTALL_CUT=<step>, passed explicitly inside env -i, stops with status 9 right after that
+# step, as a crash there would.)
 #
-# SB_RELEASE_INSTALL_CUT=<step> (tests): stop with status 9 right after that step, as a crash there would.
+# The threat statement: the supported boundary is sudo (env_reset) followed by an absolute env -i on a root-owned
+# script. Under it, nothing caller-writable steers what runs or what is installed. Running it as root directly,
+# outside that boundary, is unsupported; it is refused where detectable (an environment beyond the exact allowlist, a
+# script path any non-root principal can change), never repaired: the script doesn't re-exec or re-open itself.
 #
 # <launcher> is a launcher built beforehand, WITHOUT root (scripts/launcher-build.sh); its bytes must have exactly the
 # SHA-256 pinned in the reviewed tree at <commit> (lib/fleet/host/launcher.sha256). The root installer runs no
@@ -28,17 +36,17 @@
 #   5  daemon-reload.  6  the EFFECTIVE unit verified, still closed.  7  open: the drop-in removed, reload, verified.
 # A cut at any point leaves nothing startable: before step 4 there is no unit; from step 2 to 7 the unit is closed.
 set -eu
-# Nothing of the caller's environment reaches any tool (TAR_OPTIONS, GIT_*, locale, pagers, ...): unless the
-# environment is already exactly PATH=/usr/bin:/bin (plus what sh itself sets, and the tests' cut step), start again
-# in an empty one.
-clean_env=1
+# The environment: exactly PATH=/usr/bin:/bin, plus what sh sets (PWD, SHLVL, _) and the tests' cut step. Read by the
+# absolute /usr/bin/env (safe under the supported boundary); anything else refuses. (No re-exec.)
+env_ok=1
 while IFS= read -r line; do
-  case "$line" in PATH=/usr/bin:/bin | PWD=* | OLDPWD=* | SHLVL=* | _=* | SB_RELEASE_INSTALL_CUT=*) ;; *) clean_env=0 ;; esac
+  case "$line" in PATH=/usr/bin:/bin | PWD=* | SHLVL=* | _=* | SB_RELEASE_INSTALL_CUT=*) ;; *) env_ok=0 ;; esac
 done <<EOF_ENV
-$(env)
+$(/usr/bin/env)
 EOF_ENV
-if [ "$clean_env" != 1 ]; then
-  exec /usr/bin/env -i PATH=/usr/bin:/bin ${SB_RELEASE_INSTALL_CUT:+SB_RELEASE_INSTALL_CUT="$SB_RELEASE_INSTALL_CUT"} /bin/sh "$0" "$@"
+if [ "$env_ok" != 1 ] || [ "$PATH" != /usr/bin:/bin ]; then
+  printf '%s\n' "release-install: the environment isn't the supported one: run sudo /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh /usr/local/sbin/sagebrush-release-install ..." >&2
+  exit 1
 fi
 PATH=/usr/bin:/bin
 export PATH
@@ -127,6 +135,11 @@ empty_trace() {
   [ "$("$STAT" -c '%a' -- "$1")" = 755 ] || no "not mode 0755: $1"
   [ -z "$("$FIND" "$1" -mindepth 1 -print -quit)" ] || no "not empty (an earlier install?): $1"
 }
+# This script: an absolute path whose every component (no links) is root's with no group or other write, so nothing
+# caller-writable is what runs.
+case "$0" in /*) ;; *) no "run this script by its absolute, root-owned path (see the header)" ;; esac
+chain "$0" f
+
 prove_all() {
   for t in /bin/sh "$STAT" "$FIND" "$READLINK" /usr/bin/node "$SYSTEMCTL" "$BUSCTL" "$ANALYZE" "$SHA256SUM" "$GIT" "$TAR"; do tool "$t"; done
   chain "$(dirname "$DEST")" d
@@ -188,6 +201,10 @@ if [ -f "$gd" ]; then
   if [ -f "$gd/commondir" ]; then c=$(cat "$gd/commondir"); case "$c" in /*) gd=$c ;; *) gd=$gd/$c ;; esac; fi
 fi
 [ -d "$gd/objects" ] || no "can't find the clone's objects"
+# a self-contained object store only: alternates would point the copy at objects outside it
+for f in "$gd/objects/info/alternates" "$gd/objects/info/http-alternates"; do
+  if [ -e "$f" ] || [ -L "$f" ]; then no "the clone's object store uses alternates ($f): use a self-contained clone"; fi
+done
 igit init -q --bare --template= "$STAGE/repo.git" || no "can't create the staging repository"
 rm -rf -- "$STAGE/repo.git/objects"
 cp -R -- "$gd/objects" "$STAGE/repo.git/objects" || no "can't copy the clone's objects"

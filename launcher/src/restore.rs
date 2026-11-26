@@ -24,6 +24,9 @@ use std::ffi::CString;
 use std::io;
 
 pub const RESTORE: &str = "/srv/sagebrush/.restore";
+/// The host store's reserved project (A2 r3.14 §1): clear of the agents', tags' and profiles' ids. Begin sets its quota
+/// (setquota -P) before staging, so the kernel bounds the stage during the walk.
+pub const HOSTSTORE_PROJID: u32 = 110000;
 pub const STATE: &str = "/var/lib/sagebrush/backup/state";
 pub const SECRETS: &str = "/var/lib/sagebrush/host-secrets";
 pub const CACHE: &str = "/var/cache/sagebrush-backup";
@@ -63,12 +66,19 @@ pub enum Class {
     Config,
     /// A deleted agent's config archive (A2 r3.13): filled, root-owned, exact modes.
     ArchiveConfig,
+    /// The backup's host-store snapshot (A2 r3.14): owner `host`, staged only (restore begin's import reads it in
+    /// place), root-owned, exact modes, project 110000.
+    HostStore,
 }
 
 impl Class {
     /// The root-owned classes (A2 r3.13 §2): their only owner is root, and their modes are exact (0700, 0600).
     pub fn root_owned(self) -> bool {
-        matches!(self, Class::Config | Class::ArchiveConfig)
+        matches!(self, Class::Config | Class::ArchiveConfig | Class::HostStore)
+    }
+    /// The classes staged only, never filled or listed (A2 r3.13 `config`, r3.14 `hoststore`).
+    pub fn stage_only(self) -> bool {
+        matches!(self, Class::Config | Class::HostStore)
     }
 }
 
@@ -87,6 +97,16 @@ impl Name {
     pub fn parse(run: &str, owner: &str, class: &str, attempt: &str) -> Option<Name> {
         if run.len() != 16 || !run.bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)) {
             return None;
+        }
+        // The host's own owner name (A2 r3.14): the literal `host`, with exactly one class.
+        if owner == "host" {
+            if class != "hoststore" {
+                return None;
+            }
+            if attempt.is_empty() || attempt.len() > 6 || attempt.starts_with('0') || !attempt.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            return Some(Name { run: run.to_string(), owner: owner.to_string(), id: String::new(), class: Class::HostStore, attempt: attempt.parse().ok()? });
         }
         let (agent, id) = match owner.split_at_checked(2)? {
             ("a-", id) if is_id(id) => (true, id),
@@ -115,6 +135,7 @@ impl Name {
             Class::Tag => "tag",
             Class::Config => "config",
             Class::ArchiveConfig => "archive-config",
+            Class::HostStore => "hoststore",
         }
     }
     /// The name beneath the anchor, and the marker's exact content.
@@ -124,9 +145,14 @@ impl Name {
     pub fn parts(&self) -> [String; 4] {
         [self.run.clone(), self.owner.clone(), self.class_str().to_string(), self.attempt.to_string()]
     }
-    /// The project id range for the owner (agents 70000-79999, tags 80000-89999).
+    /// The project id range for the owner (agents 70000-79999, tags 80000-89999); the host store's is exactly
+    /// HOSTSTORE_PROJID (A2 r3.14 §1).
     pub fn projid_ok(&self, projid: u32) -> bool {
-        if self.class == Class::Tag { (80000..=89999).contains(&projid) } else { (70000..=79999).contains(&projid) }
+        match self.class {
+            Class::Tag => (80000..=89999).contains(&projid),
+            Class::HostStore => projid == HOSTSTORE_PROJID,
+            _ => (70000..=79999).contains(&projid),
+        }
     }
 }
 
@@ -636,6 +662,8 @@ pub(crate) fn dest_anchor(c: Class) -> &'static str {
         Class::ArchiveConfig => "/srv/sagebrush/archive-config",
         // (never a destination: fill-home and tree-digest refuse `config` before they look for one)
         Class::Config => "/srv/sagebrush/agent-config",
+        // (never a destination either: the host store is staged only, A2 r3.14)
+        Class::HostStore => RESTORE,
     }
 }
 
@@ -908,8 +936,9 @@ pub fn fill_home<O: RestoreOps>(o: &mut O, a: &FillArgs) -> Result<String> {
 
 fn fill_limited<O: RestoreOps>(o: &mut O, a: &FillArgs, limit: usize) -> Result<String> {
     let n = &a.name;
-    // `config` is staged only (A2 r3.13 §4): never filled, refused before anything, the marker untouched.
-    if n.class == Class::Config || !a.source.starts_with("data/") || !rel_ok(a.source) {
+    // `config` and `hoststore` are staged only (A2 r3.13 §4, r3.14 §1): never filled, refused before anything, the
+    // marker untouched.
+    if n.class.stage_only() || !a.source.starts_with("data/") || !rel_ok(a.source) {
         return Err(err(Fail::Usage, "bad arguments"));
     }
     let root = o.root().map_err(|_| pre("the root can't be opened"))?;
@@ -969,11 +998,11 @@ fn fill_limited<O: RestoreOps>(o: &mut O, a: &FillArgs, limit: usize) -> Result<
     let leaf: &str = match n.class {
         Class::Home => "home",
         Class::Sessions => "sessions",
-        Class::Archive | Class::Tag | Class::ArchiveConfig | Class::Config => &n.id,
+        Class::Archive | Class::Tag | Class::ArchiveConfig | Class::Config | Class::HostStore => &n.id,
     };
     let dest_parent = match n.class {
         Class::Home | Class::Sessions => tchild(o, &da, &n.id, mnt)?.and_then(|(_, h)| h).ok_or(identity("no agent directory"))?,
-        Class::Archive | Class::Tag | Class::ArchiveConfig | Class::Config => da,
+        Class::Archive | Class::Tag | Class::ArchiveConfig | Class::Config | Class::HostStore => da,
     };
     let (dx, probe) = tchild(o, &dest_parent, leaf, mnt)?.ok_or(identity("no destination"))?;
     if dx != e_dest {
@@ -2500,6 +2529,66 @@ mod tests {
         let ex2 = expect_file(&mut f, "rm2.json", other);
         assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex2)), 65);
         assert_eq!(f.count("unlink"), 0);
+    }
+
+    // ---- A2 r3.14: the host's stage-only `hoststore` class, project 110000
+
+    #[test]
+    fn r314_hoststore_parses_for_the_host_owner_only_with_project_110000() {
+        let n = Name::parse(RUN, "host", "hoststore", "1").expect("host/hoststore");
+        assert_eq!((n.class, n.owner.as_str(), n.id.as_str()), (Class::HostStore, "host", ""));
+        assert_eq!(n.path(), format!("{RUN}/host/hoststore/1"));
+        assert_eq!(name_of(&n.path()), Some(n.clone()), "round-trips (remove-tree's --name)");
+        assert!(n.projid_ok(HOSTSTORE_PROJID) && HOSTSTORE_PROJID == 110000);
+        for p in [0, 70000, 79999, 80000, 89999, 109999, 110001] {
+            assert!(!n.projid_ok(p), "{p}: only 110000");
+        }
+        // `host` takes no other class; no other owner takes `hoststore`; a bad attempt still refuses.
+        for class in ["home", "sessions", "archive", "tag", "config", "archive-config", "hoststores"] {
+            assert!(Name::parse(RUN, "host", class, "1").is_none(), "host/{class}");
+        }
+        for o in [owner(), format!("t-{TAG}"), "hosts".to_string(), "host-".to_string(), "h-host".to_string()] {
+            assert!(Name::parse(RUN, &o, "hoststore", "1").is_none(), "{o}/hoststore");
+        }
+        for att in ["0", "01", "", "1234567", "x"] {
+            assert!(Name::parse(RUN, "host", "hoststore", att).is_none(), "attempt {att:?}");
+        }
+        assert!(Class::HostStore.root_owned() && Class::HostStore.stage_only() && Class::Config.stage_only());
+        for c in [Class::Home, Class::Sessions, Class::Archive, Class::Tag, Class::ArchiveConfig] {
+            assert!(!c.stage_only(), "{c:?}");
+        }
+        assert!(owners_ok(Class::HostStore, &[0], 0) && !owners_ok(Class::HostStore, &[UID], UID));
+    }
+
+    #[test]
+    fn r314_a_hoststore_stage_is_charged_to_project_110000_with_its_marker_last() {
+        let mut f = host();
+        let mut r = exited(ok_reply());
+        let a = StageArgs { mount: "/srv/sagebrush", name: Name::parse(RUN, "host", "hoststore", "1").unwrap(), projid: HOSTSTORE_PROJID, snapshot: SNAP, path: "var/lib/sagebrush/backup/hoststore-staging/run" };
+        let d = restore_stage(&mut f, &mut r, &a);
+        assert_eq!(rcode(&d), 0, "{:?}", d.result);
+        let att = format!("srv/sagebrush/.restore/{RUN}/host/hoststore/1");
+        // The shared parents are root:root 0700 and carry no project of their own (grader, r3.14 r2): only the attempt is
+        // charged, so a hoststore and an agent's stage in one run never block each other.
+        for p in [format!("srv/sagebrush/.restore/{RUN}"), format!("srv/sagebrush/.restore/{RUN}/host"), format!("srv/sagebrush/.restore/{RUN}/host/hoststore"), att.clone()] {
+            let n = &f.nodes[&p];
+            assert_eq!((n.id.uid, n.id.gid, n.id.mode & 0o7777), (0, 0, 0o700), "{p}");
+        }
+        let (at, dd, lf) = (f.nodes[&att].clone(), f.nodes[&format!("{att}/data")].clone(), f.nodes[&format!("{att}/data/run")].clone());
+        assert_eq!((at.proj, at.inherit, dd.proj, dd.inherit, lf.proj, lf.inherit), (HOSTSTORE_PROJID, true, HOSTSTORE_PROJID, true, HOSTSTORE_PROJID, true), "charged to 110000");
+        assert_eq!(f.files[&format!("{att}/.complete")], format!("{RUN}/host/hoststore/1").into_bytes());
+        let pos = |s: &str| f.log.iter().position(|l| l == s).unwrap_or_else(|| panic!("{s}: {:?}", f.log));
+        assert!(pos(&format!("syncfs {att}")) < pos(&format!("marker {att}/.complete")), "durable data before the marker");
+    }
+
+    #[test]
+    fn r314_fill_home_of_hoststore_is_usage_before_anything() {
+        let (mut f, _src) = staged("home");
+        let x = fill_expect(&mut f, "home");
+        let before = f.log.len();
+        let out = fill_home(&mut f, &FillArgs { mount: "/srv/sagebrush", name: Name::parse(RUN, "host", "hoststore", "1").unwrap(), source: "data/run", expect: Box::leak(x.into_boxed_str()) });
+        assert_eq!(out.map(|_| 0).unwrap_or_else(|e| e.fail.code()), 64);
+        assert_eq!(f.log.len(), before, "no effect, no read");
     }
 
     // ---- A2 r3.13: the stage-only `config` class and the root-owned `archive-config` fill class

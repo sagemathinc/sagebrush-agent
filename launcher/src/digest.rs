@@ -204,8 +204,8 @@ pub fn tree_digest<O: DigestOps>(o: &mut O, a: &DigestArgs) -> Result<String> {
 pub fn tree_digest_limited<O: DigestOps>(o: &mut O, a: &DigestArgs, lim: Limits) -> Result<String> {
     // Arguments (64): the owner and class as restore names them; --copy-sqlite only for sessions.
     let n = crate::restore::Name::parse(a.copy_run.unwrap_or("aaaaaaaaaaaaaaaa"), a.owner, a.class, "1").ok_or(err(Fail::Usage, "bad arguments"))?;
-    // (`config` is staged only, never filled: nothing to list, A2 r3.13 §5)
-    if (a.copy_run.is_some() && n.class != Class::Sessions) || n.class == Class::Config {
+    // (`config` and `hoststore` are staged only, never filled: nothing to list, A2 r3.13 §5, r3.14 §1)
+    if (a.copy_run.is_some() && n.class != Class::Sessions) || n.class.stage_only() {
         return Err(err(Fail::Usage, "bad arguments"));
     }
     let root = o.root().map_err(|_| tree::pre("the root can't be opened"))?;
@@ -231,11 +231,11 @@ pub fn tree_digest_limited<O: DigestOps>(o: &mut O, a: &DigestArgs, lim: Limits)
     let leaf: &str = match n.class {
         Class::Home => "home",
         Class::Sessions => "sessions",
-        Class::Archive | Class::Tag | Class::ArchiveConfig | Class::Config => &n.id,
+        Class::Archive | Class::Tag | Class::ArchiveConfig | Class::Config | Class::HostStore => &n.id,
     };
     let dest_parent = match n.class {
         Class::Home | Class::Sessions => tchild(o, &da, &n.id, mnt)?.and_then(|(_, h)| h).ok_or(identity("no agent directory"))?,
-        Class::Archive | Class::Tag | Class::ArchiveConfig | Class::Config => da,
+        Class::Archive | Class::Tag | Class::ArchiveConfig | Class::Config | Class::HostStore => da,
     };
     let (dx, _) = tchild(o, &dest_parent, leaf, mnt)?.ok_or(identity("no destination"))?;
     if dx != e_dest {
@@ -936,6 +936,18 @@ mod tests {
         build(&mut f, MAX_PATH + 1);
         let x = expect(&mut f);
         assert_eq!(code(tree_digest(&mut f, &args(&x, false))), 64, "4097");
+    }
+
+    #[test]
+    fn r314_hoststore_is_never_listed() {
+        let mut f = host();
+        let x = expect(&mut f);
+        let mut a = args(&x, false);
+        a.owner = "host";
+        a.class = "hoststore";
+        let before = f.log.len();
+        assert_eq!(code(tree_digest(&mut f, &a)), 64);
+        assert_eq!(f.log.len(), before, "nothing read");
     }
 
     #[test]

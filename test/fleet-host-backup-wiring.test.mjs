@@ -488,23 +488,26 @@ test("a store owned by a live owner that doesn't serve: skipped snapshot_unavail
 // ---- T1 (r0.4 §5): a REAL live owner in another process serves the run's snapshot (the daemon's side, 4b) ----
 
 /**
- * An owner process: it holds a real HostStore (the store's lock) and serves the snapshot request as the daemon does,
- * through the real ticker and serveSnapshot in one queue. It answers "ping" on stdin with "pong" (a concurrent op on
- * the owner). With `slow`, each file of the copy takes 400 ms (so a test can kill it mid-copy).
+ * An owner process, as the daemon: it holds a real HostStore (the store's lock) and a REAL executor (Supervisor) with
+ * the backup-snapshot seam, and its timer submits the op through the real ticker and `Supervisor.submit` (the
+ * executor's own queue; a failed serve is a failed op, never a stuck queue). It answers "ping" on stdin with "pong"
+ * (a concurrent request to the owner). With `slow`, each file of the copy takes 400 ms and is announced
+ * ("copy-start"), so a test can act inside a copy.
  */
 const ownerScript = (repo) => `import * as fs from "node:fs";
 import { HostStore } from "${repo}lib/fleet/host/host-store.mjs";
+import { Supervisor } from "${repo}lib/fleet/host/executor.mjs";
 import { serveSnapshot, snapshotPending } from "${repo}lib/fleet/host/backup-snapshot.mjs";
 import { snapshotTicker } from "${repo}lib/fleet/host/host-main.mjs";
 const [root, dir, slow] = process.argv.slice(2);
 const uid = process.getuid();
 const store = await HostStore.open(root);
 const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-const fsx = slow === "slow" ? { ...fs, readFileSync: (...a) => { pause(400); return fs.readFileSync(...a); } } : fs;
-let queue = Promise.resolve();
-const submit = () => (queue = queue.then(() => serveSnapshot(store, { dir, root, uid, fsx })).then((r) => { process.stdout.write(JSON.stringify(r) + "\\n"); return r; }));
+const fsx = slow === "slow" ? { ...fs, readFileSync: (...a) => { process.stdout.write("copy-start\\n"); pause(400); return fs.readFileSync(...a); } } : fs;
+const sup = new Supervisor({ store, fx: {}, verify: () => {}, bodyOf: () => {}, fenceDir: root + "-fence", backupSnapshot: { serve: (s) => serveSnapshot(s, { dir, root, uid, fsx }) } });
+const submit = (op) => sup.submit(op).then((r) => { process.stdout.write(JSON.stringify(r) + "\\n"); return r; });
 setInterval(snapshotTicker(() => snapshotPending(dir, { uid }), submit), 20);
-process.stdin.on("data", (b) => { for (const l of String(b).split("\\n")) if (l === "ping") queue = queue.then(() => process.stdout.write("pong\\n")); });
+process.stdin.on("data", (b) => { for (const l of String(b).split("\\n")) if (l === "ping") process.stdout.write("pong\\n"); });
 process.stdout.write("ready\\n");
 `;
 
@@ -587,4 +590,26 @@ test("the daemon's 5-second check: pending only for a well-formed request with n
   try { takeSnapshot(o, req, { dir, root: h.storeRoot, uid: UID }); } finally { await o.close(); }
   assert.equal(snapshotPending(dir, { uid: UID }), false, "served: not pending");
   assert.equal(snapshotPending(join(h.base, "missing"), { uid: UID }), false, "no directory");
+});
+
+test("T1, the stale copy and its replacement: a restarted owner copying a dead run's request when a new run replaces it: that serve fails as an op, the fresh request is served, the run commits", async () => {
+  const h = host();
+  const dir = private_(join(h.dir, "snapshot"));
+  // A store with files to copy (slow in the owner); no agents.
+  const s = await HostStore.open(h.storeRoot);
+  await s.close();
+  private_(join(h.storeRoot, "config"));
+  for (let i = 0; i < 4; i += 1) writeFileSync(join(h.storeRoot, "config", `f${i}`), "x", { mode: 0o600 });
+  // A dead run's request, never served.
+  writeFileSync(join(dir, "request.json"), JSON.stringify({ v: 1, run: "20261126T020000Z-aaaaaaaa", nonce: "S".repeat(22) }) + "\n", { mode: 0o600 });
+  const o = await owner(h, "slow");
+  try {
+    assert.ok(await o.waitFor(() => o.lines().includes("copy-start")), "the restarted owner is copying the stale request");
+    const out = await h.cmd(["run"]); // (its first act removes every older entry, the stale copy in progress included)
+    assert.equal(out.line.status, "ok", JSON.stringify(out));
+    const results = o.lines().filter((l) => l.startsWith("{")).map((l) => JSON.parse(l));
+    assert.equal(results[0].status, "failed", "the stale serve failed as an op (its files removed under it)");
+    assert.ok(results.some((r) => r.status === "served" && r.run === out.line.run), "the fresh request served");
+    assert.equal(existsSync(join(dir, "20261126T020000Z-aaaaaaaa")), false);
+  } finally { await o.stop(); }
 });

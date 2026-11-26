@@ -302,6 +302,33 @@ test("a proof failure: the agent stays fenced and masked, the kill and proof are
   assert.ok(!kinds(sys).includes("unmask") && !kinds(sys).includes("start"));
 });
 
+test("a proof failure: before each retry, the unit's stop, best effort, always after a kill and never before the first", async () => {
+  const e = env(), locks = fakeLocks(), sys = fakeSys(e, { locks, stubborn: true });
+  const r = await leaseExpire(A, "L", 2, opts(e, sys, locks, { maxProofRetries: 2 }));
+  assert.equal(r.proven, false);
+  const ks = kinds(sys).filter((k) => k === "kill" || k === "stop");
+  // kill, stop, kill, stop, kill, then the final stop after the last proof
+  assert.deepEqual(ks, ["kill", "stop", "kill", "stop", "kill", "stop"]);
+  // A stop that fails, or one that ends the stubbornness, is handled: the next proof decides.
+  const s2 = fakeSys(e, { locks, stubborn: true });
+  s2.stop = async (unit) => { s2.calls.push(["stop", unit]); throw new Error("systemctl stop: timed out"); };
+  const r2 = await leaseExpire(A, "L", 3, opts(e, s2, locks, { maxProofRetries: 1 }));
+  assert.equal(r2.proven, false);
+  assert.equal(kinds(s2).filter((k) => k === "kill").length, 2, "the retry still kills and proves");
+  const s3 = fakeSys(e, { locks, stubborn: true });
+  s3.stop = async (unit) => { s3.calls.push(["stop", unit]); s3.procs = 0; }; // (the slice yields to systemd's stop)
+  const r3 = await leaseExpire(A, "L", 4, opts(e, s3, locks, { maxProofRetries: 5 }));
+  assert.equal(r3.proven, true, "the retry after the stop proves the slice empty");
+  assert.deepEqual(kinds(s3).filter((k) => k === "kill" || k === "stop"), ["kill", "stop", "stop"], "proven at the second look: no second kill needed");
+});
+
+test("the unit's stop is bounded by STOP_MS (systemctl through the bounded runner)", async () => {
+  const seen = [];
+  const sys = realSystem({ run: async (argv, o) => { seen.push([argv.join(" "), o.ms]); return { code: 0, stdout: "", stderr: "" }; } });
+  await sys.stop("sagebrush-agents-x.slice");
+  assert.deepEqual(seen, [["systemctl stop sagebrush-agents-x.slice", 10000]]);
+});
+
 test("an absent slice is proven empty; an unreadable one is never", async () => {
   const e = env(), locks = fakeLocks(), sys = fakeSys(e, { locks });
   sys.sliceExists = false;

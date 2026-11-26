@@ -785,6 +785,13 @@ mod tests {
         let flags = info.lines().find_map(|l| l.strip_prefix("flags:")).map(|v| u32::from_str_radix(v.trim(), 8).unwrap()).unwrap();
         assert_ne!(flags & libc::O_CLOEXEC as u32, 0, "O_CLOEXEC: execve releases it");
         drop(held);
-        assert!(other.try_lock().is_ok(), "released once the fd is closed");
+        // The lock belongs to the open file description. Another test thread's fork in this
+        // window gives its child a copy, held until that child execs (O_CLOEXEC) or exits; so
+        // the release is waited for, with a deadline, rather than read at once.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while other.try_lock().is_err() {
+            assert!(std::time::Instant::now() < deadline, "released once the fd is closed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

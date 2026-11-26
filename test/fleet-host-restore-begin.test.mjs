@@ -13,6 +13,11 @@ import { attestationName, attestationText, intentName } from "../lib/fleet/host/
 import { PLAN, closePlan, newPlan, readPlan, replanSet, updatePlan } from "../lib/fleet/host/restore-plan.mjs";
 import { ABANDON, BEGIN, CLOSED, REQUESTS, begin, close, closeBlockers, readBegin, removeBeneath, restoreOpen, withExclusion } from "../lib/fleet/host/restore-begin.mjs";
 
+// The fixtures here are made with the default modes, and the code under test refuses anything group- or
+// world-writable, as it must. So the file's own umask is fixed (a host's services run with 022): the rows then
+// mean the same under a login shell's 002.
+process.umask(0o022);
+
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
 const UID = typeof process.getuid === "function" ? process.getuid() : -1; // (Linux-only rows; off Linux the file only loads)

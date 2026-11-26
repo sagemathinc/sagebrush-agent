@@ -21,6 +21,11 @@ import * as fsReal from "node:fs";
 import { fenced, lowerFence, raiseFence, stop } from "../lib/fleet/host/fence.mjs";
 import { lockFile } from "../lib/fleet/host/store.mjs";
 
+// The fixtures here are made with the default modes, and the code under test refuses anything group- or
+// world-writable, as it must. So the file's own umask is fixed (a host's services run with 022): the rows then
+// mean the same under a login shell's 002.
+process.umask(0o022);
+
 const A = newId();
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const rejects = (p, code) => assert.rejects(p, (e) => (code === "lease_unverified" || e instanceof FleetError) && e.code === code, code);

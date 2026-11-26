@@ -267,6 +267,7 @@ test("the plan on disk: created once (0600, exclusive; the same plan again is fi
     { ...step3, sets: { ...step3.sets, [k]: { ...step3.sets[k], snapshot: hex() } } },
     { ...step3, sets: { ...step3.sets, [k]: { ...step3.sets[k], tree: hex() } } },
     { ...step3, sets: { ...step3.sets, [k2]: { ...step3.sets[k2], tree: hex() } } },
+    { ...step3, config: Object.fromEntries(Object.keys(step3.config).map((id) => [id, hex()])) }, // (a config hash with it)
   ];
   // The same millisecond, or a run whose string sorts higher but whose time is older, is not newer.
   const extra = newId();

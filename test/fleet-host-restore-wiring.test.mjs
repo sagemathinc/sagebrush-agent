@@ -358,7 +358,7 @@ test("the seam's imports, composed: an agent set at files_validated, its live tr
   const { newRecord, step, writeRecord, readRecord, stagingDir, stagingName } = await import("../lib/fleet/host/restore-record.mjs");
   const { EMPTY_CONFIG_HASH } = await import("../lib/fleet/host/agent-config.mjs");
   const { chmodSync, statSync } = await import("node:fs");
-  for (const recorded of [true, false]) {
+  for (const [recorded, mode] of [[true, "ok"], [false, "ok"], [true, "held"], [true, "substitute"]]) {
     const a = newId(), key = `agent-${a}`;
     const base = mkdtempSync(join(tmpdir(), "sb-wiring-imp-"));
     const dir = join(base, "restore"), staging = join(base, "staging"), expectDir = join(base, "expect");
@@ -385,13 +385,20 @@ test("the seam's imports, composed: an agent set at files_validated, its live tr
     const minor = Number(BigInt(st.dev) & 0xffn) | Number((BigInt(st.dev) >> 12n) & ~0xffn);
     const store = storeOf(a);
     const prov = store.provisioned.record;
-    store.provisioned = { record: (x) => { const p = prov(x); return p && recorded ? { ...p, config: { epoch: EPOCH, fsid: FSID, dir: obj({ uid: 0, gid: 0, dev: [major, minor], ino: st.ino }) } } : p && { ...p, config: undefined }; } };
+    store.provisioned = { record: (x) => { const p = prov(x); return p && recorded ? { ...p, config: { epoch: EPOCH, fsid: FSID, dir: obj({ uid: 0, gid: 0, dev: [major, minor], ino: mode === "substitute" ? st.ino + 1 : st.ino }) } } : p && { ...p, config: undefined }; } };
     const calls = [];
     const launch = async (args) => { calls.push(args.slice(0, 5)); return args[0] === "identify" ? { code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, object: obj({ uid: 0, gid: 0 }) }) } : { code: 0, stdout: "" }; };
     const seam = restoreWorkerSeam({ store, launch, mount: "/srv/quota", main: "/opt/r/restore-worker-main.mjs", isActive: async () => true, isGone: async () => true, anyWorker: async () => false,
       dir, uid: UID, gid: process.getgid(), staging, expectDir, configRoot: () => live });
+    const { lockFile } = await import("../lib/fleet/host/store.mjs");
+    const held = mode === "held" ? await lockFile(join(dir, `${key}.lock`), { waitMs: 0 }) : null;
     const out = await seam.imports(1000, new AbortController().signal);
-    if (recorded) {
+    await held?.release();
+    if (mode === "held") {
+      assert.deepEqual([out, readRecord("agent", a, { dir }).state, calls], [{ sets: { [key]: { status: "busy" } } }, "files_validated", []], "a worker holds the set: busy");
+    } else if (mode === "substitute") {
+      assert.deepEqual(out, { sets: { [key]: { status: "failed", reason: "outcome_unknown" } } }, "another tree than the recorded one");
+    } else if (recorded) {
       assert.deepEqual(out, { sets: { [key]: { status: "validated" } } });
       assert.equal(readRecord("agent", a, { dir }).state, "validated");
       const name = `${RUN}/a-${a}/config/1`;

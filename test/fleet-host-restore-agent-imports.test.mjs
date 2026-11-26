@@ -196,6 +196,23 @@ test("an abandon intent appearing between two effects stops the step with nothin
   assert.ok(readFileSync(join(v.dir, `${v.key}.json`)).equals(before));
 });
 
+test("an intent after the last generation stops before current; a leftover at the read-back fails; a missing live tree is not_found", async () => {
+  const w = world();
+  const intent = () => { private_(join(w.dir, "abandon")); writeFileSync(join(w.dir, "abandon", `${w.key}.json`), "{}\n", { mode: 0o600 }); };
+  // (on the tree's fsync after gen-2's rename: every generation is in place, current not yet written)
+  const io = { ...realIo, fsync: (fd) => { realIo.fsync(fd); if (existsSync(join(w.liveRoot, "gen-2"))) intent(); } };
+  assert.deepEqual(await importAgentSet(w.id, w.deps(), opts(w, { io })), { status: "abandoning" });
+  assert.ok(existsSync(join(w.liveRoot, "gen-2")) && !existsSync(join(w.liveRoot, "current")), "current never written");
+  // A .current.tmp that appears once current is in place (a writer that isn't the import's): the read-back fails it.
+  const l = world();
+  const io2 = { ...realIo, fsync: (fd) => { realIo.fsync(fd); if (existsSync(join(l.liveRoot, "current")) && !existsSync(join(l.liveRoot, ".current.tmp"))) { writeFileSync(join(l.liveRoot, ".current.tmp"), "gen-2\n", { mode: 0o600 }); chmodSync(join(l.liveRoot, ".current.tmp"), 0o600); } } };
+  assert.deepEqual(await importAgentSet(l.id, l.deps(), opts(l, { io: io2 })), { status: "failed", reason: "outcome_unknown" });
+  assert.equal(l.record().imports.config.state, "pending", "never done");
+  // The recorded live tree is missing: not_found.
+  const m = world();
+  assert.deepEqual(await importAgentSet(m.id, m.deps({ liveConfig: async () => ({ root: join(m.base, "gone"), identity: identityOf(m.liveRoot) }) }), opts(m)), { status: "failed", reason: "not_found" });
+});
+
 test("a record that moved (another run, another state) or a closed restore refuses before any effect", async () => {
   const w = world();
   writeRecord(filesValidated(w.id, RUN2), { dir: w.dir });
@@ -207,6 +224,11 @@ test("a record that moved (another run, another state) or a closed restore refus
   const c = world();
   closePlan(1795500001000, { dir: c.dir });
   await rejects(importAgentSet(c.id, c.deps(), opts(c)), "not_granted");
+  // The same run, another snapshot (not the plan's): moved.
+  const sn = world();
+  writeFileSync(join(sn.dir, `${sn.key}.json`), JSON.stringify({ ...sn.record(), snapshot: hex("b") }) + "\n", { mode: 0o600 });
+  await rejects(importAgentSet(sn.id, sn.deps(), opts(sn)), "not_granted");
+  assert.deepEqual(snapshot(sn.liveRoot), {});
   // Moved mid-step (after pending): refused, nothing more written.
   const m = world();
   await rejects(importAgentSet(m.id, m.deps({ liveConfig: async () => { writeRecord(filesValidated(m.id, RUN2), { dir: m.dir }); return { root: m.liveRoot, identity: identityOf(m.liveRoot) }; } }), opts(m)), "not_granted");
@@ -300,6 +322,24 @@ test("context: no record of this agent is the import of nothing; any record of i
   private_(join(p.dir, HOSTSTORE_COPY, RUN, "harness-turns"));
   writeFileSync(join(p.dir, HOSTSTORE_COPY, RUN, "harness-turns", `${p.id}.journal`), "x");
   assert.deepEqual(await importAgentSet(p.id, p.deps(), opts(p)), { status: "failed", reason: "outcome_unknown" });
+  // A pending import of nothing bound to another hash: failed.
+  const q = world();
+  writeRecord(step(q.record(), "import", { which: "context", phase: "pending", sha256: hex("e") }), { dir: q.dir });
+  assert.deepEqual(await importAgentSet(q.id, q.deps(), opts(q)), { status: "failed", reason: "outcome_unknown" });
+  assert.notEqual(q.record().imports.context.state, "done");
+  // Records that appear between pending and the read-back: failed, never done.
+  const a = world();
+  let asked = 0;
+  assert.deepEqual(await importAgentSet(a.id, a.deps({ hasContext: async () => ++asked > 1 }), opts(a)), { status: "failed", reason: "outcome_unknown" });
+  assert.equal(asked, 2);
+  // The copy itself not a private directory: refused, never listed.
+  const cp = world();
+  chmodSync(join(cp.dir, HOSTSTORE_COPY, RUN), 0o777);
+  await rejects(importAgentSet(cp.id, cp.deps(), opts(cp)), "not_granted");
+  // Nor its parent: every level from the restore directory down is proven.
+  const pp = world({ harness: { "harness-sessions": [] } });
+  chmodSync(join(pp.dir, HOSTSTORE_COPY), 0o777);
+  await rejects(importAgentSet(pp.id, pp.deps(), opts(pp)), "not_granted");
   // A harness directory that isn't a private directory refuses (never read through).
   const l = world({ harness: { "harness-sessions": [] } });
   chmodSync(join(l.dir, HOSTSTORE_COPY, RUN, "harness-sessions"), 0o777);
@@ -318,9 +358,18 @@ test("the step's op: every files_validated agent set in key order; a validated o
   // Again: validated, its staging discarded again (under the hold), nothing imported.
   const again = await importOnce(depsOf(w), opts(w));
   assert.deepEqual([again, w.discarded], [{ sets: {} }, ["validated", "validated"]]);
-  // A tag folder of the plan is never looked at.
-  await importOnce(depsOf(v), opts(v));
+  // A tag folder of the plan is never looked at, even at files_validated (its veto held it there).
+  let tr = step(newRecord({ kind: "tag", id: t, run: RUN, snapshot: SNAP }), "bind", { dest: { tag: { dev: "2049", ino: "140", uid: 0, gid: 80000, mode: 0o2770, projid: 80000 } } });
+  tr = step(step(tr, "digest", { cls: "tag", sha256: hex("5") }), "staged");
+  tr = step(step(step(tr, "filling", { dest: tr.dest }), "published"), "files_validated");
+  writeRecord(tr, { dir: v.dir });
+  writeRecord(step(filesValidated(v.id), "failed", { reason: "bad_form" }), { dir: v.dir });
+  assert.deepEqual(await importOnce(depsOf(v), opts(v)), { sets: {} }, "a tag folder and a failed agent set: nothing");
   assert.ok(!calls.includes(t));
+  // A set still filling (staging): not the step's.
+  const sg = world();
+  writeRecord(newRecord({ kind: "agent", id: sg.id, run: RUN, snapshot: SNAP }), { dir: sg.dir });
+  assert.deepEqual(await importOnce(depsOf(sg), opts(sg)), { sets: {} });
   // An intent, another run: skipped.
   const i = world();
   private_(join(i.dir, "abandon")); writeFileSync(join(i.dir, "abandon", `${i.key}.json`), "{}\n", { mode: 0o600 });

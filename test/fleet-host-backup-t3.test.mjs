@@ -53,7 +53,9 @@ function world({ reapAfterMs = 20_000 } = {}) {
   // The lease's system view of the same tree: cgroup.kill works on frozen tasks.
   const sys = {
     mask: async (unit) => { events.push({ t, what: "mask", unit }); },
-    stop: async (unit) => { events.push({ t, what: "stop", unit }); },
+    // A systemctl stop of a FROZEN slice: its SIGTERM can't land, so it runs its whole bound (lease.mjs STOP_MS) and
+    // stops nothing.
+    stop: async (unit) => { events.push({ t, what: "stop", unit }); t += 10_000; },
     cgroup: (d) => d,
     kill: (d) => { events.push({ t, what: "lease-kill", p: d }); g(d).procs = 0; },
     empty: (d) => { const e = g(d).procs === 0; if (e) events.push({ t, what: "proven-empty", p: d }); return e; },
@@ -87,6 +89,8 @@ test("T3: the REAL leaseExpire (production wiring: no backup seam) on a frozen t
     const s = targetStop(w);
     assert.ok(s.killed && s.proven, "the target's slice killed and proven empty");
     assert.ok(s.proven.t <= STOP_BOUND_MS, `within the stop's own bound (proven at ${s.proven.t} ms)`);
+    const stopAt = w.events.find((e) => e.what === "stop");
+    assert.ok(stopAt && s.proven.t <= stopAt.t, "killed and proven BEFORE the unit's stop (which a frozen slice holds for its whole bound)");
     assert.equal(s.thawedLive, false, "never thawed while it had processes");
     assert.deepEqual(w.events.filter((e) => e.what === "thaw" || e.what === "freeze" || e.what === "kill"), [], "nothing of the backup touched: no thaw, no reap");
     assert.equal(existsSync(join(w.fenceDir, "backup", w.target)), true, "backup stays raised");

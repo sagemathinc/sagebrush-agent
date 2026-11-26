@@ -41,6 +41,7 @@
   "lib/fleet/ed25519.mjs",
   "lib/fleet/envelope.mjs",
   "lib/fleet/host/agent-config.mjs",
+  "lib/fleet/host/backup-attach.mjs",
   "lib/fleet/host/backup-binary.mjs",
   "lib/fleet/host/backup-hoststore.mjs",
   "lib/fleet/host/backup-journal.mjs",

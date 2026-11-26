@@ -43,3 +43,19 @@ test("Node's synchronous API (the host stack's) agrees: strict Ed25519 and envel
     assert.equal(got, c.expect, c.name);
   }
 });
+
+test("the fleet fingerprint vectors agree with an independent SHA-256 (node:crypto), and the first is the honest genesis", async () => {
+  const { createHash } = await import("node:crypto");
+  const sha = (b) => createHash("sha256").update(b).digest();
+  assert.equal(F.fleet_fingerprints.length, 3);
+  assert.equal(F.fleet_fingerprints[0].genesis, F.objects.chain[0]);
+  assert.equal(F.fleet_fingerprints[0].fleet, F.ids.fleet);
+  const fulls = new Set();
+  for (const c of F.fleet_fingerprints) {
+    const want = sha(Buffer.concat([Buffer.from("sagebrush.fp.v1\nfleet\n" + c.fleet + "\n"), sha(Buffer.from(c.genesis, "utf8"))]));
+    assert.equal(c.full, want.toString("base64url"), c.name);
+    assert.match(c.shown, /^[a-z2-7]{4}(-[a-z2-7]{4}){4}$/, c.name);
+    fulls.add(c.full);
+  }
+  assert.equal(fulls.size, 3, "each case gives its own fingerprint");
+});

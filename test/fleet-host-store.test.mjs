@@ -53,3 +53,24 @@ test("writeDurable sets the requested mode exactly, whatever the umask, even ove
     assert.equal(readFileSync(join(dir, "secret.json"), "utf8"), "c\n");
   } finally { process.umask(old); }
 });
+
+test("lockDir creates a missing .lock exactly 0600 whatever the umask, and leaves an existing one as it is", async () => {
+  const { lockDir } = await import("../lib/fleet/host/store.mjs");
+  const { mkdtempSync, statSync, writeFileSync, chmodSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const old = process.umask(0o022);
+  try {
+    const d = mkdtempSync(join(tmpdir(), "sb-lockdir-"));
+    const lock = await lockDir(d);
+    assert.equal(statSync(join(d, ".lock")).mode & 0o7777, 0o600);
+    await lock.release();
+    // An existing lock file (another mode, made by an earlier version) is used as it is, never rewritten.
+    const e = mkdtempSync(join(tmpdir(), "sb-lockdir-"));
+    writeFileSync(join(e, ".lock"), "");
+    chmodSync(join(e, ".lock"), 0o640);
+    const l2 = await lockDir(e);
+    assert.equal(statSync(join(e, ".lock")).mode & 0o7777, 0o640);
+    await l2.release();
+  } finally { process.umask(old); }
+});

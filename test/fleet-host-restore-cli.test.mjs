@@ -253,12 +253,20 @@ test("list and begin (R6b): through the store and launcher ops; their lines carr
   const w = world();
   const seen = [];
   const ops = {
-    list: async () => ({ manifests: [{ snapshot: hex("9"), host: "old", run: "r", time: "t", agents: 1, deleted: 0, tags: 1 }], unusable: [{ snapshot: hex("8"), host: "old", error: "bad_manifest" }] }),
+    list: async () => ({ manifests: [{ snapshot: hex("9"), host: "old", run: "r", time: "t", agents: 1, deleted: 0, tags: 1 }], unusable: [{ snapshot: hex("8"), host: "old", error: "bad_manifest" }], skipped: 0 }),
     begin: async (snapshot, o) => { seen.push([snapshot, o.dir]); return { run: RUN, sets: ["agent-x"] }; },
     removeHostStage: async (run) => { seen.push(["removed", run]); },
   };
   const deps = { dir: w.dir, fenceDir: w.fenceDir, exclusion: w.exclusion, uid: () => UID, rootUid: UID, now: () => T0 + 3600000, ops };
-  assert.deepEqual(await restoreCommand(["list"], deps), { code: 0, line: { v: 1, manifests: (await ops.list()).manifests, unusable: (await ops.list()).unusable } });
+  assert.deepEqual(await restoreCommand(["list"], deps), { code: 0, line: { v: 1, manifests: (await ops.list()).manifests, unusable: (await ops.list()).unusable, skipped: 0 } });
+  // Nothing usable, but snapshots made by other means: their count and the hint code; skipped ones beside a usable
+  // manifest carry no hint.
+  assert.deepEqual(await restoreCommand(["list"], { ...deps, ops: { ...ops, list: async () => ({ manifests: [], unusable: [], skipped: 3 }) } }),
+    { code: 0, line: { v: 1, manifests: [], unusable: [], skipped: 3, hint: "no_manifest" } });
+  assert.deepEqual(await restoreCommand(["list"], { ...deps, ops: { ...ops, list: async () => ({ manifests: [], unusable: [], skipped: 0 }) } }),
+    { code: 0, line: { v: 1, manifests: [], unusable: [], skipped: 0 } });
+  const withOne = await restoreCommand(["list"], { ...deps, ops: { ...ops, list: async () => ({ ...(await ops.list()), skipped: 2 }) } });
+  assert.equal(withOne.line.hint, undefined);
   assert.deepEqual(await restoreCommand(["begin", hex("9")], deps), { code: 0, line: { v: 1, begun: RUN, sets: ["agent-x"] } });
   assert.deepEqual(seen[0], [hex("9"), w.dir]);
   // A listing error and a begin refusal: their code only.

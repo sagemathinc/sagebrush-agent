@@ -29,3 +29,10 @@ sagebrush-agent-backup --state DIR --secrets DIR [--cache DIR] < request.json > 
 **Tests:**
 - `cargo test --locked` runs the unit tests.
 - With `--features test-loopback-http` and `SB_TEST_WEED` set to a SeaweedFS 4.53 binary (`scripts/fetch-test-s3.sh`), it also runs the integration tests against a local S3 server: the qualification rows plus the review gates. Restore rows need `CAP_SYS_RESOURCE` absent; where the bounding set still has it, they run through `sudo -n setpriv`.
+
+**A store for a trial host.** A real host only talks `https` to its store, and checks the certificate against the system roots (there's no insecure switch outside the test-only feature). To try backup and restore on disposable machines without a provider account:
+- run SeaweedFS (the pinned binary from `scripts/fetch-test-s3.sh`): `weed mini -bucket=<name> -dir=<dir> -ip=127.0.0.1 -ip.bind=127.0.0.1`, with its keys in `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`;
+- put TLS in front of it with a throwaway CA, for example `socat OPENSSL-LISTEN:9000,fork,reuseaddr,cert=<server pem>,verify=0 TCP:127.0.0.1:8333`, with a certificate whose subjectAltName is the address the hosts use;
+- add that CA to each host's system trust store (`/usr/local/share/ca-certificates/`, then `update-ca-certificates`).
+
+MinIO's server binaries are no longer published for download (their URLs answer HTTP 410), so don't plan on them.

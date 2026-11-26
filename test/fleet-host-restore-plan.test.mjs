@@ -87,9 +87,20 @@ test("listing: every committed manifest of every host, newest first, with what e
     { snapshot: a.mid, host: "old-host", run: RUN, time: "2026-11-24T03:10:00.000Z", agents: 2, deleted: 1, tags: 1 },
   ]);
   assert.deepEqual(r.unusable, []);
+  assert.equal(r.skipped, 1, "the one snapshot with none of a backup's tags is counted, not read");
   // Only manifests are read: one readback and one dump each, nothing else.
   assert.deepEqual(s.calls.filter(([op]) => op !== "snapshots").map(([op, id]) => `${op}:${id}`).sort(),
     [a.mid, b.mid, c.mid].flatMap((id) => [`readback:${id}`, `dump:${id}`]).sort());
+});
+
+test("listing: a store of snapshots made by other means lists no manifest and counts them as skipped; a backup's set snapshots aren't counted", async () => {
+  const other = (n) => ({ id: hex(), time: "2026-11-25T00:00:00.000Z", tree: hex(), host: "old-host", paths: [`/x${n}`], tags: n ? ["mine"] : [], summary: null });
+  const only = await listManifests(store([], { edit: (l) => [...l, other(0), other(1)] }));
+  assert.deepEqual(only, { manifests: [], unusable: [], skipped: 2 });
+  const b = backup("old-host", RUN, "2026-11-24T03:10:00.000Z");
+  const r = await listManifests(store([b]));
+  assert.equal(r.manifests.length, 1);
+  assert.equal(r.skipped, 0, "a backup's own set and host-store snapshots are not skipped ones");
 });
 
 test("listing: a manifest that fails any check is unusable, with why, and the others are still offered", async () => {

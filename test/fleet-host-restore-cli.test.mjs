@@ -2,7 +2,7 @@
 // directories: status's document, retry's refusals and its crash continuation, close, and the command line's codes.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -215,10 +215,10 @@ test("the command line: argument errors are 2; not root is refused; each command
   writeRecord(reach("archive", w.d, "failed"), { dir: w.dir });
   const removed = [];
   const deps = { dir: w.dir, fenceDir: w.fenceDir, exclusion: w.exclusion, uid: () => UID, rootUid: UID, now: () => T0 + 3600000, removeHostStage: async (run) => { removed.push(run); } };
-  for (const argv of [[], ["status", "x"], ["retry"], ["retry", "a", "b"], ["close", "now"], ["begin", hex("1")], ["list"], ["nope"]]) {
+  for (const argv of [[], ["status", "x"], ["retry"], ["retry", "a", "b"], ["close", "now"], ["begin"], ["begin", "nope"], ["begin", hex("A")], ["begin", hex("1"), "x"], ["list", "x"], ["nope"]]) {
     const out = await restoreCommand(argv, deps);
     assert.equal(out.code, 2, JSON.stringify(argv));
-    assert.match(out.usage, /^usage: sagebrush-agent host restore status \| retry <kind>-<id> \| close$/);
+    assert.match(out.usage, /^usage: sagebrush-agent host restore list \| begin <snapshot> \| status \| retry <kind>-<id> \| close$/);
   }
   assert.deepEqual(await restoreCommand(["status"], { ...deps, uid: () => UID + 1 }), { code: 1, line: { v: 1, refused: "not_granted" } }, "not root");
   const st = await restoreCommand(["status"], deps);
@@ -247,4 +247,50 @@ test("the entrypoint: `sagebrush-agent host restore` dispatches through host-mai
   assert.match(usage.stderr, /usage: sagebrush-agent host restore/);
   const st = spawnSync(process.execPath, [bin, "host", "restore", "status"], { encoding: "utf8" });
   assert.deepEqual([st.status, st.stdout], [1, '{"v":1,"refused":"not_granted"}\n']);
+});
+
+test("list and begin (R6b): through the store and launcher ops; their lines carry ids and codes only", async () => {
+  const w = world();
+  const seen = [];
+  const ops = {
+    list: async () => ({ manifests: [{ snapshot: hex("9"), host: "old", run: "r", time: "t", agents: 1, deleted: 0, tags: 1 }], unusable: [{ snapshot: hex("8"), host: "old", error: "bad_manifest" }] }),
+    begin: async (snapshot, o) => { seen.push([snapshot, o.dir]); return { run: RUN, sets: ["agent-x"] }; },
+    removeHostStage: async (run) => { seen.push(["removed", run]); },
+  };
+  const deps = { dir: w.dir, fenceDir: w.fenceDir, exclusion: w.exclusion, uid: () => UID, rootUid: UID, now: () => T0 + 3600000, ops };
+  assert.deepEqual(await restoreCommand(["list"], deps), { code: 0, line: { v: 1, manifests: (await ops.list()).manifests, unusable: (await ops.list()).unusable } });
+  assert.deepEqual(await restoreCommand(["begin", hex("9")], deps), { code: 0, line: { v: 1, begun: RUN, sets: ["agent-x"] } });
+  assert.deepEqual(seen[0], [hex("9"), w.dir]);
+  // A listing error and a begin refusal: their code only.
+  assert.deepEqual(await restoreCommand(["list"], { ...deps, ops: { ...ops, list: async () => ({ error: "spawn_failed" }) } }), { code: 1, line: { v: 1, refused: "spawn_failed" } });
+  assert.deepEqual(await restoreCommand(["begin", hex("9")], { ...deps, ops: { ...ops, begin: async () => { throw new FleetError("in_progress", "a path /secret/x and a value") } } }), { code: 1, line: { v: 1, refused: "in_progress" } });
+  // close's stage removal comes from the ops when not given.
+  for (const [kind, id] of [["agent", w.a], ["archive", w.d], ["tag", w.t]]) writeRecord(reach(kind, id, "validated"), { dir: w.dir });
+  assert.equal((await restoreCommand(["close"], { ...deps, restoreRaised: () => false })).code, 0);
+  assert.deepEqual(seen.at(-1), ["removed", RUN]);
+});
+
+test("the real ops: begin refuses while the supervisor's unit is active (or unsure), and opens and releases the host store; the binary's context is the launcher's", async () => {
+  const { realRestoreOps, BACKUP_STATE_DIR, HOST_SECRETS_DIR, BACKUP_CACHE_DIR } = await import("../lib/fleet/host/restore-cli.mjs");
+  const { HostStore } = await import("../lib/fleet/host/host-store.mjs");
+  const src = readFileSync(fileURLToPath(new URL("../launcher/src/restore.rs", import.meta.url)), "utf8");
+  for (const [name, v] of [["STATE", BACKUP_STATE_DIR], ["SECRETS", HOST_SECRETS_DIR], ["CACHE", BACKUP_CACHE_DIR]]) {
+    assert.ok(src.includes(`pub const ${name}: &str = "${v}";`), `${name} pinned equal to the launcher's`);
+  }
+  for (const [what, run] of [["active", async () => ({ code: 0 })], ["unsure", async () => { throw new Error("no systemctl"); }]]) {
+    const w = world();
+    const hostStore = join(w.base, "store");
+    const ops = realRestoreOps({ release: "/nonexistent-release", run, hostStore });
+    await rejects(ops.begin(hex("9"), { dir: join(w.base, "fresh-restore"), exclusion: w.exclusion }), "in_progress");
+    // The store's lock was released: it opens again.
+    const s = await HostStore.open(hostStore);
+    await s.close();
+    assert.ok(true, what);
+  }
+  // Inactive: begin goes on to choose the manifest over the binary, which isn't installed here: refused, nothing begun.
+  const w = world();
+  const fresh = join(w.base, "fresh-restore");
+  const ops = realRestoreOps({ release: "/nonexistent-release", run: async () => ({ code: 3 }), hostStore: join(w.base, "store") });
+  await assert.rejects(ops.begin(hex("9"), { dir: fresh, exclusion: w.exclusion }), (e) => e instanceof FleetError);
+  assert.equal(existsSync(join(fresh, BEGIN)), false, "nothing begun");
 });

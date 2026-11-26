@@ -18,6 +18,11 @@ import { realIo } from "../lib/fleet/host/store.mjs";
 import { STAGED, CLASSES, MAX_ATTEMPTS, newRecord, newRestoreRun, ownerOf, readFillReport, readRecord, retryRecord, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 import { copyKey, encodePath, quote } from "../lib/fleet/host/restore-validate.mjs";
 
+// The fixtures here are made with the default modes, and the code under test refuses anything group- or
+// world-writable, as it must. So the file's own umask is fixed (a host's services run with 022): the rows then
+// mean the same under a login shell's 002.
+process.umask(0o022);
+
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
 const RUN = newRestoreRun(1795500000000, () => Buffer.alloc(6)), RUN2 = newRestoreRun(1795600000000, () => Buffer.alloc(6));
 const SNAP = "a".repeat(64);

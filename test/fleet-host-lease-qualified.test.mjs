@@ -17,6 +17,11 @@ import { DECLARED, EXPLICIT, ROOTS, leaseManifest, lex, loadsOf } from "../lib/f
 import { RECORD, argvOf, leaseQualified } from "../lib/fleet/host/lease-qualified.mjs";
 import { SUBCASES } from "../lib/fleet/host/lease-qual-subcases.mjs";
 
+// The fixtures here are made with the default modes, and the code under test refuses anything group- or
+// world-writable, as it must. So the file's own umask is fixed (a host's services run with 022): the rows then
+// mean the same under a login shell's 002.
+process.umask(0o022);
+
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const UID = process.getuid?.() ?? 0;
 const sha = (b) => createHash("sha256").update(b).digest("hex");

@@ -11,6 +11,11 @@ import { BINDS, UNIT_DIR, launcherExit, realEffects, runArgv, stagingPlan } from
 import { UNIT_DIRS_ABOVE_MASK } from "../lib/fleet/host/names.mjs";
 import { CONTRACT, launcherContract, renderUnit } from "../lib/fleet/host/unit.mjs";
 
+// The fixtures here are made with the default modes, and the code under test refuses anything group- or
+// world-writable, as it must. So the file's own umask is fixed (a host's services run with 022): the rows then
+// mean the same under a login shell's 002.
+process.umask(0o022);
+
 const A = "abcdefghijklmnopqrstuvwxya", T1 = "tagtagtagtagtagtagtagtagaa";
 // process.getuid doesn't exist off POSIX; there every test here is skipped (host-linux-only), so ME is never used.
 const UID = 70000, GID = 70000, ME = process.getuid?.() ?? -1;

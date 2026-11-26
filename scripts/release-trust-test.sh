@@ -266,8 +266,10 @@ r=0; out=$(cd "$REPO" && /usr/bin/env -i PATH=/usr/bin:/bin SB_EXTRA=1 /bin/sh "
 [ "$r" = 1 ] && [[ "$out" == *"isn't the supported one"* ]] && [ ! -e "$D" ] && ok "entrypoint: one extra variable refuses" || bad "entrypoint: an extra variable ran ($r: ${out:0:200})"
 for kind in alternates http-alternates; do
   clean; rm -rf /var/lib/sb-alt
-  if [ "$kind" = alternates ]; then git -c safe.directory='*' clone -q --shared "$REPO" /var/lib/sb-alt
-  else git -c safe.directory='*' clone -q --no-hardlinks "$REPO" /var/lib/sb-alt && echo "https://example.invalid/objects" > /var/lib/sb-alt/.git/objects/info/http-alternates; fi
+  # (the file written explicitly: `clone --shared` from a shallow checkout, as CI's is, silently makes no alternates)
+  git -c safe.directory='*' clone -q --no-hardlinks "$REPO" /var/lib/sb-alt && mkdir -p /var/lib/sb-alt/.git/objects/info
+  if [ "$kind" = alternates ]; then echo "$(git -c safe.directory='*' -C "$REPO" rev-parse --path-format=absolute --git-common-dir)/objects" > /var/lib/sb-alt/.git/objects/info/alternates
+  else echo "https://example.invalid/objects" > /var/lib/sb-alt/.git/objects/info/http-alternates; fi
   r=0; out=$(cd /var/lib/sb-alt && /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh "$SBIN" "$COMMIT" "$D" "$LAUNCH" 2>&1) || r=$?
   [ "$r" = 1 ] && [[ "$out" == *"uses alternates"* ]] && [ ! -e "$D" ] && ok "entrypoint: a clone with $kind refuses" || bad "entrypoint: $kind didn't refuse ($r: ${out:0:200})"
 done

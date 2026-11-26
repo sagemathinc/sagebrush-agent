@@ -216,6 +216,7 @@ fn http_put(port: u16, path: &str, body: &[u8]) -> u16 {
 }
 
 /// A host's backup state: dest.json, the credential handle's file and host.key, all 0600.
+#[derive(Clone)]
 struct Host {
     state: PathBuf,
     secrets: PathBuf,
@@ -850,4 +851,523 @@ fn pack_entries(w: &Weed, prefix: &str) -> Vec<String> {
 
 fn first_pack(w: &Weed, prefix: &str) -> String {
     pack_entries(w, prefix).into_iter().next().expect("a pack exists")
+}
+
+/// Every page of `tree` from the start, checked for continuity as the host does (config tree design d2r2 §A).
+fn tree_all(h: &Host, snapshot: &str, path: &str) -> (Vec<Value>, usize) {
+    let (mut all, mut pages, mut cursor) = (Vec::new(), 0usize, Value::Null);
+    loop {
+        let p = run(h, json!({ "op": "tree", "snapshot": snapshot, "path": path, "cursor": cursor }));
+        assert_eq!(p["ok"], true, "{p}");
+        let entries = p["entries"].as_array().unwrap();
+        assert!(!entries.is_empty(), "never an empty page");
+        for e in entries {
+            assert_eq!(e["index"].as_u64().unwrap() as usize, all.len(), "index = previous + 1");
+            all.push(e.clone());
+        }
+        pages += 1;
+        if p["next"].is_null() {
+            return (all, pages);
+        }
+        let next = p["next"].as_str().unwrap();
+        assert!(next.ends_with(&format!(":{}", all.len())), "next names the entry after the page's last: {next}");
+        cursor = p["next"].clone();
+    }
+}
+
+/// tree: the exact listing of a saved subtree (types, modes, owners, link counts, sizes, digests), the requested
+/// path's node first; a root-level `.gen-<n>.tmp` emitted but never descended (whatever it holds), a deeper one
+/// walked; and the structural refusals (tree_refused).
+#[test]
+fn tree_lists_a_saved_tree() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Some(bin) = weed() else { return };
+    let w = start_weed(&bin);
+    let h = host(&w, "tree");
+    assert_eq!(run(&h, json!({ "op": "init" }))["ok"], true);
+    let src = tmpdir("tree-src");
+    let set = |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+    set(&src, 0o700);
+    fs::create_dir(src.join("d")).unwrap();
+    set(&src.join("d"), 0o700);
+    fs::write(src.join("d/f600"), b"six hundred\n").unwrap();
+    set(&src.join("d/f600"), 0o600);
+    fs::write(src.join("f644"), b"x").unwrap();
+    set(&src.join("f644"), 0o644);
+    // Special bits are stored in Go's high bits: listed as the restore sets them, never dropped.
+    fs::write(src.join("suid"), b"s").unwrap();
+    set(&src.join("suid"), 0o4600);
+    fs::create_dir(src.join("sgid")).unwrap();
+    set(&src.join("sgid"), 0o2700);
+    fs::create_dir(src.join("sticky")).unwrap();
+    set(&src.join("sticky"), 0o1700);
+    fs::hard_link(src.join("f644"), src.join("f644-link")).unwrap();
+    std::os::unix::fs::symlink("d/f600", src.join("ln")).unwrap();
+    let fifo = std::ffi::CString::new(src.join("pipe").to_str().unwrap()).unwrap();
+    // SAFETY: mkfifo with a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+    // A root-level leftover holding what the restore's reader never reads: a large sparse file, a deep chain, a
+    // non-UTF-8 name. And a DEEPER `.gen-<n>.tmp`, which is an ordinary directory and is walked.
+    fs::create_dir(src.join(".gen-3.tmp")).unwrap();
+    let big = fs::File::create(src.join(".gen-3.tmp/big")).unwrap();
+    big.set_len(300 << 20).unwrap();
+    let mut deep = src.join(".gen-3.tmp");
+    for _ in 0..80 {
+        deep = deep.join("deep-level");
+        fs::create_dir(&deep).unwrap();
+    }
+    fs::write(src.join(".gen-3.tmp").join(std::ffi::OsStr::from_bytes(b"bad-\xff")), b"y").unwrap();
+    fs::create_dir(src.join("d/.gen-1.tmp")).unwrap();
+    fs::write(src.join("d/.gen-1.tmp/inner"), b"z").unwrap();
+    let b = run(&h, json!({ "op": "backup", "sources": [src], "host": "h1" }));
+    assert_eq!(b["ok"], true, "{b}");
+    let snap = snapshot_id(&b);
+    let path = src.to_str().unwrap()[1..].to_string();
+    let (all, pages) = tree_all(&h, &snap, &path);
+    assert_eq!(pages, 1);
+    let by: std::collections::HashMap<String, Value> = all.iter().map(|e| (e["path"].as_str().unwrap().to_string(), e.clone())).collect();
+    let mut names: Vec<&String> = by.keys().collect();
+    names.sort();
+    assert_eq!(names, vec!["", ".gen-3.tmp", "d", "d/.gen-1.tmp", "d/.gen-1.tmp/inner", "d/f600", "f644", "f644-link", "ln", "pipe", "sgid", "sticky", "suid"],
+        "the leftover's contents never listed; the deeper one walked");
+    assert_eq!(all[0]["path"], "", "the path's own node first");
+    let me = fs::metadata(&src).unwrap();
+    for e in &all[1..] {
+        assert_eq!(e["uid"], me.uid(), "{e}");
+        assert_eq!(e["gid"], me.gid(), "{e}");
+    }
+    // The requested path is a backup SOURCE, and the archiver stores a source's own node with synthesized metadata
+    // (no owner, mode 0755), whatever the directory was (here 0700). A restore restores only what's beneath it into
+    // its own staged directory, so this node's stored metadata is never used; the config proof checks only its type.
+    assert_eq!((by[""]["type"].clone(), by[""]["mode"].clone(), by[""]["uid"].clone(), by[""]["gid"].clone()), (json!("dir"), json!(0o755), Value::Null, Value::Null));
+    assert_eq!((by["d/f600"]["type"].clone(), by["d/f600"]["mode"].clone(), by["d/f600"]["size"].clone()), (json!("file"), json!(0o600), json!(12)));
+    assert_eq!(by["d/f600"]["sha256"], sha2_hex(b"six hundred\n"));
+    assert_eq!((by["f644"]["mode"].clone(), by["f644"]["nlink"].clone(), by["f644-link"]["nlink"].clone()), (json!(0o644), json!(2), json!(2)));
+    assert_eq!(by["d/f600"]["nlink"], 1);
+    assert_eq!((by["suid"]["mode"].clone(), by["sgid"]["mode"].clone(), by["sticky"]["mode"].clone()), (json!(0o4600), json!(0o2700), json!(0o1700)));
+    assert_eq!((by["ln"]["type"].clone(), by["ln"]["sha256"].clone()), (json!("symlink"), Value::Null));
+    assert_eq!((by["pipe"]["type"].clone(), by["pipe"]["sha256"].clone()), (json!("other"), Value::Null));
+    assert_eq!((by[".gen-3.tmp"]["type"].clone(), by[".gen-3.tmp"]["sha256"].clone()), (json!("dir"), Value::Null));
+    // The structural refusals.
+    let tree = |path: &str, cursor: Value| run(&h, json!({ "op": "tree", "snapshot": snap, "path": path, "cursor": cursor }));
+    assert_eq!(code(&tree("no/such/path", Value::Null)), "tree_absent", "a path not in the snapshot: its own code (d2r7)");
+    assert_eq!(code(&tree(&format!("{path}/f644/below"), Value::Null)), "tree_absent", "a component beneath a file");
+    let digest = sha2_hex(path.as_bytes());
+    assert_eq!(code(&tree(&path, json!(format!("{snap}:{digest}:99")))), "tree_refused", "an index past the end");
+    assert_eq!(code(&tree(&path, json!(format!("{}:{digest}:1", "0".repeat(64))))), "tree_refused", "another snapshot");
+    assert_eq!(code(&tree(&path, json!(format!("{snap}:{}:1", "0".repeat(64))))), "tree_refused", "another path");
+    for bad in ["x", "a:b", &format!("{snap}:{digest}:01"), &format!("{snap}:{digest}:-1"), &format!("{snap}:{digest}:")] {
+        assert_eq!(code(&tree(&path, json!(bad))), "tree_refused", "malformed: {bad}");
+    }
+    // A non-UTF-8 name in a WALKED part is structural.
+    let bad_src = tmpdir("tree-bad");
+    fs::write(bad_src.join(std::ffi::OsStr::from_bytes(b"bad-\xff")), b"y").unwrap();
+    let b2 = run(&h, json!({ "op": "backup", "sources": [bad_src], "host": "h1" }));
+    let p2 = run(&h, json!({ "op": "tree", "snapshot": snapshot_id(&b2), "path": &bad_src.to_str().unwrap()[1..], "cursor": null }));
+    assert_eq!(code(&p2), "tree_refused", "{p2}");
+}
+
+/// tree's pages: the entry bound (2048), the byte bound (4 MiB of serialized entries) and the hash bound (256 MiB
+/// of contents) each end a page right before the entry that would pass it; every page continues with no gap or
+/// duplicate. N1 (with the test-tree-counters feature): a page served from a cursor reads no contents before its index.
+#[test]
+fn tree_pages_and_bounds() {
+    let Some(bin) = weed() else { return };
+    let w = start_weed(&bin);
+    let h = host(&w, "tree-pages");
+    assert_eq!(run(&h, json!({ "op": "init" }))["ok"], true);
+    // The entry bound: the node and 2049 files make 2050 entries: 2048, then 2.
+    let src = tmpdir("tree-entries");
+    for i in 0..2049 {
+        fs::write(src.join(format!("f{i:05}")), b"x").unwrap();
+    }
+    let b = run(&h, json!({ "op": "backup", "sources": [src], "host": "h1" }));
+    let p1 = run(&h, json!({ "op": "tree", "snapshot": snapshot_id(&b), "path": &src.to_str().unwrap()[1..], "cursor": null }));
+    assert_eq!(p1["entries"].as_array().unwrap().len(), 2048, "exactly the entry bound");
+    let (all, pages) = tree_all(&h, &snapshot_id(&b), &src.to_str().unwrap()[1..]);
+    assert_eq!((all.len(), pages), (2050, 2));
+    // The byte bound: long paths (about 4 KiB each) end a page by its serialized bytes, well before 2048 entries.
+    let src = tmpdir("tree-bytes");
+    let mut deep = src.clone();
+    for _ in 0..15 {
+        deep = deep.join("d".repeat(250));
+        fs::create_dir(&deep).unwrap();
+    }
+    for i in 0..1200 {
+        fs::write(deep.join(format!("{i:05}{}", "n".repeat(240))), b"x").unwrap();
+    }
+    let b = run(&h, json!({ "op": "backup", "sources": [src], "host": "h1" }));
+    let path = src.to_str().unwrap()[1..].to_string();
+    let p1 = run(&h, json!({ "op": "tree", "snapshot": snapshot_id(&b), "path": &path, "cursor": null }));
+    let e1 = p1["entries"].as_array().unwrap();
+    let bytes: usize = e1.iter().map(|e| e.to_string().len() + 1).sum();
+    assert!(e1.len() < 2048 && bytes <= 4 << 20, "{} entries, {bytes} bytes", e1.len());
+    let p2 = run(&h, json!({ "op": "tree", "snapshot": snapshot_id(&b), "path": &path, "cursor": p1["next"] }));
+    let first2 = &p2["entries"].as_array().unwrap()[0];
+    assert!(bytes + first2.to_string().len() + 1 > 4 << 20, "the next entry would have passed the byte bound");
+    let (all, _) = tree_all(&h, &snapshot_id(&b), &path);
+    assert_eq!(all.len(), 1 + 15 + 1200);
+    // The hash bound, and N1: two 150 MiB files (sparse in the source; their contents still read in full).
+    let src = tmpdir("tree-hash");
+    for n in ["a", "b"] {
+        fs::File::create(src.join(n)).unwrap().set_len(150 << 20).unwrap();
+    }
+    let b = run(&h, json!({ "op": "backup", "sources": [src], "host": "h1" }));
+    let path = src.to_str().unwrap()[1..].to_string();
+    let p1 = run(&h, json!({ "op": "tree", "snapshot": snapshot_id(&b), "path": &path, "cursor": null }));
+    let names: Vec<&str> = p1["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["", "a"], "b would pass the hash bound: next page");
+    let p2 = run(&h, json!({ "op": "tree", "snapshot": snapshot_id(&b), "path": &path, "cursor": p1["next"] }));
+    let names: Vec<&str> = p2["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
+    assert_eq!((names, p2["next"].clone()), (vec!["b"], Value::Null));
+    #[cfg(feature = "test-tree-counters")]
+    {
+        assert_eq!(p1["content_bytes_read"], 150u64 << 20, "the first page reads a");
+        assert_eq!(p2["content_bytes_read"], 150u64 << 20, "a resumed page reads only its own: never a's contents (N1)");
+    }
+}
+
+/// The config proof against the restore, both real (tree design d2r6's rows): a config tree saved by a real backup,
+/// listed by the real `tree` (across pages), proven by the JS proof (proveConfig over these very answers), and restored
+/// by the real `restore` then read by agent-config's reader as the restore's config import reads it. The proof's entry
+/// equals the restored tree's hash; an invalid descendant and a root that isn't a directory are refused by both.
+#[test]
+fn tree_proof_matches_the_restore() {
+    let Some(bin) = weed() else { return };
+    let w = start_weed(&bin);
+    let h = host(&w, "tree-proof");
+    assert_eq!(run(&h, json!({ "op": "init" }))["ok"], true);
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let empty = sha2_hex(b"{\"v\":1,\"entries\":[]}\n");
+    let set = |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+    let mkdir = |p: &Path| {
+        fs::create_dir(p).unwrap();
+        set(p, 0o700);
+    };
+    let file = |p: &Path, data: &[u8]| {
+        fs::write(p, data).unwrap();
+        set(p, 0o600);
+    };
+    // A config tree at <base>/agent-config/<id>: (what it holds).
+    let tree = |tag: &str, fill: &dyn Fn(&Path)| -> PathBuf {
+        let base = tmpdir(tag);
+        set(&base, 0o700);
+        mkdir(&base.join("agent-config"));
+        let root = base.join("agent-config").join("a".repeat(26));
+        mkdir(&root);
+        fill(&root);
+        root
+    };
+    let configured = |root: &Path| {
+        for g in ["gen-1", "gen-2"] {
+            mkdir(&root.join(g));
+            file(&root.join(g).join("manifest.json"), format!("{{\"v\":1,\"g\":\"{g}\"}}\n").as_bytes());
+            mkdir(&root.join(g).join("skills"));
+            mkdir(&root.join(g).join("skills/a"));
+            file(&root.join(g).join("skills/a/SKILL.md"), b"x");
+            file(&root.join(g).join("a-b"), b"order");
+        }
+        mkdir(&root.join("gen-2/many"));
+        for i in 0..2100 {
+            file(&root.join(format!("gen-2/many/f{i:05}")), format!("{i}").as_bytes());
+        }
+        file(&root.join("current"), b"gen-2\n");
+        // The leftovers: a generation in progress (holding what the reader never reads) and a .current.tmp link.
+        mkdir(&root.join(".gen-3.tmp"));
+        fs::write(root.join(".gen-3.tmp/loose"), b"y").unwrap();
+        set(&root.join(".gen-3.tmp/loose"), 0o644);
+        std::os::unix::fs::symlink("gen-2\n", root.join(".current.tmp")).unwrap();
+    };
+    let check_env = |tag: &str, root: &Path, env: &[(&str, &str)]| -> Value {
+        let b = run_env(&h, json!({ "op": "backup", "sources": [root], "host": "h1" }), env);
+        assert_eq!(b["ok"], true, "{b}");
+        let snap = snapshot_id(&b);
+        let rel = root.to_str().unwrap()[1..].to_string();
+        let mut pages = serde_json::Map::new();
+        let mut cursor = Value::Null;
+        loop {
+            let p = run(&h, json!({ "op": "tree", "snapshot": snap, "path": rel, "cursor": cursor }));
+            pages.insert(if cursor.is_null() { "null".to_string() } else { cursor.as_str().unwrap().to_string() }, Value::String(p.to_string()));
+            if p["ok"] != true || p["next"].is_null() {
+                break;
+            }
+            cursor = p["next"].clone();
+        }
+        let dump = run(&h, json!({ "op": "dump", "snapshot": snap, "path": format!("{rel}/current") }));
+        let list = run(&h, json!({ "op": "snapshots" }));
+        let record = list["snapshots"].as_array().unwrap().iter().find(|s| s["id"] == snap.as_str()).unwrap().clone();
+        // As the launcher's restore stage requests it: the saved path's contents into its own fresh 0700 directory.
+        // An absent source (an empty one, d2r8 §5) restores nothing there: the stage's directory stays as it is.
+        let (data, _) = staged(&format!("{tag}-restore"));
+        let restored = data.join("a".repeat(26));
+        mkdir(&restored);
+        let r = run(&h, json!({ "op": "restore", "snapshot": snap, "path": rel, "dest": restored, "digests": data.join("digests.json") }));
+        let first: Value = serde_json::from_str(pages["null"].as_str().unwrap()).unwrap();
+        if code(&first) == "tree_absent" {
+            assert_eq!(code(&r), "restore_failed", "{tag}: the binary can't restore an absent path: {r}");
+        } else {
+            assert_eq!(r["ok"], true, "{tag}: {r}");
+        }
+        let input = tmpdir(&format!("{tag}-input")).join("in.json");
+        fs::write(&input, json!({ "snapshot": snap, "root": root, "uid": uid, "record": record, "pages": pages, "dump": dump.to_string(), "restored": restored }).to_string()).unwrap();
+        let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("../test/fixtures/host/tree-proof-check.mjs");
+        let out = Command::new("node").arg(driver).arg(&input).output().expect("node runs");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let mut v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["pages"] = json!(pages.len());
+        v["first"] = json!(code(&first));
+        v["root_mode"] = json!(fs::symlink_metadata(&restored).unwrap().permissions().mode() & 0o7777);
+        v
+    };
+    let check = |tag: &str, root: &Path| check_env(tag, root, &[]);
+    // Configured, across pages: the proof's entry is the restored tree's hash (gen-2's), never empty.
+    let v = check("proof-configured", &tree("proof-configured", &configured));
+    assert!(v["pages"].as_u64().unwrap() >= 2, "{v}");
+    assert_eq!(v["root_mode"], 0o700, "the restore keeps the stage's own root: the saved root's synthesized metadata is never applied");
+    assert_eq!(v["proof"], v["restored"], "{v}");
+    assert!(v["proof"].as_str().unwrap().len() == 64 && v["proof"] != empty.as_str(), "{v}");
+    // Never configured: the empty source isn't saved (tree_absent); the strict snapshot naming it proves EMPTY_CONFIG_HASH,
+    // and the stage's empty directory reads the same.
+    let v = check("proof-empty", &tree("proof-empty", &|_| {}));
+    assert_eq!((v["first"].clone(), v["proof"].clone(), v["restored"].clone()), (json!("tree_absent"), json!(empty), json!(empty)), "{v}");
+    // The same from a non-strict snapshot (the test-only hook): nothing proves it empty.
+    let v = check_env("proof-empty-lax", &tree("proof-empty-lax", &|_| {}), &[("SB_TEST_NONSTRICT", "1")]);
+    assert_eq!((v["first"].clone(), v["proof"].clone()), (json!("tree_absent"), json!("code:config_unbound")), "{v}");
+    // Invalid descendants: each refused by both (the proof's config_unbound, the reader's refusal).
+    let spoils: [(&str, &dyn Fn(&Path)); 4] = [
+        ("proof-mode", &|r: &Path| set(&r.join("gen-2/skills/a/SKILL.md"), 0o644)),
+        ("proof-suid", &|r: &Path| set(&r.join("gen-2/manifest.json"), 0o4600)),
+        ("proof-link", &|r: &Path| std::os::unix::fs::symlink("manifest.json", r.join("gen-2/ln")).unwrap()),
+        ("proof-foreign", &|r: &Path| file(&r.join("notes"), b"n")),
+    ];
+    for (tag, spoil) in spoils {
+        let root = tree(tag, &configured);
+        spoil(&root);
+        let v = check(tag, &root);
+        assert_eq!(v["proof"], "code:config_unbound", "{tag}: {v}");
+        assert!(v["restored"].as_str().unwrap().starts_with("refused"), "{tag}: {v}");
+    }
+    // The root not a directory: the saved node is a file.
+    let base = tmpdir("proof-file-root");
+    let root = base.join("cfg");
+    file(&root, b"gen-1\n");
+    let v = check("proof-file-root", &root);
+    assert_eq!(v["proof"], "code:config_unbound", "{v}");
+    assert!(v["restored"].as_str().unwrap().starts_with("refused"), "{v}");
+}
+
+/// The binary run with extra environment (the test-only hooks), bound like Node's spawns.
+fn run_env(h: &Host, req: Value, env: &[(&str, &str)]) -> Value {
+    let pid = std::process::id().to_string();
+    let mut c = Command::new(BIN);
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    run_cmd(&mut c, h, req, &["--parent-pid", &pid])
+}
+
+fn snapshot_ids(h: &Host) -> Vec<String> {
+    let l = run(h, json!({ "op": "snapshots" }));
+    assert_eq!(l["ok"], true, "{l}");
+    let mut ids: Vec<String> = l["snapshots"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap().to_string()).collect();
+    ids.sort();
+    ids
+}
+
+/// A backup through the test-only gate: `change` runs between the sources' canonicalization and the walk.
+fn backup_gated(h: &Host, sources: &[&Path], change: &dyn Fn()) -> Value {
+    let gate = tmpdir("gate");
+    let (h2, g2) = (h.clone(), gate.clone());
+    let srcs: Vec<PathBuf> = sources.iter().map(|p| p.to_path_buf()).collect();
+    let t = thread::spawn(move || run_env(&h2, json!({ "op": "backup", "sources": srcs, "host": "h1" }), &[("SB_TEST_SANITIZED_GATE", g2.to_str().unwrap())]));
+    let t0 = std::time::Instant::now();
+    while !gate.join("ready").exists() {
+        assert!(t0.elapsed() < Duration::from_secs(120), "the binary never reached the gate");
+        thread::sleep(Duration::from_millis(20));
+    }
+    change();
+    fs::write(gate.join("go"), b"").unwrap();
+    t.join().unwrap()
+}
+
+/// Strict backups (config tree d2r8, S1): every error while walking a source fails the WHOLE backup, with a closed
+/// code and no snapshot committed; a genuinely empty source is a good, marked snapshot that holds no node for it; the
+/// mark is the binary's own. (The strict=false control is the SB_TEST_NONSTRICT row: the same unreadable source then
+/// commits a snapshot with it silently left out.)
+#[test]
+fn strict_backups_leave_nothing_out() {
+    let Some(bin) = weed() else { return };
+    let w = start_weed(&bin);
+    let h = host(&w, "strict");
+    assert_eq!(run(&h, json!({ "op": "init" }))["ok"], true);
+    let set = |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+    let rel = |p: &Path| p.to_str().unwrap()[1..].to_string();
+    // A config-like source with content, and another source beside it.
+    let source = |tag: &str| -> (PathBuf, PathBuf) {
+        let base = tmpdir(tag);
+        let other = base.join("home");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("notes"), b"n").unwrap();
+        let cfg = base.join("cfg");
+        fs::create_dir(&cfg).unwrap();
+        fs::create_dir(cfg.join("gen-1")).unwrap();
+        fs::write(cfg.join("gen-1/manifest.json"), b"{}").unwrap();
+        fs::write(cfg.join("current"), b"gen-1\n").unwrap();
+        (other, cfg)
+    };
+    let failed = |what: &str, r: &Value, before: &[String]| {
+        assert_eq!((r["ok"].clone(), code(r)), (json!(false), "backup_failed"), "{what}: {r}");
+        assert_eq!(snapshot_ids(&h), before, "{what}: no snapshot committed");
+    };
+    // SAFETY: getuid has no preconditions.
+    let root = unsafe { libc::getuid() } == 0; // (root reads a 0000 file: those rows need an ordinary user, as CI is)
+
+    // The good case first: a marked snapshot.
+    let (home, cfg) = source("strict-good");
+    let ok = run(&h, json!({ "op": "backup", "sources": [home, cfg], "host": "h1", "tags": ["sb-state=good"] }));
+    assert_eq!(ok["ok"], true, "{ok}");
+    let mut t: Vec<String> = ok["snapshot"]["tags"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    t.sort();
+    assert_eq!(t, ["sagebrush.walk=strict", "sb-state=good"], "the caller's tags and the binary's mark (stored sorted)");
+    // The mark is never a caller's.
+    for tag in ["sagebrush.walk=strict", "sagebrush.walk=lax"] {
+        let r = run(&h, json!({ "op": "backup", "sources": [home], "host": "h1", "tags": [tag] }));
+        assert_eq!(code(&r), "request_invalid", "{tag}: {r}");
+    }
+    // T4: 63 caller tags, and the mark makes 64; 64 caller tags leave no room for it.
+    let tags: Vec<String> = (0..64).map(|i| format!("t{i}=x")).collect();
+    assert_eq!(code(&run(&h, json!({ "op": "backup", "sources": [home], "host": "h1", "tags": tags }))), "request_invalid", "64 caller tags leave no room for the mark");
+    let r = run(&h, json!({ "op": "backup", "sources": [home], "host": "h1", "tags": tags[..63] }));
+    assert_eq!(r["ok"], true, "{r}");
+    let got = r["snapshot"]["tags"].as_array().unwrap();
+    assert_eq!((got.len(), got.contains(&json!("sagebrush.walk=strict"))), (64, true), "63 tags and the mark");
+    // T5: tags are case-sensitive: another case is an ordinary caller tag, and the mark is still added.
+    let r = run(&h, json!({ "op": "backup", "sources": [home], "host": "h1", "tags": ["SAGEBRUSH.WALK=strict"] }));
+    let got = r["snapshot"]["tags"].as_array().unwrap();
+    assert!(got.len() == 2 && got.contains(&json!("SAGEBRUSH.WALK=strict")) && got.contains(&json!("sagebrush.walk=strict")), "{r}");
+
+    // (a) The source removed after canonicalization, before the walk.
+    let (home, cfg) = source("strict-vanish");
+    let before = snapshot_ids(&h);
+    let r = backup_gated(&h, &[&home, &cfg], &|| fs::remove_dir_all(&cfg).unwrap());
+    failed("a vanished source", &r, &before);
+    // (b) The source replaced by a link or by a file after canonicalization: refused, or stored as what replaced it
+    // (present, never absent: the config proof refuses a root that isn't a directory, and no empty source is read).
+    for (what, swap) in [("a link", true), ("a file", false)] {
+        let (home, cfg) = source(&format!("strict-swap-{}", if swap { "link" } else { "file" }));
+        let elsewhere = cfg.with_file_name("elsewhere");
+        let before = snapshot_ids(&h);
+        let r = backup_gated(&h, &[&home, &cfg], &|| {
+            fs::rename(&cfg, &elsewhere).unwrap();
+            if swap { std::os::unix::fs::symlink(&elsewhere, &cfg).unwrap() } else { fs::write(&cfg, b"x").unwrap() }
+        });
+        if r["ok"] == true {
+            let p = run(&h, json!({ "op": "tree", "snapshot": snapshot_id(&r), "path": rel(&cfg), "cursor": null }));
+            assert_eq!(p["ok"], true, "{what}: the swapped path is present: {p}");
+            let kind = p["entries"][0]["type"].as_str().unwrap().to_string();
+            assert_eq!(kind, if swap { "symlink" } else { "file" }, "{what}: stored as what replaced it");
+            println!("swap {what}: stored as a {kind} node");
+        } else {
+            failed(what, &r, &before);
+            println!("swap {what}: refused");
+        }
+    }
+    if !root {
+        // (c) A 0000 `current` file beneath the source; a 0000 directory beneath it.
+        let (home, cfg) = source("strict-current");
+        set(&cfg.join("current"), 0o000);
+        let before = snapshot_ids(&h);
+        failed("a 0000 current", &run(&h, json!({ "op": "backup", "sources": [home, cfg], "host": "h1" })), &before);
+        let (home, cfg) = source("strict-dir");
+        set(&cfg.join("gen-1"), 0o000);
+        failed("a 0000 directory", &run(&h, json!({ "op": "backup", "sources": [home, cfg.clone()], "host": "h1" })), &before);
+        // The control (strict off, through the test-only hook): the same source commits a snapshot with the
+        // directory silently left out, and unmarked.
+        let r = run_env(&h, json!({ "op": "backup", "sources": [home, cfg.clone()], "host": "h1" }), &[("SB_TEST_NONSTRICT", "1")]);
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["snapshot"]["tags"], json!([]), "a non-strict snapshot carries no mark");
+        let p = run(&h, json!({ "op": "tree", "snapshot": snapshot_id(&r), "path": rel(&cfg), "cursor": null }));
+        let paths: Vec<&str> = p["entries"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
+        assert!(!paths.contains(&"gen-1/manifest.json"), "left out without strict: {paths:?}");
+        set(&cfg.join("gen-1"), 0o755);
+    }
+    // A genuinely empty source: a good, marked snapshot that names it and holds no node for it (tree_absent).
+    let (home, cfg) = source("strict-empty");
+    fs::remove_dir_all(&cfg).unwrap();
+    fs::create_dir(&cfg).unwrap();
+    let r = run(&h, json!({ "op": "backup", "sources": [home, cfg], "host": "h1" }));
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(r["snapshot"]["tags"].as_array().unwrap().contains(&json!("sagebrush.walk=strict")));
+    assert!(r["snapshot"]["paths"].as_array().unwrap().contains(&json!(cfg)), "{r}");
+    let p = run(&h, json!({ "op": "tree", "snapshot": snapshot_id(&r), "path": rel(&cfg), "cursor": null }));
+    assert_eq!(code(&p), "tree_absent", "{p}");
+}
+
+/// T6 (config tree d2r10): strict and the mark for every class's shape of sources: an agent's three, an archive's two,
+/// a tag folder, the host store's copy. Each with a 0000 descendant fails with no snapshot committed; each good run's
+/// snapshot carries the mark. (The binary has one backup path; this pins that no class's shape escapes it.)
+#[test]
+fn strict_for_every_class() {
+    let Some(bin) = weed() else { return };
+    // SAFETY: getuid has no preconditions.
+    if unsafe { libc::getuid() } == 0 {
+        return; // (root reads a 0000 file; CI runs as an ordinary user)
+    }
+    let w = start_weed(&bin);
+    let h = host(&w, "classes");
+    assert_eq!(run(&h, json!({ "op": "init" }))["ok"], true);
+    let set = |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+    for (class, n) in [("agent", 3), ("archive", 2), ("tag", 1), ("hoststore", 1)] {
+        let base = tmpdir(&format!("class-{class}"));
+        let sources: Vec<PathBuf> = (0..n).map(|i| {
+            let d = base.join(format!("s{i}"));
+            fs::create_dir_all(d.join("sub")).unwrap();
+            fs::write(d.join("sub/f"), b"x").unwrap();
+            d
+        }).collect();
+        let tags = json!([format!("sb-kind={class}")]);
+        let ok = run(&h, json!({ "op": "backup", "sources": sources, "host": "h1", "tags": tags }));
+        assert_eq!(ok["ok"], true, "{class}: {ok}");
+        assert!(ok["snapshot"]["tags"].as_array().unwrap().contains(&json!("sagebrush.walk=strict")), "{class}: marked: {ok}");
+        let before = snapshot_ids(&h);
+        let last = sources.last().unwrap();
+        set(&last.join("sub"), 0o000);
+        let r = run(&h, json!({ "op": "backup", "sources": sources, "host": "h1", "tags": tags }));
+        set(&last.join("sub"), 0o755);
+        assert_eq!((r["ok"].clone(), code(&r)), (json!(false), "backup_failed"), "{class}: {r}");
+        assert_eq!(snapshot_ids(&h), before, "{class}: no snapshot committed");
+    }
+}
+
+/// P2 (config tree d2r10): a parent never hides a rewrite. A file rewritten after a good snapshot A with its size and
+/// mtime put back (`touch -d`) is re-read by a backup B whose parent is A (ctime and inode are always compared), and
+/// restoring B gives the new content.
+#[test]
+fn a_parent_never_hides_a_rewrite() {
+    let Some(bin) = weed() else { return };
+    let w = start_weed(&bin);
+    let h = host(&w, "parent");
+    assert_eq!(run(&h, json!({ "op": "init" }))["ok"], true);
+    let src = tmpdir("parent-src");
+    let f = src.join("f");
+    fs::write(&f, b"old content\n").unwrap();
+    let a = run(&h, json!({ "op": "backup", "sources": [src], "host": "h1" }));
+    assert_eq!(a["ok"], true, "{a}");
+    let mtime = fs::metadata(&f).unwrap().modified().unwrap();
+    thread::sleep(Duration::from_millis(1100));
+    fs::write(&f, b"new content\n").unwrap(); // (the same size)
+    fs::File::options().write(true).open(&f).unwrap().set_modified(mtime).unwrap(); // (touch -d: the old mtime)
+    assert_eq!(fs::metadata(&f).unwrap().modified().unwrap(), mtime);
+    let b = run(&h, json!({ "op": "backup", "sources": [src], "host": "h1", "parent": snapshot_id(&a) }));
+    assert_eq!(b["ok"], true, "{b}");
+    assert_eq!(b["snapshot"]["summary"]["files_changed"], 1, "re-read, not reused from the parent: {b}");
+    let rel = src.to_str().unwrap()[1..].to_string();
+    let (data, _) = staged("parent-restore");
+    let dest = data.join("d");
+    fs::create_dir(&dest).unwrap();
+    let r = run(&h, json!({ "op": "restore", "snapshot": snapshot_id(&b), "path": rel, "dest": dest, "digests": data.join("digests.json") }));
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(fs::read(dest.join("f")).unwrap(), b"new content\n");
 }

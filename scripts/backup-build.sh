@@ -10,7 +10,8 @@
 # compiler (-ffile-prefix-map), so no build path reaches an object. The dependencies must already be in cargo's cache
 # (`cargo fetch --locked` first): the build itself never touches the network. Two builds from two directories must be
 # byte-identical (the CI job checks it, and that the result equals the pin). No feature is enabled: in particular not
-# the test-only ones (test-loopback-http, test-pause-before-start).
+# the test-only ones (test-loopback-http, test-pause-before-start, test-tree-counters,
+# test-walk-hooks).
 #
 # Unlike the launcher (pure Rust), the C parts are compiled, and the whole binary linked, by the machine's C toolchain,
 # so the toolchain is pinned too, and nothing the caller's environment or a cargo config file says can choose another:

@@ -11,6 +11,7 @@ import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { advance, newJournal, readJournal, writeJournal } from "../lib/fleet/host/backup-journal.mjs";
 import { raiseFence } from "../lib/fleet/host/fence.mjs";
 import { agentSliceCgroup } from "../lib/fleet/host/names.mjs";
+import { STRICT_MARK } from "../lib/fleet/host/backup-binary.mjs";
 import {
   ROOT_RESERVE, backupEnabled, backupUnits, buildStatus, cacheEffects, emptyState, failClosedLease, newRunId, planRun,
   readState, recoverLeftover, runOnce, setKey, trimPlan, withRunLock, writeState,
@@ -365,6 +366,51 @@ test("a live agent's config not proven (until r0.4 §1.2): the run fails config_
   assert.ok(!f.calls.includes("build") && !f.calls.includes("commit"));
 });
 
+test("N2: a config proof whose listing failed in transport keeps that code (transient, retried by the next run), never config_unbound; anything else is", async () => {
+  for (const [thrown, want] of [["tree_failed", "tree_failed"], ["timed_out", "timed_out"], ["bad_result", "bad_result"], ["outcome_unknown", "outcome_unknown"],
+    ["tree_refused", "config_unbound"], ["tree_absent", "config_unbound"], ["config_unbound", "config_unbound"], ["not_granted", "config_unbound"], [undefined, "config_unbound"]]) {
+    const f = fakes();
+    f.deps.configHash = (id) => { if (id === f.a) throw Object.assign(new Error("x"), { code: thrown }); return "5".repeat(64); };
+    const r = await runOnce(f.deps);
+    assert.deepEqual([r.status, r.failures], ["failed", [{ key: `config:${f.a}`, code: want }]], String(thrown));
+    assert.ok(!f.calls.includes("build") && !f.calls.includes("commit"));
+  }
+});
+
+test("d2r10 P1, T1: each set's parent is its recorded last good snapshot only as the store's listing proves it (a newer unmarked one, another set's newer good one, never chosen); otherwise none", async () => {
+  const base = fakes();
+  const [sa, sb] = base.deps.sources();
+  const state = { ...emptyState(), sets: { [setKey(sa)]: { fingerprint: { old: 1 }, snapshot: hex(5), tree: hex(55), since: null }, [setKey(sb)]: { fingerprint: { old: 1 }, snapshot: hex(6), tree: hex(66), since: null } } };
+  const good = (id, s, extra = []) => ({ id, tree: hex(1000), host: "h1", paths: s.sources, tags: ["sb-state=good", `sb-kind=${s.kind}`, `agent=${s.id}`, STRICT_MARK, ...extra], summary: null, time: "t" });
+  const f = fakes({ state, sets: [sa, sb] });
+  const listing = [
+    good(hex(5), sa), // a's recorded good one
+    { ...good(hex(7), sa), tags: ["sb-state=good", "sb-kind=agent", `agent=${sa.id}`] }, // a's newer, unmarked
+    good(hex(8), sb), // b's newer good one (b's recorded hex(6) is unlisted)
+  ];
+  const old = f.deps.binary;
+  f.deps.binary = async (req, o) => (req.op === "snapshots" && !f.calls.some((c) => c.startsWith("backup:")) ? (f.calls.push("binary:snapshots"), { ok: true, value: { snapshots: listing } }) : old(req, o));
+  assert.equal((await runOnce(f.deps)).status, "ok");
+  assert.ok(f.calls.includes(`backup:${setKey(sa)}:${hex(5)}`), "a: its recorded good one, not the newer unmarked one");
+  assert.ok(f.calls.includes(`backup:${setKey(sb)}:none`), "b: its recorded one unlisted, so none; never another snapshot, however good");
+  // A failed parent listing: no parents at all.
+  const g = fakes({ state, sets: [sa, sb] });
+  const old2 = g.deps.binary;
+  g.deps.binary = async (req, o) => (req.op === "snapshots" && !g.calls.some((c) => c.startsWith("backup:")) ? { ok: false, code: "destination_unavailable" } : old2(req, o));
+  await runOnce(g.deps);
+  assert.deepEqual(g.calls.filter((c) => c.startsWith("backup:agent:")).sort(), [`backup:${setKey(sa)}:none`, `backup:${setKey(sb)}:none`].sort());
+});
+
+test("d2r9 S5, T2: the debt after a churn-failed warm pass whose set is then good: none, exactly as for any good set (the good snapshot recorded, since null)", async () => {
+  const base = fakes();
+  const [sa, sb] = base.deps.sources();
+  const state = { ...emptyState(), sets: { [setKey(sa)]: { fingerprint: { old: 1 }, snapshot: hex(5), tree: hex(55), since: 1000 } } };
+  const f = fakes({ state, sets: [sa, sb], outcomes: { [setKey(sa)]: { outcome: "good", snapshot: hex(42), consistency: "turn", warm: null, code: null, recovered: null } } });
+  assert.equal((await runOnce(f.deps)).status, "ok");
+  const after = f.written().sets[setKey(sa)];
+  assert.deepEqual([after.snapshot, after.since], [hex(42), null]);
+});
+
 test("A1: every set's backupSet gets the run's guard (the live sets' and the host store's)", async () => {
   const f = fakes();
   const guards = [];
@@ -407,4 +453,17 @@ test("A1 in a left-over run's recovery: the run's lock lost right after ANY cgro
     assert.equal(atLoss.fence, true, `k=${k}: the fence still up (it only comes down after every proof)`);
   }
   assert.ok(points >= 4, `every cgroup proof lost once (${points})`);
+});
+
+test("each live agent's config is proven from ITS set's committed snapshot (a kept, unchanged set's too), with the run's guard", async () => {
+  const f0 = fakes();
+  const state = { ...emptyState(), sets: { [`agent:${f0.a}`]: { fingerprint: { e: 1 }, snapshot: hex(5), tree: hex(55), since: null } } };
+  const f = fakes({ state, sets: f0.deps.sources() });
+  f.deps.snapshot = f0.deps.snapshot;
+  const seen = [];
+  f.deps.configHash = (id, snapshot, guard, record) => { seen.push([id, snapshot, typeof guard, record?.id ?? null]); return "6".repeat(64); };
+  assert.equal((await runOnce(f.deps)).status, "ok");
+  const backedUp = f.deps.lastManifest.sets.find((s) => s.id === f0.b).snapshot;
+  assert.deepEqual(seen.sort(), [[f0.a, hex(5), "function", hex(5)], [f0.b, backedUp, "function", backedUp]].sort(),
+    "the kept set's snapshot for a, this run's for b, each with its own record from the store's listing (d2r8)");
 });

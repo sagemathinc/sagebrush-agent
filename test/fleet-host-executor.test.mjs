@@ -1960,6 +1960,29 @@ test("restore-import: the host's op only, with an imports seam; owned under its 
   await late.close();
 });
 
+test("restore-abandon-finish: the host's op only, with an abandons seam; owned under its deadline; a set abandoned or refused audited, one that waits not", async () => {
+  const none = await setup({ restoreWorker: { hold: async () => ({ release: async () => {}, invalidate: () => {} }), dispatch: async () => ({ dispatched: null }) } });
+  await rejects(none.sup.submit({ kind: "restore-abandon-finish", authority: "host" }), "bad_form");
+  await none.close();
+  const B = `tag-${"b".repeat(25)}a`, C = `tag-${"c".repeat(25)}a`;
+  const calls = [];
+  let answer = { sets: { [`archive-${A}`]: { status: "abandoned" }, [B]: { status: "refused", reason: "bad_form" }, [C]: { status: "busy" } } };
+  const restoreWorker = { hold: async () => ({ release: async () => {}, invalidate: () => {} }), dispatch: async () => ({ dispatched: null }),
+    abandons: async (ms, signal) => { calls.push([ms, signal instanceof AbortSignal]); return answer; } };
+  const { sup, fx, close } = await setup({ restoreWorker });
+  for (const authority of ["person", "service", "local"]) await rejects(sup.submit({ kind: "restore-abandon-finish", authority }), "not_granted");
+  assert.deepEqual(await sup.submit({ kind: "restore-abandon-finish", authority: "host" }), { status: "finished", sets: answer.sets });
+  answer = { sets: {} };
+  assert.deepEqual(await sup.submit({ kind: "restore-abandon-finish", authority: "host" }), { status: "idle", sets: {} });
+  assert.deepEqual(calls, [[300000, true], [300000, true]]);
+  const want = [{ kind: "restore.abandon", set: `archive-${A}`, phase: "succeeded" }, { kind: "restore.abandon", set: B, phase: "failed", reason: "bad_form" }]
+    .sort((x, y) => (x.set < y.set ? -1 : 1));
+  assert.deepEqual(fx.audits.filter((r) => r.kind === "restore.abandon"), want);
+  restoreWorker.abandons = async () => { throw new FleetError("outcome_unknown", "x"); };
+  assert.deepEqual(await sup.submit({ kind: "restore-abandon-finish", authority: "host" }), { status: "failed", reason: "outcome_unknown", settled: true });
+  await close();
+});
+
 test("the restore tick is coalesced: a held import and ten more ticks queue no duplicate; a later normal input waits for at most one of each", async () => {
   const { restoreTicker } = await import("../lib/fleet/host/restore-wiring.mjs");
   const order = [];

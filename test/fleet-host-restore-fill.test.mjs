@@ -406,6 +406,48 @@ test("the caller's veto before an archive's or a tag folder's validated: the set
   }
 });
 
+test("T1 barrier (R5-d2 §3.3): the veto read false, then the intent accepted, then the validated save: the abandon finish takes the final validated record to abandoned, every destination emptied", async () => {
+  const { finishAbandon } = await import("../lib/fleet/host/restore-abandon.mjs");
+  const { createPlan } = await import("../lib/fleet/host/restore-plan.mjs");
+  const { lockFile } = await import("../lib/fleet/host/store.mjs");
+  const { setLockPath } = await import("../lib/fleet/host/restore-worker.mjs");
+  const { withExclusion } = await import("../lib/fleet/host/restore-begin.mjs");
+  const { withRestoreLock } = await import("../lib/fleet/host/restore-plan.mjs");
+  for (const kind of ["archive", "tag"]) {
+    const id = newId();
+    let w;
+    const plan = planOf(kind, id);
+    // The intent becomes durable while the worker is past its veto read (false): the race the finish must settle.
+    const accept = () => {
+      mkdirSync(join(w.dir, "abandon"), { recursive: true, mode: 0o700 });
+      writeFileSync(join(w.dir, "abandon", `${kind}-${id}.json`), JSON.stringify({ v: 1, kind, id, restore_run: RUN, set_run: RUN, set_snapshot: SNAP,
+        account: newId(), person: newId(), by: "device-1", at: 1, reason: "", envelope_sha256: "e".repeat(64), nonce: Buffer.alloc(16, 3).toString("base64url") }) + "\n", { mode: 0o600 });
+    };
+    w = world(kind, { hooks: { veto: async () => { const read = false; accept(); return read; } } });
+    mkdirSync(w.dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(w.dir, "begin.json"), JSON.stringify({ v: 1, snapshot: "1".repeat(64), manifest_sha256: "2".repeat(64), run: RUN, state: "done" }) + "\n", { mode: 0o600 });
+    createPlan(plan, { dir: w.dir });
+    assert.equal((await w.fill(kind, id, plan)).state, "validated", `${kind}: the save landed after the intent`);
+    assert.ok(Object.values(w.dests).some((d) => readdirSync(d).length > 0), "restored contents in place");
+    const lockDirPath = join(w.base, "lib");
+    mkdirSync(lockDirPath, { mode: 0o700 });
+    const deps = {
+      stop: async () => true,
+      lockSet: (k, i) => lockFile(setLockPath(w.dir, k, i), { waitMs: 0 }),
+      withLocks: (fn) => withExclusion(() => withRestoreLock(fn, { dir: w.dir }), { path: join(lockDirPath, "x.lock"), waitMs: 0, uid: process.getuid() }),
+      cleanDest: async () => { for (const d of Object.values(w.dests)) for (const e of readdirSync(d)) rmSync(join(d, e), { recursive: true }); },
+      isEmpty: async (r, cls) => readdirSync(w.dests[cls]).length === 0,
+      discardAll: async () => { rmSync(w.stage, { recursive: true, force: true }); },
+      stagingGone: async () => !existsSync(w.stage),
+      removeCopies: async () => {},
+      now: () => 2,
+    };
+    assert.deepEqual(await finishAbandon(kind, id, deps, { dir: w.dir, uid: process.getuid() }), { status: "abandoned" }, kind);
+    assert.equal(readRecord(kind, id, { dir: w.dir }).state, "abandoned");
+    assert.ok(Object.values(w.dests).every((d) => readdirSync(d).length === 0), `${kind}: emptied`);
+  }
+});
+
 test("an agent's files_validated is never vetoed here: its validated is its imports'", async () => {
   const id = newId();
   let asked = 0;

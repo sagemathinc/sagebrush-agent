@@ -117,6 +117,7 @@
   "schema/fleet/fleet.schema.json",
   "schema/fleet/host-config.schema.json",
   "schema/fleet/reasons.json",
+  "scripts/backup-static-check.sh",
   "scripts/launcher-build.sh",
   "scripts/release-install.sh",
   "scripts/release-trust.sh"

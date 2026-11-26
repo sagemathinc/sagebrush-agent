@@ -3,7 +3,7 @@
 // never `aborted`). Each binary call of each command, in a first run and in the recoveries after it, answers every
 // code the binary can give (and a raw throw), over real temporary directories and the real exclusion.
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -97,4 +97,29 @@ test("the console set: exactly the binary's codes and its local failures, withou
   assert.deepEqual([...CONSOLE_CODES].sort(), [...CODES, ...LOCAL_CODES].filter((c) => c !== "aborted").sort());
   assert.equal(new Set(CONSOLE_CODES).size, CONSOLE_CODES.length);
   for (const c of CONSOLE_CODES) assert.equal(REASONS.has(c), false, `${c} would be ambiguous with a registered reason`);
+});
+
+test("restore's lines: list answering every binary code, and a raw throw from list, begin or close, each refuse with a registered reason or a console code", async () => {
+  const { restoreCommand } = await import("../lib/fleet/host/restore-cli.mjs");
+  const base = mkdtempSync(join(tmpdir(), "sb-codes-restore-"));
+  const deps = { uid: () => UID, rootUid: UID, dir: join(base, "restore"), fenceDir: join(base, "fence"), exclusion: { path: join(base, "x.lock"), uid: UID, waitMs: 0 } };
+  const check = (out, what) => {
+    assert.equal(out.code, 1, what);
+    const c = out.line.refused;
+    assert.ok(REASONS.has(c) || CONSOLE_CODES.includes(c), `${what}: ${c} is neither registered nor a console code`);
+    assert.notEqual(c, "aborted");
+    assert.notEqual(c, "error");
+    return c;
+  };
+  for (const answer of [...CODES, ...LOCAL_CODES]) {
+    const c = check(await restoreCommand(["list"], { ...deps, ops: { list: async () => ({ error: answer }) } }), `list: ${answer}`);
+    if (answer !== "aborted") assert.equal(c, answer, "a binary code is kept as the diagnostic it is");
+  }
+  const raw = async () => { throw Object.assign(new Error("EIO"), { code: "EIO" }); };
+  assert.equal(check(await restoreCommand(["list"], { ...deps, ops: { list: raw } }), "list throws"), "outcome_unknown");
+  assert.equal(check(await restoreCommand(["begin", "a".repeat(64)], { ...deps, ops: { begin: raw } }), "begin throws"), "outcome_unknown");
+  mkdirSync(deps.dir, { mode: 0o700 });
+  chmodSync(deps.dir, 0o700);
+  writeFileSync(join(deps.dir, "begin.json"), "{", { mode: 0o600 });
+  check(await restoreCommand(["close"], { ...deps, removeHostStage: raw }), "close over a malformed begin");
 });

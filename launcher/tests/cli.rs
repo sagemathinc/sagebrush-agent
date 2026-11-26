@@ -268,7 +268,8 @@ fn a1_subcommands_refuse_bad_arguments_and_a_missing_anchor() {
         // reads a tag folder by id only.
         vec!["remove-tree", "--contents", "--contents", "--anchor", "/srv/sagebrush/tags", "--name", A, "--expect", "/x"],
         vec!["remove-tree", "--contents", "--anchor", "/srv/sagebrush/agents", "--name", A, "--expect", "/x"],
-        vec!["remove-tree", "--contents", "--anchor", "/srv/sagebrush/archive-config", "--name", A, "--expect", "/x"],
+        vec!["remove-tree", "--contents", "--anchor", "/srv/sagebrush/archive-config", "--name", &home, "--expect", "/x"],
+        vec!["remove-tree", "--contents", "--anchor", "/srv/sagebrush/agent-config", "--name", A, "--expect", "/x"],
         vec!["remove-tree", "--anchor", "/srv/sagebrush/tags", "--name", A, "--expect", "/x"],
         vec!["remove-tree", "--anchor", "/srv/sagebrush/agents", "--name", &home, "--expect", "/x"],
         vec!["identify", "--anchor", "/srv/sagebrush/tags", "--name", "x"],
@@ -282,6 +283,8 @@ fn a1_subcommands_refuse_bad_arguments_and_a_missing_anchor() {
     for ok in [
         vec!["remove-tree", "--contents", "--anchor", "/srv/sagebrush/agents", "--name", &home, "--expect", "/x"],
         vec!["remove-tree", "--contents", "--anchor", "/srv/sagebrush/tags", "--name", A, "--expect", "/x"],
+        // A2 r3.13: a deleted agent's config archive, emptied and kept by the restore's cleanup
+        vec!["remove-tree", "--contents", "--anchor", "/srv/sagebrush/archive-config", "--name", A, "--expect", "/x"],
         vec!["remove-tree", "--anchor", "/srv/sagebrush/archive", "--name", A, "--expect", "/x", "--contents"],
         vec!["identify", "--anchor", "/srv/sagebrush/tags", "--name", A],
     ] {
@@ -327,7 +330,21 @@ fn a2_subcommands_refuse_bad_arguments_then_the_root_guard() {
         assert_eq!(code(&o), 64, "{over:?}: {}", stderr(&o));
         assert!(o.stdout.is_empty());
     }
+    // A2 r3.13: the two new classes stage for an agent's owner only; `config` is never filled or listed.
+    for over in [vec![("class", "config")], vec![("class", "archive-config")]] {
+        let a = stage(&over);
+        let o = run(&a.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(code(&o), 66, "{over:?}: well formed, the root guard: {}", stderr(&o));
+    }
+    let tag_owner = format!("t-{A}");
+    for over in [vec![("class", "config"), ("owner", tag_owner.as_str())], vec![("class", "archive-config"), ("owner", tag_owner.as_str())], vec![("class", "configs")]] {
+        let a = stage(&over);
+        let o = run(&a.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(code(&o), 64, "{over:?}: {}", stderr(&o));
+    }
     for bad in [
+        vec!["fill-home", "--mount", "/srv/sagebrush", "--owner", &owner, "--class", "config", "--run", "abcdefghijklmnop", "--attempt", "1", "--source", "data/x", "--expect", "/x"],
+        vec!["tree-digest", "--mount", "/srv/sagebrush", "--owner", &owner, "--class", "config", "--expect", "/x"],
         vec!["fill-home", "--mount", "/srv/sagebrush", "--owner", &owner, "--class", "home", "--run", "abcdefghijklmnop", "--attempt", "1", "--source", "srv/x", "--expect", "/x"],
         vec!["fill-home", "--mount", "/srv/sagebrush", "--owner", &owner, "--class", "home", "--run", "abcdefghijklmnop", "--attempt", "1", "--source", "data/x", "--expect", "x"],
         vec!["fill-home", "--mount", "/srv/sagebrush", "--owner", &owner, "--class", "home", "--run", "abcdefghijklmnop", "--attempt", "1", "--source", "data/x"],

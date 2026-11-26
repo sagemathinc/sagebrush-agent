@@ -15,7 +15,7 @@ import { STATES } from "../lib/fleet/host/registry.mjs";
 import { STEPS } from "../lib/fleet/host/deprovision-record.mjs";
 import { lockFile } from "../lib/fleet/host/store.mjs";
 import { createPlan } from "../lib/fleet/host/restore-plan.mjs";
-import { newRestoreRun, readRecord } from "../lib/fleet/host/restore-record.mjs";
+import { CLASSES, newRestoreRun, readRecord } from "../lib/fleet/host/restore-record.mjs";
 import { BEGIN, writeRequest } from "../lib/fleet/host/restore-begin.mjs";
 import { holdSets, runWorker, setLockPath } from "../lib/fleet/host/restore-worker.mjs";
 import { INPUTS, buildInput, readInput, writeInput } from "../lib/fleet/host/restore-inputs.mjs";
@@ -107,6 +107,8 @@ const A = newId(), B = newId(), C = newId(), T = newId();
 const kinds = (log) => log.map((l) => l[0]);
 
 // ---- the planner
+/** A plan's config hashes for its agent sets (the manifest's, R4-d2b). */
+const withConfig = (p) => ({ ...p, config: Object.fromEntries(Object.keys(p.sets).filter((k) => k.startsWith("agent-")).map((k) => [k.slice(6), "5".repeat(64)])) });
 
 test("plan: first grant; then only what changed is stopped, masked, regenerated and restarted (any change narrows)", () => {
   const reg = { agent: () => null };
@@ -1929,6 +1931,63 @@ test("restore-dispatch: the host's op only, with a restore seam; owned under its
   await late.close();
 });
 
+test("restore-import: the host's op only, with an imports seam; owned under its deadline; each set it changed audited", async () => {
+  const none = await setup({ restoreWorker: { hold: async () => ({ release: async () => {}, invalidate: () => {} }), dispatch: async () => ({ dispatched: null }) } });
+  await rejects(none.sup.submit({ kind: "restore-import", authority: "host" }), "bad_form"); // (a seam without imports)
+  await none.close();
+  const calls = [];
+  const B = `agent-${"b".repeat(25)}a`, C = `agent-${"c".repeat(25)}a`;
+  let answer = { sets: { [`agent-${A}`]: { status: "validated" }, [B]: { status: "failed", reason: "bad_form" }, [C]: { status: "files_validated", reason: "importer_missing: context" } } };
+  const restoreWorker = { hold: async () => ({ release: async () => {}, invalidate: () => {} }), dispatch: async () => ({ dispatched: null }),
+    imports: async (ms, signal) => { calls.push([ms, signal instanceof AbortSignal]); return answer; } };
+  const { sup, fx, close } = await setup({ restoreWorker });
+  for (const authority of ["person", "service", "local"]) await rejects(sup.submit({ kind: "restore-import", authority }), "not_granted");
+  assert.deepEqual(await sup.submit({ kind: "restore-import", authority: "host" }), { status: "imported", sets: answer.sets });
+  answer = { sets: {} };
+  assert.deepEqual(await sup.submit({ kind: "restore-import", authority: "host" }), { status: "idle", sets: {} });
+  assert.deepEqual(calls, [[300000, true], [300000, true]]);
+  // (in key order; a set waiting for its importer changed nothing: not audited)
+  const want = [{ kind: "restore.import", set: `agent-${A}`, phase: "succeeded" }, { kind: "restore.import", set: B, phase: "failed", reason: "bad_form" }]
+    .sort((x, y) => (x.set < y.set ? -1 : 1));
+  assert.deepEqual(fx.audits.filter((r) => r.kind === "restore.import"), want);
+  restoreWorker.imports = async () => { throw new FleetError("outcome_unknown", "x"); };
+  assert.deepEqual(await sup.submit({ kind: "restore-import", authority: "host" }), { status: "failed", reason: "outcome_unknown", settled: true });
+  await close();
+  const slow = { hold: async () => ({ release: async () => {}, invalidate: () => {} }), dispatch: async () => ({ dispatched: null }),
+    imports: (ms, signal) => new Promise((r, j) => signal.addEventListener("abort", () => j(new Error("aborted")))) };
+  const late = await setup({ restoreWorker: slow, deadlines: { "restore-import": 20 } });
+  assert.deepEqual(await late.sup.submit({ kind: "restore-import", authority: "host" }), { status: "failed", reason: "step_deadline", settled: true });
+  await late.close();
+});
+
+test("the restore tick is coalesced: a held import and ten more ticks queue no duplicate; a later normal input waits for at most one of each", async () => {
+  const { restoreTicker } = await import("../lib/fleet/host/restore-wiring.mjs");
+  const order = [];
+  let release, imports = 0, dispatches = 0;
+  const restoreWorker = { hold: async () => ({ release: async () => {}, invalidate: () => {} }),
+    dispatch: async () => { dispatches++; order.push("dispatch"); return { dispatched: null, why: "idle" }; },
+    imports: async () => { imports++; order.push("import"); if (imports === 1) await new Promise((r) => { release = r; }); return { sets: {} }; } };
+  const { sup, close } = await setup({ restoreWorker });
+  const tick = restoreTicker((x) => sup.submit(x));
+  tick();
+  for (let i = 0; i < 50 && release === undefined; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.ok(release, "the first import is running, held");
+  for (let i = 0; i < 10; i++) { tick(); await new Promise((r) => setImmediate(r)); }
+  const later = sup.submit({ kind: "resume-all", authority: "person" }).then((x) => { order.push("later"); return x; });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual([dispatches, imports], [1, 1], "ten ticks during the held import ran nothing more");
+  release();
+  await later;
+  // (the first dispatch settled at once, so ONE more was queued behind the held import; no second import was)
+  assert.deepEqual(order, ["dispatch", "import", "dispatch", "later"], "the later input waited for at most one of each");
+  // Once both settled, the next tick submits each again, once.
+  tick();
+  for (let i = 0; i < 50 && imports < 2; i++) await new Promise((r) => setTimeout(r, 5));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual([dispatches, imports], [3, 2]);
+  await close();
+});
+
 /**
  * An open restore on a real temporary directory whose plan has `keys` (each with its request), and the executor's
  * restore seam over it with REAL set locks (holdSets). `probe(kind, id)` asks whether a worker could take a set now:
@@ -1939,15 +1998,15 @@ function openRestore(keys) {
   mkdirSync(dir, { mode: 0o700 });
   const run = newRestoreRun(1795500000000, () => Buffer.alloc(6));
   writeFileSync(join(dir, BEGIN), JSON.stringify({ v: 1, snapshot: "1".repeat(64), manifest_sha256: "2".repeat(64), run, state: "done" }) + "\n", { mode: 0o600 });
-  createPlan({ v: 1, host: "old", manifest: "1".repeat(64), sha256: "2".repeat(64), hoststore: "3".repeat(64),
-    sets: Object.fromEntries(keys.map((k) => [k, { run, snapshot: "1".repeat(64), tree: "4".repeat(64) }])) }, { dir });
+  createPlan(withConfig({ v: 1, host: "old", manifest: "1".repeat(64), sha256: "2".repeat(64), hoststore: "3".repeat(64),
+    sets: Object.fromEntries(keys.map((k) => [k, { run, snapshot: "1".repeat(64), tree: "4".repeat(64) }])) }), { dir });
   for (const k of keys) writeRequest(k, run, { dir, uid: process.getuid() });
   // Each set's input, as its dispatch writes it (the late workers below are that dispatch's).
   const ID = { epoch: { boot_id: "00000000-0000-4000-8000-000000000000", mnt_id: 7 }, fsid: "0123456789abcdef",
     object: { type: "dir", mode: 0o700, uid: 70000, gid: 70000, dev: [8, 1], ino: 4242, gen: 1, mnt_id: 7, projid: 70000, inherit: true } };
   const writeInputs = (nonce) => { for (const k of keys) {
     const [kind, id] = k.split("-");
-    const classes = Object.fromEntries({ agent: ["home", "sessions"], archive: ["archive"], tag: ["tag"] }[kind]
+    const classes = Object.fromEntries(CLASSES[kind]
       .map((c) => [c, { dest: ID, owners: { uids: [70000], gid: 70000, projid: 70000 }, unrestorable: [] }]));
     const members = kind === "agent" ? [{ agent: id, uid: 70000 }] : kind === "tag" ? [{ agent: newId(), uid: 70000 }] : [];
     writeInput({ v: 1, kind, id, run, nonce, classes, members }, { dir, uid: process.getuid() });

@@ -204,7 +204,8 @@ pub fn tree_digest<O: DigestOps>(o: &mut O, a: &DigestArgs) -> Result<String> {
 pub fn tree_digest_limited<O: DigestOps>(o: &mut O, a: &DigestArgs, lim: Limits) -> Result<String> {
     // Arguments (64): the owner and class as restore names them; --copy-sqlite only for sessions.
     let n = crate::restore::Name::parse(a.copy_run.unwrap_or("aaaaaaaaaaaaaaaa"), a.owner, a.class, "1").ok_or(err(Fail::Usage, "bad arguments"))?;
-    if a.copy_run.is_some() && n.class != Class::Sessions {
+    // (`config` is staged only, never filled: nothing to list, A2 r3.13 §5)
+    if (a.copy_run.is_some() && n.class != Class::Sessions) || n.class == Class::Config {
         return Err(err(Fail::Usage, "bad arguments"));
     }
     let root = o.root().map_err(|_| tree::pre("the root can't be opened"))?;
@@ -213,8 +214,8 @@ pub fn tree_digest_limited<O: DigestOps>(o: &mut O, a: &DigestArgs, lim: Limits)
     let f = v.exact(&["epoch", "fsid", "dest", "uids", "gid", "projid"]).ok_or(tree::bad_expect())?;
     let (e_epoch, e_fsid, e_dest) = (tree::epoch_of(f[0])?, tree::fsid_of(f[1])?, obj_of(f[2])?);
     let uids = f[3].arr().filter(|u| !u.is_empty() && u.len() <= 64).ok_or(tree::bad_expect())?.iter().map(tree::u32_of).collect::<Result<Vec<u32>>>()?;
-    let (_gid, projid) = (tree::u32_of(f[4])?, tree::u32_of(f[5])?);
-    if (n.class != Class::Tag && uids.len() != 1) || !n.projid_ok(projid) {
+    let (gid, projid) = (tree::u32_of(f[4])?, tree::u32_of(f[5])?);
+    if (n.class != Class::Tag && uids.len() != 1) || !n.projid_ok(projid) || !crate::restore::owners_ok(n.class, &uids, gid) {
         return Err(tree::bad_expect());
     }
     let _ = tree::parse_mount(a.mount)?;
@@ -230,11 +231,11 @@ pub fn tree_digest_limited<O: DigestOps>(o: &mut O, a: &DigestArgs, lim: Limits)
     let leaf: &str = match n.class {
         Class::Home => "home",
         Class::Sessions => "sessions",
-        Class::Archive | Class::Tag => &n.id,
+        Class::Archive | Class::Tag | Class::ArchiveConfig | Class::Config => &n.id,
     };
     let dest_parent = match n.class {
         Class::Home | Class::Sessions => tchild(o, &da, &n.id, mnt)?.and_then(|(_, h)| h).ok_or(identity("no agent directory"))?,
-        Class::Archive | Class::Tag => da,
+        Class::Archive | Class::Tag | Class::ArchiveConfig | Class::Config => da,
     };
     let (dx, _) = tchild(o, &dest_parent, leaf, mnt)?.ok_or(identity("no destination"))?;
     if dx != e_dest {
@@ -935,6 +936,25 @@ mod tests {
         build(&mut f, MAX_PATH + 1);
         let x = expect(&mut f);
         assert_eq!(code(tree_digest(&mut f, &args(&x, false))), 64, "4097");
+    }
+
+    #[test]
+    fn r313_config_is_never_listed_and_root_owners_only_for_archive_config() {
+        // `config` is staged only: tree-digest of it is usage, before the expect is read.
+        let mut f = host();
+        let x = expect(&mut f);
+        let mut a = args(&x, false);
+        a.class = "config";
+        let before = f.log.len();
+        assert_eq!(code(tree_digest(&mut f, &a)), 64);
+        assert_eq!(f.log.len(), before, "nothing read");
+        // A sessions listing whose expect names root as an owner: the closed shape refuses (no other class lists root).
+        let mut f = host();
+        let root = f.root().unwrap();
+        let ag = f.dir_from_root(&root, &format!("srv/sagebrush/agents/{A}")).unwrap();
+        let (sx, _) = crate::tree::child(&mut f, &ag, "sessions", MNT).unwrap().unwrap();
+        let x = expect_file(&mut f, "root-owners.json", format!("{{\"epoch\":{{\"boot_id\":\"{BOOT}\",\"mnt_id\":{MNT}}},\"fsid\":\"0000abcd00001234\",\"dest\":{},\"uids\":[0],\"gid\":0,\"projid\":{UID}}}", obj_json(&sx)));
+        assert_eq!(code(tree_digest(&mut f, &args(&x, false))), crate::tree::bad_expect().fail.code(), "the expect's closed shape");
     }
 
     #[test]

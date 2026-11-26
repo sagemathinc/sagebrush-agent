@@ -38,6 +38,8 @@ const workerArgvFor = (unit) => ["systemd-run", "--scope", "--quiet", "--collect
 
 /** A clock that only moves when the start sleeps, so its deadlines are exact and fast. */
 function clock() { let t = 0; return { now: () => t, sleep: async (ms) => { t += ms; await new Promise((r) => setImmediate(r)); } }; }
+/** A plan's config hashes for its agent sets (the manifest's, R4-d2b). */
+const withConfig = (p) => ({ ...p, config: Object.fromEntries(Object.keys(p.sets).filter((k) => k.startsWith("agent-")).map((k) => [k.slice(6), "5".repeat(64)])) });
 
 test("startDetached: spawned detached and unreferenced; resolves once the scope is active, never waiting for the worker", async () => {
   const unit = workerScope("agent", newId());
@@ -206,7 +208,7 @@ function world({ sets }) {
   mkdirSync(dir, { mode: 0o700 });
   mkdirSync(fenceDir, { mode: 0o700 });
   writeFileSync(join(dir, BEGIN), JSON.stringify({ v: 1, snapshot: hex("1"), manifest_sha256: hex("2"), run: RUN, state: "done" }) + "\n", { mode: 0o600 });
-  createPlan({ v: 1, host: "old", manifest: hex("1"), sha256: hex("2"), hoststore: hex("3"), sets: Object.fromEntries(sets.map((k) => [k, { run: RUN, snapshot: hex("1"), tree: hex("4") }])) }, { dir });
+  createPlan(withConfig({ v: 1, host: "old", manifest: hex("1"), sha256: hex("2"), hoststore: hex("3"), sets: Object.fromEntries(sets.map((k) => [k, { run: RUN, snapshot: hex("1"), tree: hex("4") }])) }), { dir });
   for (const k of sets) writeRequest(k, RUN, { dir, uid: UID });
   return { base, dir, fenceDir };
 }
@@ -322,14 +324,15 @@ test("composed for real: runWorker -> workerDeps -> the fill driver -> the adapt
   for (const empty of [false, true]) {
     const a = newId(), key = `archive-${a}`;
     const w = world({ sets: [key] });
-    const dest = obj({ uid: 0, gid: 0, projid: 70000 });
+    const dest = obj({ uid: 0, gid: 0, projid: 70000 }), cdest = obj({ uid: 0, gid: 0, projid: 70000, ino: 4243 });
     const nonce = newId();
     writeInput({ v: 1, kind: "archive", id: a, run: RUN, nonce, members: [],
-      classes: { archive: { dest: { epoch: EPOCH, fsid: FSID, object: dest }, owners: { uids: [70000], gid: 70000, projid: 70000 }, unrestorable: [] } } }, { dir: w.dir, uid: UID });
+      classes: { archive: { dest: { epoch: EPOCH, fsid: FSID, object: dest }, owners: { uids: [70000], gid: 70000, projid: 70000 }, unrestorable: [] },
+        "archive-config": { dest: { epoch: EPOCH, fsid: FSID, object: cdest }, owners: { uids: [0], gid: 0, projid: 70000 }, unrestorable: [] } } }, { dir: w.dir, uid: UID });
     const calls = [];
     const launch = async (args) => {
       calls.push(args[0]);
-      if (args[0] === "identify") return { code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, object: args.includes("/srv/sagebrush/archive") ? dest : null }) };
+      if (args[0] === "identify") return { code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, object: args.includes("/srv/sagebrush/archive") ? dest : args.includes("/srv/sagebrush/archive-config") ? cdest : null }) };
       if (args[0] === "tree-digest") return { code: 0, stdout: empty ? EMPTY_LISTING : '{"v":1}\n{"path":"x","type":"file","size":1,"mode":420,"sha256":"' + "0".repeat(64) + '"}\n{"count":1,"total_bytes":1}\n' };
       if (args[0] === "restore-stage") return { code: 73, stdout: "" }; // stop at the first stage: a permanent failure
       return { code: 0, stdout: "" };
@@ -347,6 +350,62 @@ test("composed for real: runWorker -> workerDeps -> the fill driver -> the adapt
       assert.deepEqual([out.status, out.record.reason], ["failed", "outcome_unknown"]);
       assert.deepEqual(out.record.dest.archive, { dev: String(8 * 2 ** 20 + 1), ino: "4242", uid: 0, gid: 0, mode: 0o700, projid: 70000 }, "bound to the input's recorded object");
       assert.ok(calls.indexOf("tree-digest") < calls.indexOf("restore-stage"), "admitted empty before the first stage");
+    }
+  }
+});
+
+test("the seam's imports, composed: an agent set at files_validated, its live tree from the provisioning's recorded identity, then validated and its staging discarded by the launcher", async () => {
+  const { newRecord, step, writeRecord, readRecord, stagingDir, stagingName } = await import("../lib/fleet/host/restore-record.mjs");
+  const { EMPTY_CONFIG_HASH } = await import("../lib/fleet/host/agent-config.mjs");
+  const { chmodSync, statSync } = await import("node:fs");
+  for (const [recorded, mode] of [[true, "ok"], [false, "ok"], [true, "held"], [true, "substitute"]]) {
+    const a = newId(), key = `agent-${a}`;
+    const base = mkdtempSync(join(tmpdir(), "sb-wiring-imp-"));
+    const dir = join(base, "restore"), staging = join(base, "staging"), expectDir = join(base, "expect");
+    for (const d of [dir, staging, expectDir]) mkdirSync(d, { mode: 0o700 });
+    writeFileSync(join(dir, BEGIN), JSON.stringify({ v: 1, snapshot: hex("1"), manifest_sha256: hex("2"), run: RUN, state: "done" }) + "\n", { mode: 0o600 });
+    // The manifest says the agent was never configured.
+    createPlan({ v: 1, host: "old", manifest: hex("1"), sha256: hex("2"), hoststore: hex("3"), sets: { [key]: { run: RUN, snapshot: hex("1"), tree: hex("4") } }, config: { [a]: EMPTY_CONFIG_HASH } }, { dir });
+    mkdirSync(join(dir, "hoststore-copy", RUN), { recursive: true, mode: 0o700 });
+    const D = { dev: "2049", ino: "131", uid: 70000, gid: 70000, mode: 0o700, projid: 70000 };
+    const dest = { home: D, sessions: { ...D, ino: "132" } };
+    let r = step(newRecord({ kind: "agent", id: a, run: RUN, snapshot: hex("1") }), "bind", { dest });
+    for (const cls of ["home", "sessions"]) r = step(r, "digest", { cls, sha256: hex("5") });
+    r = step(step(step(step(r, "staged"), "filling", { dest }), "published"), "files_validated");
+    writeRecord(r, { dir });
+    // The staged config attempt (an empty tree) and its marker; the live tree, empty, provisioned.
+    const att = stagingDir(r, "config", staging);
+    mkdirSync(join(att, "data", a), { recursive: true, mode: 0o700 });
+    for (let p = staging, parts = [...stagingName(r, "config").split("/"), "data", a], i = 0; i < parts.length; i++) chmodSync(p = join(p, parts[i]), 0o700);
+    writeFileSync(join(att, ".complete"), stagingName(r, "config"));
+    const live = join(base, "agent-config", a);
+    mkdirSync(live, { recursive: true, mode: 0o700 });
+    const st = statSync(live);
+    const major = Number((BigInt(st.dev) >> 8n) & 0xfffn) | Number((BigInt(st.dev) >> 32n) & ~0xfffn);
+    const minor = Number(BigInt(st.dev) & 0xffn) | Number((BigInt(st.dev) >> 12n) & ~0xffn);
+    const store = storeOf(a);
+    const prov = store.provisioned.record;
+    store.provisioned = { record: (x) => { const p = prov(x); return p && recorded ? { ...p, config: { epoch: EPOCH, fsid: FSID, dir: obj({ uid: 0, gid: 0, dev: [major, minor], ino: mode === "substitute" ? st.ino + 1 : st.ino }) } } : p && { ...p, config: undefined }; } };
+    const calls = [];
+    const launch = async (args) => { calls.push(args.slice(0, 5)); return args[0] === "identify" ? { code: 0, stdout: line({ epoch: EPOCH, fsid: FSID, object: obj({ uid: 0, gid: 0 }) }) } : { code: 0, stdout: "" }; };
+    const seam = restoreWorkerSeam({ store, launch, mount: "/srv/quota", main: "/opt/r/restore-worker-main.mjs", isActive: async () => true, isGone: async () => true, anyWorker: async () => false,
+      dir, uid: UID, gid: process.getgid(), staging, expectDir, configRoot: () => live });
+    const { lockFile } = await import("../lib/fleet/host/store.mjs");
+    const held = mode === "held" ? await lockFile(join(dir, `${key}.lock`), { waitMs: 0 }) : null;
+    const out = await seam.imports(1000, new AbortController().signal);
+    await held?.release();
+    if (mode === "held") {
+      assert.deepEqual([out, readRecord("agent", a, { dir }).state, calls], [{ sets: { [key]: { status: "busy" } } }, "files_validated", []], "a worker holds the set: busy");
+    } else if (mode === "substitute") {
+      assert.deepEqual(out, { sets: { [key]: { status: "failed", reason: "outcome_unknown" } } }, "another tree than the recorded one");
+    } else if (recorded) {
+      assert.deepEqual(out, { sets: { [key]: { status: "validated" } } });
+      assert.equal(readRecord("agent", a, { dir }).state, "validated");
+      const name = `${RUN}/a-${a}/config/1`;
+      assert.deepEqual(calls, [["identify", "--anchor", staging, "--name", name], ["remove-tree", "--anchor", staging, "--name", name]], "the config attempt removed by the launcher, once validated");
+    } else {
+      assert.deepEqual(out, { sets: { [key]: { status: "failed", reason: "not_found" } } }, "no recorded tree: nothing imported");
+      assert.deepEqual(calls, []);
     }
   }
 });

@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { lockFile } from "../lib/fleet/host/store.mjs";
-import { newRecord, newRestoreRun, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
+import { CLASSES, newRecord, newRestoreRun, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 import { PLAN, closePlan, newPlan, readPlan, replanSet, updatePlan } from "../lib/fleet/host/restore-plan.mjs";
 import { ABANDON, BEGIN, CLOSED, HOSTSTORE_COPY, REQUESTS, begin, close, closeBlockers, readBegin, removeBeneath, restoreOpen, withExclusion } from "../lib/fleet/host/restore-begin.mjs";
 
@@ -24,7 +24,7 @@ function chosenOf({ sha256 = hex("2"), snapshot = SNAP } = {}) {
   const a = newId(), d = newId(), t = newId();
   const manifest = { host: "old-host", time: "2026-11-24T03:10:00.000Z", hoststore: hex("3"), registry: { hash: hex("4") },
     sets: [{ kind: "agent", id: a, snapshot: hex("5"), tree: hex("6") }, { kind: "archive", id: d, snapshot: hex("7"), tree: hex("8") },
-      { kind: "tag", id: t, snapshot: hex("9"), tree: hex("a") }] };
+      { kind: "tag", id: t, snapshot: hex("9"), tree: hex("a") }], config: { [a]: hex("b") } };
   return { chosen: { manifest, snapshot, sha256 }, a, d, t };
 }
 
@@ -238,7 +238,7 @@ function records(h, states) {
     let r = newRecord({ kind, id, run: RUN, snapshot: SNAP });
     if (target === "staging") return r;
     if (target === "abandoned") return step(r, "abandoned");
-    const cls = { agent: ["home", "sessions"], archive: ["archive"], tag: ["tag"] }[kind];
+    const cls = CLASSES[kind];
     const dest = Object.fromEntries(cls.map((c, i) => [c, ident(String(10 + i))]));
     r = step(r, "bind", { dest });
     for (const c of cls) r = step(r, "digest", { cls: c, sha256: hex("d") });

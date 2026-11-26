@@ -342,6 +342,26 @@ fn a2_subcommands_refuse_bad_arguments_then_the_root_guard() {
         let o = run(&a.iter().map(String::as_str).collect::<Vec<_>>());
         assert_eq!(code(&o), 64, "{over:?}: {}", stderr(&o));
     }
+    // A2 r3.14: the host's `hoststore` stages for the `host` owner at project 110000 only; never filled or listed.
+    let o = run(&stage(&[("owner", "host"), ("class", "hoststore"), ("projid", "110000")]).iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(code(&o), 66, "host/hoststore at 110000: well formed, the root guard: {}", stderr(&o));
+    for over in [
+        vec![("owner", "host"), ("class", "hoststore"), ("projid", "70000")],
+        vec![("owner", "host"), ("class", "hoststore"), ("projid", "110001")],
+        vec![("owner", "host"), ("class", "home"), ("projid", "110000")],
+        vec![("class", "hoststore"), ("projid", "110000")],
+    ] {
+        let a = stage(&over);
+        let o = run(&a.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(code(&o), 64, "{over:?}: {}", stderr(&o));
+    }
+    for bad in [
+        vec!["fill-home", "--mount", "/srv/sagebrush", "--owner", "host", "--class", "hoststore", "--run", "abcdefghijklmnop", "--attempt", "1", "--source", "data/x", "--expect", "/x"],
+        vec!["tree-digest", "--mount", "/srv/sagebrush", "--owner", "host", "--class", "hoststore", "--expect", "/x"],
+    ] {
+        let o = run(&bad);
+        assert_eq!(code(&o), 64, "{bad:?}: {}", stderr(&o));
+    }
     for bad in [
         vec!["fill-home", "--mount", "/srv/sagebrush", "--owner", &owner, "--class", "config", "--run", "abcdefghijklmnop", "--attempt", "1", "--source", "data/x", "--expect", "/x"],
         vec!["tree-digest", "--mount", "/srv/sagebrush", "--owner", &owner, "--class", "config", "--expect", "/x"],

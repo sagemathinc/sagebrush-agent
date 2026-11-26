@@ -67,7 +67,8 @@ jobs:
   # SHA-256). The restore rows remove CAP_SYS_RESOURCE with `sudo setpriv`, as the launcher's runner will, and one
   # restores with no /proc (`sudo unshare -m`), as the runner's filesystem view has none.
   backup:
-    runs-on: ubuntu-latest
+    # (a pinned image: the backup binary's C toolchain is part of its pin; scripts/backup-build.sh)
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -102,12 +103,15 @@ jobs:
           sha256sum "$RUNNER_TEMP/backup-1"
           test "$(sha256sum < "$RUNNER_TEMP/backup-1" | cut -d' ' -f1)" = "$(cut -d' ' -f1 lib/fleet/host/backup.sha256)"
       - run: scripts/backup-static-check-test.sh "$RUNNER_TEMP/backup-1"
+      # the compilers that made it, as recorded in the binary (the pinned gcc, and Rust's own musl objects)
+      - run: readelf -p .comment "$RUNNER_TEMP/backup-1" | grep -F "13.3.0-6ubuntu2~24.04.1"
 
   # The launcher (launcher/, sagebrush-agent-launch, root-run and security-critical): its unit and CLI tests, then
   # the shipped release build. Its Landlock rows need the kernel's ABI 4; SB_TEST_REQUIRE_LANDLOCK makes a runner
   # kernel without it fail the job rather than skip them.
   launcher:
-    runs-on: ubuntu-latest
+    # (a pinned image: it builds the backup binary too, whose C toolchain is part of its pin)
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

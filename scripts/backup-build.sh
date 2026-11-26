@@ -11,6 +11,11 @@
 # (`cargo fetch --locked` first): the build itself never touches the network. Two builds from two directories must be
 # byte-identical (the CI job checks it, and that the result equals the pin). No feature is enabled: in particular not
 # the test-only ones (test-loopback-http, test-pause-before-start).
+#
+# Unlike the launcher (pure Rust), the C parts are compiled by the machine's C toolchain, so the toolchain is pinned too:
+# Ubuntu 24.04's gcc-13 13.3.0-6ubuntu2~24.04.1 (through musl-gcc) and musl-dev 1.2.4-2, exactly, checked by their
+# installed package versions (another compiler or musl gives other bytes: refused, as another rustc is). CI builds on the
+# pinned runner image ubuntu-24.04; a change of either package moves the pin, deliberately.
 set -eu
 
 [ "$#" -eq 1 ] || { echo "usage: scripts/backup-build.sh <out>" >&2; exit 2; }
@@ -20,6 +25,10 @@ target=x86_64-unknown-linux-musl
 
 version=$(rustc --version | cut -d' ' -f2)
 [ "$version" = 1.99.0 ] || { echo "backup-build: rust 1.99.0 is required (found $version)" >&2; exit 1; }
+pkg() { dpkg-query -W -f '${Version}' "$1" 2>/dev/null || echo none; }
+[ "$(pkg gcc-13)" = 13.3.0-6ubuntu2~24.04.1 ] || { echo "backup-build: gcc-13 13.3.0-6ubuntu2~24.04.1 is required (found $(pkg gcc-13))" >&2; exit 1; }
+[ "$(pkg musl-dev)" = 1.2.4-2 ] || { echo "backup-build: musl-dev 1.2.4-2 is required (found $(pkg musl-dev))" >&2; exit 1; }
+[ "$(musl-gcc -dumpfullversion 2>/dev/null)" = 13.3.0 ] || { echo "backup-build: musl-gcc must run gcc 13.3.0" >&2; exit 1; }
 
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
 cargo_home=$(cd "$cargo_home" && pwd -P)

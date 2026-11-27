@@ -200,6 +200,11 @@
       "meaning": "a required host platform, privilege, account, unit, adapter, Landlock or path-contract control is missing at start"
     },
     {
+      "name": "pairing_expired",
+      "owner": "host",
+      "meaning": "the pairing expired before an approval, or its local resume horizon passed; pairing.json is removed, and a new `host pair` run starts over with a new host id"
+    },
+    {
       "name": "landlock_abi",
       "owner": "host",
       "meaning": "the kernel's Landlock ABI is below 4"

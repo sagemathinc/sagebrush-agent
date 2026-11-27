@@ -43,7 +43,13 @@ fn code_of(extra: &[&str], pre: Option<libc::c_int>) -> String {
         }
     }
     let mut c = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    c.stdin.take().unwrap().write_all(br#"{"op":"snapshots"}"#).unwrap();
+    // A refusal before any work (usage, parent_gone) can exit before reading stdin, closing the pipe first: the write
+    // then fails EPIPE, which is that refusal's own effect, never the row's failure. Any other write error is.
+    match c.stdin.take().unwrap().write_all(br#"{"op":"snapshots"}"#) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("writing the request: {e}"),
+    }
     let out = c.wait_with_output().unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("one JSON line: {}", String::from_utf8_lossy(&out.stdout)));
     if v["ok"] == true { "ok".into() } else { v["error"]["code"].as_str().unwrap_or("").to_string() }

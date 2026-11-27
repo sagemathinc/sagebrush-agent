@@ -30,13 +30,15 @@ test("the seven turn reasons are host entries, each with exactly one meaning", (
 const DAEMON = ["identity_broken", "host_ended", "lease_unqualified", "bad_config"];
 // The execution lease's suspend gate (lease-on r1.5 §6.5, C8b, T4), host health reasons added after those.
 const GATE = ["suspend_gate_stuck", "suspend_gate_exhausted"];
+// Host pairing's one host-local reason (host pairing d3, d3r1, d3r2), added after those.
+const PAIRING = ["pairing_expired"];
 const PREFLIGHT_BEFORE = "a required unit, Landlock or path-contract control is missing at start";
 const PREFLIGHT_NOW = "a required host platform, privilege, account, unit, adapter, Landlock or path-contract control is missing at start";
 
 test("every entry that existed before is byte-for-byte unchanged, but for preflight_missing's ruled widening", () => {
   // sha256 of JSON.stringify of the registry's 50 entries before this change, in order (preflight_missing with the
   // meaning it had then: the only later change to any of them).
-  const before = registry.reasons.filter((r) => !NEW.includes(r.name) && !DAEMON.includes(r.name) && !GATE.includes(r.name))
+  const before = registry.reasons.filter((r) => !NEW.includes(r.name) && !DAEMON.includes(r.name) && !GATE.includes(r.name) && !PAIRING.includes(r.name))
     .map((r) => (r.name === "preflight_missing" ? { ...r, meaning: PREFLIGHT_BEFORE } : r));
   assert.equal(before.length, 50);
   assert.equal(createHash("sha256").update(JSON.stringify(before)).digest("hex"), "49d4933821966df89ba7ee9fbf2fa006fe5bbf5f356160f47e340fd2e73e854c");
@@ -44,6 +46,11 @@ test("every entry that existed before is byte-for-byte unchanged, but for prefli
   // The unit start's own mapping is untouched: its codes are still preflight_missing, never a turn's reason.
   for (const c of [65, 66, 68, 69]) assert.equal(launcherExit(c), "preflight_missing", String(c));
   assert.equal(launcherExit(67), "landlock_abi");
+});
+
+test("host pairing's reason: host-local, no HTTP status, as registered", () => {
+  assert.deepEqual(byName.get("pairing_expired"), { name: "pairing_expired", owner: "host",
+    meaning: "the pairing expired before an approval, or its local resume horizon passed; pairing.json is removed, and a new `host pair` run starts over with a new host id" });
 });
 
 test("the launcher's failure record maps to exactly one reason, and an unknown code to none", () => {

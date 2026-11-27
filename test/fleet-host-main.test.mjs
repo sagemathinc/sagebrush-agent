@@ -139,7 +139,7 @@ function harness(o = {}) {
     hostInfo: { ramMb: 8192, cpus: 4 },
     inputs: (x) => {
       ev("inputs"); made.submit = x.submit; made.inputsCtx = x;
-      const stop = () => ev("inputsStop");
+      const stop = o.inputsDrainMs ? () => { ev("inputsStop"); return new Promise((r) => setTimeout(() => { ev("inputsDrained"); r(); }, o.inputsDrainMs)); } : () => ev("inputsStop");
       if (o.inputsExtra) Object.assign(stop, o.inputsExtra(ev));
       return stop;
     },
@@ -1154,6 +1154,17 @@ test("slice B's wiring: the inputs get the daemon's context; an adoption that ad
   assert.equal(h.made.resumeCalls[0].opts.pairOf(A), PAIR);
   h.term();
   await run;
+});
+
+test("A-H2: SIGTERM awaits the inputs' drain before the executor and the audit stream close", async () => {
+  const { id } = await paired();
+  const h = harness({ id, adapters: Object.fromEntries(BROKER_SIDE.map((k) => [k, () => {}])), openAudit: fakeAudit, inputsDrainMs: 30 });
+  const run = hostRun(h.d);
+  await until(() => h.lines.some((l) => l.serving));
+  h.term();
+  assert.equal((await run).code, 0);
+  const i = (x) => h.log.indexOf(x);
+  assert.ok(i("inputsStop") < i("inputsDrained") && i("inputsDrained") < i("close") && i("close") < i("auditClose"), JSON.stringify(h.log.slice(-8)));
 });
 
 test("the restore resume through hostRun's wiring: exactly the base keys plus the per-call liveLease and verifyCtx; pairOf is null, so a real request refuses no_receipt and launches nothing", async () => {

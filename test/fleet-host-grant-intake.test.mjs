@@ -74,6 +74,7 @@ async function setup(o = {}) {
     verifyPair: async (pair) => {
       const t = JSON.parse(new TextDecoder().decode(pair.transfer)).body, r = JSON.parse(new TextDecoder().decode(pair.receipt)).body;
       if (t.bad || r.bad) throw new FleetError("bad_signature", "fake pair");
+      if (o.revoked?.has(t.agent)) throw new FleetError("device_removed", "its signer was removed since");
       return { transfer: t, receipt: r, transferHash: hashOf(pair.transfer) };
     },
     applied: () => ({ gen: ex.gen, hash: ex.hash }),
@@ -89,6 +90,7 @@ async function setup(o = {}) {
       return { status: "applied", gen: b.gen };
     },
     stream, files, hint, timers,
+    ...(o.checkPair ? { checkPair: o.checkPair } : {}),
     barrier: async (name, info) => { log.push(name); if (o.barrier) await o.barrier(name, info); },
   });
   return { root, stream, w, ex, intake, files, hint, log, adapters };
@@ -291,7 +293,7 @@ test("a newer transfer of an agent replaces its older stored pair (written, repl
   const ps = (await events(s)).filter((b) => b.op === "pair.store");
   assert.deepEqual(ps.map((b) => [b.gen, b.detail.pair.action]), [[1, "written"], [2, "written"]]);
   assert.deepEqual(ps[1].detail.pair.replaces, { gen: 1, transfer_digest: hashOf(w.grants.get(1).pairs[0].transfer) });
-  assert.equal(PairFiles.genOf(s.intake.pairOf(x)), 2);
+  assert.equal(PairFiles.genOf(await s.intake.pairOf(x)), 2);
 });
 
 test("pair_conflict: a stored pair at the SAME gen with other bytes refuses the generation; the stored pair is untouched", async () => {
@@ -328,7 +330,7 @@ test("a failure after the pair writes and before the terminal: no submit; the NE
   assert.equal(intents.length, 2);
   assert.deepEqual(ev.filter((b) => b.op === "grant.intake" && b.intent?.seq === intents[0].seq).map((b) => b.phase), ["unknown_effect"]);
   assert.deepEqual(ps.map((b) => [b.detail.pair.action, b.detail.reconciles]), [["kept", { epoch: 0, seq: intents[0].seq }]]);
-  assert.ok(s.intake.pairOf(x));
+  assert.ok(await s.intake.pairOf(x));
 });
 
 test("recovery (d1r6/d1r7): a stored pair with no record that binds to the grant its agent was listed in since, as the stream shows it applied, is recorded kept and pairOf returns it; an older genuine pair (moved at 5 and again at 8, the file holds 5) is not", async () => {
@@ -345,9 +347,9 @@ test("recovery (d1r6/d1r7): a stored pair with no record that binds to the grant
   fs.mkdirSync(join(s2.root, "transfers", "pairs"), { recursive: true, mode: 0o700 });
   fs.copyFileSync(join(s.root, "transfers", "pairs", x), join(s2.root, "transfers", "pairs", x));
   fs.chmodSync(join(s2.root, "transfers", "pairs", x), 0o600);
-  assert.equal(s2.intake.pairOf(x), null, "no record yet: null (P1)");
+  assert.equal(await s2.intake.pairOf(x), null, "no record yet: null (P1)");
   assert.deepEqual(await s2.intake.recover(), [x]);
-  assert.ok(s2.intake.pairOf(x), "kept, then returned");
+  assert.ok(await s2.intake.pairOf(x), "kept, then returned");
   // the gen 5 / gen 8 case: listed since 8, the file holds 5
   const w5 = world();
   const y = A();
@@ -362,7 +364,7 @@ test("recovery (d1r6/d1r7): a stored pair with no record that binds to the grant
   const p5 = w5.grants.get(5).pairs[0];
   s6.files.stage(y, PairFiles.textOf(p5)); s6.files.syncDir();
   assert.deepEqual(await s6.intake.recover(), [], "pair 5 doesn't bind to gen 8: not reconciled");
-  assert.equal(s6.intake.pairOf(y), null);
+  assert.equal(await s6.intake.pairOf(y), null);
   s6.files.stage(y, PairFiles.textOf(w5.grants.get(8).pairs[0])); s6.files.syncDir();
   assert.deepEqual(await s6.intake.recover(), [y], "pair 8 does");
 });
@@ -375,7 +377,7 @@ test("recovery never blesses a rollback: a file rolled back to an older valid pa
   await s.intake.cycle(); // pair 2 recorded last
   s.files.stage(x, PairFiles.textOf(w.grants.get(1).pairs[0])); s.files.syncDir(); // rolled back to pair 1
   assert.deepEqual(await s.intake.recover(), []);
-  assert.equal(s.intake.pairOf(x), null);
+  assert.equal(await s.intake.pairOf(x), null);
 });
 
 // ---- pairOf (d1 §3, d1r2 N4/N5, d1r4 B-H6)
@@ -386,21 +388,21 @@ test("pairOf: the intaken pair byte-identical; null for a tampered file, a symli
   w.add(1, [x], [x]);
   const s = await setup({ world: w });
   await s.intake.cycle();
-  const p = s.intake.pairOf(x);
+  const p = await s.intake.pairOf(x);
   assert.deepEqual([Buffer.from(p.transfer), Buffer.from(p.receipt)], [Buffer.from(w.grants.get(1).pairs[0].transfer), Buffer.from(w.grants.get(1).pairs[0].receipt)]);
-  assert.equal(s.intake.pairOf(A()), null, "no file");
+  assert.equal(await s.intake.pairOf(A()), null, "no file");
   const f = join(s.root, "transfers", "pairs", x);
   const good = readFileSync(f);
   writeFileSync(f, good.toString().replace(/"nonce":"[a-z2-7]+"/, `"nonce":"${newId()}"`)); fs.chmodSync(f, 0o600);
-  assert.equal(s.intake.pairOf(x), null, "tampered");
+  assert.equal(await s.intake.pairOf(x), null, "tampered");
   fs.rmSync(f); symlinkSync(join(s.root, "elsewhere"), f);
-  assert.equal(s.intake.pairOf(x), null, "a symlink");
+  assert.equal(await s.intake.pairOf(x), null, "a symlink");
   fs.rmSync(f); writeFileSync(f, "x".repeat(PAIR_FILE_MAX + 1), { mode: 0o600 });
-  assert.equal(s.intake.pairOf(x), null, "over the bound");
+  assert.equal(await s.intake.pairOf(x), null, "over the bound");
   fs.rmSync(f); writeFileSync(f, good, { mode: 0o644 }); fs.chmodSync(f, 0o644);
-  assert.equal(s.intake.pairOf(x), null, "not 0600");
+  assert.equal(await s.intake.pairOf(x), null, "not 0600");
   fs.chmodSync(f, 0o600);
-  assert.ok(s.intake.pairOf(x), "restored");
+  assert.ok(await s.intake.pairOf(x), "restored");
 });
 
 // ---- audit: unanchored, refusals (d1r4 B-H3, d1r5 N8, d1r8 N13)
@@ -468,4 +470,93 @@ test("the poller: one cycle at a time; three nudges during a cycle give exactly 
   await Promise.race([p.stop(), Promise.resolve()]);
   for (const s of sets.splice(0)) s.fn();
   assert.equal(cycles, n, "no cycle after stop");
+});
+
+// ---- AUDIT A-H1/A-H3 on the first head: durable presence for kept pairs; pairOf re-verifies at use
+
+test("A-H1: a crash after a pair's rename and before the directory fsync; the retry finds it byte-identical (kept) and STILL fsyncs the directory before any pair.store; with that fsync failing, no pair.store and no submit", async () => {
+  const w = world();
+  const x = A();
+  w.add(1, [x], [x]);
+  let crash = true, dirFsyncFails = false;
+  const ops = [];
+  const io = {
+    open: (p, f, m) => { const fd = realIo.open(p, f, m); if (p.endsWith("pairs")) dirFds.add(fd); return fd; },
+    write: (fd, b, o2, l) => realIo.write(fd, b, o2, l),
+    fsync: (fd) => { if (dirFds.has(fd)) { ops.push("dir fsync"); if (dirFsyncFails) throw Object.assign(new Error("EIO"), { code: "EIO" }); } return realIo.fsync(fd); },
+    close: (fd) => { dirFds.delete(fd); return realIo.close(fd); },
+    rename: (a, b) => realIo.rename(a, b),
+  };
+  const dirFds = new Set();
+  let s;
+  s = await setup({ world: w, io, barrier: async (name) => {
+    if (name === "after_pair_rename" && crash) { crash = false; throw new Error("crash after the rename"); }
+    if (name === "after_pair_store") ops.push("pair.store");
+  } });
+  assert.equal((await s.intake.cycle()).status, "fault");
+  assert.deepEqual([ops, s.ex.submits], [[], []], "the first attempt: renamed, never fsynced, nothing recorded or submitted");
+  assert.ok(s.files.read(x)?.pair, "the file is visible");
+  // the retry, with the directory fsync failing: the kept pair is never asserted
+  dirFsyncFails = true;
+  assert.equal((await s.intake.cycle()).status, "fault");
+  assert.deepEqual([ops, s.ex.submits], [["dir fsync"], []]);
+  assert.ok(!(await events(s)).some((b) => b.op === "pair.store"), "no pair.store without the barrier");
+  assert.ok(s.files.read(x)?.pair, "the file remains");
+  // the disk recovers: the barrier, then kept, then the submit
+  dirFsyncFails = false;
+  await s.intake.cycle();
+  assert.deepEqual([ops, s.ex.submits], [["dir fsync", "dir fsync", "pair.store"], [1]]);
+  const ps = (await events(s)).filter((b) => b.op === "pair.store");
+  assert.deepEqual(ps.map((b) => b.detail.pair.action), ["kept"]);
+});
+
+test("A-H3: pairOf re-verifies at use: a pair whose signer was removed since, or one the host's own checks refuse (another host, a grant not accepted), is null, naming the agent and gen in health", async () => {
+  const w = world();
+  const x = A();
+  w.add(1, [x], [x]);
+  const revoked = new Set();
+  let refuseHost = false;
+  const s = await setup({ world: w, revoked, checkPair: () => { if (refuseHost) throw new FleetError("not_granted", "another host"); return { first: true }; } });
+  await s.intake.cycle();
+  assert.ok(await s.intake.pairOf(x), "verifies now");
+  revoked.add(x);
+  assert.equal(await s.intake.pairOf(x), null, "its signer removed since storage");
+  assert.match(s.intake.health().pairs[x], /^gen 1: the pair no longer verifies \(device_removed\)/);
+  revoked.delete(x); refuseHost = true;
+  assert.equal(await s.intake.pairOf(x), null, "refused by the host's own checks");
+  assert.match(s.intake.health().pairs[x], /^gen 1: refused for this host \(not_granted\)/);
+  refuseHost = false;
+  assert.ok(await s.intake.pairOf(x));
+});
+
+test("A-H2: the poller's stop resolves only after the cycle in flight has settled", async () => {
+  const sets = [];
+  const timers = { set: (ms, fn) => { sets.push(fn); return sets.length; }, clear: () => {} };
+  let release;
+  const intake = { cycle: () => new Promise((r) => { release = () => r({ status: "applied" }); }), stop: () => {} };
+  const p = new GrantPoller(intake, { timers });
+  p.start();
+  sets.shift()();
+  let settled = false;
+  const stopping = p.stop().then(() => { settled = true; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(settled, false, "still in flight");
+  release();
+  await stopping;
+  assert.equal(settled, true);
+});
+
+test("a stale temp file, or a link planted at the temp name, is removed and never followed: the pair is written through a fresh O_EXCL|O_NOFOLLOW file and the link's target is untouched", async () => {
+  const w = world();
+  const x = A();
+  w.add(1, [x], [x]);
+  const s = await setup({ world: w });
+  s.files.ensure();
+  const target = join(s.root, "outside");
+  writeFileSync(target, "untouched");
+  symlinkSync(target, join(s.root, "transfers", "pairs", `.${x}.${process.pid}.tmp`));
+  await s.intake.cycle();
+  assert.deepEqual(s.ex.submits, [1]);
+  assert.equal(readFileSync(target, "utf8"), "untouched");
+  assert.ok(await s.intake.pairOf(x));
 });

@@ -451,6 +451,20 @@ test("claude-path: a long run that can't start says so; its holder is ended", { 
   assert.equal(held.alive(), false);
 });
 
+test("claude-path: a holder that can't start (its cwd is gone) is terminal at once: an error, no group, end() resolves", { skip, timeout: 30_000 }, async () => {
+  const b = base(); const gone = join(b, "gone"); // (never created)
+  const held = heldSpawn(process.execPath, ["-e", ""], { env: {}, cwd: gone });
+  const r = await exitOf(held);
+  assert.match(String(r.error?.message), /ENOENT/);
+  assert.equal(held.pid, undefined, "no holder, so no group id");
+  assert.equal(held.alive(), false, "a holder that never started is gone");
+  assert.equal(held.signal("SIGTERM"), false, "no signal to a group that never existed");
+  const t0 = Date.now();
+  assert.equal(await held.end({ graceMs: 10_000, boundMs: 10_000 }), null, "end() reports no survivor");
+  assert.ok(Date.now() - t0 < 2_000, "end() doesn't wait out the grace or the bound");
+  rmSync(b, { recursive: true });
+});
+
 test("claude-path: when this process dies, the holder ends its own group (nothing is left running)", { skip, timeout: 30_000 }, async () => {
   const b = base();
   const pf = join(b, "pid");

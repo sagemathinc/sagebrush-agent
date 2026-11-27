@@ -75,8 +75,9 @@ export async function checkFixtures(core, F) {
   }
   // agent messages (agent-messages r6 §2, with r7 to r10): a device's message against the chain, a host's record against
   // the certified host's own key (the certificate above), each through its own verifier
+  const msgChains = { honest: st, removed: await core.replayChain(F.transfers.chain_removed.map(enc), ctx) };
   for (const c of O.agent_messages ?? []) {
-    check("agent_messages", c.name, await result(() => core.verifyAgentMessage(enc(c.bytes), { ...(c.ctx ?? ctx), chain: st, host: F.ids.host, agent: F.ids.agent })), c.expect);
+    check("agent_messages", c.name, await result(() => core.verifyAgentMessage(enc(c.bytes), { ...(c.ctx ?? ctx), chain: msgChains[c.chain ?? "honest"], host: F.ids.host, agent: F.ids.agent })), c.expect);
   }
   for (const c of O.agent_replies ?? []) {
     check("agent_replies", c.name, await result(() => core.verifyAgentReply(enc(c.bytes), { ...ctx, cert })), c.expect);

@@ -284,6 +284,13 @@ export async function build() {
     { name: "a message with an extra field (a subject)", bytes: msg(B, signer(B, bId), { subject: "x" }), expect: "bad_form" },
     { name: "a message id that isn't a fleet id (B22-shaped)", bytes: msg(B, signer(B, bId), { id: "A".repeat(21) + "A" }), expect: "bad_form" },
     { name: "a message for another agent", bytes: msg(B, signer(B, bId), { agent: id(94) }), expect: "not_granted" },
+    { name: "a message for another host", bytes: msg(B, signer(B, bId), { host: id(94) }), expect: "not_granted" },
+    // (the device key's rules, on this type: enrolled at the record's chain_seq, not removed by then, and no chain_seq
+    // past the head; chain "removed" is the transfers' chain_removed, the browser device removed at the next seq)
+    { name: "a message from a device enrolled only after its chain_seq", bytes: msg(N2, signer(N2, n2Id), { chain_seq: 1 }), expect: "device_unknown" },
+    { name: "a message from a device removed at or before its chain_seq", bytes: msg(B, signer(B, bId), { chain_seq: headAt.seq + 1 }), chain: "removed", expect: "device_unknown" },
+    { name: "a message from a device enrolled at its chain_seq but removed by the head", bytes: msg(B, signer(B, bId)), chain: "removed", expect: "device_removed" },
+    { name: "a message whose chain_seq is past the head", bytes: msg(B, signer(B, bId), { chain_seq: headAt.seq + 5 }), expect: "device_unknown" },
     { name: "a message signed by a host", bytes: await forge("sb.agent-message.v1", hostSigner, msgBody(), H), expect: "bad_signature" },
     { name: "a message's signer swapped to another device (the signature no longer verifies)", bytes: txt(enc(canonText({ ...JSON.parse(m0), signer: signer(N, nId) }))), expect: "bad_signature" },
   ];
@@ -311,6 +318,15 @@ export async function build() {
     { name: "a reason outside every closed set", bytes: rep({ kind: "turn_failed", reason: "because", body_sha256: null }), expect: "bad_form" },
     { name: "a reply signed by a device", bytes: await forge("sb.agent-reply.v1", signer(N, nId), repBody(), N), expect: "bad_signature" },
     { name: "a reply signed by a key other than the certified host's", bytes: txt(seal("sb.agent-reply.v1", hostSigner, repBody(), N2)), expect: "bad_signature" },
+    { name: "the certified host's signature under another key id", bytes: txt(seal("sb.agent-reply.v1", { ...hostSigner, key: N2.key }, repBody(), H)), expect: "bad_signature" },
+    { name: "the certified host's signature over a body naming another host", bytes: rep({ host: id(94) }), expect: "bad_signature" },
+    { name: "a refused record with a turn but no covers", bytes: rep({ kind: "refused", reason: "replayed", covers: null, body_sha256: null }), expect: "bad_form" },
+    { name: "a covered record without covers", bytes: rep({ kind: "covered", body_sha256: null, covers: null }), expect: "bad_form" },
+    { name: "a turn_failed without a turn", bytes: rep({ kind: "turn_failed", reason: "crashed", body_sha256: null, turn: null }), expect: "bad_form" },
+    { name: "answer_lost on a refused record (r11)", bytes: rep({ kind: "refused", reason: "answer_lost", turn: null, covers: null, body_sha256: null }), expect: "bad_form" },
+    { name: "not_granted on a turn_failed (r11)", bytes: rep({ kind: "turn_failed", reason: "not_granted", body_sha256: null }), expect: "bad_form" },
+    { name: "an answer on a turn_failed", bytes: rep({ kind: "turn_failed", reason: "crashed", body_sha256: null, answer: { thread: id(97), id: id(98) } }), expect: "bad_form" },
+    { name: "an answer on a refused record", bytes: rep({ kind: "refused", reason: "replayed", turn: null, covers: null, body_sha256: null, answer: { thread: id(97), id: id(98) } }), expect: "bad_form" },
   ];
 
   // ---- 7. moving an agent (r2.4 §3.7): the receipt pair (checks 1-3), then the new host's own (checks 4-6)

@@ -14,7 +14,7 @@ import { AcceptedHint, BACKOFF_MAX_MS, GrantIntake, GrantPoller, PAIR_FILE_MAX, 
 import { keyFromSeed } from "../lib/fleet/index.mjs";
 import { realIo } from "../lib/fleet/host/store.mjs";
 
-const UID = process.getuid();
+const UID = typeof process.getuid === "function" ? process.getuid() : -1; // (Linux-only rows; off Linux the file only loads)
 const HOST = newId(), FP = b64(new Uint8Array(32).fill(3));
 const key = keyFromSeed(new Uint8Array(32).fill(9));
 const CERT = b64(new Uint8Array(32).fill(1));

@@ -560,3 +560,53 @@ test("a stale temp file, or a link planted at the temp name, is removed and neve
   assert.equal(readFileSync(target, "utf8"), "untouched");
   assert.ok(await s.intake.pairOf(x));
 });
+
+// ---- rows added in the TESTS review: the binding to the arrival gen, one field at a time, and a cleared fault
+
+test("N14: moved once at 5 and stayed through 8: no new pair needed, pairOf is the gen-5 pair; and after the records are lost, recovery keeps it (L = 5, not the applied 8)", async () => {
+  const w = world(); const y = A();
+  for (let g = 1; g <= 8; g++) w.add(g, g >= 5 ? [y] : [A()], g === 5 ? [y] : []);
+  const s = await setup({ world: w });
+  await s.intake.cycle();
+  assert.deepEqual(s.ex.submits.length >= 1, true);
+  const p = await s.intake.pairOf(y);
+  assert.ok(p, "the gen-5 pair stands at applied 8");
+  assert.deepEqual(Buffer.from(p.transfer), Buffer.from(w.grants.get(5).pairs[0].transfer));
+  // lose the pair records but keep the stream's applied grants: a fresh intake over the same stream dir and files
+  const s2 = await setup({ world: w, applied: 8, appliedHash: w.grants.get(8).hash });
+  s2.ex.listed.set(y, 5);
+  for (let g = 1; g <= 8; g++) { s2.ex.gen = g; s2.ex.hash = w.grants.get(g).hash; s2.adapters.audit({ kind: "grant.apply", gen: g, phase: "succeeded" }); }
+  await s2.stream.drain();
+  s2.files.ensure(); s2.files.stage(y, PairFiles.textOf(w.grants.get(5).pairs[0])); s2.files.syncDir();
+  assert.deepEqual(await s2.intake.recover(), [y], "pair 5 binds to L = 5");
+});
+
+test("C4: a rollback's fault clears from health once the service catches up past the applied gen", async () => {
+  const w = world();
+  w.add(1, [A()]); w.add(2, [A()]);
+  const s = await setup({ world: w, applied: 3, appliedHash: b64(new Uint8Array(32).fill(4)) });
+  const r = await s.intake.cycle();
+  assert.equal(r.kind, "grant_rollback");
+  assert.ok(s.intake.health().faults.grant_rollback, "health names it");
+  // the service catches up: grant 3 with the applied hash's grant, then 4
+  const g3 = w.add(3, [A()]);
+  s.ex.hash = g3.hash;
+  w.add(4, [A()]);
+  const r2 = await s.intake.cycle();
+  assert.notEqual(r2.status, "fault", JSON.stringify(r2));
+  assert.equal(s.intake.health().faults.grant_rollback, undefined, "cleared");
+});
+
+test("T3: recovery refuses a pair that differs from L's binding in ONE field: the grant hash, the gen, or the host key", async () => {
+  for (const [what, transfer] of [["grant", { grant: b64(new Uint8Array(32).fill(9)) }], ["gen", { gen: 7 }], ["host key", { to_host_key: b64(new Uint8Array(32).fill(5)) }]]) {
+    const w = world(); const y = A();
+    w.add(8, [y], [{ agent: y, transfer }]);
+    const s2 = await setup({ world: w, applied: 8, appliedHash: w.grants.get(8).hash });
+    s2.ex.listed.set(y, 8);
+    s2.adapters.audit({ kind: "grant.apply", gen: 8, phase: "succeeded" });
+    await s2.stream.drain();
+    s2.files.ensure(); s2.files.stage(y, PairFiles.textOf(w.grants.get(8).pairs[0])); s2.files.syncDir();
+    assert.deepEqual(await s2.intake.recover(), [], "a pair whose " + what + " isn't L's: not reconciled");
+    assert.equal(await s2.intake.pairOf(y), null, what);
+  }
+});

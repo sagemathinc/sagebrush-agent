@@ -94,6 +94,7 @@
   "lib/fleet/host/net.mjs",
   "lib/fleet/host/plan.mjs",
   "lib/fleet/host/pool.mjs",
+  "lib/fleet/host/profile-life.mjs",
   "lib/fleet/host/profiles.mjs",
   "lib/fleet/host/provision.mjs",
   "lib/fleet/host/provisioned.mjs",

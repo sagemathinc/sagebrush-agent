@@ -236,6 +236,7 @@ test("the executor's shapes: failed is written as unknown_effect with its reason
   assert.equal(rs.find((b) => b.op === "grant.apply").detail.step, "broker-gen");
   assert.ok(!rs.some((b) => b.phase === "exploded") && !rs.some((b) => b.detail?.set === "not a set"));
   assert.equal(s.health().counters.bad_records, 2);
+  assert.deepEqual([s.health().state, ...auditHealth(s).reasons], ["degraded_audit", "audit_unavailable"], "a record refused at the writer is gone: never ok (H6)");
 });
 
 test("the classification table: narrowing kinds and phases, and widening", () => {
@@ -457,4 +458,41 @@ test("a refusal summary's times out of order, or a count of 0, is refused at the
     await assert.rejects(s.append("sb.audit-event.v1", { op: "grant.intake", op_id: b64(new Uint8Array(16).fill(refusal.count + 1)), phase: "refused", gen: 2, reason: "chain_fork", detail: { refusal } }), (e) => e.code === "bad_form");
   }
   await s.close();
+});
+
+test("H6: a record dropped past heldMax keeps health out of ok after the disk recovers and the held ones flush; a recovered disk with nothing missing is ok again", async () => {
+  const x = steeredIo();
+  const s = await open(fresh(), { trustGenesis: true, io: x.io, limits: { ...SMALL, heldMax: 1 } });
+  const a = auditAdapters(s);
+  x.st.failNext = "EAGAIN";
+  a.audit({ kind: "agent.stop", agent: newId(), phase: "succeeded" }); // A: held
+  await s.drain();
+  x.st.failNext = "EAGAIN";
+  a.audit({ kind: "agent.stop", agent: newId(), phase: "succeeded" }); // A's replay fails; B: past heldMax, dropped
+  await s.drain();
+  a.audit({ kind: "agent.stop", agent: newId(), phase: "succeeded" }); // the disk is back: A (late), then C
+  await s.drain();
+  const h = s.health();
+  assert.deepEqual([h.held, h.counters.dropped], [0, 1]);
+  assert.deepEqual([h.state, ...auditHealth(s).reasons], ["degraded_audit", "audit_unavailable"], "B is gone for good: never ok");
+  await s.close();
+  // the same failure with nothing dropped: ok once the held record lands
+  const y = steeredIo();
+  const s2 = await open(fresh(), { trustGenesis: true, io: y.io });
+  y.st.failNext = "EAGAIN";
+  auditAdapters(s2).audit({ kind: "agent.stop", agent: newId(), phase: "succeeded" });
+  await s2.drain();
+  assert.notEqual(s2.health().state, "ok");
+  auditAdapters(s2).audit({ kind: "agent.stop", agent: newId(), phase: "succeeded" });
+  await s2.drain();
+  assert.equal(s2.health().state, "ok");
+  // a capacity failure (ENOSPC) that clears: reserve_only while held, ok once it lands
+  y.st.failNext = "ENOSPC";
+  auditAdapters(s2).audit({ kind: "agent.stop", agent: newId(), phase: "succeeded" });
+  await s2.drain();
+  assert.equal(s2.health().state, "reserve_only");
+  auditAdapters(s2).audit({ kind: "agent.stop", agent: newId(), phase: "succeeded" });
+  await s2.drain();
+  assert.equal(s2.health().state, "ok");
+  await s2.close();
 });

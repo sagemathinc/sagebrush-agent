@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { b64, hostFingerprint, keyFromSeed, newId, replayChain, seal, sha256b64 } from "../lib/fleet/index.mjs";
 import { classify, firstBoot, hostPaths } from "../lib/fleet/host/identity.mjs";
-import { ADAPTERS, CONFIG_MAX, CONTAIN_RETRY_MS, INITIAL_SYNC_MS, RESUME_BASE_KEYS, brokerAccount, hostResetIdentity, hostRun, readHostConfig, realContainSys, resumeBase, resumeRequester, supervisorUnit } from "../lib/fleet/host/host-main.mjs";
+import { ADAPTERS, AUDIT_ADAPTERS, CONFIG_MAX, CONTAIN_RETRY_MS, INITIAL_SYNC_MS, RESUME_BASE_KEYS, brokerAccount, hostResetIdentity, hostRun, readHostConfig, realContainSys, resumeBase, resumeRequester, supervisorUnit } from "../lib/fleet/host/host-main.mjs";
 import { RESUME_HELPER_MS, requestResume } from "../lib/fleet/host/restore-resume.mjs";
 import { expectedOf } from "../lib/fleet/host/restore-plan.mjs";
 import { QUALIFIED_MAJOR } from "../lib/fleet/host/host-preflight.mjs";
@@ -117,6 +117,7 @@ function harness(o = {}) {
     resumeMain: "/opt/sagebrush/release/lib/fleet/host/restore-resume-main.mjs",
     requestResume: async (agent, opts) => { ev("requestResume"); (made.resumeCalls ??= []).push({ agent, opts }); return { resumed: false, reason: "no_receipt" }; },
     adapters,
+    ...(o.openAudit ? { openAudit: o.openAudit(ev, made) } : {}),
     unmaskBroker: async () => ev("unmask"),
     openStore: async () => { ev("store"); return { grants: { highwater: { gen: 0 } }, close: async () => ev("storeClose") }; },
     effects: (x) => { ev("effects"); made.effects = x; return {}; },
@@ -336,6 +337,12 @@ test("PAIRED gates: bad_config, lease_unqualified and each missing adapter refus
     assert.equal((await hostRun(h.d)).code, 3, reason);
     assert.deepEqual(refusal(h.lines), [reason]);
     assert.deepEqual(h.log, ["lock", "systemd", "classify", "dropOrphans", ...steps, ...CONTAIN, "release"], reason);
+  }
+  // Each refusal names exactly the adapters missing (fixed names, never a value).
+  for (const k of ADAPTERS) {
+    const h = harness({ id, adapters: Object.fromEntries(ADAPTERS.filter((x) => x !== k).map((x) => [x, () => {}])) });
+    await hostRun(h.d);
+    assert.deepEqual(h.lines.filter((l) => l.refused), [{ v: 1, refused: "preflight_missing", item: k }], k);
   }
   // Unproven before the refusal: the retry, then the refusal once proven.
   const h = harness({ id, config: { lease: "on" }, contain: [false, true] });
@@ -813,6 +820,44 @@ test("the unit as shipped: the release's host run as root, refusals (status 3) n
     "RestartPreventExitStatus=3", "TimeoutStopSec=30s", "WantedBy=multi-user.target"]) assert.ok(u.split("\n").includes(l), l);
   assert.ok(!/ExecStop/.test(u) && !u.includes("@RELEASE@"));
   for (const bad of ["rel", "/a b", "/a$x", "/a%n", "/a\"b", null]) assert.throws(() => supervisorUnit(bad), (e) => e.code === "bad_form", String(bad));
+});
+
+// ---- the host audit stream's three adapters (audit stream d1-d1r5)
+
+const BROKER_SIDE = ADAPTERS.filter((k) => !AUDIT_ADAPTERS.includes(k));
+const fakeAudit = (ev, made) => async (ident) => {
+  ev("auditOpen");
+  made.auditIdent = ident;
+  made.auditAdapters = Object.fromEntries(AUDIT_ADAPTERS.map((k) => [k, () => {}]));
+  return { adapters: made.auditAdapters, health: () => ({ state: "ok", reasons: [] }), close: async () => ev("auditClose") };
+};
+
+test("PAIRED with the audit stream: opened only after every other adapter is present, under the certificate, its three adapters given to the effects; closed after the executor, before the store", async () => {
+  const { id } = await paired();
+  const others = Object.fromEntries(BROKER_SIDE.map((k) => [k, () => {}]));
+  const h = harness({ id, adapters: others, openAudit: fakeAudit });
+  const run = hostRun(h.d);
+  await until(() => h.lines.some((l) => l.serving));
+  assert.ok(h.log.indexOf("auditOpen") > h.log.indexOf("syncMade") && h.log.indexOf("auditOpen") < h.log.indexOf("effects"));
+  const x = h.made.auditIdent;
+  assert.deepEqual([x.fleet, x.aud, x.host, x.cert], [id.pin.fleet, id.pin.aud, id.cert.body.host, id.cert.hash]);
+  assert.equal(x.signer, id.keys.sign);
+  assert.equal(x.chainSeq(), id.chain.seq, "the pinned head, read at each record");
+  assert.equal(x.keyFor(id.cert.hash, 0), id.keys.sign.raw);
+  assert.throws(() => x.keyFor("another", 0), (e) => e.code === "bad_signature");
+  for (const k of AUDIT_ADAPTERS) assert.equal(h.made.effects.adapters[k], h.made.auditAdapters[k], k);
+  for (const k of BROKER_SIDE) assert.equal(h.made.effects.adapters[k], others[k], k);
+  h.term();
+  assert.equal((await run).code, 0);
+  assert.deepEqual(h.log.slice(-4), ["close", "auditClose", "storeClose", "release"]);
+});
+
+test("PAIRED with the audit stream but no broker or ack adapters (the shipped wiring today): preflight_missing naming exactly those four; the stream is never opened", async () => {
+  const { id } = await paired();
+  const h = harness({ id, adapters: {}, openAudit: fakeAudit });
+  assert.equal((await hostRun(h.d)).code, 3);
+  assert.deepEqual(h.lines.filter((l) => l.refused), [{ v: 1, refused: "preflight_missing", item: BROKER_SIDE.join(",") }]);
+  assert.ok(!h.log.includes("auditOpen") && !h.log.includes("store"));
 });
 
 // ---- the registry (AUDIT H1): every emitter's name, host-owned, and the phrase its meaning must contain

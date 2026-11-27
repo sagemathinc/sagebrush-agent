@@ -296,3 +296,165 @@ test("health for the host's report: unanchored and failed closed are audit_unava
   assert.ok(accepted(auditHealth(s)));
   await s.close();
 });
+
+// ---- AUDIT's H1-H5 on the first head (short writes, one replay pump, nonblocking recovery, health's cause)
+
+/** An io over real files whose writes, fsyncs or both a row can steer. */
+function steeredIo() {
+  const st = { chunk: Infinity, failNext: null, failAfter: null, hang: false, hung: [], fsyncFail: 0 };
+  const io = {
+    open: (p, f, m) => import("node:fs").then((fs) => fs.promises.open(p, f, m)),
+    write: async (fh, b) => {
+      if (st.failNext) { const code = st.failNext; st.failNext = null; throw Object.assign(new Error(code), { code }); }
+      const n = Math.min(st.chunk, b.length);
+      const r = await fh.write(b, 0, n, null);
+      if (st.failAfter !== null && --st.failAfter < 0) { st.failAfter = null; st.failNext = "EIO"; }
+      return r;
+    },
+    fsync: (fh) => {
+      if (st.fsyncFail > 0) { st.fsyncFail -= 1; return Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" })); }
+      return st.hang ? new Promise((r) => st.hung.push(() => r(fh.datasync()))) : fh.datasync();
+    },
+    close: (fh) => fh.close(),
+  };
+  return { st, io, release: () => { st.hang = false; for (const r of st.hung.splice(0)) r(); } };
+}
+
+test("H1: short writes loop to the whole line (and the stream reopens clean); a write failing after part of a line breaks the epoch: the intent is refused, nothing more is written, and the next open truncates the torn tail", async () => {
+  const d = fresh();
+  const x = steeredIo();
+  const s = await open(d, { trustGenesis: true, io: x.io });
+  x.st.chunk = 7; // (every write call takes at most 7 bytes)
+  await auditAdapters(s).appendIntent({ op: "grant.apply", gen: 1 }, 2000);
+  auditAdapters(s).audit({ kind: "grant.apply", gen: 1, phase: "succeeded" });
+  await s.drain();
+  x.st.chunk = Infinity;
+  // a failure after the first chunk of the next line
+  x.st.chunk = 10; x.st.failAfter = 0;
+  await assert.rejects(auditAdapters(s).appendIntent({ op: "grant.apply", gen: 2 }, 2000), (e) => e.code === "audit_unavailable");
+  x.st.chunk = Infinity;
+  assert.equal(s.health().state, "fail_closed");
+  assert.deepEqual(auditHealth(s).reasons, ["audit_unavailable"]);
+  auditAdapters(s).audit({ kind: "agent.stop", agent: newId(), phase: "succeeded" });
+  await s.drain();
+  assert.ok(s.health().held >= 1, "narrowing held, never written after the partial line");
+  await s.close();
+  const reopened = await open(d);
+  assert.equal(reopened.health().state, "degraded_audit", "the torn tail truncated; the stream opens (unanchored)");
+  const rs = lines(d, 0);
+  assert.deepEqual(rs.filter((r) => r.body.op === "grant.apply").map((r) => [r.body.gen, r.body.phase]), [[1, "authorized"], [1, "succeeded"]]);
+  await reopened.close();
+});
+
+test("H1: a write failing before any byte (or with zero progress) takes nothing: the intent is refused, the epoch isn't broken, and the next record is written", async () => {
+  const d = fresh();
+  const x = steeredIo();
+  const s = await open(d, { trustGenesis: true, io: x.io });
+  x.st.failNext = "EAGAIN";
+  await assert.rejects(auditAdapters(s).appendIntent({ op: "grant.apply", gen: 1 }, 2000), (e) => e.code === "audit_unavailable");
+  await auditAdapters(s).appendIntent({ op: "grant.apply", gen: 2 }, 2000);
+  assert.equal(s.health().state, "ok");
+  await s.close();
+  assert.deepEqual(lines(d, 0).filter((r) => r.body.op === "grant.apply").map((r) => r.body.gen), [2]);
+});
+
+test("H2: held records replay exactly once, in order, before newer ones, under concurrent new records (one pump)", async () => {
+  const d = fresh();
+  const x = steeredIo();
+  const s = await open(d, { trustGenesis: true, io: x.io });
+  const a = auditAdapters(s);
+  const ag = Array.from({ length: 4 }, () => newId());
+  x.st.failNext = "EAGAIN"; // (A can't be taken: held)
+  a.audit({ kind: "agent.stop", agent: ag[0], phase: "succeeded" });
+  await s.drain();
+  // B is held behind A while the first replay attempt also fails
+  x.st.failNext = "EAGAIN";
+  a.audit({ kind: "agent.stop", agent: ag[1], phase: "succeeded" });
+  await s.drain();
+  assert.equal(s.health().held, 2);
+  // the disk recovers; two new records at once
+  a.audit({ kind: "agent.stop", agent: ag[2], phase: "succeeded" });
+  a.audit({ kind: "agent.stop", agent: ag[3], phase: "succeeded" });
+  await s.close();
+  const stops = lines(d, 0).filter((r) => r.body.op === "agent.stop").map((r) => [ag.indexOf(r.body.agent), r.body.detail?.late === true]);
+  assert.deepEqual(stops, [[0, true], [1, true], [2, false], [3, false]]);
+});
+
+test("H4: recovery's unknown_effect closures never wait or throw: openIntents answers at once under a hung fsync, and under storage that takes nothing; the closures land (or are held), claiming no effect", async () => {
+  const d = fresh();
+  const s0 = await open(d, { trustGenesis: true });
+  await auditAdapters(s0).appendIntent({ op: "grant.apply", gen: 9 }, 2000);
+  await s0.close();
+  const x = steeredIo();
+  const s = await open(d, { io: x.io });
+  x.st.hang = true;
+  const t0 = Date.now();
+  const answer = await Promise.race([auditAdapters(s).openIntents(), new Promise((r) => setTimeout(() => r("waited on the disk"), 1000))]);
+  assert.deepEqual(answer, [9]);
+  assert.ok(Date.now() - t0 < 100, "answered without waiting on the disk");
+  x.release();
+  await s.close();
+  const u = lines(d, 1).filter((r) => r.body.phase === "unknown_effect");
+  assert.equal(u.length, 1);
+  assert.deepEqual(u[0].body.intent, { epoch: 0, seq: 1 });
+  // storage that takes nothing: no throw, the closure held
+  const d2 = fresh();
+  const s1 = await open(d2, { trustGenesis: true });
+  await auditAdapters(s1).appendIntent({ op: "grant.apply", gen: 3 }, 2000);
+  await s1.close();
+  const y = steeredIo();
+  const s2 = await open(d2, { io: y.io });
+  y.st.failNext = "ENOSPC";
+  assert.deepEqual(await auditAdapters(s2).openIntents(), [3]);
+  await s2.drain();
+  assert.equal(s2.health().held, 1);
+  assert.deepEqual(auditHealth(s2).reasons, ["audit_unavailable"], "(unanchored: the stream's own state names it)");
+  await s2.close();
+});
+
+test("H5: health keeps the cause: a failed fsync under an anchored stream is fail_closed (audit_unavailable), never ok; an EIO-held narrowing record is audit_unavailable, not audit_full; ENOSPC is audit_full; a hung fsync past the deadline is audit_timeout", async () => {
+  const x = steeredIo();
+  const s = await open(fresh(), { trustGenesis: true, io: x.io });
+  x.st.fsyncFail = 1;
+  auditAdapters(s).audit({ kind: "grant.apply", gen: 1, phase: "succeeded" });
+  await s.drain();
+  assert.equal(s.health().state, "fail_closed");
+  assert.deepEqual(auditHealth(s).reasons, ["audit_unavailable"]);
+  assert.ok(s.health().counters.uncertain >= 1);
+  await s.close();
+  // EIO before any byte, on a narrowing record: held, and its cause is unavailability
+  const y = steeredIo();
+  const s2 = await open(fresh(), { trustGenesis: true, io: y.io });
+  y.st.failNext = "EIO";
+  auditAdapters(s2).audit({ kind: "agent.stop", agent: newId(), phase: "succeeded" });
+  await s2.drain();
+  assert.deepEqual([s2.health().state, ...auditHealth(s2).reasons], ["degraded_audit", "audit_unavailable"]);
+  await s2.close();
+  // ENOSPC: capacity
+  const z = steeredIo();
+  const s3 = await open(fresh(), { trustGenesis: true, io: z.io });
+  z.st.failNext = "ENOSPC";
+  auditAdapters(s3).audit({ kind: "agent.stop", agent: newId(), phase: "succeeded" });
+  await s3.drain();
+  assert.deepEqual([s3.health().state, ...auditHealth(s3).reasons], ["reserve_only", "audit_full"]);
+  await s3.close();
+  // a hung fsync past the intent deadline
+  const w = steeredIo();
+  const s4 = await open(fresh(), { trustGenesis: true, io: w.io, limits: { ...SMALL, intentMs: 30 } });
+  w.st.hang = true;
+  auditAdapters(s4).audit({ kind: "grant.apply", gen: 1, phase: "succeeded" });
+  const syncing = s4.drain();
+  await new Promise((r) => setTimeout(r, 60));
+  assert.deepEqual([s4.health().state, ...auditHealth(s4).reasons], ["degraded_audit", "audit_timeout"]);
+  w.release();
+  await syncing;
+  await s4.close();
+});
+
+test("a refusal summary's times out of order, or a count of 0, is refused at the writer", async () => {
+  const s = await open(fresh(), { trustGenesis: true });
+  for (const refusal of [{ count: 1, first_at_ms: 5, last_at_ms: 4 }, { count: 0, first_at_ms: 4, last_at_ms: 5 }]) {
+    await assert.rejects(s.append("sb.audit-event.v1", { op: "grant.intake", op_id: b64(new Uint8Array(16).fill(refusal.count + 1)), phase: "refused", gen: 2, reason: "chain_fork", detail: { refusal } }), (e) => e.code === "bad_form");
+  }
+  await s.close();
+});

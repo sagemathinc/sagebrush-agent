@@ -2150,14 +2150,7 @@
           "$ref": "#/$defs/count"
         },
         "prev": {
-          "oneOf": [
-            {
-              "type": "null"
-            },
-            {
-              "$ref": "#/$defs/b64_32"
-            }
-          ]
+          "$ref": "#/$defs/b64_32"
         },
         "at_ms": {
           "$ref": "#/$defs/ms"
@@ -2334,7 +2327,7 @@
               ],
               "properties": {
                 "count": {
-                  "$ref": "#/$defs/count"
+                  "$ref": "#/$defs/gen"
                 },
                 "first_at_ms": {
                   "$ref": "#/$defs/ms"
@@ -2394,14 +2387,7 @@
           "$ref": "#/$defs/count"
         },
         "prev": {
-          "oneOf": [
-            {
-              "type": "null"
-            },
-            {
-              "$ref": "#/$defs/b64_32"
-            }
-          ]
+          "$ref": "#/$defs/b64_32"
         },
         "at_ms": {
           "$ref": "#/$defs/ms"

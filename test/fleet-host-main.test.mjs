@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { b64, hostFingerprint, keyFromSeed, newId, replayChain, seal, sha256b64 } from "../lib/fleet/index.mjs";
 import { classify, firstBoot, hostPaths } from "../lib/fleet/host/identity.mjs";
-import { ADAPTERS, AUDIT_ADAPTERS, CONFIG_MAX, CONTAIN_RETRY_MS, INITIAL_SYNC_MS, RESUME_BASE_KEYS, brokerAccount, hostResetIdentity, hostRun, readHostConfig, realContainSys, resumeBase, resumeRequester, supervisorUnit } from "../lib/fleet/host/host-main.mjs";
+import { ADAPTERS, AUDIT_ADAPTERS, CONFIG_MAX, certValidity, CONTAIN_RETRY_MS, INITIAL_SYNC_MS, RESUME_BASE_KEYS, brokerAccount, hostResetIdentity, hostRun, readHostConfig, realContainSys, resumeBase, resumeRequester, supervisorUnit } from "../lib/fleet/host/host-main.mjs";
 import { RESUME_HELPER_MS, requestResume } from "../lib/fleet/host/restore-resume.mjs";
 import { expectedOf } from "../lib/fleet/host/restore-plan.mjs";
 import { QUALIFIED_MAJOR } from "../lib/fleet/host/host-preflight.mjs";
@@ -843,13 +843,30 @@ test("PAIRED with the audit stream: opened only after every other adapter is pre
   assert.deepEqual([x.fleet, x.aud, x.host, x.cert], [id.pin.fleet, id.pin.aud, id.cert.body.host, id.cert.hash]);
   assert.equal(x.signer, id.keys.sign);
   assert.equal(x.chainSeq(), id.chain.seq, "the pinned head, read at each record");
-  assert.equal(x.keyFor(id.cert.hash, 0), id.keys.sign.raw);
-  assert.throws(() => x.keyFor("another", 0), (e) => e.code === "bad_signature");
+  // the exact certificate at the record's chain_seq: certified at the head, not before it was issued, never another
+  assert.equal(x.keyFor(id.cert.hash, id.chain.seq), id.keys.sign.raw);
+  assert.throws(() => x.keyFor(id.cert.hash, id.chain.seq - 1), (e) => e.code === "bad_signature");
+  assert.throws(() => x.keyFor("another", id.chain.seq), (e) => e.code === "bad_signature");
   for (const k of AUDIT_ADAPTERS) assert.equal(h.made.effects.adapters[k], h.made.auditAdapters[k], k);
   for (const k of BROKER_SIDE) assert.equal(h.made.effects.adapters[k], others[k], k);
   h.term();
   assert.equal((await run).code, 0);
   assert.deepEqual(h.log.slice(-4), ["close", "auditClose", "storeClose", "release"]);
+});
+
+test("certValidity: the certificate counts at each seq from its issue until its signer is removed; a record at a later seq fails, an earlier one still verifies", async () => {
+  const { id } = await paired();
+  const N2 = keyFromSeed(Buffer.from(F.keys["device-native-2"].seed, "hex"));
+  const chain = await replayChain(id.entries, { aud: AUD, fleet: FLEET });
+  const removal = seal("sb.device-chain.v1", { kind: "device", id: F.ids.device_native_2, alg: "ed25519", key: N2.key },
+    { fleet: FLEET, aud: AUD, seq: chain.seq + 1, prev: chain.head, op: "remove", at_ms: NOW, auth_time_ms: NOW, remove: F.ids.device_native, regrants: [] }, N2);
+  const v = await certValidity({ entries: [...id.entries, removal], certBytes: id.certBytes, pin: id.pin });
+  assert.equal(v.get(chain.seq), true, "issued at the head");
+  for (let s = 0; s < chain.seq; s++) assert.equal(v.get(s), false, `before its issue (${s})`);
+  assert.equal(v.get(chain.seq + 1), false, "after its signer's removal");
+  // without the removal (the chain as pinned): it counts at the head only
+  const w = await certValidity({ entries: id.entries, certBytes: id.certBytes, pin: id.pin });
+  assert.deepEqual([...w.entries()].filter(([, ok]) => ok).map(([s]) => s), [chain.seq]);
 });
 
 test("PAIRED with the audit stream but no broker or ack adapters (the shipped wiring today): preflight_missing naming exactly those four; the stream is never opened", async () => {

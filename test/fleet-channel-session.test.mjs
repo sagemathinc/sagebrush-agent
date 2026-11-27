@@ -379,6 +379,74 @@ test("takeover 4: a late result after an abandon and a resume is discarded; ever
   assert.equal(s.broker.ended, null);
 });
 
+test("takeover 5: a started command its transport refused before sending is refuseUnsent: not run (takeover), in seq order, once; its late answer is discarded", async () => {
+  const s = sessions();
+  const t = connect(s.broker, s.app);
+  const release = s.exec.barrier(2);
+  const out = [s.broker.submit({ n: 1 }), s.broker.submit({ n: 2, hold: "before" }), s.broker.submit({ n: 3, click: true })];
+  await t.pump();
+  assert.equal(s.app.executing, 2);
+  assert.equal(s.app.refuseUnsent(2, "takeover"), false, "takeover only while paused");
+  s.app.pause(); // (3 never started: swept as takeover)
+  const before = s.app.held;
+  assert.equal(s.app.refuseUnsent(2, "takeover"), true);
+  assert.equal(s.app.refuseUnsent(2, "takeover"), false, "once");
+  assert.equal(s.app.abandon(2), false, "and no abandon after it");
+  assert.deepEqual(s.app.held, before, "the refusal keeps its own result slot and adds no result bytes");
+  assert.equal(before.arrivals, 0);
+  release(); // (the late answer)
+  await t.pump();
+  const o = await Promise.all(out);
+  assert.deepEqual(o.map((x) => `${x.outcome}:${x.reason ?? ""}`), ["result:", "not_run:takeover", "not_run:takeover"]);
+  assert.deepEqual(kinds(s.appSent).filter((k) => k === "res:1" || k === "ctl:refused" || k.startsWith("res:")), ["res:1", "ctl:refused", "ctl:refused"], "one outcome per seq, in order; the late answer never went out");
+  assert.equal(s.exec.clicks, 0);
+  assert.equal(s.broker.ended, null);
+});
+
+test("takeover 6: refuseUnsent \"bad\" needs no pause, and the queue moves on; any other seq, state or reason changes nothing", async () => {
+  const s = sessions();
+  const t = connect(s.broker, s.app);
+  const release = s.exec.barrier(1);
+  const out = [s.broker.submit({ n: 1, hold: "before" }), s.broker.submit({ n: 2 })];
+  await t.pump();
+  for (const [seq, reason] of [[2, "bad"], [3, "bad"], [1, "paused"], [1, "credits"], [1, "abandoned"], [1, undefined]]) assert.equal(s.app.refuseUnsent(seq, reason), false, `${seq} ${reason}`);
+  assert.equal(s.app.executing, 1, "nothing changed");
+  assert.equal(s.app.refuseUnsent(1, "bad"), true);
+  assert.equal(s.app.executing, 2, "the next command starts");
+  release();
+  await t.pump();
+  assert.deepEqual((await Promise.all(out)).map((x) => `${x.outcome}:${x.reason ?? ""}`), ["not_run:bad", "result:"]);
+  assert.deepEqual(s.exec.started, [1, 2]);
+  assert.equal(s.app.refuseUnsent(1, "bad"), false, "a done or refused command: nothing");
+});
+
+test("takeover 7: a refuseUnsent outcome lost with its transport is replayed on the resume, once", async () => {
+  const s = sessions();
+  const t1 = connect(s.broker, s.app);
+  const release = s.exec.barrier(1);
+  const p = s.broker.submit({ n: 1, hold: "before" });
+  await t1.pump();
+  s.app.pause();
+  t1.cut(); // (the refusal below has no transport to go out on)
+  assert.equal(s.app.refuseUnsent(1, "takeover"), true);
+  release();
+  const t2 = connect(s.broker, s.app);
+  await t2.pump();
+  assert.deepEqual(await p, { outcome: "not_run", reason: "takeover" });
+  assert.equal(s.appSent.filter((m) => m.kind === "ctl" && m.value.ctl === "refused" && m.value.seq === 1).length, 1);
+  assert.equal(s.broker.ended, null);
+});
+
+test("takeover 8: refuseUnsent after the session ended changes nothing", async () => {
+  const s = sessions();
+  const t = connect(s.broker, s.app);
+  s.exec.barrier(1);
+  s.broker.submit({ n: 1, hold: "before" });
+  await t.pump();
+  s.app.end("gone");
+  assert.equal(s.app.refuseUnsent(1, "bad"), false);
+});
+
 // ---- the bounds, each at the limit and one past it
 
 test("bounds: 32 credits; the broker holds what would pass 1 MiB of unadmitted command bytes", async () => {

@@ -1,5 +1,5 @@
 // Builds test/fixtures/fleet-fixtures.json: the shared vectors every fleet-protocol implementation (this package, the
-// page's mirror, the Python verifier) must pass (design agent-autonomous-schemas.md r2.3 §9). Deterministic: fixed
+// page's mirror, the Python verifier) must pass (design agent-autonomous-schemas.md r2.4 §9). Deterministic: fixed
 // seeds, ids and times, so a rebuild is byte-identical; test/fleet-fixtures.test.mjs checks that and runs every case.
 //
 //   node test/make-fleet-fixtures.mjs > test/fixtures/fleet-fixtures.json
@@ -7,7 +7,7 @@
 // Each case gives its inputs as exact bytes or JSON, and its expected result: "ok" or a reason code from
 // schema/fleet/reasons.json. Stateful cases carry everything a verifier needs (the chain entries, the context).
 
-import { b64, enc, idOfBytes, canonText, keyFromSeed, seal, sealAdd, signedBytes, FREEZE, hostFingerprint, preimageHash, sha256b64 } from "../lib/fleet/index.mjs";
+import { b64, enc, idOfBytes, canonText, keyFromSeed, seal, sealAdd, signedBytes, FREEZE, hostFingerprint, fleetFingerprint, showFingerprint, preimageHash, sha256b64 } from "../lib/fleet/index.mjs";
 
 const AUD = "https://dev.sagebrush.space";
 const NOW = 1_800_000_000_000;
@@ -132,6 +132,52 @@ export async function build() {
     { name: "past the pinned head", chain_seq: s2Seq + 1, signer: sv(s2Id, S2), expect: "device_unknown" },
   ];
 
+  // ---- 5b. lease keys (r2.5 §1.7a): native devices only, never a service key's material or id, half-open as §1.7.
+  // A chain of its own (the honest chain plus three entries), built without moving the honest chain's seq or head.
+  const L1 = key("lease-1", seed(40)), L2 = key("lease-2", seed(41));
+  const l1Id = id(40), l2Id = id(41);
+  Object.assign(ids, { lease_1: l1Id, lease_2: l2Id });
+  const saved = { seq, head, n: entries.length };
+  const lk = (by, byId, lid, k) => seal("sb.device-chain.v1", signer(by, byId), body("lease-key", { lease_key: { id: lid, alg: "ed25519", key: b64(k.raw) } }), by);
+  const sk = (lid, k) => next(N, nId, "service-key", { service_key: { id: lid, alg: "ed25519", key: b64(k.raw) } });
+  const lease_chain = [
+    // (on the honest chain, before any lease key)
+    { name: "a browser device pins the first lease key", entries: honest, append: txt(lk(B, bId, id(42), keyFromSeed(seed(42)))), expect: "device_tier" },
+    { name: "a native device pins the first lease key", entries: honest, append: txt(lk(N, nId, id(42), keyFromSeed(seed(42)))), expect: "ok" },
+  ];
+  push(lk(N, nId, l1Id, L1));
+  const l1Seq = seq - 1;
+  push(seal("sb.device-chain.v1", signer(N, nId), body("policy", { policy: { require_native_for_widening: true } }), N));
+  push(lk(N2, n2Id, l2Id, L2));
+  const l2Seq = seq - 1;
+  const leased = [...entries];
+  lease_chain.push(
+    { name: "the leased chain replays", entries: leased, expect: "ok" },
+    { name: "a browser device rotates a native-pinned lease key", entries: leased, append: txt(lk(B, bId, id(43), keyFromSeed(seed(43)))), expect: "device_tier" },
+    { name: "a native device rotates the lease key", entries: leased, append: txt(lk(N, nId, id(43), keyFromSeed(seed(43)))), expect: "ok" },
+    { name: "the recovery key signs a lease-key entry", entries: leased, append: txt(seal("sb.device-chain.v1", { kind: "recovery", id: fleet, alg: "ed25519", key: R2.key }, body("lease-key", { lease_key: { id: id(43), alg: "ed25519", key: b64(keyFromSeed(seed(43)).raw) } }), R2)), expect: "device_unknown" },
+    { name: "a lease key that is a pinned service key", entries: leased, append: txt(lk(N, nId, id(44), S1)), expect: "bad_form" },
+    { name: "a service key that is a pinned lease key", entries: leased, append: sk(id(45), L1), expect: "bad_form" },
+    { name: "a lease key under a service key's id", entries: leased, append: txt(lk(N, nId, s1Id, keyFromSeed(seed(46)))), expect: "bad_form" },
+    { name: "a service key under a lease key's id", entries: leased, append: sk(l1Id, keyFromSeed(seed(47))), expect: "bad_form" },
+    { name: "a lease key id twice", entries: leased, append: txt(lk(N, nId, l2Id, keyFromSeed(seed(48)))), expect: "bad_form" },
+  );
+  const lv = (lid, k, kind = "lease") => ({ kind, id: lid, alg: "ed25519", key: k.key });
+  const lease_keys = [
+    { name: "key 1 inside its interval", lookup: "lease", chain_seq: l1Seq + 1, signer: lv(l1Id, L1), expect: "ok" },
+    { name: "key 2 after the rotation", lookup: "lease", chain_seq: l2Seq, signer: lv(l2Id, L2), expect: "ok" },
+    { name: "an old lease after the rotation", lookup: "lease", chain_seq: l1Seq, signer: lv(l1Id, L1), expect: "ok" },
+    { name: "the old key past its replacement", lookup: "lease", chain_seq: l2Seq, signer: lv(l1Id, L1), expect: "bad_signature" },
+    { name: "before any lease key", lookup: "lease", chain_seq: l1Seq - 1, signer: lv(l1Id, L1), expect: "bad_signature" },
+    { name: "past the pinned head", lookup: "lease", chain_seq: l2Seq + 1, signer: lv(l2Id, L2), expect: "device_unknown" },
+    { name: "signer kind service naming the lease key", lookup: "lease", chain_seq: l2Seq, signer: lv(l2Id, L2, "service"), expect: "bad_signature" },
+    { name: "signer kind lease naming the service key", lookup: "lease", chain_seq: l2Seq, signer: lv(s2Id, S2), expect: "bad_signature" },
+    { name: "the lease lookup before any lease key, naming the service key then in force", lookup: "lease", chain_seq: l1Seq - 1, signer: lv(s2Id, S2), expect: "bad_signature" },
+    { name: "the service lookup never sees a lease key", lookup: "service", chain_seq: l2Seq, signer: lv(l2Id, L2, "service"), expect: "bad_signature" },
+    { name: "the service key stays in force beside the lease keys", lookup: "service", chain_seq: l2Seq, signer: lv(s2Id, S2, "service"), expect: "ok" },
+  ];
+  entries.length = saved.n; seq = saved.seq; head = saved.head;
+
   // ---- 6. envelopes and objects outside the chain (§1.3, §3, §4), against the honest chain
   const encRaw = new Uint8Array(32).fill(9);
   const certBody = { fleet, aud: AUD, chain_seq: headAt.seq, host, sign_key: b64(H.raw), enc_key: b64(encRaw), fingerprint: b64(await hostFingerprint(host, H.raw, encRaw)), name: "lab-box", at_ms: NOW };
@@ -158,6 +204,19 @@ export async function build() {
     { name: "a browser device widens under the native policy", bytes: grant(B, bId, {}), current: null, expect: "device_tier" },
     { name: "a tag the grant doesn't name", bytes: grant(N, nId, { agents: [{ ...a0, tags: [id(77)] }] }), current: null, expect: "bad_form" },
   ];
+  // a lineage under the native policy (§3.2, the fleet page's anchored walk): the native first grant g1, then two
+  // successive browser-signed narrowings, each verified against the one before it, as the host accepted them; on its
+  // own (current null) a narrowing is a widening and refused; then a browser-signed widening of the last
+  const n2 = grant(B, bId, { gen: 2, agents: [{ ...a0, workspace: [{ path: "/Algebra", access: "read" }] }] });
+  const n3 = grant(B, bId, { gen: 3, not_after_ms: NOW + 1_800_000, agents: [{ ...a0, workspace: [{ path: "/Algebra", access: "read" }] }] });
+  const w4 = grant(B, bId, { gen: 4, not_after_ms: NOW + 1_800_000, agents: [{ ...a0, workspace: [{ path: "/Algebra", access: "write" }] }] });
+  grants.push(
+    { name: "a lineage: a browser narrowing of the native first grant", bytes: n2, current: { gen: 1, bytes: g1 }, expect: "ok" },
+    { name: "a lineage: a second browser narrowing, of the first narrowing", bytes: n3, current: { gen: 2, bytes: n2 }, expect: "ok" },
+    { name: "a lineage: the first browser narrowing on its own", bytes: n2, current: null, expect: "device_tier" },
+    { name: "a lineage: the second browser narrowing on its own", bytes: n3, current: null, expect: "device_tier" },
+    { name: "a lineage: a browser widening of the second narrowing", bytes: w4, current: { gen: 3, bytes: n3 }, expect: "device_tier" },
+  );
   const op = (k, kid, o, extra = {}) => txt(seal("sb.host-op.v1", signer(k, kid), { fleet, aud: AUD, chain_seq: headAt.seq, op_id: id(60 + Object.keys(extra).length), op: o, host, agent: "all", gen: 3, at_ms: NOW, not_after_ms: NOW + 600_000, ...extra }, k));
   const host_ops = [
     { name: "a pause", bytes: op(B, bId, "pause"), current_gen: 3, expect: "ok" },
@@ -189,6 +248,7 @@ export async function build() {
   const grant_acks = [
     { name: "an ack of the current generation", bytes: ack0, current_gen: 3, expect: "ok" },
     { name: "an ack of an older generation", bytes: ack("sb.grant-ack.v1", hostSigner, ackBody({ gen: 2 }), H), current_gen: 3, expect: "ok" },
+    { name: "an ack of the first grant", bytes: ack("sb.grant-ack.v1", hostSigner, ackBody({ gen: 1 }), H), current_gen: 1, expect: "ok" },
     { name: "an ack ahead of the grant", bytes: ack("sb.grant-ack.v1", hostSigner, ackBody({ gen: 4 }), H), current_gen: 3, expect: "stale_generation" },
     { name: "signed by a key other than the certified host's", bytes: ack("sb.grant-ack.v1", hostSigner, ackBody(), N2), current_gen: 3, expect: "bad_signature" },
     { name: "another host", bytes: ack("sb.grant-ack.v1", { ...hostSigner, id: agent }, ackBody({ host: agent }), H), current_gen: 3, expect: "bad_signature" },
@@ -203,14 +263,226 @@ export async function build() {
     { name: "a host signing a grant", bytes: txt(enc(canonText({ ...JSON.parse(g1), signer: { kind: "host", id: host, alg: "ed25519", key: H.key } }))), expect: "bad_signature" },
   ];
 
+  // ---- 6b. agent messages (agent-messages r6 §2, with r7 to r10): a person->agent message signed by any enrolled
+  // device of the fleet (no tier), and the host's signed records answering it; checked by verifyAgentMessage (against
+  // the honest chain) and verifyAgentReply (against the certificate above). body_sha256 is over a ciphertext the
+  // service never opens: here a fixed stand-in.
+  const ct = sha256b64(enc("a sealed body"));
+  const msgBody = (extra = {}) => ({ fleet, aud: AUD, host, agent, thread: id(90), id: id(91), in_reply_to: null, at_ms: NOW, chain_seq: headAt.seq, body_sha256: ct, ...extra });
+  const msg = (k, sg, extra) => txt(seal("sb.agent-message.v1", sg, msgBody(extra), k));
+  const repBody = (extra = {}) => ({ fleet, aud: AUD, host, agent, thread: id(90), id: id(92), in_reply_to: id(91), covers: [id(91)], turn: id(93), kind: "reply", reason: null, answer: null, at_ms: NOW, chain_seq: headAt.seq, body_sha256: ct, ...extra });
+  const rep = (extra) => txt(seal("sb.agent-reply.v1", hostSigner, repBody(extra), H));
+  // (a signer of a kind the type doesn't allow: seal() refuses to make one, so it is signed by hand, as an attacker would)
+  const forge = async (type, sg, body, k) => txt(enc(canonText({ v: 1, type, signer: sg, body, sig: b64(await k.sign(signedBytes(type, sg, body))) })));
+  const m0 = msg(B, signer(B, bId));
+  const agent_messages = [
+    { name: "a message from a browser device", bytes: m0, expect: "ok" },
+    { name: "a message from a native device", bytes: msg(N, signer(N, nId)), expect: "ok" },
+    { name: "a message answering another", bytes: msg(B, signer(B, bId), { in_reply_to: id(92) }), expect: "ok" },
+    { name: "a message answering itself", bytes: msg(B, signer(B, bId), { in_reply_to: id(91) }), expect: "bad_form" },
+    { name: "a message to another audience", bytes: m0, ctx: { aud: "https://sagebrush.space", fleet }, expect: "bad_audience" },
+    { name: "a message with an extra field (a subject)", bytes: msg(B, signer(B, bId), { subject: "x" }), expect: "bad_form" },
+    { name: "a message id that isn't a fleet id (B22-shaped)", bytes: msg(B, signer(B, bId), { id: "A".repeat(21) + "A" }), expect: "bad_form" },
+    { name: "a message for another agent", bytes: msg(B, signer(B, bId), { agent: id(94) }), expect: "not_granted" },
+    { name: "a message for another host", bytes: msg(B, signer(B, bId), { host: id(94) }), expect: "not_granted" },
+    // (the device key's rules, on this type: enrolled at the record's chain_seq, not removed by then, and no chain_seq
+    // past the head; chain "removed" is the transfers' chain_removed, the browser device removed at the next seq)
+    { name: "a message from a device enrolled only after its chain_seq", bytes: msg(N2, signer(N2, n2Id), { chain_seq: 1 }), expect: "device_unknown" },
+    { name: "a message from a device removed at or before its chain_seq", bytes: msg(B, signer(B, bId), { chain_seq: headAt.seq + 1 }), chain: "removed", expect: "device_unknown" },
+    { name: "a message from a device enrolled at its chain_seq but removed by the head", bytes: msg(B, signer(B, bId)), chain: "removed", expect: "device_removed" },
+    { name: "a message whose chain_seq is past the head", bytes: msg(B, signer(B, bId), { chain_seq: headAt.seq + 5 }), expect: "device_unknown" },
+    { name: "a message signed by a host", bytes: await forge("sb.agent-message.v1", hostSigner, msgBody(), H), expect: "bad_signature" },
+    { name: "a message's signer swapped to another device (the signature no longer verifies)", bytes: txt(enc(canonText({ ...JSON.parse(m0), signer: signer(N, nId) }))), expect: "bad_signature" },
+  ];
+  const agent_replies = [
+    { name: "a reply", bytes: rep(), expect: "ok" },
+    { name: "a reply covering three, in_reply_to the last", bytes: rep({ covers: [id(95), id(96), id(91)] }), expect: "ok" },
+    { name: "a reply whose in_reply_to isn't the last of covers", bytes: rep({ covers: [id(91), id(95)] }), expect: "bad_form" },
+    { name: "covers with a repeat", bytes: rep({ covers: [id(91), id(91)] }), expect: "bad_form" },
+    { name: "covers of 64", bytes: rep({ covers: [...Array.from({ length: 63 }, (_, i) => id(100 + i)), id(91)] }), expect: "ok" },
+    { name: "covers of 65", bytes: rep({ covers: [...Array.from({ length: 64 }, (_, i) => id(100 + i)), id(91)] }), expect: "bad_form" },
+    { name: "a reply without a body", bytes: rep({ body_sha256: null }), expect: "bad_form" },
+    { name: "a reply with a reason", bytes: rep({ reason: "crashed" }), expect: "bad_form" },
+    { name: "a turn_failed: no body, a closed reason", bytes: rep({ kind: "turn_failed", reason: "crashed", body_sha256: null }), expect: "ok" },
+    { name: "a turn_failed for a lost answer (C1)", bytes: rep({ kind: "turn_failed", reason: "answer_lost", body_sha256: null }), expect: "ok" },
+    { name: "a turn_failed with a refused record's reason", bytes: rep({ kind: "turn_failed", reason: "replayed", body_sha256: null }), expect: "bad_form" },
+    { name: "a turn_failed with a body", bytes: rep({ kind: "turn_failed", reason: "stalled" }), expect: "bad_form" },
+    { name: "a refused record: no turn, no covers, no body", bytes: rep({ kind: "refused", reason: "not_granted", turn: null, covers: null, body_sha256: null }), expect: "ok" },
+    { name: "a refused record with covers", bytes: rep({ kind: "refused", reason: "replayed", turn: null, body_sha256: null }), expect: "bad_form" },
+    { name: "a refused record with a turn_failed's reason", bytes: rep({ kind: "refused", reason: "budget", turn: null, covers: null, body_sha256: null }), expect: "bad_form" },
+    { name: "a covered record", bytes: rep({ kind: "covered", body_sha256: null }), expect: "ok" },
+    { name: "a covered record naming the answer in another thread", bytes: rep({ kind: "covered", body_sha256: null, answer: { thread: id(97), id: id(98) } }), expect: "ok" },
+    { name: "a covered record with a body", bytes: rep({ kind: "covered" }), expect: "bad_form" },
+    { name: "an answer on a reply", bytes: rep({ answer: { thread: id(97), id: id(98) } }), expect: "bad_form" },
+    { name: "a reply of kind message", bytes: rep({ kind: "message" }), expect: "bad_form" },
+    { name: "a reason outside every closed set", bytes: rep({ kind: "turn_failed", reason: "because", body_sha256: null }), expect: "bad_form" },
+    { name: "a reply signed by a device", bytes: await forge("sb.agent-reply.v1", signer(N, nId), repBody(), N), expect: "bad_signature" },
+    { name: "a reply signed by a key other than the certified host's", bytes: txt(seal("sb.agent-reply.v1", hostSigner, repBody(), N2)), expect: "bad_signature" },
+    { name: "the certified host's signature under another key id", bytes: txt(seal("sb.agent-reply.v1", { ...hostSigner, key: N2.key }, repBody(), H)), expect: "bad_signature" },
+    { name: "the certified host's signature over a body naming another host", bytes: rep({ host: id(94) }), expect: "bad_signature" },
+    { name: "a refused record with a turn but no covers", bytes: rep({ kind: "refused", reason: "replayed", covers: null, body_sha256: null }), expect: "bad_form" },
+    { name: "a covered record without covers", bytes: rep({ kind: "covered", body_sha256: null, covers: null }), expect: "bad_form" },
+    { name: "a turn_failed without a turn", bytes: rep({ kind: "turn_failed", reason: "crashed", body_sha256: null, turn: null }), expect: "bad_form" },
+    { name: "answer_lost on a refused record (r11)", bytes: rep({ kind: "refused", reason: "answer_lost", turn: null, covers: null, body_sha256: null }), expect: "bad_form" },
+    { name: "not_granted on a turn_failed (r11)", bytes: rep({ kind: "turn_failed", reason: "not_granted", body_sha256: null }), expect: "bad_form" },
+    { name: "an answer on a turn_failed", bytes: rep({ kind: "turn_failed", reason: "crashed", body_sha256: null, answer: { thread: id(97), id: id(98) } }), expect: "bad_form" },
+    { name: "an answer on a refused record", bytes: rep({ kind: "refused", reason: "replayed", turn: null, covers: null, body_sha256: null, answer: { thread: id(97), id: id(98) } }), expect: "bad_form" },
+  ];
+
+  // ---- 7. moving an agent (r2.4 §3.7): the receipt pair (checks 1-3), then the new host's own (checks 4-6)
+  const tSigned = (type, sg, b) => sha256b64(signedBytes(type, sg, b));
+  const g1Env = JSON.parse(g1);
+  const grantHash = tSigned("sb.host-grant.v1", g1Env.signer, g1Env.body);
+  const nonceT = b64(Uint8Array.from({ length: 16 }, (_, i) => 200 + i));
+  const fromHost = id(30);
+  const tBody = (extra = {}) => ({ fleet, aud: AUD, agent, from_host: fromHost, to_host: host, to_host_key: certBody.fingerprint, gen: 3, grant: grantHash, nonce: nonceT,
+    chain_seq: headAt.seq, at_ms: NOW, not_after_ms: NOW + 600_000, auth_time_ms: NOW, ...extra });
+  const tEnv = (k, sg, b, type = "sb.agent-transfer.v1") => ({ text: txt(seal(type, sg, b, k)), hash: tSigned(type, sg, b) });
+  const T0 = tEnv(N, signer(N, nId), tBody());
+  const rBody = (tHash, extra = {}) => ({ fleet, aud: AUD, agent, from_host: fromHost, to_host: host, to_host_key: certBody.fingerprint, gen: 3, nonce: nonceT,
+    transfer: tHash, chain_seq: s2Seq, at_ms: NOW, ...extra });
+  const rcpt = (k, sg, b, type = "sb.agent-transfer-receipt.v1") => txt(seal(type, sg, b, k));
+  const R0 = rcpt(S2, sv(s2Id, S2), rBody(T0.hash));
+  const withT = (t, extraR = {}) => ({ transfer: t.text, receipt: rcpt(S2, sv(s2Id, S2), rBody(t.hash, extraR)) });
+  const removedChain = [...honest, next(N, nId, "remove", { remove: bId, regrants: [] })];
+  const late = tEnv(N, signer(N, nId), tBody({ at_ms: NOW - 7_200_000, not_after_ms: NOW - 6_600_000, auth_time_ms: NOW - 7_200_000 }));
+  const transfer_receipts = [
+    { name: "a transfer and its receipt", ...withT(T0), expect: "ok" },
+    { name: "the new key at the rotation's boundary", transfer: T0.text, receipt: R0, expect: "ok" },
+    { name: "a receipt signed before the rotation, verified after it", transfer: T0.text, receipt: rcpt(S1, sv(s1Id, S1), rBody(T0.hash, { chain_seq: s1Seq })), expect: "ok" },
+    { name: "the old key at the new key's chain_seq", transfer: T0.text, receipt: rcpt(S1, sv(s1Id, S1), rBody(T0.hash)), expect: "bad_signature" },
+    { name: "a receipt past the pinned head", transfer: T0.text, receipt: rcpt(S2, sv(s2Id, S2), rBody(T0.hash, { chain_seq: s2Seq + 1 })), expect: "device_unknown" },
+    { name: "a receipt for another fleet", transfer: T0.text, receipt: rcpt(S2, sv(s2Id, S2), rBody(T0.hash, { fleet: id(99) })), expect: "bad_form" },
+    { name: "a receipt for another audience", transfer: T0.text, receipt: rcpt(S2, sv(s2Id, S2), rBody(T0.hash, { aud: "https://sagebrush.space" })), expect: "bad_audience" },
+    { name: "a device as a receipt's signer (still well-formed; receipts are the service's)", transfer: T0.text, receipt: txt(enc(canonText({ ...JSON.parse(R0), signer: signer(N, nId) }))), expect: "bad_signature" },
+    { name: "a receipt's body under another type", transfer: T0.text, receipt: rcpt(S2, sv(s2Id, S2), rBody(T0.hash), "sb.audit-ack.v1"), expect: "bad_form" },
+    { name: "the service as a transfer's signer (still well-formed; transfers are a device's)", transfer: txt(enc(canonText({ ...JSON.parse(T0.text), signer: sv(s2Id, S2) }))), receipt: R0, expect: "bad_signature" },
+    { name: "a transfer whose signer wasn't enrolled at its chain_seq", ...withT(tEnv(N2, signer(N2, n2Id), tBody({ chain_seq: 1 }))), expect: "device_unknown" },
+    { name: "a transfer whose signer was removed at the pinned head", chain: "removed", ...withT(tEnv(B, signer(B, bId), tBody())), expect: "device_removed" },
+    { name: "a browser device under the native policy (a transfer widens)", ...withT(tEnv(B, signer(B, bId), tBody())), expect: "device_tier" },
+    { name: "a transfer past its not_after_ms at the resume (the window is the service's check)", ...withT(late), expect: "ok" },
+    { name: "a transfer's body under another type", ...withT(tEnv(N, signer(N, nId), tBody(), "sb.host-op.v1")), expect: "bad_form" },
+    { name: "the receipt names another transfer", transfer: T0.text, receipt: rcpt(S2, sv(s2Id, S2), rBody(late.hash)), expect: "bad_form" },
+    ...["agent", "from_host", "to_host", "to_host_key", "gen", "nonce"].map((k) => ({
+      name: `the receipt's ${k} differs, both signatures valid`, transfer: T0.text,
+      receipt: rcpt(S2, sv(s2Id, S2), rBody(T0.hash, { [k]: k === "gen" ? 4 : k === "nonce" ? b64(new Uint8Array(16).fill(1)) : k === "to_host_key" ? b64(new Uint8Array(32).fill(2)) : id(40) })), expect: "bad_form" })),
+  ];
+  // checks 4-6 over the host's records (JSON: grants by gen with their hash and agents; listed_since, entry_gen,
+  // accepted and nonces by key), for the verified pair above
+  const pair0 = { transfer: tBody(), transferHash: T0.hash };
+  const rec = (over = {}) => ({ id: host, fingerprint: certBody.fingerprint, grants: { 3: { hash: grantHash, agents: [agent] } }, listed_since: { [agent]: 3 },
+    entry_gen: { [agent]: 3 }, accepted: {}, nonces: {}, ...over });
+  const otherHash = b64(new Uint8Array(32).fill(5));
+  const transfer_hosts = [
+    { name: "the first acceptance", pair: pair0, host: rec(), expect: "ok", first: true },
+    { name: "the accepted pair again (a resume retried)", pair: pair0, host: rec({ accepted: { [agent]: { gen: 3, nonce: nonceT, transfer: T0.hash } }, nonces: { [nonceT]: T0.hash } }), expect: "ok", first: false },
+    { name: "to another host", pair: { ...pair0, transfer: tBody({ to_host: id(31) }) }, host: rec(), expect: "not_granted" },
+    { name: "a to_host_key that isn't this host's fingerprint", pair: pair0, host: rec({ fingerprint: otherHash }), expect: "not_granted" },
+    { name: "a grant hash this host never accepted", pair: pair0, host: rec({ grants: { 3: { hash: otherHash, agents: [agent] } } }), expect: "not_granted" },
+    { name: "no grant accepted at that generation", pair: pair0, host: rec({ grants: {} }), expect: "not_granted" },
+    { name: "a grant that doesn't list the agent", pair: pair0, host: rec({ grants: { 3: { hash: grantHash, agents: [] } } }), expect: "not_granted" },
+    { name: "the agent not in the current grant", pair: pair0, host: rec({ listed_since: {}, entry_gen: {} }), expect: "not_granted" },
+    { name: "the agent dropped and re-added after gen", pair: pair0, host: rec({ listed_since: { [agent]: 5 }, entry_gen: { [agent]: 5 } }), expect: "stale_generation" },
+    { name: "an entry generation below gen", pair: pair0, host: rec({ entry_gen: { [agent]: 2 } }), expect: "stale_generation" },
+    { name: "an entry that moved up since (the person edited it)", pair: pair0, host: rec({ entry_gen: { [agent]: 6 } }), expect: "ok", first: true },
+    { name: "an unrelated later grant", pair: pair0, host: rec({ grants: { 3: { hash: grantHash, agents: [agent] }, 4: { hash: otherHash, agents: [agent, id(33)] } } }), expect: "ok", first: true },
+    { name: "the next transfer of a multi-agent restore", pair: pair0, host: rec({ accepted: { [id(32)]: { gen: 3, nonce: b64(new Uint8Array(16).fill(3)), transfer: otherHash } } }), expect: "ok", first: true },
+    { name: "a gen not above the transfer this host accepted", pair: pair0, host: rec({ accepted: { [agent]: { gen: 3, nonce: b64(new Uint8Array(16).fill(4)), transfer: otherHash } } }), expect: "stale_generation" },
+    { name: "a newer move than the one accepted", pair: pair0, host: rec({ accepted: { [agent]: { gen: 2, nonce: b64(new Uint8Array(16).fill(4)), transfer: otherHash } } }), expect: "ok", first: true },
+    { name: "a nonce this host saw for another transfer", pair: pair0, host: rec({ nonces: { [nonceT]: otherHash } }), expect: "replay" },
+    { name: "the nonce seen for this same transfer", pair: pair0, host: rec({ nonces: { [nonceT]: T0.hash } }), expect: "ok", first: true },
+  ];
+
+  // ---- 8. execution-lease renewal (r2.5 §3.8.3), on the leased chain (§1.7a's keys), with the objects' host
+  const hs = { kind: "host", id: host, alg: "ed25519", key: H.key };
+  // (an envelope seal() refuses to make, for a signer kind the type doesn't accept)
+  const rawSeal = (type, s, b, k) => txt(enc(canonText({ v: 1, type, signer: s, body: b, sig: b64(k.sign(signedBytes(type, s, b))) })));
+  const BOOT = "0f6c2b5e-8d3a-4c1e-9b7f-2a4d6e8f0a1c";
+  const lNonce = b64(new Uint8Array(16).fill(9));
+  const reqBody = (extra = {}) => ({ fleet, aud: AUD, agent, host, gen: 3, nonce: lNonce, boot_id: BOOT, at_ms: NOW, ...extra });
+  const rq = reqBody();
+  const reqBytes = txt(seal("sb.lease-request.v1", hs, rq, H));
+  const reqHash = sha256b64(signedBytes("sb.lease-request.v1", hs, rq));
+  const H2 = keyFromSeed(seed(50));
+  const lease_requests = [
+    { name: "a request", bytes: reqBytes, expect: "ok", hash: reqHash },
+    { name: "signed by a device", bytes: rawSeal("sb.lease-request.v1", signer(N, nId), rq, N), expect: "bad_signature" },
+    { name: "signed by another host key under this host's id", bytes: txt(seal("sb.lease-request.v1", { ...hs, key: H2.key }, rq, H2)), expect: "bad_signature" },
+    { name: "the certified key id with another key's signature", bytes: txt(seal("sb.lease-request.v1", hs, rq, H2)), expect: "bad_signature" },
+    { name: "this host's signature under another key id", bytes: rawSeal("sb.lease-request.v1", { ...hs, key: H2.key }, rq, H), expect: "bad_signature" },
+    { name: "a body naming another host, signed by this one", bytes: txt(seal("sb.lease-request.v1", hs, reqBody({ host: id(51) }), H)), expect: "bad_signature" },
+    { name: "for another host id", bytes: txt(seal("sb.lease-request.v1", { ...hs, id: id(51) }, reqBody({ host: id(51) }), H)), expect: "bad_signature" },
+    { name: "another fleet", bytes: txt(seal("sb.lease-request.v1", hs, reqBody({ fleet: id(52) }), H)), expect: "bad_form" },
+    { name: "another audience", bytes: txt(seal("sb.lease-request.v1", hs, reqBody({ aud: "https://sagebrush.space" }), H)), expect: "bad_audience" },
+    { name: "gen 0", bytes: txt(seal("sb.lease-request.v1", hs, reqBody({ gen: 0 }), H)), expect: "bad_form" },
+    { name: "an extra field", bytes: txt(seal("sb.lease-request.v1", hs, reqBody({ ttl_ms: 1 }), H)), expect: "bad_form" },
+  ];
+  const ls = (k, lid, kind = "lease") => ({ kind, id: lid, alg: "ed25519", key: k.key });
+  const leaseBody = (extra = {}) => ({ fleet, aud: AUD, agent, host, host_key: certBody.fingerprint, gen: 3, lease_id: id(53), ttl_ms: 600_000,
+    nonce: lNonce, boot_id: BOOT, request: reqHash, chain_seq: l2Seq, ...extra });
+  const lease = (extra, k = L2, s = ls(L2, l2Id)) => txt(seal("sb.execution-lease.v1", s, leaseBody(extra), k));
+  const outstanding = { request: reqHash, agent, gen: 3, nonce: lNonce, boot_id: BOOT };
+  const envelopeHash = sha256b64(enc(reqBytes));
+  const leases = [
+    { name: "a lease", bytes: lease({}), expect: "ok" },
+    { name: "a lease under the old key, signed before the rotation", bytes: lease({ chain_seq: l1Seq + 1 }, L1, ls(L1, l1Id)), expect: "ok" },
+    { name: "ttl_ms at its bound", bytes: lease({ ttl_ms: 600_000 }), expect: "ok" },
+    { name: "the old key at the rotation's seq", bytes: lease({}, L1, ls(L1, l1Id)), expect: "bad_signature" },
+    { name: "chain_seq past the pinned head", bytes: lease({ chain_seq: l2Seq + 1 }), expect: "device_unknown" },
+    { name: "signed by the service key", bytes: txt(seal("sb.execution-lease.v1", { kind: "lease", id: s2Id, alg: "ed25519", key: S2.key }, leaseBody(), S2)), expect: "bad_signature" },
+    { name: "signer kind service", bytes: rawSeal("sb.execution-lease.v1", ls(L2, l2Id, "service"), leaseBody(), L2), expect: "bad_signature" },
+    { name: "signer kind host", bytes: rawSeal("sb.execution-lease.v1", hs, leaseBody(), H), expect: "bad_signature" },
+    { name: "another fleet", bytes: lease({ fleet: id(54) }), expect: "bad_form" },
+    { name: "another audience", bytes: lease({ aud: "https://sagebrush.space" }), expect: "bad_audience" },
+    { name: "another host", bytes: lease({ host: id(55) }), expect: "not_granted" },
+    { name: "another host key", bytes: lease({ host_key: b64(new Uint8Array(32).fill(7)) }), expect: "not_granted" },
+    { name: "another request", bytes: lease({ request: b64(new Uint8Array(32).fill(8)) }), expect: "not_granted" },
+    { name: "the request's envelope hash, not its signed bytes'", bytes: lease({ request: envelopeHash }), expect: "not_granted" },
+    { name: "another agent", bytes: lease({ agent: id(56) }), expect: "not_granted" },
+    { name: "another gen", bytes: lease({ gen: 4 }), expect: "not_granted" },
+    { name: "another nonce", bytes: lease({ nonce: b64(new Uint8Array(16).fill(10)) }), expect: "not_granted" },
+    { name: "another boot", bytes: lease({ boot_id: "1f6c2b5e-8d3a-4c1e-9b7f-2a4d6e8f0a1c" }), expect: "not_granted" },
+    { name: "no request outstanding", bytes: lease({}), outstanding: null, expect: "not_granted" },
+    { name: "ttl_ms 0", bytes: lease({ ttl_ms: 0 }), expect: "bad_form" },
+    { name: "ttl_ms one past its bound", bytes: lease({ ttl_ms: 600_001 }), expect: "bad_form" },
+  ].map((c) => ({ ...c, outstanding: c.outstanding === undefined ? outstanding : c.outstanding }));
+
+  // ---- 9. the old host's fence acknowledgement (r2.4 §3.7.4): the envelope's check, by the host's certified key
+  const fbody = (extra = {}) => ({ fleet, aud: AUD, agent, host, gen: 3, transfer: b64(new Uint8Array(32).fill(11)), boot_id: BOOT, proven_empty: true, at_ms: NOW, ...extra });
+  const fb = fbody();
+  const fence_acks = [
+    { name: "an acknowledgement", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fb, H)), expect: "ok", hash: sha256b64(signedBytes("sb.agent-fence-ack.v1", hs, fb)) },
+    { name: "signed by a device", bytes: rawSeal("sb.agent-fence-ack.v1", signer(N, nId), fb, N), expect: "bad_signature" },
+    { name: "another host key under this host's id", bytes: txt(seal("sb.agent-fence-ack.v1", { ...hs, key: H2.key }, fb, H2)), expect: "bad_signature" },
+    { name: "this host's signature under another key id", bytes: rawSeal("sb.agent-fence-ack.v1", { ...hs, key: H2.key }, fb, H), expect: "bad_signature" },
+    { name: "a body naming another host", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ host: id(57) }), H)), expect: "bad_signature" },
+    { name: "proven_empty false", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ proven_empty: false }), H)), expect: "bad_form" },
+    { name: "another fleet", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ fleet: id(58) }), H)), expect: "bad_form" },
+    { name: "another audience", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ aud: "https://sagebrush.space" }), H)), expect: "bad_audience" },
+    { name: "an extra field", bytes: txt(seal("sb.agent-fence-ack.v1", hs, fbody({ reason: "x" }), H)), expect: "bad_form" },
+  ];
+
+  // ---- the fleet fingerprint (host pairing's trust anchor): over the fleet id and the genesis entry's exact bytes
+  const fp = async (name, f, genesis) => { const full = await fleetFingerprint(f, enc(genesis)); return { name, fleet: f, genesis, full: b64(full), shown: showFingerprint(full) }; };
+  const fingerprints = [
+    await fp("the honest chain's genesis", fleet, honest[0]),
+    await fp("the same genesis under another fleet id", id(59), honest[0]),
+    await fp("one byte more after the genesis's text: other bytes, another fingerprint", fleet, honest[0] + " "),
+  ];
+
   return {
-    $comment: "Shared fleet-protocol vectors (agent-autonomous-schemas.md r2.3 §9). Built by test/make-fleet-fixtures.mjs; every implementation must agree with every case. Mock data only: no real key, device or host.",
+    $comment: "Shared fleet-protocol vectors (agent-autonomous-schemas.md r2.5 §9, §3.7.5, §3.8.3). Built by test/make-fleet-fixtures.mjs; every implementation must agree with every case. Mock data only: no real key, device or host.",
     freeze: FREEZE.sha256,
     aud: AUD, now_ms: NOW, ids, keys,
     canonical, base64url, ids_cases: idCases, ed25519,
     chain: { entries_note: "envelope texts, in order", cases: chain },
     service_keys: { chain: honest, cases: service_keys },
-    objects: { chain: honest, host_cert: cert, grants, grant_acks, host_ops, approvals, envelopes },
+    lease_keys: { chain: leased, chain_cases: lease_chain, cases: lease_keys },
+    fence_acks: { chain: honest, host_cert: cert, cases: fence_acks },
+    leases: { chain: leased, host_cert: cert, host: host, host_key: certBody.fingerprint, requests: lease_requests, leases },
+    objects: { chain: honest, host_cert: cert, grants, grant_acks, host_ops, approvals, envelopes, agent_messages, agent_replies },
+    transfers: { chain: honest, chain_removed: removedChain, receipts: transfer_receipts, hosts: transfer_hosts },
+    fleet_fingerprints: fingerprints,
   };
 }
 

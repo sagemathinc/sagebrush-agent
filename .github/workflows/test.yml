@@ -67,7 +67,8 @@ jobs:
   # SHA-256). The restore rows remove CAP_SYS_RESOURCE with `sudo setpriv`, as the launcher's runner will, and one
   # restores with no /proc (`sudo unshare -m`), as the runner's filesystem view has none.
   backup:
-    runs-on: ubuntu-latest
+    # (a pinned image: the backup binary's C toolchain is part of its pin; scripts/backup-build.sh)
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -81,23 +82,46 @@ jobs:
       - run: cargo deny --manifest-path backup/Cargo.toml check licenses sources
       - run: node scripts/backup-third-party.mjs --check
       - run: cargo test --locked --manifest-path backup/Cargo.toml --bins
+      # The parent binding (init/run d6 §5.3), with the test-only pause that lets a row kill the parent before the
+      # binary's first check (the feature is never in a release build: see the no-trace check below).
+      - run: cargo test --locked --manifest-path backup/Cargo.toml --features test-pause-before-start --test parent
       - run: scripts/fetch-test-s3.sh "$RUNNER_TEMP/weed"
-      - run: cargo test --locked --manifest-path backup/Cargo.toml --features test-loopback-http
+      - run: cargo test --locked --manifest-path backup/Cargo.toml --features test-loopback-http,test-tree-counters,test-walk-hooks
         env:
           SB_TEST_WEED: ${{ runner.temp }}/weed/bin/weed
           SB_TEST_REQUIRE_WEED: "1"
           SB_TEST_REQUIRE_NOPROC: "1"
-      # The shipped build: static musl, checked to name no dynamic loader (the launcher refuses one that does).
+      # The hook check's positive control: a build WITH every test-only hook holds every name the script lists.
+      - run: cargo build --locked --manifest-path backup/Cargo.toml --features test-pause-before-start,test-walk-hooks
+      - run: scripts/backup-hook-trace.sh backup/target/debug/sagebrush-agent-backup present
+      # The shipped build (init/run d3 §4.1): scripts/backup-build.sh, static musl, run from two different directories,
+      # must produce byte-identical binaries, equal to the pin the root installer and the pinned runner accept
+      # (lib/fleet/host/backup.sha256), and checked to name no dynamic loader (the launcher refuses one that does).
       - run: sudo apt-get update && sudo apt-get install -y musl-tools && rustup target add x86_64-unknown-linux-musl
-      - run: cargo build --locked --release --manifest-path backup/Cargo.toml --target x86_64-unknown-linux-musl
-      - run: scripts/backup-static-check-test.sh backup/target/x86_64-unknown-linux-musl/release/sagebrush-agent-backup
+      - run: cargo fetch --locked --manifest-path backup/Cargo.toml
+      - run: |
+          for d in "$RUNNER_TEMP/a" "$RUNNER_TEMP/bb/c"; do
+            mkdir -p "$d" && git archive HEAD backup scripts | tar -x -C "$d"
+          done
+          (cd "$RUNNER_TEMP/a" && scripts/backup-build.sh "$RUNNER_TEMP/backup-1")
+          (cd "$RUNNER_TEMP/bb/c" && scripts/backup-build.sh "$RUNNER_TEMP/backup-2")
+          cmp "$RUNNER_TEMP/backup-1" "$RUNNER_TEMP/backup-2"
+          sha256sum "$RUNNER_TEMP/backup-1"
+          test "$(sha256sum < "$RUNNER_TEMP/backup-1" | cut -d' ' -f1)" = "$(cut -d' ' -f1 lib/fleet/host/backup.sha256)"
+      - run: scripts/backup-static-check-test.sh "$RUNNER_TEMP/backup-1"
+      # the compilers that made it, as recorded in the binary (the pinned gcc, and Rust's own musl objects)
+      - run: readelf -p .comment "$RUNNER_TEMP/backup-1" | grep -F "13.3.0-6ubuntu2~24.04.1"
+      # the pinned build holds no trace of the test-only pause (its environment variable is named only in that code)
+      # (the strict-backup rows' hooks too; the hook names are listed once, in the script)
+      - run: scripts/backup-hook-trace.sh "$RUNNER_TEMP/backup-1" absent
 
   # The launcher (launcher/, sagebrush-agent-launch, root-run and security-critical): its unit and CLI tests, then
   # the shipped release build. Its Landlock rows need the kernel's ABI 4; SB_TEST_REQUIRE_LANDLOCK makes a runner
   # kernel without it fail the job rather than skip them.
   launcher:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # (a pinned image: it builds the backup binary too, whose C toolchain is part of its pin)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -107,6 +131,48 @@ jobs:
         env:
           SB_TEST_REQUIRE_LANDLOCK: "1"
       - run: cargo build --locked --release --manifest-path launcher/Cargo.toml
+      # The shipped build (lease-on r1.7 §2.2): scripts/launcher-build.sh, static musl, run from two different
+      # directories, must produce byte-identical binaries (the one a qualified release ships).
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools && rustup target add x86_64-unknown-linux-musl
+      - run: cargo fetch --locked --manifest-path launcher/Cargo.toml
+      - run: |
+          for d in "$RUNNER_TEMP/a" "$RUNNER_TEMP/bb/c"; do
+            mkdir -p "$d" && git archive HEAD launcher scripts | tar -x -C "$d"
+          done
+          (cd "$RUNNER_TEMP/a" && scripts/launcher-build.sh "$RUNNER_TEMP/launch-1")
+          (cd "$RUNNER_TEMP/bb/c" && scripts/launcher-build.sh "$RUNNER_TEMP/launch-2")
+          cmp "$RUNNER_TEMP/launch-1" "$RUNNER_TEMP/launch-2"
+          sha256sum "$RUNNER_TEMP/launch-1"
+          # the pinned digest the root installer accepts (lib/fleet/host/launcher.sha256) is exactly this build's
+          test "$(sha256sum < "$RUNNER_TEMP/launch-1" | cut -d' ' -f1)" = "$(cut -d' ' -f1 lib/fleet/host/launcher.sha256)"
+      # The trust boundary (lease-on r1.12 §2.5, §2.6): the checker, the preload regression and the fresh installer
+      # against the runner's real systemd, as root (scripts/release-trust-test.sh; the runner is disposable).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.21.0
+      - run: sudo install -m 0755 -o root -g root "$(readlink -f "$(command -v node)")" /usr/bin/node
+      # the backup binary the installer installs beside the launcher: the pinned build (the backup job checks it twice)
+      - run: cargo fetch --locked --manifest-path backup/Cargo.toml
+      - run: |
+          scripts/backup-build.sh "$RUNNER_TEMP/backup-1"
+          test "$(sha256sum < "$RUNNER_TEMP/backup-1" | cut -d' ' -f1)" = "$(cut -d' ' -f1 lib/fleet/host/backup.sha256)"
+      - run: |
+          sudo env SB_TEST_LAUNCHER="$RUNNER_TEMP/launch-1" SB_TEST_BACKUP="$RUNNER_TEMP/backup-1" scripts/release-trust-test.sh
+
+  # The turn's syscall policy (schema/fleet/agent-seccomp-policy.json): regenerated from its pin, offline, in the pinned
+  # Ubuntu 24.04 image with the pinned systemd, and required byte for byte (scripts/seccomp-policy-ci.sh). The network is
+  # used only to pull the image by digest and fetch the five hash-pinned .debs, before the run.
+  seccomp-policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.21.0
+      - run: sh scripts/seccomp-policy-ci.sh
 
   # The Python reference verifier (python/): every case of both shared fleet fixture files, each with the JavaScript
   # checker's result, the RFC 9180 vector, and its own rule rows. Its one dependency, cryptography (with cffi and

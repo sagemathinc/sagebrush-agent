@@ -247,6 +247,7 @@ fn a_panic_prints_only_the_fixed_72_line_and_every_secret_is_zeroed() {
 fn a1_subcommands_refuse_bad_arguments_and_a_missing_anchor() {
     let run = |args: &[&str]| Command::new(BIN).env_clear().args(args).output().unwrap();
     let json = format!("{A}.json");
+    let home = format!("{A}/home");
     for bad in [
         vec!["identify", "--anchor", "/etc", "--name", A],
         vec!["identify", "--anchor", "/var/lib/sagebrush/contract", "--name", A], // the contract anchor wants <id>.json
@@ -263,6 +264,15 @@ fn a1_subcommands_refuse_bad_arguments_and_a_missing_anchor() {
         vec!["check-parents"],
         vec!["remove-tree", "--anchor", "/srv/sagebrush/archive", "--name", A, "--expect", "relative.json"],
         vec!["remove-tree", "--anchor", "/srv/sagebrush/archive", "--name", A, "--expect", "/x", "--", "y"],
+        // A1 r2.6/r2.7: --contents only for its four destinations; plain remove-tree never on agents or tags; identify
+        // reads a tag folder by id only.
+        vec!["remove-tree", "--contents", "--contents", "--anchor", "/srv/sagebrush/tags", "--name", A, "--expect", "/x"],
+        vec!["remove-tree", "--contents", "--anchor", "/srv/sagebrush/agents", "--name", A, "--expect", "/x"],
+        vec!["remove-tree", "--contents", "--anchor", "/srv/sagebrush/archive-config", "--name", &home, "--expect", "/x"],
+        vec!["remove-tree", "--contents", "--anchor", "/srv/sagebrush/agent-config", "--name", A, "--expect", "/x"],
+        vec!["remove-tree", "--anchor", "/srv/sagebrush/tags", "--name", A, "--expect", "/x"],
+        vec!["remove-tree", "--anchor", "/srv/sagebrush/agents", "--name", &home, "--expect", "/x"],
+        vec!["identify", "--anchor", "/srv/sagebrush/tags", "--name", "x"],
     ] {
         let o = run(&bad);
         assert_eq!(code(&o), 64, "{bad:?}: {}", stderr(&o));
@@ -270,6 +280,18 @@ fn a1_subcommands_refuse_bad_arguments_and_a_missing_anchor() {
     }
     // Well-formed arguments as a non-root user: the root guard refuses (66) before anything is opened; as root (the
     // qualification VM), a missing anchor refuses the same way.
+    for ok in [
+        vec!["remove-tree", "--contents", "--anchor", "/srv/sagebrush/agents", "--name", &home, "--expect", "/x"],
+        vec!["remove-tree", "--contents", "--anchor", "/srv/sagebrush/tags", "--name", A, "--expect", "/x"],
+        // A2 r3.13: a deleted agent's config archive, emptied and kept by the restore's cleanup
+        vec!["remove-tree", "--contents", "--anchor", "/srv/sagebrush/archive-config", "--name", A, "--expect", "/x"],
+        vec!["remove-tree", "--anchor", "/srv/sagebrush/archive", "--name", A, "--expect", "/x", "--contents"],
+        vec!["identify", "--anchor", "/srv/sagebrush/tags", "--name", A],
+    ] {
+        let o = run(&ok);
+        assert_eq!(code(&o), 66, "{ok:?}: {}", stderr(&o));
+        assert!(o.stdout.is_empty());
+    }
     let o = run(&["identify", "--anchor", "/var/lib/sagebrush/contract", "--name", &json]);
     assert_eq!(code(&o), 66, "{}", stderr(&o));
     assert_eq!(stderr(&o).lines().count(), 1);
@@ -308,7 +330,41 @@ fn a2_subcommands_refuse_bad_arguments_then_the_root_guard() {
         assert_eq!(code(&o), 64, "{over:?}: {}", stderr(&o));
         assert!(o.stdout.is_empty());
     }
+    // A2 r3.13: the two new classes stage for an agent's owner only; `config` is never filled or listed.
+    for over in [vec![("class", "config")], vec![("class", "archive-config")]] {
+        let a = stage(&over);
+        let o = run(&a.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(code(&o), 66, "{over:?}: well formed, the root guard: {}", stderr(&o));
+    }
+    let tag_owner = format!("t-{A}");
+    for over in [vec![("class", "config"), ("owner", tag_owner.as_str())], vec![("class", "archive-config"), ("owner", tag_owner.as_str())], vec![("class", "configs")]] {
+        let a = stage(&over);
+        let o = run(&a.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(code(&o), 64, "{over:?}: {}", stderr(&o));
+    }
+    // A2 r3.14: the host's `hoststore` stages for the `host` owner at project 110000 only; never filled or listed.
+    let o = run(&stage(&[("owner", "host"), ("class", "hoststore"), ("projid", "110000")]).iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(code(&o), 66, "host/hoststore at 110000: well formed, the root guard: {}", stderr(&o));
+    for over in [
+        vec![("owner", "host"), ("class", "hoststore"), ("projid", "70000")],
+        vec![("owner", "host"), ("class", "hoststore"), ("projid", "110001")],
+        vec![("owner", "host"), ("class", "home"), ("projid", "110000")],
+        vec![("class", "hoststore"), ("projid", "110000")],
+    ] {
+        let a = stage(&over);
+        let o = run(&a.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(code(&o), 64, "{over:?}: {}", stderr(&o));
+    }
     for bad in [
+        vec!["fill-home", "--mount", "/srv/sagebrush", "--owner", "host", "--class", "hoststore", "--run", "abcdefghijklmnop", "--attempt", "1", "--source", "data/x", "--expect", "/x"],
+        vec!["tree-digest", "--mount", "/srv/sagebrush", "--owner", "host", "--class", "hoststore", "--expect", "/x"],
+    ] {
+        let o = run(&bad);
+        assert_eq!(code(&o), 64, "{bad:?}: {}", stderr(&o));
+    }
+    for bad in [
+        vec!["fill-home", "--mount", "/srv/sagebrush", "--owner", &owner, "--class", "config", "--run", "abcdefghijklmnop", "--attempt", "1", "--source", "data/x", "--expect", "/x"],
+        vec!["tree-digest", "--mount", "/srv/sagebrush", "--owner", &owner, "--class", "config", "--expect", "/x"],
         vec!["fill-home", "--mount", "/srv/sagebrush", "--owner", &owner, "--class", "home", "--run", "abcdefghijklmnop", "--attempt", "1", "--source", "srv/x", "--expect", "/x"],
         vec!["fill-home", "--mount", "/srv/sagebrush", "--owner", &owner, "--class", "home", "--run", "abcdefghijklmnop", "--attempt", "1", "--source", "data/x", "--expect", "x"],
         vec!["fill-home", "--mount", "/srv/sagebrush", "--owner", &owner, "--class", "home", "--run", "abcdefghijklmnop", "--attempt", "1", "--source", "data/x"],
@@ -374,4 +430,17 @@ fn a4_profile_mounts_refuses_bad_arguments_then_the_root_guard() {
     }
     let o = run(&["identify", "--anchor", "/srv/sagebrush/claude-profiles", "--name", ".locks"]);
     assert_eq!(code(&o), 64);
+}
+
+#[test]
+fn a5_turn_is_off_until_the_filter_lands_and_refuses_before_touching_a_descriptor() {
+    // No fd 3 or 4 is passed: were the gate after the handshake, an invalid status pipe would be 65. It is 64, with the
+    // fixed usage line and nothing on stdout, for a well-formed turn id as for any other argument.
+    let run = |args: &[&str]| Command::new(BIN).env_clear().args(args).output().unwrap();
+    for args in [vec!["turn", "--turn", "0123456789abcdef0123456789abcdef"], vec!["turn"], vec!["turn", "--turn", "x", "--", "y"]] {
+        let o = run(&args);
+        assert_eq!(code(&o), 64, "{args:?}: {}", stderr(&o));
+        assert_eq!(stderr(&o).trim_end(), "sagebrush-agent-launch: usage: bad arguments", "{args:?}");
+        assert!(o.stdout.is_empty());
+    }
 }

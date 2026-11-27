@@ -13,6 +13,9 @@
 //! anchor table and check-parents.
 //!
 //! Amendment A3 (execution lease) adds `lease-check`, root-only, run as the unit's `ExecStartPre=+` (lease.rs).
+//!
+//! Amendment A5 (profiles piece 3) adds `turn`, root-only, run by the supervisor in the turn's scope (turn.rs,
+//! turn_exec.rs). It stays off (64) until the syscall filter lands.
 
 // Unsafe code is refused everywhere except the syscall module and the secret's zeroing Drop (contract §6).
 #![deny(unsafe_code)]
@@ -22,6 +25,7 @@ mod args;
 mod child;
 mod restore;
 mod contract;
+mod digest;
 mod err;
 mod exec;
 mod json;
@@ -29,8 +33,11 @@ mod landlock;
 mod lease;
 mod profile;
 mod secret;
+mod sha256;
 mod stage;
 mod tree;
+mod turn;
+mod turn_exec;
 #[allow(unsafe_code)]
 mod sys;
 
@@ -60,6 +67,12 @@ fn run() -> err::Result<()> {
             a1(cmd, rest)
         }
         // Launcher contract amendment A2 (backup restore): root only, outside any unit.
+        "tree-digest" => {
+            if !after.is_empty() {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            tree_digest(rest)
+        }
         "restore-stage" | "fill-home" => {
             if !after.is_empty() {
                 return Err(err(Fail::Usage, "bad arguments"));
@@ -88,6 +101,14 @@ fn run() -> err::Result<()> {
             }
             lease::hold(v[0]).map(drop) // the fd closes here: the shared lock is released before ExecStart
         }
+        // Launcher contract amendment A5 (turn): root only, the supervisor's turn scope. Off until part 3b-ii adds the
+        // syscall filter: it refuses before touching any descriptor.
+        "turn" => {
+            if !turn_exec::TURN_ENABLED || !after.is_empty() {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            turn_exec::run(&mut tree::RealOps, &mut turn_exec::RealProc::default(), rest)
+        }
         "exec" => {
             let v = args::flags(rest, &["agent", "contract", "cli"])?;
             let e = exec::run(&exec::parse(&v)?, &after)?;
@@ -104,7 +125,8 @@ fn a1(cmd: &str, rest: &[String]) -> err::Result<()> {
     let out = match cmd {
         "identify" => {
             let v = args::flags(rest, &["anchor", "name"])?;
-            if !tree::anchor_name_ok(v[0], v[1]) {
+            // A1 r2.7: a tag folder is a read-only row, for identify only.
+            if !tree::anchor_name_ok(v[0], v[1]) && !(v[0] == tree::TAGS && args::is_id(v[1])) {
                 return Err(err(Fail::Usage, "bad arguments"));
             }
             guard()?;
@@ -155,15 +177,61 @@ fn a1(cmd: &str, rest: &[String]) -> err::Result<()> {
             String::new()
         }
         _ => {
-            let v = args::flags(rest, &["anchor", "name", "expect"])?;
-            if !tree::anchor_name_ok(v[0], v[1]) || args::rel(v[2]).is_none() {
+            // `--contents` takes no value (A1 r2.6 §5a): it empties a restore destination and keeps it.
+            let contents = rest.iter().filter(|a| *a == "--contents").count();
+            if contents > 1 {
                 return Err(err(Fail::Usage, "bad arguments"));
             }
-            guard()?;
-            tree::remove_tree(&mut o, v[0], v[1], v[2])?;
+            let kept: Vec<String> = rest.iter().filter(|a| *a != "--contents").cloned().collect();
+            let v = args::flags(&kept, &["anchor", "name", "expect"])?;
+            if args::rel(v[2]).is_none() {
+                return Err(err(Fail::Usage, "bad arguments"));
+            }
+            if contents == 1 {
+                if !tree::contents_ok(v[0], v[1]) {
+                    return Err(err(Fail::Usage, "bad arguments"));
+                }
+                guard()?;
+                tree::remove_contents(&mut o, v[0], v[1], v[2])?;
+            } else {
+                if !tree::anchor_name_ok(v[0], v[1]) {
+                    return Err(err(Fail::Usage, "bad arguments"));
+                }
+                guard()?;
+                tree::remove_tree(&mut o, v[0], v[1], v[2])?;
+            }
             String::new()
         }
     };
+    std::io::stdout().write_all(out.as_bytes()).map_err(|_| err(Fail::Internal, "internal error"))
+}
+
+/// A2 r3.8.1 §4a: `tree-digest --mount <m> --owner <o> --class <c> --expect <file> [--copy-sqlite --run <run>]`.
+fn tree_digest(rest: &[String]) -> err::Result<()> {
+    let bad = || err(Fail::Usage, "bad arguments");
+    let copies = rest.iter().filter(|a| *a == "--copy-sqlite").count();
+    if copies > 1 {
+        return Err(bad());
+    }
+    let kept: Vec<String> = rest.iter().filter(|a| *a != "--copy-sqlite").cloned().collect();
+    let (v, run) = if copies == 1 {
+        let v = args::flags(&kept, &["mount", "owner", "class", "expect", "run"])?;
+        let run = v[4];
+        (v, Some(run))
+    } else {
+        (args::flags(&kept, &["mount", "owner", "class", "expect"])?, None)
+    };
+    tree::parse_mount(v[0])?;
+    if args::rel(v[3]).is_none() || v[2] == "config" || v[2] == "hoststore" {
+        // (`config` and `hoststore` are staged only: nothing is ever filled to list, A2 r3.13 §5, r3.14 §1)
+        return Err(bad());
+    }
+    if !sys::is_root() {
+        return Err(err(Fail::Preflight, "root only"));
+    }
+    sys::umask0();
+    let a = digest::DigestArgs { mount: v[0], owner: v[1], class: v[2], expect: v[3], copy_run: run };
+    let out = digest::tree_digest(&mut tree::RealOps, &a)?;
     std::io::stdout().write_all(out.as_bytes()).map_err(|_| err(Fail::Internal, "internal error"))
 }
 
@@ -189,6 +257,11 @@ fn a2(cmd: &str, rest: &[String]) -> err::Result<()> {
     } else {
         let v = args::flags(rest, &["mount", "owner", "class", "run", "attempt", "source", "expect"])?;
         let name = restore::Name::parse(v[3], v[1], v[2], v[4]).ok_or_else(bad)?;
+        // `config` and `hoststore` are staged only, never filled (A2 r3.13 §4, r3.14 §1): usage, before the root guard
+        // and anything else.
+        if name.class.stage_only() {
+            return Err(bad());
+        }
         tree::parse_mount(v[0])?;
         if !v[5].starts_with("data/") || !restore::rel_ok(v[5]) || args::rel(v[6]).is_none() {
             return Err(bad());

@@ -2,7 +2,8 @@
 //! only; the unit runs it as `ExecStartPre=+` (outside the sandbox, inside the unit's cgroup, so inside the agent's
 //! slice). It passes only while the agent holds a current lease, read under the agent's activation lock taken SHARED:
 //! the published record exists, the tombstone's lg is below the record's, and now < expiry_tick - 30 s on
-//! CLOCK_BOOTTIME. Otherwise it exits 78 (`lease`) and nothing of the unit executes.
+//! CLOCK_BOOTTIME, and the suspend gate (lease-on r1.5 §6.1) is open at exactly the record's `sg`. Otherwise it exits
+//! 78 (`lease`) and nothing of the unit executes.
 //!
 //! File trust: the lease directory and every ancestor are under A1's anchor policy (root:root, no group or other write,
 //! no access or default ACL), opened one component at a time without following a symlink. Each opened file is checked
@@ -31,6 +32,8 @@ const POLL_MS: u64 = 10;
 const MAX_FILE: usize = 4096;
 /// The largest lg, expiry_tick or tombstone: 2^53 - 1, the JSON-safe integer bound both writers share.
 pub(crate) const MAX_SAFE: u64 = (1 << 53) - 1;
+/// The highest suspend-gate generation that ever opens; MAX_SAFE itself is terminal (exhaustion: closed, T4).
+pub(crate) const G_MAX: u64 = MAX_SAFE - 1;
 
 const ACL_ACCESS: &std::ffi::CStr = c"system.posix_acl_access";
 const ACL_DEFAULT: &std::ffi::CStr = c"system.posix_acl_default";
@@ -142,19 +145,62 @@ fn read_trusted<O: LeaseOps>(o: &mut O, dir: &O::H, name: &str) -> Result<Option
     o.read(&h, MAX_FILE).map(Some).map_err(|_| pre("a lease file can't be read"))
 }
 
-/// The record's (lg, expiry_tick), if it has exactly the closed shape and ranges.
-pub(crate) fn parse_record(src: &[u8]) -> Option<(u64, u64)> {
+/// The record's (lg, expiry_tick, sg), if it has exactly the closed shape `{lease_id, lg, expiry_tick, gen, sg}` and
+/// its ranges (A3 r3; lease-on r1.5 §6.2). `gen`, the lease's grant generation, is range-checked as part of the shape
+/// and never compared (only the restore-resume helper compares it). `sg` is the suspend gate's generation the lease
+/// was requested under: the lease is current only while the gate is open at exactly it.
+pub(crate) fn parse_record(src: &[u8]) -> Option<(u64, u64, u64)> {
     let v = json::parse_with(src, 64)?;
-    let f = v.exact(&["lease_id", "lg", "expiry_tick"])?;
+    let f = v.exact(&["lease_id", "lg", "expiry_tick", "gen", "sg"])?;
     let id = f[0].str()?;
     if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
         return None;
     }
-    let (lg, expiry) = (f[1].int()?, f[2].int()?);
-    if !(1..=MAX_SAFE).contains(&lg) || expiry > MAX_SAFE {
+    let (lg, expiry, gen, sg) = (f[1].int()?, f[2].int()?, f[3].int()?, f[4].int()?);
+    if !(1..=MAX_SAFE).contains(&lg) || expiry > MAX_SAFE || !(1..=MAX_SAFE).contains(&gen) || sg > MAX_SAFE {
         return None;
     }
-    Some((lg, expiry))
+    Some((lg, expiry, sg))
+}
+
+/// `sleep`'s closed shape `{gen, phase, pre_ok, pre_at}`: (gen >= 1, phase is "post", pre_at), or None. A `pre` record
+/// parses as Some with post = false.
+pub(crate) fn parse_sleep(src: &[u8]) -> Option<(u64, bool, u64)> {
+    let v = json::parse_with(src, 16)?;
+    let f = v.exact(&["gen", "phase", "pre_ok", "pre_at"])?;
+    let (gen, at) = (f[0].int()?, f[3].int()?);
+    let post = match f[1].str()? {
+        "post" => true,
+        "pre" => false,
+        _ => return None,
+    };
+    if !matches!(f[2], json::Value::Bool(_)) || !(1..=MAX_SAFE).contains(&gen) || at > MAX_SAFE {
+        return None;
+    }
+    Some((gen, post, at))
+}
+
+/// `reopen`'s closed shape `{gen}`: gen >= 1, or None.
+pub(crate) fn parse_reopen(src: &[u8]) -> Option<u64> {
+    let v = json::parse_with(src, 16)?;
+    let f = v.exact(&["gen"])?;
+    let gen = f[0].int()?;
+    (1..=MAX_SAFE).contains(&gen).then_some(gen)
+}
+
+/// THE gate rule (lease-on r1.5 §6.1), the same table as lease.mjs `gateOf`, over the same fixture vectors: the
+/// generation the gate is open at, or None (closed). Open only when both files are absent (0), or both are well
+/// formed, `sleep` is at post with pre_at <= now, `reopen` equals `sleep`'s generation, and that is at most G_MAX.
+pub(crate) fn gate_of(sleep: Option<&[u8]>, reopen: Option<&[u8]>, now: u64) -> Option<u64> {
+    match (sleep, reopen) {
+        (None, None) => Some(0),
+        (Some(s), Some(r)) => {
+            let (gen, post, at) = parse_sleep(s)?;
+            let re = parse_reopen(r)?;
+            (post && at <= now && re == gen && gen <= G_MAX).then_some(gen)
+        }
+        _ => None,
+    }
 }
 
 /// The tombstone's lg: `0` or a decimal without leading zeros, at most 16 digits, at most MAX_SAFE, then one newline.
@@ -215,13 +261,20 @@ pub fn check<O: LeaseOps>(o: &mut O, agent: &str, wait_ms: u64) -> Result<O::H> 
     }
 
     let rec = read_trusted(o, &d, agent)?.ok_or(lease("no lease record"))?;
-    let (lg, expiry) = parse_record(&rec).ok_or(lease("a malformed lease record"))?;
+    let (lg, expiry, sg) = parse_record(&rec).ok_or(lease("a malformed lease record"))?;
     let spent = match read_trusted(o, &d, &format!("{agent}.spent"))? {
         None => 0,
         Some(b) => parse_tombstone(&b).ok_or(lease("a malformed tombstone"))?,
     };
     let (sec, nsec) = o.boottime().map_err(|_| lease("no boot clock"))?;
     let now = now_ms(sec, nsec).ok_or(lease("the boot clock is out of range"))?;
+    // The suspend gate, under the same shared lock (lease-on r1.5 §6.2): open at exactly the record's sg. An
+    // untrusted gate file refuses through read_trusted; a malformed or closed gate refuses here.
+    let sleep = read_trusted(o, &d, "sleep")?;
+    let reopen = read_trusted(o, &d, "reopen")?;
+    if gate_of(sleep.as_deref(), reopen.as_deref(), now) != Some(sg) {
+        return Err(lease("the suspend gate isn't open at this lease's generation"));
+    }
     if !current(spent, lg, expiry, now) {
         return Err(lease("no current lease"));
     }
@@ -316,7 +369,7 @@ mod tests {
         for p in [top.clone(), top.join("run"), top.join("run/sagebrush"), lease.clone()] {
             fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        write(&lease.join(A), br#"{"lease_id":"L1","lg":5,"expiry_tick":100000}"#, 0o644);
+        write(&lease.join(A), br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":3,"sg":0}"#, 0o644);
         let me = uid_of(&top);
         (T { top, me, foreign: HashSet::new(), foreign_group: HashSet::new(), access: HashSet::new(), default: HashSet::new(), now: (1, 0), sleeps: 0, hook: None }, lease)
     }
@@ -370,26 +423,58 @@ mod tests {
     fn a_malformed_record_is_78_and_an_oversize_one_66() {
         for bad in [
             &br#"{"lease_id":"L1","lg":5}"#[..],
-            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"x":1}"#,
-            br#"{"lease_id":"","lg":5,"expiry_tick":100000}"#,
-            br#"{"lease_id":"a b","lg":5,"expiry_tick":100000}"#,
-            br#"{"lease_id":"L1","lg":0,"expiry_tick":100000}"#,
-            br#"{"lease_id":"L1","lg":9007199254740992,"expiry_tick":100000}"#,
-            br#"{"lease_id":"L1","lg":5,"expiry_tick":9007199254740992}"#,
-            br#"{"lease_id":"L1","lg":"5","expiry_tick":100000}"#,
-            br#"{"lease_id":"L1","lg":5,"expiry_tick":-1}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":3,"x":1}"#,
+            br#"{"lease_id":"","lg":5,"expiry_tick":100000,"gen":3}"#,
+            br#"{"lease_id":"a b","lg":5,"expiry_tick":100000,"gen":3}"#,
+            br#"{"lease_id":"L1","lg":0,"expiry_tick":100000,"gen":3}"#,
+            br#"{"lease_id":"L1","lg":9007199254740992,"expiry_tick":100000,"gen":3}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":9007199254740992,"gen":3}"#,
+            br#"{"lease_id":"L1","lg":"5","expiry_tick":100000,"gen":3}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":-1,"gen":3}"#,
             b"not json",
+            // gen (A3 r3): the old three-key shape, out of range, not an integer, duplicated
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":0}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":9007199254740992}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":"3"}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":-1}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":1.5}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":null}"#,
+            br#"{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":3,"gen":3}"#,
         ] {
             let (mut t, lease) = setup();
             write(&lease.join(A), bad, 0o644);
             assert_eq!(code(&mut t), 78, "{}", String::from_utf8_lossy(bad));
         }
-        let long = format!(r#"{{"lease_id":"{}","lg":5,"expiry_tick":100000}}"#, "x".repeat(65));
+        let long = format!(r#"{{"lease_id":"{}","lg":5,"expiry_tick":100000,"gen":3}}"#, "x".repeat(65));
         let (mut t, lease) = setup();
         write(&lease.join(A), long.as_bytes(), 0o644);
         assert_eq!(code(&mut t), 78, "a 65-character lease id");
         write(&lease.join(A), &vec![b' '; 5000], 0o644);
         assert_eq!(code(&mut t), 66, "oversize");
+    }
+
+    #[test]
+    fn the_records_gen_is_range_checked_and_never_changes_an_outcome() {
+        // Its bounds pass.
+        for g in ["1", "9007199254740991"] {
+            let (mut t, lease) = setup();
+            write(&lease.join(A), format!(r#"{{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":{g},"sg":0}}"#).as_bytes(), 0o644);
+            assert_eq!(code(&mut t), 0, "gen {g}");
+        }
+        // The same record with each of two gens: the same outcome, passing, spent and expired alike.
+        for gen in [1u64, 7] {
+            let rec = format!(r#"{{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":{gen},"sg":0}}"#);
+            let (mut t, lease) = setup();
+            write(&lease.join(A), rec.as_bytes(), 0o644);
+            assert_eq!(code(&mut t), 0, "passing, gen {gen}");
+            write(&lease.join(format!("{A}.spent")), b"5\n", 0o644);
+            assert_eq!(code(&mut t), 78, "spent, gen {gen}");
+            let (mut t, lease) = setup();
+            write(&lease.join(A), rec.as_bytes(), 0o644);
+            t.now = (70, 0); // 70 000 ms: past the effective end, 100 000 - 30 000
+            assert_eq!(code(&mut t), 78, "expired, gen {gen}");
+        }
     }
 
     #[test]
@@ -624,6 +709,43 @@ mod tests {
     }
 
     #[test]
+    fn the_suspend_gate_must_be_open_at_the_records_sg() {
+        let sleep = |gen: u64, phase: &str| format!(r#"{{"gen":{gen},"phase":"{phase}","pre_ok":true,"pre_at":0}}"#);
+        let reopen = |gen: u64| format!(r#"{{"gen":{gen}}}"#);
+        let rec = |sg: u64| format!(r#"{{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":3,"sg":{sg}}}"#);
+        // No gate files: open at 0, a record at sg 0 passes; one at sg 2 doesn't.
+        let (mut t, lease) = setup();
+        assert_eq!(code(&mut t), 0, "both absent, sg 0");
+        write(&lease.join(A), rec(2).as_bytes(), 0o644);
+        assert_eq!(code(&mut t), 78, "both absent, sg 2");
+        // Open at 2: sg 2 passes, sg 0 (a lease from before the suspend) doesn't.
+        write(&lease.join("sleep"), sleep(2, "post").as_bytes(), 0o644);
+        write(&lease.join("reopen"), reopen(2).as_bytes(), 0o644);
+        assert_eq!(code(&mut t), 0, "open at 2, sg 2");
+        write(&lease.join(A), rec(0).as_bytes(), 0o644);
+        assert_eq!(code(&mut t), 78, "open at 2, sg 0");
+        // Closed: a PRE (sleep at pre), an unacknowledged post, a one-sided file, a reopen ahead.
+        write(&lease.join(A), rec(3).as_bytes(), 0o644);
+        for (s, r, why) in [(sleep(3, "pre"), Some(reopen(2)), "pre"), (sleep(3, "post"), Some(reopen(2)), "unacknowledged"),
+                            (sleep(3, "post"), None, "one-sided"), (sleep(3, "post"), Some(reopen(4)), "reopen ahead")] {
+            write(&lease.join("sleep"), s.as_bytes(), 0o644);
+            let _ = fs::remove_file(lease.join("reopen"));
+            if let Some(r) = r { write(&lease.join("reopen"), r.as_bytes(), 0o644); }
+            assert_eq!(code(&mut t), 78, "{why}");
+        }
+        // The terminal generation never opens, even acknowledged.
+        write(&lease.join(A), rec(MAX_SAFE).as_bytes(), 0o644);
+        write(&lease.join("sleep"), sleep(MAX_SAFE, "post").as_bytes(), 0o644);
+        write(&lease.join("reopen"), reopen(MAX_SAFE).as_bytes(), 0o644);
+        assert_eq!(code(&mut t), 78, "terminal");
+        // An untrusted gate file (group-writable) refuses through the file-trust path.
+        write(&lease.join(A), rec(2).as_bytes(), 0o644);
+        write(&lease.join("sleep"), sleep(2, "post").as_bytes(), 0o664);
+        write(&lease.join("reopen"), reopen(2).as_bytes(), 0o644);
+        assert_ne!(code(&mut t), 0, "group-writable sleep");
+    }
+
+    #[test]
     fn cross_language_fixture_rust_column() {
         let fx = json::parse_with(include_bytes!("../../test/fixtures/host/lease-files.json"), 1024).unwrap();
         let get = |k: &str| match &fx {
@@ -640,6 +762,15 @@ mod tests {
             let want = matches!(f[2], json::Value::Bool(true));
             assert_eq!(parse_record(f[0].str().unwrap().as_bytes()).is_some(), want, "{:?}", f[0]);
         }
+        let rows = get("gate");
+        assert!(rows.arr().unwrap().len() >= 20);
+        for row in rows.arr().unwrap() {
+            let f = row.exact(&["name", "sleep", "reopen", "now", "js", "rust"]).unwrap();
+            let text = |v: &json::Value| match v { json::Value::Null => None, v => Some(v.str().unwrap().as_bytes().to_vec()) };
+            let want = match f[5] { json::Value::Null => None, v => Some(v.int().unwrap()) };
+            let (s, r) = (text(f[1]), text(f[2]));
+            assert_eq!(gate_of(s.as_deref(), r.as_deref(), f[3].int().unwrap()), want, "{:?}", f[0]);
+        }
     }
 
     #[test]
@@ -654,6 +785,13 @@ mod tests {
         let flags = info.lines().find_map(|l| l.strip_prefix("flags:")).map(|v| u32::from_str_radix(v.trim(), 8).unwrap()).unwrap();
         assert_ne!(flags & libc::O_CLOEXEC as u32, 0, "O_CLOEXEC: execve releases it");
         drop(held);
-        assert!(other.try_lock().is_ok(), "released once the fd is closed");
+        // The lock belongs to the open file description. Another test thread's fork in this
+        // window gives its child a copy, held until that child execs (O_CLOEXEC) or exits; so
+        // the release is waited for, with a deadline, rather than read at once.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while other.try_lock().is_err() {
+            assert!(std::time::Instant::now() < deadline, "released once the fd is closed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

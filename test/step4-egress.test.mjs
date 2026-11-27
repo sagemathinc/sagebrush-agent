@@ -209,7 +209,7 @@ test("egress: sagebrush_docs pages (#1552): only a member of the site's index, r
     const calls = [];
     const get = async (u, o) => {
       calls.push({ u: u.origin + u.target, o });
-      if (u.pathname === "/docs-index.json") return typeof index === "function" ? index() : { status: 200, type: "application/json", body: Buffer.from(typeof index === "string" ? index : JSON.stringify(index)) };
+      if (u.pathname === "/docs-pages.json") return typeof index === "function" ? index() : { status: 200, type: "application/json", body: Buffer.from(typeof index === "string" ? index : JSON.stringify(index)) };
       return page;
     };
     return { v: netVerbs({ budget: new CardlessBudget(), get }), calls };
@@ -220,9 +220,9 @@ test("egress: sagebrush_docs pages (#1552): only a member of the site's index, r
     assert.equal(r.content[1].text, "Sharing\n\nHow to share.", "the page, HTML turned into text");
     assert.match(r.content[0].text, /^Untrusted content from https:\/\/sagebrush\.space\./);
     assert.ok((await v.sagebrush_docs({ path: "/blog/" })).content[1].text);
-    assert.equal(calls.filter((c) => c.u.endsWith("/docs-index.json")).length, 1, "the index is read once a turn");
+    assert.equal(calls.filter((c) => c.u.endsWith("/docs-pages.json")).length, 1, "the index is read once a turn");
     assert.ok(calls.every(({ u, o }) => u.startsWith("https://sagebrush.space/") && JSON.stringify(o.hosts) === '["sagebrush.space"]'), "only sagebrush.space, redirects only there");
-    const listed = await v.sagebrush_docs({ path: "/docs-index.json" });
+    const listed = await v.sagebrush_docs({ path: "/docs-pages.json" });
     assert.deepEqual(JSON.parse(listed.content[1].text), { paths: INDEX.paths }, "the model can read the list itself");
     const before = calls.length;
     for (const p of ["/docs/storage", "/docs/sharing/", "/articles/groebner/", "/blog/x"]) {
@@ -249,7 +249,7 @@ test("egress: sagebrush_docs pages (#1552): only a member of the site's index, r
     const { v, calls } = mk(index);
     const r = await v.sagebrush_docs({ path: "/docs/" });
     assert.ok(r.isError && /couldn't be read/.test(r.content[0].text), `${what}: no page read`);
-    assert.ok(!calls.some((c) => !c.u.endsWith("/docs-index.json")), `${what}: only the index was asked for`);
+    assert.ok(!calls.some((c) => !c.u.endsWith("/docs-pages.json")), `${what}: only the index was asked for`);
     await v.sagebrush_docs({ path: "/docs/sharing" });
     assert.equal(calls.length, 1, `${what}: and not asked again this turn`);
   }

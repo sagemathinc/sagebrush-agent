@@ -14,7 +14,7 @@ from pathlib import Path
 from .core import CANON_DEPTH, FleetError, canon, refuse
 
 CANON_MAX = 16 * 1024
-FREEZE = {"revision": "r2.3", "sha256": "db905c9d72ba5d4e18620d3267ea9214992d3a82c735289dda4088970dddc7e3"}
+FREEZE = {"revision": "r2.5", "sha256": "589730708dbc76d742f67831e2772e8f4a85fac51650640eb76fb0747c1a1bd3"}
 
 ANNOTATIONS = {"$comment", "$id", "$schema", "title", "description"}
 KNOWN = ANNOTATIONS | {

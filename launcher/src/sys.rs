@@ -150,10 +150,17 @@ pub fn umount2_detach(path: &CStr) -> io::Result<()> {
     if r != 0 { Err(last()) } else { Ok(()) }
 }
 
+/// The renameat2 system call itself: musl's static libc (the shipped build, lease-on r1.7 §2.2) has no wrapper for it,
+/// and glibc's wrapper is this same call. Returns the call's result (-1 with errno set on failure).
+unsafe fn renameat2(olddir: libc::c_int, old: *const libc::c_char, newdir: libc::c_int, new: *const libc::c_char, flags: libc::c_uint) -> libc::c_int {
+    // SAFETY: the caller's: both directory descriptors are open and both names NUL-terminated.
+    unsafe { libc::syscall(libc::SYS_renameat2, olddir, old, newdir, new, flags) as libc::c_int }
+}
+
 /// renameat2(dir, from, dir, to, RENAME_NOREPLACE).
 pub fn rename_noreplace(dir: &OwnedFd, from: &CStr, to: &CStr) -> io::Result<()> {
     // SAFETY: `dir` is open; both names are NUL-terminated.
-    let r = unsafe { libc::renameat2(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) };
+    let r = unsafe { renameat2(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) };
     if r != 0 { Err(last()) } else { Ok(()) }
 }
 
@@ -358,7 +365,8 @@ struct FsXattr {
 }
 const _: () = assert!(core::mem::size_of::<FsXattr>() == 28);
 /// _IOR('X', 31, struct fsxattr): not in libc 0.2.191.
-const FS_IOC_FSGETXATTR: libc::Ioctl = 0x801c_581f;
+// (from u32: musl's Ioctl is i32, where the request's top bit wraps to the same 32 bits the kernel reads as unsigned)
+const FS_IOC_FSGETXATTR: libc::Ioctl = 0x801c_581f_u32 as libc::Ioctl;
 const FS_XFLAG_PROJINHERIT: u32 = 0x0000_0200;
 
 /// ioctl(fd, FS_IOC_FSGETXATTR): (project id, project-inherit flag) (an O_RDONLY fd; A1 §1).
@@ -408,7 +416,7 @@ pub fn rmdirat(dir: &OwnedFd, name: &CStr) -> io::Result<()> {
 /// renameat2(from_dir, name, to_dir, name, RENAME_NOREPLACE): archive-home's move between two opened parents.
 pub fn rename_noreplace_between(from_dir: &OwnedFd, from: &CStr, to_dir: &OwnedFd, to: &CStr) -> io::Result<()> {
     // SAFETY: both directories are open; both names are NUL-terminated.
-    let r = unsafe { libc::renameat2(from_dir.as_raw_fd(), from.as_ptr(), to_dir.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) };
+    let r = unsafe { renameat2(from_dir.as_raw_fd(), from.as_ptr(), to_dir.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) };
     if r != 0 { Err(last()) } else { Ok(()) }
 }
 
@@ -948,4 +956,191 @@ pub fn clock_boottime() -> io::Result<(i64, i64)> {
     // SAFETY: clock_gettime returned 0, so the kernel initialized the timespec.
     let ts = unsafe { ts.assume_init() };
     Ok((ts.tv_sec as i64, ts.tv_nsec as i64))
+}
+
+// ---- launcher contract amendment A5 (turn): the unit's namespaces, the user namespace, the idmapped mount.
+
+/// pidfd_send_signal(pidfd, 0, NULL, 0): Ok if the process the pidfd names is still alive (ESRCH once it's gone).
+pub fn pidfd_alive(pidfd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: `pidfd` is open; signal 0 delivers nothing; the info pointer is NULL as the call allows.
+    let r = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), 0, core::ptr::null::<libc::siginfo_t>(), 0 as libc::c_uint) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// setns(pidfd, nstype): join the namespaces `nstype` names, of the process the pidfd names (Linux 5.8+).
+pub fn setns(pidfd: &OwnedFd, nstype: libc::c_int) -> io::Result<()> {
+    // SAFETY: `pidfd` is open; `nstype` is a set of CLONE_NEW* constants.
+    let r = unsafe { libc::setns(pidfd.as_raw_fd(), nstype) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// unshare(CLONE_NEWUSER): only in the user-namespace child, which then waits to be reaped.
+pub fn unshare_user() -> io::Result<()> {
+    // SAFETY: a constant flag.
+    let r = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// openat(nsdir, name, O_RDONLY | O_CLOEXEC | O_NOCTTY): ONE namespace entry beneath an opened `/proc/<pid>/ns`
+/// handle. Those entries are magic links, which openat2's RESOLVE_BENEATH and RESOLVE_NO_SYMLINKS refuse by design,
+/// so this is the one plain openat: one fixed component, relative to a handle the caller opened with openat2 and
+/// checked, and the caller checks the result's namespace type (A5 r4.6 step 6).
+pub fn open_ns_entry(nsdir: &OwnedFd, name: &CStr) -> io::Result<OwnedFd> {
+    // SAFETY: `nsdir` is open; `name` is NUL-terminated; the flags are constants.
+    let fd = unsafe { libc::openat(nsdir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOCTTY) };
+    own(fd as libc::c_long)
+}
+
+/// ioctl(fd, NS_GET_NSTYPE): the CLONE_NEW* type of the namespace a namespace descriptor names.
+pub fn ns_type(fd: &OwnedFd) -> io::Result<libc::c_int> {
+    // SAFETY: `fd` is open; NS_GET_NSTYPE takes no argument and returns the type.
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), libc::NS_GET_NSTYPE) };
+    if r < 0 { Err(last()) } else { Ok(r) }
+}
+
+/// mount_setattr(clone, "", AT_EMPTY_PATH, { attr_set: MOUNT_ATTR_IDMAP, userns_fd }): idmap a detached clone.
+pub fn mount_setattr_idmap(clone: &OwnedFd, userns: &OwnedFd) -> io::Result<()> {
+    let attr = MountAttr { attr_set: libc::MOUNT_ATTR_IDMAP, attr_clr: 0, propagation: 0, userns_fd: userns.as_raw_fd() as u64 };
+    // SAFETY: `clone` is an open mount fd and `userns` an open user-namespace fd; `attr` lives across the call and
+    // its size is passed.
+    let r = unsafe {
+        libc::syscall(libc::SYS_mount_setattr, clone.as_raw_fd(), c"".as_ptr(), libc::AT_EMPTY_PATH, &attr as *const MountAttr, core::mem::size_of::<MountAttr>())
+    };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+// ---- A5 (turn): the status and go pipes, the stdio check, the setid and its read-back.
+
+/// fcntl(fd, F_SETFD, FD_CLOEXEC) on an inherited descriptor number (fds 3 and 4, §1's first action).
+pub fn fd_cloexec(fd: libc::c_int) -> io::Result<()> {
+    // SAFETY: plain integer arguments; an invalid fd is EBADF.
+    let r = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// Whether `fd` is a pipe opened write-only (fstat S_IFIFO, then F_GETFL's access mode).
+pub fn fd_is_pipe_writer(fd: libc::c_int) -> io::Result<bool> {
+    let mut st = core::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `st` is writable for a whole stat; an invalid fd is EBADF.
+    let r = unsafe { libc::fstat(fd, st.as_mut_ptr()) };
+    if r != 0 {
+        return Err(last());
+    }
+    // SAFETY (§6 conversion 2): fstat returned 0, so the kernel initialized the whole struct.
+    let st = unsafe { st.assume_init() };
+    // SAFETY: plain integer arguments.
+    let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if fl < 0 {
+        return Err(last());
+    }
+    Ok(st.st_mode & libc::S_IFMT == libc::S_IFIFO && fl & libc::O_ACCMODE == libc::O_WRONLY)
+}
+
+/// Whether `fd` is an AF_UNIX SOCK_STREAM socket (fstat S_IFSOCK, then SO_DOMAIN and SO_TYPE).
+pub fn fd_is_unix_stream(fd: libc::c_int) -> io::Result<bool> {
+    let mut st = core::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `st` is writable for a whole stat; an invalid fd is EBADF.
+    let r = unsafe { libc::fstat(fd, st.as_mut_ptr()) };
+    if r != 0 {
+        return Err(last());
+    }
+    // SAFETY (§6 conversion 2): fstat returned 0, so the kernel initialized the whole struct.
+    let st = unsafe { st.assume_init() };
+    if st.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+        return Ok(false);
+    }
+    let opt = |name: libc::c_int| -> io::Result<libc::c_int> {
+        let mut v: libc::c_int = 0;
+        let mut len = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `v` and `len` are writable and `len` holds v's size.
+        let r = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, name, (&mut v as *mut libc::c_int).cast(), &mut len) };
+        if r != 0 { Err(last()) } else { Ok(v) }
+    };
+    Ok(opt(libc::SO_DOMAIN)? == libc::AF_UNIX && opt(libc::SO_TYPE)? == libc::SOCK_STREAM)
+}
+
+/// close_range(from, ~0U, 0): every descriptor from `from` up.
+pub fn close_range_from(from: libc::c_uint) -> io::Result<()> {
+    // SAFETY: plain integer arguments; no OwnedFd the caller still holds is at or above `from` (the caller's duty).
+    let r = unsafe { libc::syscall(libc::SYS_close_range, from, libc::c_uint::MAX, 0 as libc::c_uint) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// write(fd, buf) on an inherited descriptor number (the status pipe, fd 3).
+pub fn write_raw(fd: libc::c_int, buf: &[u8]) -> io::Result<usize> {
+    // SAFETY: `buf` is readable for its length; an invalid fd is EBADF.
+    let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+    if n < 0 { Err(last()) } else { Ok(n as usize) }
+}
+
+/// read(fd, buf) on an inherited descriptor number (the go pipe, fd 4).
+pub fn read_raw(fd: libc::c_int, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `buf` is writable for its length; an invalid fd is EBADF.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 { Err(last()) } else { Ok(n as usize) }
+}
+
+/// setgroups(gids).
+pub fn setgroups(gids: &[u32]) -> io::Result<()> {
+    // SAFETY: `gids` is readable for its length (gid_t is u32 on Linux).
+    let r = unsafe { libc::setgroups(gids.len(), gids.as_ptr()) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// setresgid(g, g, g).
+pub fn setresgid(g: u32) -> io::Result<()> {
+    // SAFETY: plain integer arguments.
+    let r = unsafe { libc::setresgid(g, g, g) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// setresuid(u, u, u).
+pub fn setresuid(u: u32) -> io::Result<()> {
+    // SAFETY: plain integer arguments.
+    let r = unsafe { libc::setresuid(u, u, u) };
+    if r != 0 { Err(last()) } else { Ok(()) }
+}
+
+/// getresuid(): (real, effective, saved).
+pub fn getresuid() -> io::Result<(u32, u32, u32)> {
+    let (mut r, mut e, mut s) = (0, 0, 0);
+    // SAFETY: the three are writable.
+    let x = unsafe { libc::getresuid(&mut r, &mut e, &mut s) };
+    if x != 0 { Err(last()) } else { Ok((r, e, s)) }
+}
+
+/// getresgid(): (real, effective, saved).
+pub fn getresgid() -> io::Result<(u32, u32, u32)> {
+    let (mut r, mut e, mut s) = (0, 0, 0);
+    // SAFETY: the three are writable.
+    let x = unsafe { libc::getresgid(&mut r, &mut e, &mut s) };
+    if x != 0 { Err(last()) } else { Ok((r, e, s)) }
+}
+
+/// getgroups(): the supplementary groups (at most 65536).
+pub fn getgroups() -> io::Result<Vec<u32>> {
+    let mut v = vec![0u32; 65536];
+    // SAFETY: `v` is writable for its length.
+    let n = unsafe { libc::getgroups(v.len() as libc::c_int, v.as_mut_ptr()) };
+    if n < 0 {
+        return Err(last());
+    }
+    v.truncate(n as usize);
+    Ok(v)
+}
+
+/// fcntl(fd, F_GETFD): a descriptor's flags (tests only: they read back FD_CLOEXEC).
+#[cfg(test)]
+pub fn fd_flags(fd: libc::c_int) -> io::Result<libc::c_int> {
+    // SAFETY: plain integer arguments; an invalid fd is EBADF.
+    let r = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if r < 0 { Err(last()) } else { Ok(r) }
+}
+
+/// dup(fd): a new, inheritable descriptor (no FD_CLOEXEC), the lowest free number (tests only).
+#[cfg(test)]
+pub fn dup_inheritable(from: &OwnedFd) -> io::Result<libc::c_int> {
+    // SAFETY: `from` is open; dup takes a plain integer and returns a new descriptor or -1.
+    let r = unsafe { libc::dup(from.as_raw_fd()) };
+    if r < 0 { Err(last()) } else { Ok(r) }
 }

@@ -43,10 +43,19 @@ pub const ANCHORS: [(&str, &str); 10] = [
     ("/srv/sagebrush/claude-profiles", ""),
 ];
 
+/// The tag folders' parent (A1 r2.7): `identify` reads a tag folder (`<id>`); only `--contents` empties one (§5a).
+pub const TAGS: &str = "/srv/sagebrush/tags";
+/// The live agents' parent: only `--contents` reaches into it (an agent's `home` or `sessions`, §5a).
+pub const AGENTS: &str = "/srv/sagebrush/agents";
+const ARCHIVE: &str = "/srv/sagebrush/archive";
+/// A deleted agent's config archive (A2 r3.13): `--contents` empties a restore destination there, and keeps it.
+const ARCHIVE_CONFIG: &str = "/srv/sagebrush/archive-config";
+
 /// Whether `name` is `<id><suffix>` for the anchor's suffix; beneath A2's `.restore`, `<run>/<owner>/<class>/<attempt>`.
 pub fn anchor_name_ok(anchor: &str, name: &str) -> bool {
     ANCHORS.iter().any(|(a, suffix)| *a == anchor && name.strip_suffix(suffix).is_some_and(is_id))
         || (anchor == crate::restore::RESTORE && crate::restore::name_of(name).is_some())
+        || (anchor == crate::digest::VALIDATE && crate::digest::copy_name_ok(name))
 }
 
 /// How a child is opened beneath its parent (always with RESOLVE_NO_XDEV).
@@ -62,32 +71,41 @@ pub enum At {
 }
 
 /// The handle operations A1 needs. `RealOps` maps each to one syscall wrapper in `sys`.
+///
+/// Names are bytes (A1 r2.5 §1): a listed name is the raw `getdents64` bytes, and every by-name operation takes it
+/// back unchanged. Nothing requires a name to be UTF-8; fixed names (`"home"`, `"data"`) are passed as their bytes.
 pub trait Ops {
     type H;
     fn root(&mut self) -> io::Result<Self::H>;
     /// openat2 from the trusted root (BENEATH | NO_SYMLINKS | NO_MAGICLINKS), O_RDONLY | O_DIRECTORY; "" is the root.
     fn dir_from_root(&mut self, root: &Self::H, rel: &str) -> io::Result<Self::H>;
-    fn at(&mut self, dir: &Self::H, name: &str, how: At) -> io::Result<Self::H>;
+    fn at(&mut self, dir: &Self::H, name: impl AsRef<[u8]>, how: At) -> io::Result<Self::H>;
     fn ident(&mut self, h: &Self::H) -> io::Result<Ident>;
-    fn ident_at(&mut self, dir: &Self::H, name: &str) -> io::Result<Ident>;
+    fn ident_at(&mut self, dir: &Self::H, name: impl AsRef<[u8]>) -> io::Result<Ident>;
     fn generation(&mut self, h: &Self::H) -> io::Result<u32>;
     fn project(&mut self, h: &Self::H) -> io::Result<(u32, bool)>;
     fn fsid(&mut self, h: &Self::H) -> io::Result<u64>;
     /// The next batch of names from the directory's own read cursor (one getdents64 call's worth, without "." and
-    /// ".."); empty at the end. A handle's cursor only moves forward: a second walk needs a freshly opened handle.
-    fn batch(&mut self, dir: &Self::H) -> io::Result<Vec<String>>;
+    /// ".."), as raw bytes; empty at the end. A handle's cursor only moves forward: a second walk needs a freshly
+    /// opened handle.
+    fn batch(&mut self, dir: &Self::H) -> io::Result<Vec<Vec<u8>>>;
     fn has_acl(&mut self, dir: &Self::H) -> io::Result<bool>;
     fn chmod(&mut self, dir: &Self::H, mode: u16) -> io::Result<()>;
     fn drop_acls(&mut self, dir: &Self::H) -> io::Result<()>;
-    fn unlink(&mut self, dir: &Self::H, name: &str, is_dir: bool) -> io::Result<()>;
-    fn rename(&mut self, from: &Self::H, to: &Self::H, name: &str) -> io::Result<()>;
+    fn unlink(&mut self, dir: &Self::H, name: impl AsRef<[u8]>, is_dir: bool) -> io::Result<()>;
+    fn rename(&mut self, from: &Self::H, to: &Self::H, name: impl AsRef<[u8]>) -> io::Result<()>;
     fn fsync(&mut self, dir: &Self::H) -> io::Result<()>;
     /// A small file read through the trusted root (at most `max` bytes, else EFBIG).
     fn read(&mut self, root: &Self::H, rel: &str, max: usize) -> io::Result<Vec<u8>>;
 }
 
 pub(crate) fn c(s: &str) -> io::Result<CString> {
-    CString::new(s).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+    cb(s.as_bytes())
+}
+
+/// A name's raw bytes as a C string (a NUL inside is EINVAL; a listed name never has one).
+pub(crate) fn cb(b: &[u8]) -> io::Result<CString> {
+    CString::new(b).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
 }
 
 /// The real handle operations: the syscall module, nothing else.
@@ -104,19 +122,19 @@ impl Ops for RealOps {
     fn dir_from_root(&mut self, root: &OwnedFd, rel: &str) -> io::Result<OwnedFd> {
         sys::openat2(root, &c(if rel.is_empty() { "." } else { rel })?, libc::O_RDONLY | libc::O_DIRECTORY, 0)
     }
-    fn at(&mut self, dir: &OwnedFd, name: &str, how: At) -> io::Result<OwnedFd> {
+    fn at(&mut self, dir: &OwnedFd, name: impl AsRef<[u8]>, how: At) -> io::Result<OwnedFd> {
         let flags = match how {
             At::Path => libc::O_PATH,
             At::Dir => libc::O_RDONLY | libc::O_DIRECTORY,
             At::File => libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW,
         };
-        sys::openat2_xdev(dir, &c(name)?, flags)
+        sys::openat2_xdev(dir, &cb(name.as_ref())?, flags)
     }
     fn ident(&mut self, h: &OwnedFd) -> io::Result<Ident> {
         sys::ident(h)
     }
-    fn ident_at(&mut self, dir: &OwnedFd, name: &str) -> io::Result<Ident> {
-        sys::ident_at_nofollow(dir, &c(name)?)
+    fn ident_at(&mut self, dir: &OwnedFd, name: impl AsRef<[u8]>) -> io::Result<Ident> {
+        sys::ident_at_nofollow(dir, &cb(name.as_ref())?)
     }
     fn generation(&mut self, h: &OwnedFd) -> io::Result<u32> {
         sys::inode_generation(h)
@@ -127,7 +145,7 @@ impl Ops for RealOps {
     fn fsid(&mut self, h: &OwnedFd) -> io::Result<u64> {
         sys::fsid(h)
     }
-    fn batch(&mut self, dir: &OwnedFd) -> io::Result<Vec<String>> {
+    fn batch(&mut self, dir: &OwnedFd) -> io::Result<Vec<Vec<u8>>> {
         let mut buf = vec![0u8; BATCH_BYTES];
         loop {
             let n = sys::getdents64(dir, &mut buf)?;
@@ -135,14 +153,8 @@ impl Ops for RealOps {
                 return Ok(Vec::new());
             }
             let names = dirent_names(&buf, n).ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
-            let mut out = Vec::with_capacity(names.len());
-            for nm in names {
-                if nm == b"." || nm == b".." {
-                    continue;
-                }
-                // A name that isn't UTF-8 is refused by the caller as foreign (it can't be any name we made).
-                out.push(String::from_utf8(nm).map_err(|_| io::Error::from_raw_os_error(libc::EILSEQ))?);
-            }
+            // Raw bytes, whatever their encoding (A1 r2.5): a name that isn't UTF-8 is listed like any other.
+            let out: Vec<Vec<u8>> = names.into_iter().filter(|nm| nm != b"." && nm != b"..").collect();
             if !out.is_empty() {
                 return Ok(out);
             }
@@ -158,11 +170,12 @@ impl Ops for RealOps {
         sys::remove_xattr(dir, ACL_ACCESS)?;
         sys::remove_xattr(dir, ACL_DEFAULT)
     }
-    fn unlink(&mut self, dir: &OwnedFd, name: &str, is_dir: bool) -> io::Result<()> {
-        if is_dir { sys::rmdirat(dir, &c(name)?) } else { sys::unlinkat(dir, &c(name)?) }
+    fn unlink(&mut self, dir: &OwnedFd, name: impl AsRef<[u8]>, is_dir: bool) -> io::Result<()> {
+        let n = cb(name.as_ref())?;
+        if is_dir { sys::rmdirat(dir, &n) } else { sys::unlinkat(dir, &n) }
     }
-    fn rename(&mut self, from: &OwnedFd, to: &OwnedFd, name: &str) -> io::Result<()> {
-        let n = c(name)?;
+    fn rename(&mut self, from: &OwnedFd, to: &OwnedFd, name: impl AsRef<[u8]>) -> io::Result<()> {
+        let n = cb(name.as_ref())?;
         sys::rename_noreplace_between(from, &n, to, &n)
     }
     fn fsync(&mut self, dir: &OwnedFd) -> io::Result<()> {
@@ -240,7 +253,8 @@ pub(crate) fn kind_of(id: &Ident) -> Option<Kind> {
 /// The child `name` of `dir`, fully identified. Ok(None) if it doesn't exist. For a directory, also its O_RDONLY
 /// handle (to descend). A symlink is identified by name (never followed); a device, socket or FIFO is refused (73)
 /// without ever being opened for reading.
-pub(crate) fn child<O: Ops>(o: &mut O, dir: &O::H, name: &str, anchor_mnt: u64) -> Result<Option<(Obj, Option<O::H>)>> {
+pub(crate) fn child<O: Ops>(o: &mut O, dir: &O::H, name: impl AsRef<[u8]>, anchor_mnt: u64) -> Result<Option<(Obj, Option<O::H>)>> {
+    let name = name.as_ref();
     let id = match o.at(dir, name, At::Path) {
         Ok(h) => o.ident(&h).map_err(open_err)?,
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
@@ -410,7 +424,8 @@ pub(crate) fn read_expect<O: Ops>(o: &mut O, root: &O::H, path: &str) -> Result<
 // ---- identify (A1 §2)
 
 pub fn identify<O: Ops>(o: &mut O, anchor: &str, name: &str) -> Result<String> {
-    if !anchor_name_ok(anchor, name) {
+    // A1 r2.7: a tag folder is a read-only row, for identify only.
+    if !anchor_name_ok(anchor, name) && !(anchor == TAGS && is_id(name)) {
         return Err(err(Fail::Usage, "bad arguments"));
     }
     let root = o.root().map_err(|_| pre("the root can't be opened"))?;
@@ -575,6 +590,8 @@ fn inspect<O: Ops>(o: &mut O, root: &O::H, mount: &str, agent: &str, tree: Tree,
     }
     let mut entries = Vec::with_capacity(names.len());
     for n in names {
+        // Every name these trees may hold is a fixed ASCII one: a name that isn't UTF-8 is an unknown entry (A1 r2.5).
+        let n = String::from_utf8(n).map_err(|_| identity("an entry isn't one of the tree's names"))?;
         let (x, _) = child(o, &h, &n, epoch.mnt_id)?.ok_or(identity("an entry vanished"))?;
         entries.push((n, x));
     }
@@ -753,13 +770,17 @@ struct Walk {
     limit: usize,
     anchor_mnt: u64,
     owners: Vec<u32>,
+    /// A1 r2.8–r2.9 §5b: beneath `.restore`, owners aren't checked from this depth down (the attempt is depth 1, `data`
+    /// 2, the class leaf 3).
+    any_owner_from: Option<usize>,
     objects: usize,
     removed: usize,
 }
 
 impl Walk {
-    fn owner_ok(&self, uid: u32) -> bool {
-        self.owners.contains(&uid)
+    /// Whether an object at `depth` may be owned by `uid`.
+    fn owner_ok(&self, uid: u32, depth: usize) -> bool {
+        self.owners.contains(&uid) || self.any_owner_from.is_some_and(|d| depth >= d)
     }
     /// Before the first unlink, a refusal is "nothing removed" (73); after it, any failure is partial (75).
     fn fail(&self, msg: &'static str) -> Error {
@@ -775,7 +796,7 @@ fn pass1<O: Ops>(o: &mut O, w: &mut Walk, dir: &O::H, depth: usize) -> Result<()
         return Err(identity("the tree is too deep"));
     }
     let id = o.ident(dir).map_err(open_err)?;
-    if kind_of(&id) != Some(Kind::Dir) || id.mnt_id != w.anchor_mnt || !w.owner_ok(id.uid) {
+    if kind_of(&id) != Some(Kind::Dir) || id.mnt_id != w.anchor_mnt || !w.owner_ok(id.uid, depth) {
         return Err(identity("a foreign directory"));
     }
     if id.mode & 0o022 != 0 {
@@ -794,7 +815,7 @@ fn pass1<O: Ops>(o: &mut O, w: &mut Walk, dir: &O::H, depth: usize) -> Result<()
                 return Err(identity("the tree is too large"));
             }
             let (x, h) = child(o, dir, &name, w.anchor_mnt)?.ok_or(identity("an entry vanished"))?;
-            if !w.owner_ok(x.uid) {
+            if !w.owner_ok(x.uid, depth + 1) {
                 return Err(identity("an object owned by a foreign uid"));
             }
             if let Some(h) = h {
@@ -809,7 +830,7 @@ fn pass1<O: Ops>(o: &mut O, w: &mut Walk, dir: &O::H, depth: usize) -> Result<()
 /// locked-down mode and absent ACL), and removes every entry it lists, each re-checked and unlinked by name from the
 /// checked handle; rounds repeat until a fresh listing is empty (unlinking while reading may skip a name, never invent
 /// one). Then the caller unlinks the directory itself.
-fn pass2<O: Ops>(o: &mut O, w: &mut Walk, parent: &O::H, name: &str, depth: usize) -> Result<()> {
+fn pass2<O: Ops>(o: &mut O, w: &mut Walk, parent: &O::H, name: &[u8], depth: usize) -> Result<()> {
     if depth > MAX_DEPTH {
         return Err(w.fail("the tree is too deep"));
     }
@@ -824,35 +845,40 @@ fn pass2<O: Ops>(o: &mut O, w: &mut Walk, parent: &O::H, name: &str, depth: usiz
             _ => return Err(w.fail("a directory changed between the passes")),
         };
         let acl = o.has_acl(&h).map_err(|_| w.fail("an ACL can't be read"))?;
-        if !w.owner_ok(x.uid) || x.mode & 0o022 != 0 || acl {
+        if !w.owner_ok(x.uid, depth) || x.mode & 0o022 != 0 || acl {
             return Err(w.fail("a directory isn't locked down"));
         }
-        let mut seen = false;
-        loop {
-            let names = o.batch(&h).map_err(|_| w.fail("a directory can't be listed"))?;
-            if names.is_empty() {
-                break;
-            }
-            for n in names {
-                seen = true;
-                let (cx, ch) = match child(o, &h, &n, w.anchor_mnt) {
-                    Ok(Some(v)) => v,
-                    Ok(None) => continue, // already gone (removed in an earlier round)
-                    Err(_) => return Err(w.fail("an object changed between the passes")),
-                };
-                if !w.owner_ok(cx.uid) {
-                    return Err(w.fail("an object owned by a foreign uid"));
-                }
-                if ch.is_some() {
-                    drop(ch);
-                    pass2(o, w, &h, &n, depth + 1)?;
-                }
-                o.unlink(&h, &n, cx.kind == Kind::Dir).map_err(|_| w.fail("an unlink failed"))?;
-                w.removed += 1;
-            }
-        }
-        if !seen {
+        if !remove_entries(o, w, &h, depth)? {
             return Ok(());
+        }
+    }
+}
+
+/// One round over a checked directory's fresh handle: each listed entry re-checked and removed (a directory through
+/// `pass2` first). Ok(true) if it listed anything.
+fn remove_entries<O: Ops>(o: &mut O, w: &mut Walk, h: &O::H, depth: usize) -> Result<bool> {
+    let mut seen = false;
+    loop {
+        let names = o.batch(h).map_err(|_| w.fail("a directory can't be listed"))?;
+        if names.is_empty() {
+            return Ok(seen);
+        }
+        for n in names {
+            seen = true;
+            let (cx, ch) = match child(o, h, &n, w.anchor_mnt) {
+                Ok(Some(v)) => v,
+                Ok(None) => continue, // already gone (removed in an earlier round)
+                Err(_) => return Err(w.fail("an object changed between the passes")),
+            };
+            if !w.owner_ok(cx.uid, depth + 1) {
+                return Err(w.fail("an object owned by a foreign uid"));
+            }
+            if ch.is_some() {
+                drop(ch);
+                pass2(o, w, h, &n, depth + 1)?;
+            }
+            o.unlink(h, &n, cx.kind == Kind::Dir).map_err(|_| w.fail("an unlink failed"))?;
+            w.removed += 1;
         }
     }
 }
@@ -871,8 +897,13 @@ fn remove_tree_limited<O: Ops>(o: &mut O, anchor: &str, name: &str, expect_path:
     let (e_epoch, e_fsid, e_root) = (epoch_of(f[0])?, fsid_of(f[1])?, obj_of(f[2])?);
     // A2: an attempt beneath .restore may hold root and up to 64 tag members' files.
     let restore = anchor == crate::restore::RESTORE;
-    let max_owners = if restore { 65 } else { 4 };
-    let owners = f[3].arr().filter(|a| !a.is_empty() && a.len() <= max_owners).ok_or(bad_expect())?.iter().map(u32_of).collect::<Result<Vec<u32>>>()?;
+    // A2 r3.7: beneath the validate anchor, `<run>/<owner>`: one staging parent, root-only copies.
+    let validate = anchor == crate::digest::VALIDATE;
+    let owners = f[3].arr().filter(|a| !a.is_empty() && a.len() <= 4).ok_or(bad_expect())?.iter().map(u32_of).collect::<Result<Vec<u32>>>()?;
+    // A1 r2.8–r2.9 §5b: beneath .restore, exactly [0]; owners aren't checked from the class leaf down.
+    if restore && owners != [0] {
+        return Err(bad_expect());
+    }
     let a = anchor_policy(o, &root, anchor)?;
     // The epoch FIRST, even when the target is absent (A1 r2 §1, TESTS T1).
     let (epoch, fsid) = epoch_now(o, &root, &a)?;
@@ -884,10 +915,15 @@ fn remove_tree_limited<O: Ops>(o: &mut O, anchor: &str, name: &str, expect_path:
     }
     // A2: beneath .restore, the attempt's three staging parents first, each root:root 0700 on the anchor's mount; a
     // missing one means the attempt is already gone.
-    let (a, name) = if restore {
-        let parts = crate::restore::name_of(name).ok_or(err(Fail::Usage, "bad arguments"))?.parts();
+    let (a, name) = if restore || validate {
+        let parts: Vec<String> = if restore {
+            crate::restore::name_of(name).ok_or(err(Fail::Usage, "bad arguments"))?.parts().to_vec()
+        } else {
+            name.split('/').map(str::to_string).collect()
+        };
+        let staging = parts.len() - 1;
         let mut cur = a;
-        for part in &parts[..3] {
+        for part in &parts[..staging] {
             match child(o, &cur, part, epoch.mnt_id)? {
                 Some((x, Some(h))) if x.kind == Kind::Dir && x.uid == 0 && x.gid == 0 && x.mode == 0o700 => cur = h,
                 None => {
@@ -897,7 +933,7 @@ fn remove_tree_limited<O: Ops>(o: &mut O, anchor: &str, name: &str, expect_path:
                 _ => return Err(identity("a staging directory isn't root:root 0700")),
             }
         }
-        (cur, parts[3].clone())
+        (cur, parts[staging].clone())
     } else {
         (a, name.to_string())
     };
@@ -911,13 +947,80 @@ fn remove_tree_limited<O: Ops>(o: &mut O, anchor: &str, name: &str, expect_path:
     if x != e_root {
         return Err(identity("the target differs from the expected identity"));
     }
-    drop(h);
-    remove_below(o, &a, name, &x, Walk { limit, anchor_mnt: epoch.mnt_id, owners, objects: 1, removed: 0 })
+    if restore {
+        let h = h.ok_or(identity("the attempt isn't a directory"))?;
+        if x.uid != 0 || x.gid != 0 || x.mode != 0o700 {
+            return Err(identity("the attempt isn't root:root 0700"));
+        }
+        restore_shape(o, &h, epoch.mnt_id)?;
+    } else {
+        drop(h);
+    }
+    let any_owner_from = restore.then_some(3);
+    remove_below(o, &a, name, &x, Walk { limit, anchor_mnt: epoch.mnt_id, owners, any_owner_from, objects: 1, removed: 0 })
+}
+
+/// A1 r2.9 §5b: a staging attempt's two top levels hold any subset of a closed set, nothing else. The attempt:
+/// `data` (root:root 0700) and `.complete` (the marker). `data`: at most one directory (the class leaf), `digests.json`
+/// and at most one `.digests.json.tmp-<n>`. Each file regular, root-owned, no group, other or special bits, one link.
+fn restore_shape<O: Ops>(o: &mut O, attempt: &O::H, mnt: u64) -> Result<()> {
+    let bad = |m| Err(identity(m));
+    let file_ok = |x: &Obj, nlink: u32| x.kind == Kind::File && x.uid == 0 && x.mode & 0o7077 == 0 && nlink == 1;
+    let mut data = None;
+    for n in all_names(o, attempt)? {
+        let (x, h) = child(o, attempt, &n, mnt)?.ok_or(identity("an entry vanished"))?;
+        match n.as_slice() {
+            b"data" if x.kind == Kind::Dir && x.uid == 0 && x.gid == 0 && x.mode == 0o700 => data = h,
+            b".complete" => {
+                let id = o.ident_at(attempt, b".complete").map_err(open_err)?;
+                if !file_ok(&x, id.nlink) || id.size > 64 {
+                    return bad("the attempt's marker isn't a root 0600 file of at most 64 bytes");
+                }
+            }
+            _ => return bad("an unexpected entry in the attempt"),
+        }
+    }
+    let Some(data) = data else { return Ok(()) };
+    let (mut dirs, mut tmps) = (0, 0);
+    for n in all_names(o, &data)? {
+        let (x, _) = child(o, &data, &n, mnt)?.ok_or(identity("an entry vanished"))?;
+        if x.kind == Kind::Dir {
+            dirs += 1;
+            continue;
+        }
+        let nlink = o.ident_at(&data, &n).map_err(open_err)?.nlink;
+        let tmp = n.strip_prefix(b".digests.json.tmp-").is_some_and(|d| !d.is_empty() && d.len() <= 10 && d.iter().all(u8::is_ascii_digit));
+        if tmp {
+            tmps += 1;
+        }
+        if !(tmp || n == b"digests.json") || !file_ok(&x, nlink) {
+            return bad("an unexpected entry in data");
+        }
+    }
+    if dirs > 1 || tmps > 1 {
+        return bad("more than one leaf or temporary list in data");
+    }
+    Ok(())
+}
+
+/// Every name in a directory, read through a fresh handle (the shape check's own listing).
+fn all_names<O: Ops>(o: &mut O, dir: &O::H) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    loop {
+        let b = o.batch(dir).map_err(open_err)?;
+        if b.is_empty() {
+            return Ok(out);
+        }
+        out.extend(b);
+        if out.len() > 64 {
+            return Err(identity("too many entries in a staging level"));
+        }
+    }
 }
 
 /// The two passes and the final unlink of `name` (identity `x`, already checked) beneath the opened anchor `a`.
 fn remove_below<O: Ops>(o: &mut O, a: &O::H, name: &str, x: &Obj, mut w: Walk) -> Result<()> {
-    if !w.owner_ok(x.uid) {
+    if !w.owner_ok(x.uid, 1) {
         return Err(identity("the target is owned by a foreign uid"));
     }
     if x.kind == Kind::Dir {
@@ -927,12 +1030,124 @@ fn remove_below<O: Ops>(o: &mut O, a: &O::H, name: &str, x: &Obj, mut w: Walk) -
         // may have been tightened), never 66, which promises zero effects (SEC H2 on part 1).
         pass1(o, &mut w, &h, 1).map_err(|e| if e.fail == Fail::Preflight { identity(e.msg) } else { e })?;
         drop(h); // its read cursor is spent: pass 2 opens every directory afresh
-        pass2(o, &mut w, a, name, 1)?;
+        pass2(o, &mut w, a, name.as_bytes(), 1)?;
     }
     o.unlink(a, name, x.kind == Kind::Dir).map_err(|_| w.fail("the target can't be unlinked"))?;
     w.removed += 1;
     o.fsync(a).map_err(|_| err(Fail::Partial, "removed; not yet confirmed durable"))?;
     Ok(())
+}
+
+// ---- remove-tree --contents (A1 r2.6 §5a): empty a restore destination, keep the destination
+
+/// Whether `--contents` takes this anchor and name (A1 r2.6 §5a's closed table): main.rs checks it before the root
+/// guard, as every argument.
+pub fn contents_ok(anchor: &str, name: &str) -> bool {
+    contents_target(anchor, name).is_some()
+}
+
+/// The closed table: (the intermediate directory, if any; the kept root's name) for an anchor and `--name`.
+fn contents_target(anchor: &str, name: &str) -> Option<(Option<String>, String)> {
+    match anchor {
+        AGENTS => {
+            let (id, leaf) = name.split_once('/')?;
+            (is_id(id) && (leaf == "home" || leaf == "sessions")).then(|| (Some(id.to_string()), leaf.to_string()))
+        }
+        TAGS | ARCHIVE | ARCHIVE_CONFIG => is_id(name).then(|| (None, name.to_string())),
+        _ => None,
+    }
+}
+
+pub fn remove_contents<O: Ops>(o: &mut O, anchor: &str, name: &str, expect_path: &str) -> Result<()> {
+    remove_contents_limited(o, anchor, name, expect_path, MAX_OBJECTS)
+}
+
+fn remove_contents_limited<O: Ops>(o: &mut O, anchor: &str, name: &str, expect_path: &str, limit: usize) -> Result<()> {
+    let (mid, leaf) = contents_target(anchor, name).ok_or(err(Fail::Usage, "bad arguments"))?;
+    let root = o.root().map_err(|_| pre("the root can't be opened"))?;
+    let v = read_expect(o, &root, expect_path)?;
+    let f = v.exact(&["epoch", "fsid", "root", "owners"]).ok_or(bad_expect())?;
+    let (e_epoch, e_fsid, e_root) = (epoch_of(f[0])?, fsid_of(f[1])?, obj_of(f[2])?);
+    // Root and the class's own uids: for a tag folder, its members, so up to 65 (A1 r2.6).
+    let owners = f[3].arr().filter(|a| !a.is_empty() && a.len() <= 65).ok_or(bad_expect())?.iter().map(u32_of).collect::<Result<Vec<u32>>>()?;
+    let a = anchor_policy(o, &root, anchor)?;
+    let (epoch, fsid) = epoch_now(o, &root, &a)?;
+    if epoch != e_epoch {
+        return Err(identity("a stale epoch: requalify first"));
+    }
+    if fsid != e_fsid {
+        return Err(identity("another filesystem"));
+    }
+    // The intermediate `agents/<id>`: root:root, no group or other write, no ACL, on the anchor's mount.
+    let parent = match mid {
+        Some(id) => {
+            let (x, h) = child(o, &a, &id, epoch.mnt_id)?.ok_or(identity("the agent's directory is missing"))?;
+            let h = h.ok_or(identity("the agent's directory isn't a directory"))?;
+            let acl = o.has_acl(&h).map_err(|_| identity("an ACL can't be read"))?;
+            if x.uid != 0 || x.gid != 0 || x.mode & 0o022 != 0 || acl {
+                return Err(identity("the agent's directory isn't root-only"));
+            }
+            h
+        }
+        None => a,
+    };
+    // The kept root: present, the recorded object, no ACL, no other-write bit. It is never changed.
+    let (x, h) = child(o, &parent, &leaf, epoch.mnt_id)?.ok_or(identity("the destination is missing"))?;
+    if x != e_root {
+        return Err(identity("the destination differs from the expected identity"));
+    }
+    let h = h.ok_or(identity("the destination isn't a directory"))?;
+    if o.has_acl(&h).map_err(|_| identity("an ACL can't be read"))? || x.mode & 0o002 != 0 {
+        return Err(identity("the destination has an ACL or other-write"));
+    }
+    let mut w = Walk { limit, anchor_mnt: epoch.mnt_id, owners, any_owner_from: None, objects: 0, removed: 0 };
+    // Pass 1 over the root's entries, the root itself not locked down; every directory below is, as §5. Once it has
+    // begun, a lockdown may have happened, so EVERY refusal in it (the root's own entries included) is 73, never 66.
+    contents_pass1(o, &mut w, &h).map_err(|e| if e.fail == Fail::Preflight { identity(e.msg) } else { e })?;
+    drop(h);
+    // Pass 2: rounds over fresh handles of the root, each re-checked as the same unchanged object.
+    let mut rounds = 0usize;
+    loop {
+        rounds += 1;
+        if rounds > w.limit {
+            return Err(w.fail("the tree is too large"));
+        }
+        let (rx, rh) = match child(o, &parent, &leaf, w.anchor_mnt) {
+            Ok(Some((rx, Some(rh)))) => (rx, rh),
+            _ => return Err(w.fail("the destination changed between the passes")),
+        };
+        let acl = o.has_acl(&rh).map_err(|_| w.fail("an ACL can't be read"))?;
+        if rx != x || acl {
+            return Err(w.fail("the destination changed between the passes"));
+        }
+        if !remove_entries(o, &mut w, &rh, 1)? {
+            o.fsync(&rh).map_err(|_| err(Fail::Partial, "emptied; not yet confirmed durable"))?;
+            return Ok(());
+        }
+    }
+}
+
+/// Pass 1 of `--contents` over the kept root's own entries (the caller maps every refusal to 73).
+fn contents_pass1<O: Ops>(o: &mut O, w: &mut Walk, root: &O::H) -> Result<()> {
+    loop {
+        let names = o.batch(root).map_err(open_err)?;
+        if names.is_empty() {
+            return Ok(());
+        }
+        for n in names {
+            w.objects += 1;
+            if w.objects > w.limit {
+                return Err(identity("the tree is too large"));
+            }
+            let (cx, ch) = child(o, root, &n, w.anchor_mnt)?.ok_or(identity("an entry vanished"))?;
+            if !w.owner_ok(cx.uid, 2) {
+                return Err(identity("an object owned by a foreign uid"));
+            }
+            if let Some(ch) = ch {
+                pass1(o, w, &ch, 2)?;
+            }
+        }
+    }
 }
 
 // ---- argument parsing for main.rs
@@ -976,6 +1191,7 @@ pub(crate) mod tests {
     /// A fake tree: paths relative to the root ("" is the root). A node whose mnt_id differs from its parent's is a
     /// mount: opening it with NO_XDEV fails EXDEV. Symlinks fail ELOOP. `hook` runs once, when op `.0` has been called
     /// `.1` times; `fail` makes one op fail.
+    #[derive(Clone)]
     pub(crate) struct Fake {
         pub(crate) nodes: BTreeMap<String, Node>,
         pub(crate) files: BTreeMap<String, Vec<u8>>,
@@ -984,6 +1200,7 @@ pub(crate) mod tests {
         pub(crate) counts: BTreeMap<&'static str, usize>,
         pub(crate) hook: Option<(&'static str, usize, Hook)>,
         pub(crate) fail: Option<&'static str>,
+        pub(crate) fail_after: Option<&'static str>,
         /// A kernel that reports a different mount without failing the open (the mnt_id postcondition must refuse).
         pub(crate) no_exdev: bool,
         pub(crate) cursors: BTreeMap<u64, usize>,
@@ -997,6 +1214,11 @@ pub(crate) mod tests {
         pub(crate) exe: String,
         pub(crate) proj_skew: u32,
         pub(crate) caps_fail: bool,
+        /// The turn's two mount namespaces (A5 r4.6): set by `setns`. From then on, any lookup through a HOST
+        /// handle is refused and logged as `SEALED ...`; host-only paths can't be reached from a turn handle.
+        pub(crate) joined: bool,
+        /// The turn root's mount id (a private copy has its own; a test makes it the host's).
+        pub(crate) turn_root_mnt: u64,
     }
 
     /// The fake's batch size: small, so every walk crosses batch boundaries.
@@ -1004,6 +1226,31 @@ pub(crate) mod tests {
 
     pub(crate) fn join(dir: &str, name: &str) -> String {
         if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") }
+    }
+    /// The fake keys its nodes by path STRINGS, each name in §4b's encoded form (lossless; plain ASCII without `%`
+    /// is unchanged). The trait boundary takes and returns raw bytes (A1 r2.5): `key` on the way in, `unkey` out. A
+    /// test names a raw 0xFF byte as `%FF` and a literal `%` as `%25`.
+    pub(crate) fn key(raw: &[u8]) -> String {
+        crate::digest::encode(raw)
+    }
+    pub(crate) fn unkey(k: &str) -> Vec<u8> {
+        let b = k.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            // %XX with two uppercase hex digits is one raw byte; anything else is itself.
+            let hex = |c: u8| (c as char).to_digit(16).filter(|_| !c.is_ascii_lowercase());
+            if b[i] == b'%' {
+                if let (Some(h), Some(l)) = (b.get(i + 1).copied().and_then(hex), b.get(i + 2).copied().and_then(hex)) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        out
     }
     pub(crate) fn parent(p: &str) -> &str {
         p.rfind('/').map_or("", |i| &p[..i])
@@ -1014,7 +1261,7 @@ pub(crate) mod tests {
 
     impl Fake {
         pub(crate) fn new() -> Fake {
-            let mut f = Fake { nodes: BTreeMap::new(), files: BTreeMap::new(), fsid: 0xabcd_0000_1234, next_ino: 2, counts: BTreeMap::new(), hook: None, fail: None, no_exdev: false, cursors: BTreeMap::new(), log: vec![], xattrs: BTreeMap::new(), errno_at: None, quota: None, space: (1 << 20, 1 << 20), exe: String::new(), proj_skew: 0, caps_fail: false };
+            let mut f = Fake { nodes: BTreeMap::new(), files: BTreeMap::new(), fsid: 0xabcd_0000_1234, next_ino: 2, counts: BTreeMap::new(), hook: None, fail: None, fail_after: None, no_exdev: false, cursors: BTreeMap::new(), log: vec![], xattrs: BTreeMap::new(), errno_at: None, quota: None, space: (1 << 20, 1 << 20), exe: String::new(), proj_skew: 0, caps_fail: false, joined: false, turn_root_mnt: MNT + 900 };
             f.add("", S_IFDIR | 0o755, 0, 0);
             f.nodes.get_mut("").unwrap().id.attributes = libc::STATX_ATTR_MOUNT_ROOT as u64;
             for d in ["run", "run/sagebrush", "run/sagebrush/binds", "var", "var/lib", "var/lib/sagebrush", "var/lib/sagebrush/contract", "srv", "srv/sagebrush", "srv/sagebrush/agents", "srv/sagebrush/agent-config"] {
@@ -1086,13 +1333,33 @@ pub(crate) mod tests {
         pub(crate) id: u64,
         /// The inode opened: like a real fd, the handle keeps naming it if the path is replaced afterwards.
         pub(crate) ino: u64,
+        /// Opened in the turn's namespace (A5 r4.6), not the host's.
+        pub(crate) turn: bool,
     }
 
     impl Fake {
         pub(crate) fn handle(&mut self, p: String) -> FH {
             self.next_ino += 1;
             let ino = self.nodes.get(&p).map_or(0, |n| n.id.ino);
-            FH { p, id: self.next_ino, ino }
+            FH { p, id: self.next_ino, ino, turn: false }
+        }
+        /// A handle in the same namespace as `from`.
+        pub(crate) fn handle_in(&mut self, p: String, from: &FH) -> FH {
+            let mut h = self.handle(p);
+            h.turn = from.turn;
+            h
+        }
+        /// After `setns`, a lookup through a host handle is refused and recorded (A5 r4.6); before it, nothing.
+        pub(crate) fn sealed(&mut self, op: &str, h: &FH) -> io::Result<()> {
+            if self.joined && !h.turn {
+                self.log.push(format!("SEALED {op} {}", h.p));
+                return Err(e(libc::EBADF));
+            }
+            Ok(())
+        }
+        /// Host paths the unit's view doesn't show (the profiles, the agents' stores, the host's /proc).
+        pub(crate) fn hidden(&self, from: &FH, p: &str) -> bool {
+            from.turn && ["srv/sagebrush/claude-profiles", "srv/sagebrush/agents", "proc"].iter().any(|h| p == *h || p.starts_with(&format!("{h}/")))
         }
     }
 
@@ -1101,13 +1368,21 @@ pub(crate) mod tests {
         fn root(&mut self) -> io::Result<FH> {
             Ok(self.handle(String::new()))
         }
-        fn dir_from_root(&mut self, _root: &FH, rel: &str) -> io::Result<FH> {
+        fn dir_from_root(&mut self, root: &FH, rel: &str) -> io::Result<FH> {
+            self.sealed("open", root)?;
+            if self.hidden(root, rel) {
+                return Err(e(libc::ENOENT));
+            }
             let n = self.nodes.get(rel).ok_or(e(libc::ENOENT))?;
-            if n.id.mode & S_IFMT != S_IFDIR { Err(e(libc::ENOTDIR)) } else { Ok(self.handle(rel.to_string())) }
+            if n.id.mode & S_IFMT != S_IFDIR { Err(e(libc::ENOTDIR)) } else { Ok(self.handle_in(rel.to_string(), root)) }
         }
-        fn at(&mut self, dir: &FH, name: &str, how: At) -> io::Result<FH> {
+        fn at(&mut self, dir: &FH, name: impl AsRef<[u8]>, how: At) -> io::Result<FH> {
             self.tick("at")?;
-            let p = join(&dir.p, name);
+            self.sealed("at", dir)?;
+            let p = join(&dir.p, &key(name.as_ref()));
+            if self.hidden(dir, &p) {
+                return Err(e(libc::ENOENT));
+            }
             let n = self.nodes.get(&p).ok_or(e(libc::ENOENT))?;
             if n.id.mnt_id != self.nodes[&dir.p].id.mnt_id && !self.no_exdev {
                 return Err(e(libc::EXDEV));
@@ -1118,14 +1393,18 @@ pub(crate) mod tests {
             if how == At::Dir && n.id.mode & S_IFMT != S_IFDIR {
                 return Err(e(libc::ENOTDIR));
             }
-            Ok(self.handle(p))
+            Ok(self.handle_in(p, dir))
         }
         fn ident(&mut self, h: &FH) -> io::Result<Ident> {
-            // The opened object's identity: a path replaced since the open still reports the opened inode.
-            self.nodes.get(&h.p).map(|n| Ident { ino: if h.ino != 0 { h.ino } else { n.id.ino }, ..n.id }).ok_or(e(libc::ENOENT))
+            self.sealed("stat", h)?;
+            // The opened object's identity: a path replaced since the open still reports the opened inode. The turn's
+            // root is a private copy of the host's root mount, with its own mount id.
+            let mnt = if h.turn && h.p.is_empty() { Some(self.turn_root_mnt) } else { None };
+            self.nodes.get(&h.p).map(|n| Ident { ino: if h.ino != 0 { h.ino } else { n.id.ino }, mnt_id: mnt.unwrap_or(n.id.mnt_id), ..n.id }).ok_or(e(libc::ENOENT))
         }
-        fn ident_at(&mut self, dir: &FH, name: &str) -> io::Result<Ident> {
-            self.nodes.get(&join(&dir.p, name)).map(|n| n.id).ok_or(e(libc::ENOENT))
+        fn ident_at(&mut self, dir: &FH, name: impl AsRef<[u8]>) -> io::Result<Ident> {
+            self.sealed("statat", dir)?;
+            self.nodes.get(&join(&dir.p, &key(name.as_ref()))).map(|n| n.id).ok_or(e(libc::ENOENT))
         }
         fn generation(&mut self, h: &FH) -> io::Result<u32> {
             self.tick("generation")?;
@@ -1138,13 +1417,14 @@ pub(crate) mod tests {
             Ok(self.fsid)
         }
         /// At most BATCH names per call from this handle's cursor, then empty forever: a spent handle lists nothing.
-        fn batch(&mut self, dir: &FH) -> io::Result<Vec<String>> {
+        fn batch(&mut self, dir: &FH) -> io::Result<Vec<Vec<u8>>> {
             self.tick("list")?;
+            self.sealed("list", dir)?;
             let at = *self.cursors.get(&dir.id).unwrap_or(&0);
             if at == 0 {
                 self.log.push(format!("list {}", dir.p));
             }
-            let names: Vec<String> = self.children(&dir.p).into_iter().skip(at).take(BATCH).collect();
+            let names: Vec<Vec<u8>> = self.children(&dir.p).into_iter().skip(at).take(BATCH).map(|k| unkey(&k)).collect();
             self.cursors.insert(dir.id, at + names.len());
             Ok(names)
         }
@@ -1172,9 +1452,9 @@ pub(crate) mod tests {
             self.tick("drop_default")?;
             Ok(())
         }
-        fn unlink(&mut self, dir: &FH, name: &str, is_dir: bool) -> io::Result<()> {
+        fn unlink(&mut self, dir: &FH, name: impl AsRef<[u8]>, is_dir: bool) -> io::Result<()> {
             self.tick("unlink")?;
-            let p = join(&dir.p, name);
+            let p = join(&dir.p, &key(name.as_ref()));
             let n = self.nodes.get(&p).ok_or(e(libc::ENOENT))?;
             if is_dir != (n.id.mode & S_IFMT == S_IFDIR) {
                 return Err(e(if is_dir { libc::ENOTDIR } else { libc::EISDIR }));
@@ -1189,9 +1469,10 @@ pub(crate) mod tests {
             self.log.push(format!("unlink {p}"));
             Ok(())
         }
-        fn rename(&mut self, from: &FH, to: &FH, name: &str) -> io::Result<()> {
+        fn rename(&mut self, from: &FH, to: &FH, name: impl AsRef<[u8]>) -> io::Result<()> {
             self.tick("rename")?;
-            let (src, dst) = (join(&from.p, name), join(&to.p, name));
+            let k = key(name.as_ref());
+            let (src, dst) = (join(&from.p, &k), join(&to.p, &k));
             if self.nodes.contains_key(&dst) {
                 return Err(e(libc::EEXIST));
             }
@@ -1202,6 +1483,10 @@ pub(crate) mod tests {
             for k in keys {
                 let n = self.nodes.remove(&k).unwrap();
                 self.nodes.insert(format!("{dst}{}", &k[src.len()..]), n);
+                // A file's (or a symlink's) contents move with it, as the inode does.
+                if let Some(b) = self.files.remove(&k) {
+                    self.files.insert(format!("{dst}{}", &k[src.len()..]), b);
+                }
             }
             self.log.push(format!("rename {src} {dst}"));
             Ok(())
@@ -1211,7 +1496,11 @@ pub(crate) mod tests {
             self.log.push(format!("fsync {}", h.p));
             Ok(())
         }
-        fn read(&mut self, _root: &FH, rel: &str, max: usize) -> io::Result<Vec<u8>> {
+        fn read(&mut self, root: &FH, rel: &str, max: usize) -> io::Result<Vec<u8>> {
+            self.sealed("read", root)?;
+            if self.hidden(root, rel) {
+                return Err(e(libc::ENOENT));
+            }
             let b = self.files.get(rel).ok_or(e(libc::ENOENT))?;
             if b.len() > max { Err(e(libc::EFBIG)) } else { Ok(b.clone()) }
         }
@@ -1589,6 +1878,276 @@ pub(crate) mod tests {
         assert_eq!(f.count("unlink"), 0);
     }
 
+    /// A1 r2.5: names are bytes. The fake keys names encoded (`%FF` is the byte 0xFF), and it finds a node only by
+    /// the encoding of the EXACT bytes it is given, so a converted name would be ENOENT, never this one.
+    fn odd_names(f: &mut Fake, h: &str) {
+        f.file(&format!("{h}/%FF"), UID, 0o600); // a lone invalid byte
+        f.dir(&format!("{h}/%E2%82"), UID, 0o700); // a truncated sequence, holding a file
+        f.file(&format!("{h}/%E2%82/in"), UID, 0o600);
+        f.add(&format!("{h}/%C0%80"), S_IFLNK | 0o777, UID, UID); // an overlong encoding, a symlink
+        f.file(&format!("{h}/é%FE"), UID, 0o600); // valid UTF-8, then 0xFE
+    }
+
+    #[test]
+    fn remove_tree_removes_names_that_are_not_utf8_by_their_exact_bytes() {
+        let mut f = Fake::new();
+        let x = archive_tree(&mut f);
+        let h = format!("srv/sagebrush/archive/{A}/home");
+        odd_names(&mut f, &h);
+        remove_tree(&mut f, "/srv/sagebrush/archive", A, &x).unwrap();
+        assert!(!f.nodes.keys().any(|k| k.starts_with(&format!("srv/sagebrush/archive/{A}"))));
+        for n in ["%FF", "%E2%82/in", "%E2%82", "%C0%80", "é%FE"] {
+            assert!(f.log.contains(&format!("unlink {h}/{n}")), "{n} unlinked by its exact bytes");
+        }
+        // A foreign owner on one of them is still 73 with zero unlinks.
+        let mut f = Fake::new();
+        let x = archive_tree(&mut f);
+        odd_names(&mut f, &h);
+        f.node(&format!("{h}/%E2%82/in")).id.uid = UID + 1;
+        assert_eq!(code(remove_tree(&mut f, "/srv/sagebrush/archive", A, &x)), 73);
+        assert_eq!(f.count("unlink"), 0);
+    }
+
+    #[test]
+    fn inspect_home_a_fourth_entry_that_is_not_utf8_is_an_unknown_entry() {
+        let mut f = Fake::new();
+        f.agent("srv/sagebrush/agents");
+        f.dir(&format!("srv/sagebrush/agents/{A}/%FF"), UID, 0o700);
+        assert_eq!(code(inspect_home(&mut f, "/", A, Tree::Home, false)), 73);
+        let mut g = Fake::new();
+        let _ = config(&mut g);
+        g.file(&format!("srv/sagebrush/agent-config/{A}/gen-1%FF"), 0, 0o600);
+        assert_eq!(code(inspect_home(&mut g, "/", A, Tree::Config, false)), 73, "config: a non-UTF-8 name is no gen-<n>");
+    }
+
+    // ---- remove-tree --contents (A1 r2.6 §5a) and identify of a tag folder (r2.7)
+
+    const TAG: &str = "tttttttttttttttttttttttttq";
+    const TGID: u32 = 80001;
+
+    /// The four destinations, each populated: an agent's home and sessions, a tag folder (2770, root:tag gid) with
+    /// root's and 64 members' files, and an archived agent dir. Returns (anchor, name, kept root's path, owners).
+    fn destinations(f: &mut Fake) -> Vec<(&'static str, String, String, Vec<u32>)> {
+        f.agent("srv/sagebrush/agents");
+        f.add("srv/sagebrush/tags", S_IFDIR | 0o755, 0, 0);
+        let mut out = vec![];
+        for leaf in ["home", "sessions"] {
+            let r = format!("srv/sagebrush/agents/{A}/{leaf}");
+            f.dir(&format!("{r}/proj"), UID, 0o755);
+            f.file(&format!("{r}/proj/a.txt"), UID, 0o644);
+            f.file(&format!("{r}/%FFraw"), UID, 0o600);
+            f.add(&format!("{r}/link"), S_IFLNK | 0o777, UID, UID);
+            out.push((AGENTS, format!("{A}/{leaf}"), r, vec![0, UID]));
+        }
+        let t = format!("srv/sagebrush/tags/{TAG}");
+        f.add(&t, S_IFDIR | 0o2770, 0, TGID);
+        f.node(&t).proj = TGID;
+        f.node(&t).inherit = true;
+        let members: Vec<u32> = (70001..70065).collect();
+        for m in &members {
+            f.dir(&format!("{t}/d{m}"), *m, 0o2770);
+            f.file(&format!("{t}/d{m}/f"), *m, 0o660);
+        }
+        f.file(&format!("{t}/rootfile"), 0, 0o640);
+        out.push((TAGS, TAG.to_string(), t, std::iter::once(0).chain(members).collect()));
+        f.agent("srv/sagebrush/archive");
+        let r = format!("srv/sagebrush/archive/{A}");
+        out.push((ARCHIVE, A.to_string(), r, vec![0, UID]));
+        out
+    }
+
+    fn contents_expect(f: &mut Fake, root_path: &str, owners: &[u32]) -> String {
+        let root = f.root().unwrap();
+        let (parent, leaf) = root_path.rsplit_once('/').unwrap();
+        let p = f.dir_from_root(&root, parent).unwrap();
+        let (x, _) = child(f, &p, leaf, MNT).unwrap().unwrap();
+        let o: Vec<String> = owners.iter().map(|u| u.to_string()).collect();
+        expect_file(f, "contents.json", format!("{{\"epoch\":{{\"boot_id\":\"{BOOT}\",\"mnt_id\":{MNT}}},\"fsid\":\"0000abcd00001234\",\"root\":{},\"owners\":[{}]}}", obj_json(&x), o.join(",")))
+    }
+
+    #[test]
+    fn contents_empties_each_destination_and_keeps_it_unchanged() {
+        let mut f = Fake::new();
+        for (anchor, name, r, owners) in destinations(&mut f) {
+            let x = contents_expect(&mut f, &r, &owners);
+            let before = f.nodes[&r].clone();
+            f.log.clear();
+            remove_contents(&mut f, anchor, &name, &x).unwrap();
+            let after = &f.nodes[&r];
+            assert_eq!((after.id, after.gen, after.proj, after.inherit, after.acl), (before.id, before.gen, before.proj, before.inherit, before.acl), "{r}: the root unchanged");
+            assert!(!f.nodes.keys().any(|k| k.starts_with(&format!("{r}/"))), "{r}: emptied");
+            // No call ever touches the root itself, and its sync is the last one.
+            for l in &f.log {
+                assert!(!(l == &format!("chmod {r} {:o}", before.id.mode & 0o7777 & !0o022) || l == &format!("unlink {r}") || l.starts_with(&format!("rename {r} "))), "{r}: {l}");
+                assert!(!l.starts_with(&format!("chmod {r} ")), "{r}: the root chmodded: {l}");
+            }
+            assert_eq!(f.log.last().unwrap(), &format!("fsync {r}"), "{r}");
+        }
+        // The tag root is still 2770 with its group; directories below it were locked down before being listed.
+        let t = format!("srv/sagebrush/tags/{TAG}");
+        assert_eq!((f.nodes[&t].id.mode & 0o7777, f.nodes[&t].id.gid), (0o2770, TGID));
+    }
+
+    #[test]
+    fn contents_locks_down_below_the_root_only() {
+        let mut f = Fake::new();
+        let d = destinations(&mut f);
+        let (anchor, name, r, owners) = d[2].clone();
+        let x = contents_expect(&mut f, &r, &owners);
+        f.log.clear();
+        remove_contents(&mut f, anchor, &name, &x).unwrap();
+        let sub = format!("{r}/d70001");
+        let chmod = f.log.iter().position(|l| l == &format!("chmod {sub} 2750")).expect("a member's 2770 directory locked down");
+        let list = f.log.iter().position(|l| l == &format!("list {sub}")).unwrap();
+        assert!(chmod < list);
+    }
+
+    #[test]
+    fn contents_refuses_with_zero_unlinks() {
+        type Spoil = fn(&mut Fake, &str);
+        let rows: Vec<(&str, usize, Spoil, i32)> = vec![
+            ("the root absent", 0, |f, r| { let ks: Vec<String> = f.nodes.keys().filter(|k| *k == r || k.starts_with(&format!("{r}/"))).cloned().collect(); for k in ks { f.nodes.remove(&k); } }, 73),
+            ("another root (gen)", 0, |f, r| f.node(r).gen = 99, 73),
+            ("an ACL on the root", 2, |f, r| f.node(r).acl = true, 73),
+            ("an owner outside owners", 0, |f, r| f.node(&format!("{r}/proj/a.txt")).id.uid = UID + 7, 73),
+            ("agents/<id> group-writable", 0, |f, _| f.node(&format!("srv/sagebrush/agents/{A}")).id.mode = S_IFDIR | 0o775, 73),
+            ("agents/<id> not root's", 0, |f, _| f.node(&format!("srv/sagebrush/agents/{A}")).id.uid = UID, 73),
+            ("agents/<id> with an ACL", 0, |f, _| f.node(&format!("srv/sagebrush/agents/{A}")).acl = true, 73),
+            ("a stale epoch", 0, |f, _| { f.files.insert("proc/sys/kernel/random/boot_id".into(), b"11111111-2222-3333-4444-555555555555\n".to_vec()); }, 73),
+            ("a bind below the root", 0, |f, r| f.node(&format!("{r}/proj")).id.mnt_id = MNT + 1, 73),
+        ];
+        for (what, which, spoil, want) in rows {
+            let mut f = Fake::new();
+            let d = destinations(&mut f);
+            let (anchor, name, r, owners) = d[which].clone();
+            let x = contents_expect(&mut f, &r, &owners);
+            spoil(&mut f, &r);
+            f.log.clear();
+            assert_eq!(code(remove_contents(&mut f, anchor, &name, &x)), want, "{what}");
+            assert_eq!(f.count("unlink"), 0, "{what}");
+            // A refusal of the root itself happens before pass 1: nothing below it was locked down either.
+            if what.contains("on the root") {
+                assert!(!f.log.iter().any(|l| l.starts_with("chmod")), "{what}: {:?}", f.log);
+            }
+        }
+        // Any pass-1 failure AFTER an earlier entry's directory was locked down: 73 (a lockdown happened), never 66,
+        // whether opening, reading metadata, listing or reading an ACL fails, at the root's own entries or below.
+        // The home's entries are listed `%FFraw`, `link`, `proj`, `z` (sorted keys, two per batch); `proj`'s lockdown
+        // comes first, then the next such operation fails (`generation`: `z`'s, a root entry's own metadata).
+        for op in ["at", "generation", "list", "has_acl"] {
+            let mut f = Fake::new();
+            let d = destinations(&mut f);
+            let (anchor, name, r, owners) = d[0].clone();
+            f.node(&format!("{r}/proj")).id.mode = S_IFDIR | 0o775;
+            f.file(&format!("{r}/z"), UID, 0o600);
+            let x = contents_expect(&mut f, &r, &owners);
+            f.counts.clear();
+            f.log.clear();
+            f.fail_after = Some(op);
+            f.hook = Some(("chmod", 1, |f| f.fail = f.fail_after));
+            assert_eq!(code(remove_contents(&mut f, anchor, &name, &x)), 73, "{op}: {:?}", f.log);
+            assert!(f.log.iter().any(|l| l.starts_with("chmod ")) && f.count("unlink") == 0, "{op}: {:?}", f.log);
+        }
+        // An other-write bit on the root, recorded so (the identity matches): still refused, before any lockdown.
+        let mut f = Fake::new();
+        let d = destinations(&mut f);
+        let (anchor, name, r, owners) = d[2].clone();
+        f.node(&r).id.mode |= 0o002;
+        let x = contents_expect(&mut f, &r, &owners);
+        f.log.clear();
+        assert_eq!(code(remove_contents(&mut f, anchor, &name, &x)), 73);
+        assert!(f.count("unlink") == 0 && !f.log.iter().any(|l| l.starts_with("chmod")));
+        // The root replaced between the passes (another generation at pass 2's re-check): refused before any unlink.
+        let mut f = Fake::new();
+        let d = destinations(&mut f);
+        let (anchor, name, _r, owners) = d[2].clone();
+        let x = contents_expect(&mut f, &d[2].2, &owners);
+        f.counts.clear();
+        // has_acl: the anchor policy reads four (/, srv, srv/sagebrush, the anchor) and the root's own check is the
+        // fifth, after the root was identified: the root is replaced then, before pass 1, and pass 2's first re-check
+        // of it must refuse.
+        f.hook = Some(("has_acl", 5, |f| { let k = format!("srv/sagebrush/tags/{TAG}"); f.node(&k).gen = 99; }));
+        assert_eq!(code(remove_contents(&mut f, anchor, &name, &x)), 73);
+        assert_eq!(f.count("unlink"), 0);
+        // Outside the table: 64, nothing opened.
+        let mut f = Fake::new();
+        let _ = destinations(&mut f);
+        let x = expect_file(&mut f, "x.json", "{}".into());
+        for (anchor, name) in [(AGENTS, format!("{A}/var-tmp")), (AGENTS, A.to_string()), (AGENTS, format!("{A}/home/x")), (crate::restore::RESTORE, "a/b/c/1".to_string()), (TAGS, "x".to_string()), ("/srv/sagebrush/claude-profiles", A.to_string())] {
+            f.counts.clear();
+            assert_eq!(code(remove_contents(&mut f, anchor, &name, &x)), 64, "{anchor} {name}");
+            assert_eq!(f.count("at"), 0);
+        }
+        // A tag's 64 members plus root: 65 owners accepted; 66 refused (65).
+        let mut f = Fake::new();
+        let d = destinations(&mut f);
+        let (anchor, name, r, mut owners) = d[2].clone();
+        owners.push(79999);
+        let x = contents_expect(&mut f, &r, &owners);
+        assert_eq!(code(remove_contents(&mut f, anchor, &name, &x)), 65);
+        // Plain remove-tree still never reaches agents or tags: 64 before anything is opened.
+        for (anchor, name) in [(AGENTS, A.to_string()), (AGENTS, format!("{A}/home")), (TAGS, TAG.to_string())] {
+            f.counts.clear();
+            assert_eq!(code(remove_tree(&mut f, anchor, &name, "/run/sagebrush/expect/x.json")), 64, "{anchor} {name}");
+            assert_eq!(f.count("at"), 0);
+        }
+    }
+
+    #[test]
+    fn contents_after_the_first_unlink_is_partial_and_a_retry_converges_with_the_same_root() {
+        // The FIRST unlink failing: nothing was removed, so 73.
+        let mut f = Fake::new();
+        let d = destinations(&mut f);
+        let (anchor, name, r, owners) = d[2].clone();
+        let x = contents_expect(&mut f, &r, &owners);
+        let n = f.nodes.keys().filter(|k| k.starts_with(&format!("{r}/"))).count();
+        f.errno_at = Some(("unlink", 1, libc::EIO));
+        assert_eq!(code(remove_contents(&mut f, anchor, &name, &x)), 73);
+        assert_eq!(f.nodes.keys().filter(|k| k.starts_with(&format!("{r}/"))).count(), n, "nothing removed");
+        // A later unlink failing: 75, then a retry converges with the same root.
+        for at in [2usize, 5, 40] {
+            let mut f = Fake::new();
+            let d = destinations(&mut f);
+            let (anchor, name, r, owners) = d[2].clone();
+            let x = contents_expect(&mut f, &r, &owners);
+            let before = f.nodes[&r].clone();
+            f.errno_at = Some(("unlink", at, libc::EIO));
+            assert_eq!(code(remove_contents(&mut f, anchor, &name, &x)), 75, "unlink {at}");
+            remove_contents(&mut f, anchor, &name, &x).unwrap();
+            assert!(!f.nodes.keys().any(|k| k.starts_with(&format!("{r}/"))));
+            assert_eq!(f.nodes[&r].id, before.id);
+        }
+        // The final sync failing: 75; the retry syncs the (already empty) root and succeeds.
+        let mut f = Fake::new();
+        let d = destinations(&mut f);
+        let (anchor, name, r, owners) = d[0].clone();
+        let x = contents_expect(&mut f, &r, &owners);
+        f.fail = Some("fsync");
+        assert_eq!(code(remove_contents(&mut f, anchor, &name, &x)), 75);
+        f.fail = None;
+        f.log.clear();
+        f.counts.clear();
+        remove_contents(&mut f, anchor, &name, &x).unwrap();
+        assert_eq!(f.log.iter().filter(|l| l.starts_with("fsync")).collect::<Vec<_>>(), [&format!("fsync {r}")]);
+        // An empty destination is emptied again: success, nothing unlinked, the root synced.
+        assert_eq!(f.count("unlink"), 0);
+    }
+
+    #[test]
+    fn identify_reads_a_tag_folder_and_nothing_else_new() {
+        let mut f = Fake::new();
+        let _ = destinations(&mut f);
+        let out = identify(&mut f, TAGS, TAG).unwrap();
+        assert!(out.contains(&format!("\"type\":\"dir\",\"mode\":{},\"uid\":0,\"gid\":{TGID}", 0o2770)), "{out}");
+        assert!(out.contains(&format!("\"projid\":{TGID},\"inherit\":true")) && out.contains(&format!("\"boot_id\":\"{BOOT}\"")), "{out}");
+        assert!(identify(&mut f, TAGS, "bbbbbbbbbbbbbbbbbbbbbbbbbq").unwrap().contains("\"object\":null"));
+        assert_eq!(code(identify(&mut f, TAGS, "x")), 64);
+        assert_eq!(code(identify(&mut f, AGENTS, A)), 64, "agents stays out of identify's table");
+        // The anchor policy applies to the tags anchor.
+        f.node("srv/sagebrush/tags").id.mode = S_IFDIR | 0o775;
+        assert_eq!(code(identify(&mut f, TAGS, TAG)), 66);
+    }
+
     #[test]
     fn the_mnt_id_postcondition_refuses_on_its_own() {
         let mut f = Fake::new();
@@ -1749,13 +2308,14 @@ pub(crate) mod tests {
         }
 
         fn walk(mnt: u64) -> Walk {
-            Walk { limit: MAX_OBJECTS, anchor_mnt: mnt, owners: vec![my_uid()], objects: 1, removed: 0 }
+            Walk { limit: MAX_OBJECTS, anchor_mnt: mnt, owners: vec![my_uid()], any_owner_from: None, objects: 1, removed: 0 }
         }
 
         /// This process's uid, read (without unsafe code) as the owner of a directory it just made.
         fn my_uid() -> u32 {
             use std::os::unix::fs::MetadataExt;
-            let d = tmp("whoami");
+            // (its own name per thread: two tests may ask at once, and one would remove the other's directory)
+            let d = tmp(&format!("whoami-{:?}", std::thread::current().id()).replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
             let uid = std::fs::metadata(&d).unwrap().uid();
             std::fs::remove_dir_all(&d).unwrap();
             uid
@@ -1768,7 +2328,7 @@ pub(crate) mod tests {
             let mut o = RealOps;
             let root = o.root().unwrap();
             let h = o.dir_from_root(&root, &d.to_str().unwrap()[1..]).unwrap();
-            assert_eq!(o.batch(&h).unwrap(), vec!["keep".to_string()]);
+            assert_eq!(o.batch(&h).unwrap(), vec![b"keep".to_vec()]);
             assert!(o.batch(&h).unwrap().is_empty(), "the same handle lists nothing again");
             std::fs::remove_dir_all(&d).unwrap();
         }
@@ -1802,6 +2362,40 @@ pub(crate) mod tests {
             remove_below(&mut RealOps, &p, "t", &x, walk(mnt)).unwrap();
             assert!(!t.exists(), "the whole tree is gone");
             assert_eq!(std::fs::read(&outside).unwrap(), b"keep me", "the symlink was unlinked as itself");
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+
+        /// A1 r2.5 on the real kernel: names that aren't UTF-8 (a lone 0xFF, a truncated sequence holding a file, an
+        /// overlong symlink, valid UTF-8 then 0xFE) are listed by getdents64 as bytes and removed by those bytes.
+        #[test]
+        fn names_that_are_not_utf8_are_removed_on_the_real_kernel() {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let base = tmp("bytes");
+            let t = base.join("t");
+            std::fs::create_dir(&t).unwrap();
+            let n = |b: &[u8]| t.join(OsStr::from_bytes(b));
+            std::fs::write(n(b"\xff"), b"x").unwrap();
+            std::fs::create_dir(n(b"\xe2\x82")).unwrap();
+            std::fs::write(n(b"\xe2\x82").join("in"), b"x").unwrap();
+            symlink("/nonexistent", n(b"\xc0\x80")).unwrap();
+            std::fs::write(n(&[0xc3, 0xa9, 0xfe]), b"x").unwrap(); // é then 0xFE
+            let mut o = RealOps;
+            let root = o.root().unwrap();
+            let h = o.dir_from_root(&root, &t.to_str().unwrap()[1..]).unwrap();
+            let mut listed = Vec::new();
+            loop {
+                let b = o.batch(&h).unwrap();
+                if b.is_empty() {
+                    break;
+                }
+                listed.extend(b);
+            }
+            listed.sort();
+            assert_eq!(listed, vec![b"\xc0\x80".to_vec(), vec![0xc3, 0xa9, 0xfe], b"\xe2\x82".to_vec(), b"\xff".to_vec()]);
+            let Some((p, x, mnt)) = open(&base, "t") else { return };
+            remove_below(&mut RealOps, &p, "t", &x, walk(mnt)).unwrap();
+            assert!(!t.exists(), "every name is gone");
             std::fs::remove_dir_all(&base).unwrap();
         }
 

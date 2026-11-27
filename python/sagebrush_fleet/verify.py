@@ -1,4 +1,4 @@
-"""The reference verifiers for objects outside the device chain (lib/fleet/core/verify.mjs; r2.3 §3, §4).
+"""The reference verifiers for objects outside the device chain (lib/fleet/core/verify.mjs; r2.4 §3, §3.7, §4).
 
 Each takes the envelope's bytes and the verifier's own state and returns the verified body, or raises a FleetError
 whose code is in schema/fleet/reasons.json. Recording a use (an op_id, an approval) is the caller's.
@@ -9,8 +9,8 @@ from __future__ import annotations
 import math
 import re
 
-from .chain import device_key, require_tier
-from .core import b64, canon_text, check_public_key, concat, enc, refuse, sha256, sha256b64, unb64
+from .chain import device_key, lease_key_at, require_tier, service_key_at
+from .core import b64, canon_text, check_public_key, concat, enc, key_id, refuse, sha256, sha256b64, unb64
 from .envelope import body_validator, open_envelope
 
 B32 = "abcdefghijklmnopqrstuvwxyz234567"
@@ -283,3 +283,122 @@ def verify_approval(data: bytes, ctx):
 def preimage_hash(preimage) -> str:
     """The hash a question's preimage must produce for its subject (§4)."""
     return sha256b64(enc(canon_text(preimage, 640 * 1024)))
+
+
+# ---- moving an agent to another host (r2.4 §3.7)
+
+def verify_agent_transfer(data: bytes, ctx):
+    """§3.7.3 check 2 on the new host: form, signer at chain_seq and the head, tier. No window or freshness check."""
+    env = open_by_device(data, ctx, "sb.agent-transfer.v1", "agent-transfer")
+    require_tier(ctx["chain"], env["device"], True)
+    return {"body": env["body"], "hash": sha256b64(env["signed"])}
+
+
+REPEATED = ("fleet", "aud", "agent", "from_host", "to_host", "to_host_key", "gen", "nonce")
+
+
+def verify_transfer_receipt(pair, ctx):
+    """§3.7.3 checks 1-3: the receipt under the service key in force at its chain_seq, the transfer, and their match."""
+    def resolve_key(signer, t, body):
+        if t != "sb.agent-transfer-receipt.v1":
+            refuse("bad_form", "another type")
+        body_validator("agent-transfer-receipt")(body)
+        return service_key_at(ctx["chain"], signer, body.get("chain_seq"))
+
+    receipt = open_envelope(pair["receipt"], {"aud": ctx["aud"], "fleet": ctx["fleet"], "resolve_key": resolve_key})
+    transfer = verify_agent_transfer(pair["transfer"], ctx)
+    r, t = receipt["body"], transfer["body"]
+    if r["transfer"] != transfer["hash"]:
+        refuse("bad_form", "the receipt names another transfer")
+    for k in REPEATED:
+        if r[k] != t[k]:
+            refuse("bad_form", f"the receipt's {k} isn't the transfer's")
+    return {"transfer": t, "receipt": r, "transfer_hash": transfer["hash"]}
+
+
+def check_transfer_for_host(pair, host):
+    """§3.7.3 checks 4-6 over the host's records (see lib/fleet/core/verify.mjs). Returns {"first": bool}."""
+    t = pair["transfer"]
+    if t["to_host"] != host["id"] or t["to_host_key"] != host["fingerprint"]:
+        refuse("not_granted", "a transfer to another host")
+    g = host["grant_hash_at"](t["gen"])
+    if g is None or g != t["grant"]:
+        refuse("not_granted", "a grant this host didn't accept at that generation")
+    if not host["grant_lists_agent"](t["gen"], t["agent"]):
+        refuse("not_granted", "that grant doesn't list the agent")
+    since, cur = host["listed_since"](t["agent"]), host["entry_gen"](t["agent"])
+    if since is None or cur is None:
+        refuse("not_granted", "the agent isn't in this host's current grant")
+    if since > t["gen"] or cur < t["gen"]:
+        refuse("stale_generation", "the agent hasn't been listed since that generation")
+    accepted = host["accepted_transfer"](t["agent"])
+    if accepted is not None:
+        if accepted["transfer"] == pair["transfer_hash"] and accepted["gen"] == t["gen"] and accepted["nonce"] == t["nonce"]:
+            return {"first": False}
+        if t["gen"] <= accepted["gen"]:
+            refuse("stale_generation", "not above the transfer this host accepted")
+    seen = host["nonce_seen"](t["nonce"])
+    if seen is not None and seen != pair["transfer_hash"]:
+        refuse("replay", "this nonce named another transfer here")
+    return {"first": True}
+
+
+# ---- the old host's fence acknowledgement (r2.4 §3.7.4)
+
+def verify_fence_ack(data: bytes, ctx):
+    """§3.7.4, the envelope's check (see lib/fleet/core/verify.mjs). ctx: { aud, fleet, cert }."""
+    def resolve_key(signer, t, body):
+        if t != "sb.agent-fence-ack.v1":
+            refuse("bad_form", "another type")
+        body_validator("agent-fence-ack")(body)
+        cert = ctx["cert"]
+        if signer["kind"] != "host" or signer["id"] != cert["body"]["host"] or body["host"] != signer["id"]:
+            refuse("bad_signature")
+        if signer["key"] != key_id("ed25519", cert["sign_raw"]):
+            refuse("bad_signature", "not the certified host key")
+        return cert["sign_raw"]
+
+    env = open_envelope(data, {"aud": ctx["aud"], "fleet": ctx["fleet"], "resolve_key": resolve_key})
+    return {"body": env["body"], "hash": sha256b64(env["signed"])}
+
+
+# ---- execution-lease renewal (r2.5 §3.8)
+
+def verify_lease_request(data: bytes, ctx):
+    """§3.8.1, the service's check: form, fleet, aud and the certified host key's signature. ctx: { aud, fleet, cert }."""
+    def resolve_key(signer, t, body):
+        if t != "sb.lease-request.v1":
+            refuse("bad_form", "another type")
+        body_validator("lease-request")(body)
+        cert = ctx["cert"]
+        if signer["kind"] != "host" or signer["id"] != cert["body"]["host"] or body["host"] != signer["id"]:
+            refuse("bad_signature")
+        if signer["key"] != key_id("ed25519", cert["sign_raw"]):
+            refuse("bad_signature", "not the certified host key")
+        return cert["sign_raw"]
+
+    env = open_envelope(data, {"aud": ctx["aud"], "fleet": ctx["fleet"], "resolve_key": resolve_key})
+    return {"body": env["body"], "hash": sha256b64(env["signed"])}
+
+
+ECHOED = ("request", "agent", "gen", "nonce", "boot_id")
+
+
+def verify_execution_lease(data: bytes, ctx):
+    """§3.8.2, the host's check (see lib/fleet/core/verify.mjs). ctx: { aud, fleet, chain, host, host_key, outstanding }."""
+    def resolve_key(signer, t, body):
+        if t != "sb.execution-lease.v1":
+            refuse("bad_form", "another type")
+        body_validator("execution-lease")(body)
+        return lease_key_at(ctx["chain"], signer, body.get("chain_seq"))
+
+    env = open_envelope(data, {"aud": ctx["aud"], "fleet": ctx["fleet"], "resolve_key": resolve_key})
+    lease, o = env["body"], ctx.get("outstanding")
+    if lease["host"] != ctx["host"] or lease["host_key"] != ctx["host_key"]:
+        refuse("not_granted", "a lease for another host")
+    if not o:
+        refuse("not_granted", "no request outstanding")
+    for k in ECHOED:
+        if lease[k] != o[k]:
+            refuse("not_granted", f"the lease's {k} isn't the outstanding request's")
+    return {"body": lease, "hash": sha256b64(env["signed"])}

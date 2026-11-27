@@ -11,6 +11,11 @@ import { BINDS, UNIT_DIR, launcherExit, realEffects, runArgv, stagingPlan } from
 import { UNIT_DIRS_ABOVE_MASK } from "../lib/fleet/host/names.mjs";
 import { CONTRACT, launcherContract, renderUnit } from "../lib/fleet/host/unit.mjs";
 
+// The fixtures here are made with the default modes, and the code under test refuses anything group- or
+// world-writable, as it must. So the file's own umask is fixed (a host's services run with 022): the rows then
+// mean the same under a login shell's 002.
+process.umask(0o022);
+
 const A = "abcdefghijklmnopqrstuvwxya", T1 = "tagtagtagtagtagtagtagtagaa";
 // process.getuid doesn't exist off POSIX; there every test here is skipped (host-linux-only), so ME is never used.
 const UID = 70000, GID = 70000, ME = process.getuid?.() ?? -1;
@@ -387,6 +392,14 @@ test("mask counts only if systemd reports the unit masked; unmask only if it loa
   // unmask --runtime can't lift a persistent mask, or anything else: only "static" counts.
   for (const state of ["masked", "masked-runtime", "not-found"]) await assert.rejects(setup({ over: { "is-enabled": () => ({ code: 1, stdout: `${state}\n` }) } }).fx.unmask(A, 1000), host, state);
   await setup().fx.unmask(A, 1000);
+});
+
+test("systemdVersion runs exactly `systemctl --version` within its deadline; a non-zero exit is a failure", async () => {
+  const ok = setup({ over: { "--version": () => ({ code: 0, stdout: "systemd 255 (255.4-1ubuntu8.19)\n+PAM\n" }) } });
+  assert.equal(await ok.fx.systemdVersion(1000), "systemd 255 (255.4-1ubuntu8.19)\n+PAM\n");
+  assert.deepEqual(ok.calls, [["systemctl", "--version"]]);
+  const bad = setup({ over: { "--version": () => ({ code: 1, stdout: "systemd 255 (255.4-1ubuntu8.19)\n" }) } });
+  await assert.rejects(bad.fx.systemdVersion(1000), host);
 });
 
 test("writeUnit installs below the runtime mask, and refuses while an agent unit file sits in a load path above it", async () => {

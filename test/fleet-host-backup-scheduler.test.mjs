@@ -11,6 +11,7 @@ import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { advance, newJournal, readJournal, writeJournal } from "../lib/fleet/host/backup-journal.mjs";
 import { raiseFence } from "../lib/fleet/host/fence.mjs";
 import { agentSliceCgroup } from "../lib/fleet/host/names.mjs";
+import { STRICT_MARK } from "../lib/fleet/host/backup-binary.mjs";
 import {
   ROOT_RESERVE, backupEnabled, backupUnits, buildStatus, cacheEffects, emptyState, failClosedLease, newRunId, planRun,
   readState, recoverLeftover, runOnce, setKey, trimPlan, withRunLock, writeState,
@@ -25,7 +26,9 @@ const me = typeof process.getuid === "function" ? process.getuid() : -1;
 function setupDir() {
   const dir = join(mkdtempSync(join(tmpdir(), "sb-sched-")), "backup");
   mkdirSync(dir, { mode: 0o700 }); chmodSync(dir, 0o700);
-  for (const f of ["dest.json", "enabled"]) { writeFileSync(join(dir, f), "{}", { mode: 0o600 }); chmodSync(join(dir, f), 0o600); }
+  // (dest.json in the binary's state directory, backup/state; the enabled flag in backup/ itself)
+  mkdirSync(join(dir, "state"), { mode: 0o700 }); chmodSync(join(dir, "state"), 0o700);
+  for (const f of ["state/dest.json", "enabled"]) { writeFileSync(join(dir, f), "{}", { mode: 0o600 }); chmodSync(join(dir, f), 0o600); }
   return dir;
 }
 
@@ -37,8 +40,30 @@ test("enabled only with a root 0700 directory holding a root-owned 0600 dest.jso
   { const d = setupDir(); chmodSync(join(d, "enabled"), 0o644); assert.equal(backupEnabled({ dir: d, rootUid: me }).enabled, false, "a group- or world-readable flag"); }
   { const d = setupDir(); chmodSync(d, 0o755); assert.equal(backupEnabled({ dir: d, rootUid: me }).enabled, false, "a readable directory"); }
   { const d = setupDir(); const t = join(d, "..", "flag"); writeFileSync(t, "x", { mode: 0o600 }); chmodSync(t, 0o600); rmSync(join(d, "enabled")); symlinkSync(t, join(d, "enabled")); assert.equal(backupEnabled({ dir: d, rootUid: me }).enabled, false, "a link is never the flag"); }
-  { const d = setupDir(); rmSync(join(d, "dest.json")); assert.deepEqual(backupEnabled({ dir: d, rootUid: me }), { enabled: false, why: "not set up" }); }
+  { const d = setupDir(); rmSync(join(d, "state", "dest.json")); assert.deepEqual(backupEnabled({ dir: d, rootUid: me }), { enabled: false, why: "not set up" }); }
   { const d = setupDir(); rmSync(join(d, "enabled")); mkdirSync(join(d, "enabled"), { mode: 0o600 }); chmodSync(join(d, "enabled"), 0o600); assert.equal(backupEnabled({ dir: d, rootUid: me }).enabled, false, "a 0600 directory is not the flag file"); }
+});
+
+test("dest.json counts only in the binary's state directory (backup/state), itself root's 0700 directory", async () => {
+  const { BACKUP_DIR, BACKUP_STATE_DIR } = await import("../lib/fleet/host/names.mjs");
+  assert.equal(BACKUP_STATE_DIR, join(BACKUP_DIR, "state"), "the default state directory is backup/state");
+  // The old place, backup/dest.json, set up with the flag: not enabled (there is no state directory).
+  { const d = setupDir(); writeFileSync(join(d, "dest.json"), "{}", { mode: 0o600 }); chmodSync(join(d, "dest.json"), 0o600); rmSync(join(d, "state"), { recursive: true });
+    assert.deepEqual(backupEnabled({ dir: d, rootUid: me }), { enabled: false, why: "not set up" }, "backup/dest.json alone"); }
+  // The state directory present but dest.json only in the old place: not enabled.
+  { const d = setupDir(); rmSync(join(d, "state", "dest.json")); writeFileSync(join(d, "dest.json"), "{}", { mode: 0o600 }); chmodSync(join(d, "dest.json"), 0o600);
+    assert.deepEqual(backupEnabled({ dir: d, rootUid: me }), { enabled: false, why: "not set up" }, "backup/dest.json beside an empty state/"); }
+  // dest.json in state/ but no flag: not enabled (attach's state: the binary reaches the store, backup stays off).
+  { const d = setupDir(); rmSync(join(d, "enabled")); assert.deepEqual(backupEnabled({ dir: d, rootUid: me }), { enabled: false, why: "not set up" }, "attached, not enabled"); }
+  // The state directory must be root's 0700 directory, never a link.
+  { const d = setupDir(); chmodSync(join(d, "state"), 0o755); assert.equal(backupEnabled({ dir: d, rootUid: me }).enabled, false, "a readable state directory"); }
+  { const d = setupDir(); const real = join(d, "..", "elsewhere"); mkdirSync(real, { mode: 0o700 }); chmodSync(real, 0o700);
+    writeFileSync(join(real, "dest.json"), "{}", { mode: 0o600 }); chmodSync(join(real, "dest.json"), 0o600);
+    rmSync(join(d, "state"), { recursive: true }); symlinkSync(real, join(d, "state"));
+    assert.equal(backupEnabled({ dir: d, rootUid: me }).enabled, false, "a linked state directory"); }
+  { const d = setupDir(); chmodSync(join(d, "state", "dest.json"), 0o644); assert.equal(backupEnabled({ dir: d, rootUid: me }).enabled, false, "a readable dest.json"); }
+  // An explicit stateDir is honoured.
+  { const d = setupDir(); assert.deepEqual(backupEnabled({ dir: d, stateDir: join(d, "state"), rootUid: me }), { enabled: true }); }
 });
 
 test("run ids: the UTC second and 8 base32 characters", () => {
@@ -79,7 +104,8 @@ test("status: not set up, or ok / failing with the last success and the oldest c
 
 test("the units: a oneshot in the backup slice, and a daily 03:00 timer that catches up a missed run", () => {
   const u = backupUnits("/opt/sagebrush/release-1");
-  assert.match(u.service, /^ExecStart=\/opt\/sagebrush\/release-1\/bin\/sagebrush-agent host backup run$/m);
+  assert.match(u.service, /^ExecStartPre=\/usr\/lib\/sagebrush\/release-trust \/opt\/sagebrush\/release-1$/m);
+  assert.match(u.service, /^ExecStart=\/usr\/bin\/node \/opt\/sagebrush\/release-1\/bin\/sagebrush-agent\.mjs host backup run$/m);
   assert.match(u.service, /^Type=oneshot$/m); assert.match(u.service, /^Slice=sagebrush-backup\.slice$/m);
   assert.match(u.timer, /^OnCalendar=\*-\*-\* 03:00:00$/m); assert.match(u.timer, /^Persistent=true$/m);
   for (const bad of ["rel", "/a/../b", "/a b", "/a;b"]) refused(() => backupUnits(bad), "bad_form");
@@ -105,13 +131,15 @@ function fakes({ enabled = { enabled: true }, free = 10 * ROOT_RESERVE, sets = n
   const calls = [];
   let written = null, n = 0;
   const deps = {
+    withExclusion: async (fn) => { calls.push("exclusion"); return fn(() => {}); },
+    restoreOpen: () => false,
     enabled: () => enabled,
-    withRunLock: async (fn) => { calls.push("lock"); return fn(); },
+    withRunLock: async (fn) => { calls.push("lock"); return fn({ held: () => true }); },
     freeBytes: () => free,
     ensureCache: async () => { calls.push("cache"); },
     trimCache: async () => { calls.push("trim"); },
     recoverLeftover: async () => { calls.push("recover"); },
-    registry: () => registry,
+    snapshot: async () => { calls.push("snapshot"); return { ok: true, registry, hoststore: "/var/lib/sagebrush/backup/snapshot/r/hoststore" }; },
     configHash: (id) => hex(500 + Object.keys(registry.agents).indexOf(id)),
     forbidden: () => ["/srv/sagebrush/claude-profiles"],
     sources: () => theSets,
@@ -123,7 +151,6 @@ function fakes({ enabled = { enabled: true }, free = 10 * ROOT_RESERVE, sets = n
       const o = outcomes[setKey(s)] ?? { outcome: "good", snapshot: hex(100 + n++) };
       return o;
     },
-    copyHostStore: async (staging) => { calls.push("hoststore-copy"); return staging; },
     binary: async (req) => {
       calls.push(`binary:${req.op}`);
       if (req.op === "snapshots") return { ok: true, value: { snapshots: Array.from({ length: 300 }, (_, i) => ({ id: hex(i), tree: hex(1000 + i) })) } };
@@ -137,7 +164,7 @@ function fakes({ enabled = { enabled: true }, free = 10 * ROOT_RESERVE, sets = n
     pruneDue: () => prunePast,
     checkDataPart: () => ({ part: 7, of: 30 }),
     state: { read: () => state, write: (s) => { calls.push("state"); written = s; } },
-    host: "h1", now: () => Date.parse("2026-11-24T03:00:00Z"), stagingDir: (name) => `/var/lib/sagebrush/backup/${name}`,
+    hostId: () => "h1", now: () => Date.parse("2026-11-24T03:00:00Z"), stagingDir: (name) => `/var/lib/sagebrush/backup/${name}`,
   };
   return { deps, calls, a, b, written: () => written };
 }
@@ -146,12 +173,12 @@ test("not set up, or the root reserve short: nothing runs", async () => {
   {
     const f = fakes({ enabled: { enabled: false, why: "not set up" } });
     assert.deepEqual(await runOnce(f.deps), { status: "not set up", why: "not set up" });
-    assert.deepEqual(f.calls, []);
+    assert.deepEqual(f.calls, ["exclusion"]);
   }
   {
     const f = fakes({ free: ROOT_RESERVE - 1 });
     assert.deepEqual(await runOnce(f.deps), { status: "skipped", why: "root_reserve" });
-    assert.deepEqual(f.calls, ["lock"]);
+    assert.deepEqual(f.calls, ["exclusion", "lock"]);
   }
 });
 
@@ -159,8 +186,8 @@ test("a full run: cache, a left-over run recovered, forbidden roots checked, eac
   const f = fakes();
   const r = await runOnce(f.deps);
   assert.equal(r.status, "ok"); assert.equal(r.manifest, hex(900));
-  assert.deepEqual(f.calls, ["lock", "cache", "recover", "forbidden", "state",
-    `backup:agent:${f.a}:none`, `backup:agent:${f.b}:none`, "hoststore-copy", "backup:hoststore:host:none",
+  assert.deepEqual(f.calls, ["exclusion", "lock", "cache", "recover", "snapshot", "forbidden", "state",
+    `backup:agent:${f.a}:none`, `backup:agent:${f.b}:none`, "backup:hoststore:host:none",
     "binary:snapshots", "build", "commit", "retention", "binary:prune", "binary:check-data", "state", "trim"]);
   const w = f.written();
   assert.equal(w.last_success, Date.parse("2026-11-24T03:00:00Z"));
@@ -174,7 +201,7 @@ test("change-aware: an unchanged set keeps its last good snapshot in the manifes
   const f0 = fakes();
   const state = { ...emptyState(), sets: { [`agent:${f0.a}`]: { fingerprint: { e: 1 }, snapshot: hex(5), tree: hex(55), since: null } } };
   const f = fakes({ state, sets: f0.deps.sources(), fingerprints: {} });
-  f.deps.registry = f0.deps.registry; f.a = f0.a; f.b = f0.b;
+  f.deps.snapshot = f0.deps.snapshot; f.a = f0.a; f.b = f0.b;
   const r = await runOnce(f.deps);
   assert.equal(r.status, "ok");
   assert.ok(!f.calls.includes(`backup:agent:${f0.a}:none`) && !f.calls.some((c) => c.startsWith(`backup:agent:${f0.a}`)), "the unchanged set isn't backed up");
@@ -185,10 +212,10 @@ test("change-aware: an unchanged set keeps its last good snapshot in the manifes
 test("a set that fails: no host store, no manifest; the state records the debt, not a success", async () => {
   const f0 = fakes();
   const f = fakes({ sets: f0.deps.sources(), outcomes: { [`agent:${f0.b}`]: { outcome: "abandoned", code: "cap" } } });
-  f.deps.registry = f0.deps.registry;
+  f.deps.snapshot = f0.deps.snapshot;
   const r = await runOnce(f.deps);
   assert.equal(r.status, "failed"); assert.deepEqual(r.failures, [{ key: `agent:${f0.b}`, code: "cap" }]);
-  assert.ok(!f.calls.includes("commit") && !f.calls.includes("hoststore-copy"));
+  assert.ok(!f.calls.includes("commit") && !f.calls.includes("backup:hoststore:host:none"));
   const w = f.written();
   assert.equal(w.last_success, null);
   assert.equal(w.sets[`agent:${f0.b}`].since, Date.parse("2026-11-24T03:00:00Z"));
@@ -219,7 +246,7 @@ test("the debt is written before any backup: a manifest that won't commit, a fai
     // a's change was copied (good) but b failed: a's change is still not in any manifest, so a keeps its debt
     const f0 = fakes();
     const f = fakes({ sets: f0.deps.sources(), outcomes: { [`agent:${f0.b}`]: { outcome: "abandoned", code: "cap" } } });
-    f.deps.registry = f0.deps.registry;
+    f.deps.snapshot = f0.deps.snapshot;
     await runOnce(f.deps);
     assert.equal(debtOf(f, f0.a).since, now, "a good but unmanifested copy is still debt");
     assert.equal(debtOf(f, f0.b).since, now);
@@ -229,7 +256,7 @@ test("the debt is written before any backup: a manifest that won't commit, a fai
     const f0 = fakes();
     const state = { ...emptyState(), sets: { [`agent:${f0.a}`]: { fingerprint: { e: 0 }, snapshot: hex(5), tree: hex(55), since: 42 } } };
     const f = fakes({ state, sets: f0.deps.sources(), commit: { ok: false, code: "readback_failed" } });
-    f.deps.registry = f0.deps.registry;
+    f.deps.snapshot = f0.deps.snapshot;
     await runOnce(f.deps);
     assert.deepEqual(debtOf(f, f0.a), { fingerprint: { e: 0 }, snapshot: hex(5), tree: hex(55), since: 42 });
   }
@@ -329,4 +356,114 @@ test("one run at a time: a second run while one holds the run lock is refused", 
   let second;
   await withRunLock(async () => { second = withRunLock(async () => "ran", { dir }); await assert.rejects(second, (e) => e.code === "in_progress"); }, { dir });
   assert.equal(await withRunLock(async () => "ran", { dir }), "ran", "free again afterwards");
+});
+
+test("a live agent's config not proven (until r0.4 §1.2): the run fails config_unbound for it, and no manifest is committed", async () => {
+  const f = fakes();
+  f.deps.configHash = (id) => { if (id === f.a) throw Object.assign(new Error("unbound"), { code: "config_unbound" }); return "5".repeat(64); };
+  const r = await runOnce(f.deps);
+  assert.deepEqual([r.status, r.failures], ["failed", [{ key: `config:${f.a}`, code: "config_unbound" }]]);
+  assert.ok(!f.calls.includes("build") && !f.calls.includes("commit"));
+});
+
+test("N2: a config proof whose listing failed in transport keeps that code (transient, retried by the next run), never config_unbound; anything else is", async () => {
+  for (const [thrown, want] of [["tree_failed", "tree_failed"], ["timed_out", "timed_out"], ["bad_result", "bad_result"], ["outcome_unknown", "outcome_unknown"],
+    ["tree_refused", "config_unbound"], ["tree_absent", "config_unbound"], ["config_unbound", "config_unbound"], ["not_granted", "config_unbound"], [undefined, "config_unbound"]]) {
+    const f = fakes();
+    f.deps.configHash = (id) => { if (id === f.a) throw Object.assign(new Error("x"), { code: thrown }); return "5".repeat(64); };
+    const r = await runOnce(f.deps);
+    assert.deepEqual([r.status, r.failures], ["failed", [{ key: `config:${f.a}`, code: want }]], String(thrown));
+    assert.ok(!f.calls.includes("build") && !f.calls.includes("commit"));
+  }
+});
+
+test("d2r10 P1, T1: each set's parent is its recorded last good snapshot only as the store's listing proves it (a newer unmarked one, another set's newer good one, never chosen); otherwise none", async () => {
+  const base = fakes();
+  const [sa, sb] = base.deps.sources();
+  const state = { ...emptyState(), sets: { [setKey(sa)]: { fingerprint: { old: 1 }, snapshot: hex(5), tree: hex(55), since: null }, [setKey(sb)]: { fingerprint: { old: 1 }, snapshot: hex(6), tree: hex(66), since: null } } };
+  const good = (id, s, extra = []) => ({ id, tree: hex(1000), host: "h1", paths: s.sources, tags: ["sb-state=good", `sb-kind=${s.kind}`, `agent=${s.id}`, STRICT_MARK, ...extra], summary: null, time: "t" });
+  const f = fakes({ state, sets: [sa, sb] });
+  const listing = [
+    good(hex(5), sa), // a's recorded good one
+    { ...good(hex(7), sa), tags: ["sb-state=good", "sb-kind=agent", `agent=${sa.id}`] }, // a's newer, unmarked
+    good(hex(8), sb), // b's newer good one (b's recorded hex(6) is unlisted)
+  ];
+  const old = f.deps.binary;
+  f.deps.binary = async (req, o) => (req.op === "snapshots" && !f.calls.some((c) => c.startsWith("backup:")) ? (f.calls.push("binary:snapshots"), { ok: true, value: { snapshots: listing } }) : old(req, o));
+  assert.equal((await runOnce(f.deps)).status, "ok");
+  assert.ok(f.calls.includes(`backup:${setKey(sa)}:${hex(5)}`), "a: its recorded good one, not the newer unmarked one");
+  assert.ok(f.calls.includes(`backup:${setKey(sb)}:none`), "b: its recorded one unlisted, so none; never another snapshot, however good");
+  // A failed parent listing: no parents at all.
+  const g = fakes({ state, sets: [sa, sb] });
+  const old2 = g.deps.binary;
+  g.deps.binary = async (req, o) => (req.op === "snapshots" && !g.calls.some((c) => c.startsWith("backup:")) ? { ok: false, code: "destination_unavailable" } : old2(req, o));
+  await runOnce(g.deps);
+  assert.deepEqual(g.calls.filter((c) => c.startsWith("backup:agent:")).sort(), [`backup:${setKey(sa)}:none`, `backup:${setKey(sb)}:none`].sort());
+});
+
+test("d2r9 S5, T2: the debt after a churn-failed warm pass whose set is then good: none, exactly as for any good set (the good snapshot recorded, since null)", async () => {
+  const base = fakes();
+  const [sa, sb] = base.deps.sources();
+  const state = { ...emptyState(), sets: { [setKey(sa)]: { fingerprint: { old: 1 }, snapshot: hex(5), tree: hex(55), since: 1000 } } };
+  const f = fakes({ state, sets: [sa, sb], outcomes: { [setKey(sa)]: { outcome: "good", snapshot: hex(42), consistency: "turn", warm: null, code: null, recovered: null } } });
+  assert.equal((await runOnce(f.deps)).status, "ok");
+  const after = f.written().sets[setKey(sa)];
+  assert.deepEqual([after.snapshot, after.since], [hex(42), null]);
+});
+
+test("A1: every set's backupSet gets the run's guard (the live sets' and the host store's)", async () => {
+  const f = fakes();
+  const guards = [];
+  const real = f.deps.backupSet;
+  f.deps.backupSet = async (s, run, o) => { guards.push([setKey(s), typeof o.guard]); return real(s, run, o); };
+  assert.equal((await runOnce(f.deps)).status, "ok");
+  assert.deepEqual(guards.map((g) => g[1]), ["function", "function", "function"]);
+});
+
+test("A1 in a left-over run's recovery: the run's lock lost right after ANY cgroup proof (the last thaw proof included): no fence comes down and no journal write follows", async () => {
+  let points = 0;
+  for (let k = 1; ; k += 1) {
+    const root = mkdtempSync(join(tmpdir(), "sb-left-"));
+    const dir = join(root, "backup"), fenceDir = join(root, "fence");
+    mkdirSync(dir, { mode: 0o700 }); mkdirSync(fenceDir, { mode: 0o700 });
+    const a = newId(), run = "20261124T020000Z-abcdefgh";
+    writeJournal({ ...advance(advance(advance(newJournal(run, [a]), "fenced"), "idle"), "frozen"), warm: hex(77) }, { dir });
+    raiseFence("backup", a, { dir: fenceDir });
+    const groups = { [agentSliceCgroup(a)]: { frozen: true } };
+    let ops = 0, isLost = false, atLoss = null;
+    const guard = () => { if (isLost) throw Object.assign(new Error("lost"), { code: "lock_lost" }); };
+    const raw = { kill: () => {}, procs: () => 0, freeze: (p, on) => { groups[p].frozen = on; }, frozen: (p) => groups[p]?.frozen ?? false };
+    // As realRunDeps passes it: each cgroup operation behind the guard; the loss lands right after the k-th.
+    const cg = Object.fromEntries(Object.entries(raw).map(([op, f]) => [op, (...x) => {
+      guard();
+      const r = f(...x);
+      ops += 1;
+      if (ops === k) { isLost = true; atLoss = { fence: existsSync(join(fenceDir, "backup", a)), journal: JSON.stringify(readJournal({ dir })) }; }
+      return r;
+    }]));
+    const binary = async () => ({ ok: true, value: { forgotten: 1 } });
+    const clock = (() => { let t = 0; return { now: () => t, sleep: async (ms) => { t += ms; } }; })();
+    let out;
+    try { out = await recoverLeftover({ binary, dir, fenceDir, cg, guard, ...clock }); } catch (e) { out = e; }
+    if (!isLost) { assert.deepEqual(out, { ok: true, recovered: run }); break; }
+    points += 1;
+    assert.equal(out?.code, "lock_lost", `k=${k}`);
+    assert.equal(existsSync(join(fenceDir, "backup", a)), atLoss.fence, `k=${k}: no fence change after the loss`);
+    assert.equal(JSON.stringify(readJournal({ dir })), atLoss.journal, `k=${k}: no journal write after the loss`);
+    assert.equal(atLoss.fence, true, `k=${k}: the fence still up (it only comes down after every proof)`);
+  }
+  assert.ok(points >= 4, `every cgroup proof lost once (${points})`);
+});
+
+test("each live agent's config is proven from ITS set's committed snapshot (a kept, unchanged set's too), with the run's guard", async () => {
+  const f0 = fakes();
+  const state = { ...emptyState(), sets: { [`agent:${f0.a}`]: { fingerprint: { e: 1 }, snapshot: hex(5), tree: hex(55), since: null } } };
+  const f = fakes({ state, sets: f0.deps.sources() });
+  f.deps.snapshot = f0.deps.snapshot;
+  const seen = [];
+  f.deps.configHash = (id, snapshot, guard, record) => { seen.push([id, snapshot, typeof guard, record?.id ?? null]); return "6".repeat(64); };
+  assert.equal((await runOnce(f.deps)).status, "ok");
+  const backedUp = f.deps.lastManifest.sets.find((s) => s.id === f0.b).snapshot;
+  assert.deepEqual(seen.sort(), [[f0.a, hex(5), "function", hex(5)], [f0.b, backedUp, "function", backedUp]].sort(),
+    "the kept set's snapshot for a, this run's for b, each with its own record from the store's listing (d2r8)");
 });

@@ -15,14 +15,14 @@ sys.path.insert(0, str(ROOT / "python"))
 
 from sagebrush_fleet import (  # noqa: E402
     FleetError, apply_chain_entry, canon_text, derive_key_pair, device_key, is_id, key_id, open_cap, open_envelope,
-    parse_canonical, replay, service_key_at, unb64, verify_approval, verify_grant, verify_grant_ack, verify_host_cert, verify_host_op,
-    verify_package, verify_strict,
+    parse_canonical, replay, service_key_at, lease_key_at, verify_lease_request, verify_execution_lease, verify_fence_ack, unb64, verify_approval, verify_grant, verify_grant_ack, verify_host_cert, verify_host_op,
+    verify_package, verify_strict, verify_transfer_receipt, check_transfer_for_host,
 )
 from sagebrush_fleet.hpke import Recipient, Sender, receive_export, send_export  # noqa: E402
 
 FIXTURES = ROOT / "test" / "fixtures"
 # (the JavaScript checker's case counts: a fixture file that loses cases fails here, not silently)
-COUNTS = {"fleet": 91, "hpke": 34}
+COUNTS = {"fleet": 201, "hpke": 34}
 
 
 def load(name):
@@ -89,6 +89,53 @@ class FleetFixtures(Cases):
         sk = replay([enc(x) for x in self.F["service_keys"]["chain"]], self.ctx)
         self.each("service_keys", ((c["name"], result(lambda: service_key_at(sk, c["signer"], c["chain_seq"])), c["expect"]) for c in self.F["service_keys"]["cases"]))
 
+    def test_lease_keys(self):
+        L = self.F["lease_keys"]
+
+        def run(c):
+            def go():
+                st = replay([enc(x) for x in c["entries"]], self.ctx)
+                if c.get("append"):
+                    apply_chain_entry(st, enc(c["append"]), self.ctx)
+            return result(go)
+
+        self.each("lease_chain", ((c["name"], run(c), c["expect"]) for c in L["chain_cases"]))
+        lk = replay([enc(x) for x in L["chain"]], self.ctx)
+        at = {"lease": lease_key_at, "service": service_key_at}
+        self.each("lease_keys", ((c["name"], result(lambda: at[c["lookup"]](lk, c["signer"], c["chain_seq"])), c["expect"]) for c in L["cases"]))
+
+    def test_fence_acks(self):
+        A = self.F["fence_acks"]
+        ac = replay([enc(x) for x in A["chain"]], self.ctx)
+        cert = verify_host_cert(enc(A["host_cert"]), {**self.ctx, "chain": ac})
+        rows = []
+        for c in A["cases"]:
+            got = {}
+
+            def go(c=c, got=got):
+                got["hash"] = verify_fence_ack(enc(c["bytes"]), {**self.ctx, "cert": cert})["hash"]
+            rows.append((c["name"], result(go), c["expect"]))
+            if c.get("hash"):
+                rows.append((f"{c['name']}: its hash", got.get("hash"), c["hash"]))
+        self.each("fence_acks", rows)
+
+    def test_leases(self):
+        E = self.F["leases"]
+        lc = replay([enc(x) for x in E["chain"]], self.ctx)
+        cert = verify_host_cert(enc(E["host_cert"]), {**self.ctx, "chain": lc})
+        rows = []
+        for c in E["requests"]:
+            got = {}
+
+            def go(c=c, got=got):
+                got["hash"] = verify_lease_request(enc(c["bytes"]), {**self.ctx, "cert": cert})["hash"]
+            rows.append((c["name"], result(go), c["expect"]))
+            if c.get("hash"):
+                rows.append((f"{c['name']}: its hash", got.get("hash"), c["hash"]))
+        self.each("lease_requests", rows)
+        ctx = {**self.ctx, "chain": lc, "host": E["host"], "host_key": E["host_key"]}
+        self.each("leases", ((c["name"], result(lambda c=c: verify_execution_lease(enc(c["bytes"]), {**ctx, "outstanding": c["outstanding"]})), c["expect"]) for c in E["leases"]))
+
     def objects(self):
         O = self.F["objects"]
         st = replay([enc(x) for x in O["chain"]], self.ctx)
@@ -126,9 +173,33 @@ class FleetFixtures(Cases):
             **self.ctx, "chain": st, "now": self.F["now_ms"], "expect": c["expect_op"], "current": c.get("current"), "used": lambda a: a in c["used"],
         })), c["expect"]) for c in O["approvals"]))
 
+    def test_transfer_receipts(self):
+        X = self.F["transfers"]
+        chains = {"honest": replay([enc(x) for x in X["chain"]], self.ctx), "removed": replay([enc(x) for x in X["chain_removed"]], self.ctx)}
+        self.each("transfer_receipts", ((c["name"], result(lambda: verify_transfer_receipt(
+            {"transfer": enc(c["transfer"]), "receipt": enc(c["receipt"])}, {**self.ctx, "chain": chains[c.get("chain", "honest")]})), c["expect"]) for c in X["receipts"]))
+
+    def test_transfer_hosts(self):
+        def host_of(r):
+            return {
+                "id": r["id"], "fingerprint": r["fingerprint"],
+                "grant_hash_at": lambda g: (r["grants"].get(str(g)) or {}).get("hash"),
+                "grant_lists_agent": lambda g, a: a in (r["grants"].get(str(g)) or {}).get("agents", []),
+                "listed_since": lambda a: r["listed_since"].get(a), "entry_gen": lambda a: r["entry_gen"].get(a),
+                "accepted_transfer": lambda a: r["accepted"].get(a), "nonce_seen": lambda x: r["nonces"].get(x),
+            }
+
+        def run(c):
+            out = {}
+            got = result(lambda: out.update(check_transfer_for_host({"transfer": c["pair"]["transfer"], "transfer_hash": c["pair"]["transferHash"]}, host_of(c["host"]))))
+            return f"ok first={str(out['first']).lower()}" if got == "ok" else got
+
+        self.each("transfer_hosts", ((c["name"], run(c), f"ok first={str(c['first']).lower()}" if c["expect"] == "ok" else c["expect"]) for c in self.F["transfers"]["hosts"]))
+
     def test_zz_every_case_ran(self):
         """(named to run last in the class) the JavaScript checker's count of cases, all of them run here"""
-        groups = ["canonical", "base64url", "ids", "ed25519", "chain", "service_keys", "envelopes", "grants", "grant_acks", "host_ops", "approvals"]
+        groups = ["canonical", "base64url", "ids", "ed25519", "chain", "service_keys", "lease_chain", "lease_keys", "lease_requests", "leases", "fence_acks", "envelopes", "grants", "grant_acks", "host_ops", "approvals",
+                  "transfer_receipts", "transfer_hosts"]
         missing = [g for g in groups if g not in Cases.ran]
         if missing:
             self.skipTest(f"run alone: {missing} not run")

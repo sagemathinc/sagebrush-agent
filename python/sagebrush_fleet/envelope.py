@@ -28,8 +28,13 @@ TYPES = {
     "sb.audit-checkpoint.v1": ("host",),
     "sb.audit-continuity.v1": ("host",),
     "sb.audit-ack.v1": ("service",),
+    "sb.agent-transfer.v1": ("device",),
+    "sb.agent-transfer-receipt.v1": ("service",),
+    "sb.agent-fence-ack.v1": ("host",),
+    "sb.lease-request.v1": ("host",),
+    "sb.execution-lease.v1": ("lease",),
 }
-KINDS = {"device", "host", "recovery", "service"}
+KINDS = {"device", "host", "recovery", "service", "lease"}
 
 
 @lru_cache(maxsize=1)

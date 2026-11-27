@@ -11,11 +11,20 @@ import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import {
-  MARGIN_MS, activationArgv, armArgv, armWatchdog, bootNow, leaseActivate, leaseExpire, liveCheck, monotonicDeadline,
-  parseArgs, publish, readRecord, readTombstone, realSystem, unitObjectPath, watchdogTimer, writeRecord,
+  G_MAX, MARGIN_MS, REOPEN_FILE, SLEEP_FILE, activationArgv, parseGateJson, parseReopen, parseSleep, armArgv, armWatchdog, bootNow, gateOf, leaseActivate, leaseExpire,
+  liveCheck, monotonicDeadline, parseArgs, publish, readGate, readGateFile, readRecord, readTombstone, realSystem, unitObjectPath,
+  watchdogTimer, writeRecord,
 } from "../lib/fleet/host/lease.mjs";
+import { realIo } from "../lib/fleet/host/store.mjs";
+import { chmodSync, symlinkSync } from "node:fs";
+import * as fsReal from "node:fs";
 import { fenced, lowerFence, raiseFence, stop } from "../lib/fleet/host/fence.mjs";
 import { lockFile } from "../lib/fleet/host/store.mjs";
+
+// The fixtures here are made with the default modes, and the code under test refuses anything group- or
+// world-writable, as it must. So the file's own umask is fixed (a host's services run with 022): the rows then
+// mean the same under a login shell's 002.
+process.umask(0o022);
 
 const A = newId();
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
@@ -123,7 +132,7 @@ test("arming: an absolute OnBootSec timer, AccuracySec=1s, running lease-expire 
 
 test("armWatchdog: verified only when active, waiting, and elapsing at or before m*; else lease_unverified", async () => {
   const e = env(), c = fakeClock();
-  const rec = { lease_id: "L1", lg: 1, expiry_tick: c.boot() + 600_000 };
+  const rec = { lease_id: "L1", lg: 1, expiry_tick: c.boot() + 600_000, gen: 3, sg: 0 };
   const ok = await armWatchdog(A, rec, { sys: fakeSys(e), clock: c });
   assert.equal(ok.timer, watchdogTimer(A, 1));
   await rejects(armWatchdog(A, rec, { sys: fakeSys(e, { armFails: true }), clock: c }), "lease_unverified");
@@ -132,13 +141,13 @@ test("armWatchdog: verified only when active, waiting, and elapsing at or before
   await rejects(armWatchdog(A, rec, { sys: fakeSys(e, { readBack: () => 0 }), clock: c }), "lease_unverified");
   // a deadline already inside the margin: refused before anything is armed
   const late = fakeSys(e);
-  await rejects(armWatchdog(A, { ...rec, expiry_tick: c.boot() + MARGIN_MS }, { sys: late, clock: c }), "lease_unverified");
+  await rejects(armWatchdog(A, { ...rec, expiry_tick: c.boot() + MARGIN_MS, gen: 3, sg: 0 }, { sys: late, clock: c }), "lease_unverified");
   assert.deepEqual(late.calls, []);
 });
 
 test("publish (re-arm step 2) and SEC H1: nothing is published once now >= expiry_tick - 30 s, or for a spent or elapsed timer", async () => {
   const e = env(), c = fakeClock(), sys = fakeSys(e);
-  const rec = { lease_id: "L1", lg: 2, expiry_tick: c.boot() + 600_000 };
+  const rec = { lease_id: "L1", lg: 2, expiry_tick: c.boot() + 600_000, gen: 3, sg: 0 };
   await armWatchdog(A, rec, { sys, clock: c });
   const o = { dir: e.dir, sys, clock: c };
   // inside the margin but before the signed expiry: treated as expired
@@ -161,14 +170,49 @@ test("publish (re-arm step 2) and SEC H1: nothing is published once now >= expir
   assert.equal(statSync(join(e.dir, A)).mode & 0o777, 0o644);
 });
 
+test("the record's gen (execution lease r3.12): written, read back as a number, required, and refused out of range", () => {
+  const e = env();
+  const rec = { lease_id: "L1", lg: 5, expiry_tick: 100000, gen: 7, sg: 0 };
+  writeRecord(A, rec, { dir: e.dir });
+  assert.equal(readFileSync(join(e.dir, A), "utf8"), '{"lease_id":"L1","lg":5,"expiry_tick":100000,"gen":7,"sg":0}');
+  const got = readRecord(A, { dir: e.dir });
+  assert.deepEqual(got, { state: "ok", rec });
+  assert.equal(typeof got.rec.gen, "number", "a number: the restore-resume helper compares it with ===");
+  for (const gen of [undefined, 0, -1, 1.5, "7", 2 ** 53, null]) {
+    assert.throws(() => writeRecord(A, { ...rec, gen }, { dir: e.dir }), (x) => x.code === "bad_form", String(gen));
+    writeFileSync(join(e.dir, A), JSON.stringify(gen === undefined ? { lease_id: "L1", lg: 5, expiry_tick: 100000 } : { ...rec, gen }));
+    assert.deepEqual(readRecord(A, { dir: e.dir }), { state: "bad" }, `read ${String(gen)}`);
+  }
+  for (const gen of [1, 2 ** 53 - 1]) {
+    writeRecord(A, { ...rec, gen }, { dir: e.dir });
+    assert.equal(readRecord(A, { dir: e.dir }).rec.gen, gen);
+  }
+});
+
+test("the helper activates alike whatever the record's gen", async () => {
+  for (const gen of [1, 7]) {
+    const e = env(), c = fakeClock(), locks = fakeLocks(), sys = fakeSys(e, { locks });
+    const rec = { lease_id: "L", lg: 1, expiry_tick: c.boot() + 600_000, gen, sg: 0 };
+    await armWatchdog(A, rec, { sys, clock: c });
+    assert.equal(await publish(A, rec, { dir: e.dir, sys, clock: c }), true);
+    raiseFence("lease", A, { dir: join(e.fenceDir, "..") });
+    const r = await leaseActivate(A, "L", 1, { dir: e.dir, fenceDir: e.fenceDir, sys, clock: c, lock: locks.lock });
+    assert.deepEqual(r, { activated: true, reason: null, lowered: true }, `gen ${gen}`);
+  }
+});
+
 test("the watchdog is a no-op only for a strictly newer lg: same, older, missing and unreadable records all act", async () => {
   for (const [label, setup, acts] of [
-    ["newer", (e) => writeRecord(A, { lease_id: "L", lg: 6, expiry_tick: 1 }, { dir: e.dir }), false],
-    ["same", (e) => writeRecord(A, { lease_id: "L", lg: 5, expiry_tick: 1 }, { dir: e.dir }), true],
-    ["older", (e) => writeRecord(A, { lease_id: "L", lg: 4, expiry_tick: 1 }, { dir: e.dir }), true],
+    ["newer", (e) => writeRecord(A, { lease_id: "L", lg: 6, expiry_tick: 1, gen: 3, sg: 0 }, { dir: e.dir }), false],
+    ["same", (e) => writeRecord(A, { lease_id: "L", lg: 5, expiry_tick: 1, gen: 3, sg: 0 }, { dir: e.dir }), true],
+    ["older", (e) => writeRecord(A, { lease_id: "L", lg: 4, expiry_tick: 1, gen: 3, sg: 0 }, { dir: e.dir }), true],
     ["missing", () => {}, true],
     ["unreadable", (e) => { mkdirSync(e.dir, { recursive: true }); writeFileSync(join(e.dir, A), "{not json"); }, true],
-    ["malformed", (e) => { mkdirSync(e.dir, { recursive: true }); writeFileSync(join(e.dir, A), JSON.stringify({ lease_id: "L", lg: 9, expiry_tick: 1, x: 1 })); }, true],
+    ["malformed", (e) => { mkdirSync(e.dir, { recursive: true }); writeFileSync(join(e.dir, A), JSON.stringify({ lease_id: "L", lg: 9, expiry_tick: 1, gen: 3, x: 1 })); }, true],
+    // r3.12: gen changes nothing here; the old three-key shape is malformed, so the watchdog acts on it.
+    ["newer, another gen", (e) => writeRecord(A, { lease_id: "L", lg: 6, expiry_tick: 1, gen: 7, sg: 0 }, { dir: e.dir }), false],
+    ["same, another gen", (e) => writeRecord(A, { lease_id: "L", lg: 5, expiry_tick: 1, gen: 9, sg: 0 }, { dir: e.dir }), true],
+    ["the old shape, newer lg", (e) => { mkdirSync(e.dir, { recursive: true }); writeFileSync(join(e.dir, A), JSON.stringify({ lease_id: "L", lg: 9, expiry_tick: 1 })); }, true],
   ]) {
     const e = env(), locks = fakeLocks(), sys = fakeSys(e, { locks });
     setup(e);
@@ -235,8 +279,8 @@ test("a watchdog never kills outside the slice, never by pid: a busy lock held O
 
 test("a record renewed while the watchdog waited for the lock: it is stale after all and stops nothing", async () => {
   const e = env(), locks = fakeLocks(), sys = fakeSys(e, { locks });
-  writeRecord(A, { lease_id: "L", lg: 3, expiry_tick: 1 }, { dir: e.dir });
-  const lock = async (p, o) => { writeRecord(A, { lease_id: "M", lg: 4, expiry_tick: 2 }, { dir: e.dir }); return locks.lock(p, o); };
+  writeRecord(A, { lease_id: "L", lg: 3, expiry_tick: 1, gen: 3, sg: 0 }, { dir: e.dir });
+  const lock = async (p, o) => { writeRecord(A, { lease_id: "M", lg: 4, expiry_tick: 2, gen: 3, sg: 0 }, { dir: e.dir }); return locks.lock(p, o); };
   const r = await leaseExpire(A, "L", 3, { ...opts(e, sys, locks), lock });
   assert.equal(r.acted, false);
   assert.equal(existsSync(e.fence), false);
@@ -258,6 +302,33 @@ test("a proof failure: the agent stays fenced and masked, the kill and proof are
   assert.ok(!kinds(sys).includes("unmask") && !kinds(sys).includes("start"));
 });
 
+test("a proof failure: before each retry, the unit's stop, best effort, always after a kill and never before the first", async () => {
+  const e = env(), locks = fakeLocks(), sys = fakeSys(e, { locks, stubborn: true });
+  const r = await leaseExpire(A, "L", 2, opts(e, sys, locks, { maxProofRetries: 2 }));
+  assert.equal(r.proven, false);
+  const ks = kinds(sys).filter((k) => k === "kill" || k === "stop");
+  // kill, stop, kill, stop, kill, then the final stop after the last proof
+  assert.deepEqual(ks, ["kill", "stop", "kill", "stop", "kill", "stop"]);
+  // A stop that fails, or one that ends the stubbornness, is handled: the next proof decides.
+  const s2 = fakeSys(e, { locks, stubborn: true });
+  s2.stop = async (unit) => { s2.calls.push(["stop", unit]); throw new Error("systemctl stop: timed out"); };
+  const r2 = await leaseExpire(A, "L", 3, opts(e, s2, locks, { maxProofRetries: 1 }));
+  assert.equal(r2.proven, false);
+  assert.equal(kinds(s2).filter((k) => k === "kill").length, 2, "the retry still kills and proves");
+  const s3 = fakeSys(e, { locks, stubborn: true });
+  s3.stop = async (unit) => { s3.calls.push(["stop", unit]); s3.procs = 0; }; // (the slice yields to systemd's stop)
+  const r3 = await leaseExpire(A, "L", 4, opts(e, s3, locks, { maxProofRetries: 5 }));
+  assert.equal(r3.proven, true, "the retry after the stop proves the slice empty");
+  assert.deepEqual(kinds(s3).filter((k) => k === "kill" || k === "stop"), ["kill", "stop", "stop"], "proven at the second look: no second kill needed");
+});
+
+test("the unit's stop is bounded by STOP_MS (systemctl through the bounded runner)", async () => {
+  const seen = [];
+  const sys = realSystem({ run: async (argv, o) => { seen.push([argv.join(" "), o.ms]); return { code: 0, stdout: "", stderr: "" }; } });
+  await sys.stop("sagebrush-agents-x.slice");
+  assert.deepEqual(seen, [["systemctl stop sagebrush-agents-x.slice", 10000]]);
+});
+
 test("an absent slice is proven empty; an unreadable one is never", async () => {
   const e = env(), locks = fakeLocks(), sys = fakeSys(e, { locks });
   sys.sliceExists = false;
@@ -270,7 +341,7 @@ test("an absent slice is proven empty; an unreadable one is never", async () => 
 function activated(e, c, lg = 1, more = {}) {
   const locks = fakeLocks(), sys = fakeSys(e, { locks, ...more });
   return { locks, sys, run: async () => {
-    const rec = { lease_id: "L", lg, expiry_tick: c.boot() + 600_000 };
+    const rec = { lease_id: "L", lg, expiry_tick: c.boot() + 600_000, gen: 3, sg: 0 };
     await armWatchdog(A, rec, { sys, clock: c });
     assert.equal(await publish(A, rec, { dir: e.dir, sys, clock: c }), true);
     raiseFence("lease", A, { dir: join(e.fenceDir, "..") });
@@ -293,7 +364,9 @@ test("the helper refuses, changing nothing: outside the slice, busy, unpublished
   const cases = [
     ["outside_slice", (k) => { k.sys.self = "/system.slice/x.service"; }],
     ["busy", async (k, e) => { await k.locks.lock(join(e.dir, `${A}.lock`), {}); }],
-    ["not_published", (k, e) => writeRecord(A, { lease_id: "OTHER", lg: 1, expiry_tick: 9e12 }, { dir: e.dir })],
+    ["not_published", (k, e) => writeRecord(A, { lease_id: "OTHER", lg: 1, expiry_tick: 9e12, gen: 3, sg: 0 }, { dir: e.dir })],
+    // r3.12: the same lease in the old three-key shape is malformed, so it isn't published either
+    ["not_published", (k, e) => writeFileSync(join(e.dir, A), JSON.stringify({ lease_id: "L", lg: 1, expiry_tick: 9e12 }))],
     ["spent", (k, e) => writeFileSync(join(e.dir, `${A}.spent`), "1\n")],
     ["timer_not_waiting", (k) => { k.sys.timers[watchdogTimer(A, 1)].sub = "elapsed"; }],
     ["expired", (k, e, c) => c.advance(600_000 - MARGIN_MS)],
@@ -338,9 +411,9 @@ test("a watchdog at every activation seam: no lease fence ends lowered after a w
 test("T2d: arm, then both watchdogs fire before publication; publication 10 s before the signed expiry finds the lg spent", async () => {
   for (const first of [true, false]) {
     const e = env(), c = fakeClock(), locks = fakeLocks(), sys = fakeSys(e, { locks });
-    if (!first) { const old = { lease_id: "O", lg: 1, expiry_tick: c.boot() + 60_000 }; await armWatchdog(A, old, { sys, clock: c }); await publish(A, old, { dir: e.dir, sys, clock: c }); }
+    if (!first) { const old = { lease_id: "O", lg: 1, expiry_tick: c.boot() + 60_000, gen: 3, sg: 0 }; await armWatchdog(A, old, { sys, clock: c }); await publish(A, old, { dir: e.dir, sys, clock: c }); }
     const lg = first ? 1 : 2;
-    const rec = { lease_id: "N", lg, expiry_tick: c.boot() + 120_000 };
+    const rec = { lease_id: "N", lg, expiry_tick: c.boot() + 120_000, gen: 3, sg: 0 };
     await armWatchdog(A, rec, { sys, clock: c });
     // the supervisor is stopped here; both timers fire
     if (!first) await leaseExpire(A, "O", 1, opts(e, sys, locks));
@@ -411,7 +484,7 @@ test("a watchdog that had to kill the slice for the lock completes its stop even
   mkdirSync(e.dir, { recursive: true });
   await locks.holdInSlice(join(e.dir, `${A}.lock`), true);
   const kill = sys.kill;
-  sys.kill = (d) => { kill(d); writeRecord(A, { lease_id: "M", lg: 9, expiry_tick: 2 }, { dir: e.dir }); };
+  sys.kill = (d) => { kill(d); writeRecord(A, { lease_id: "M", lg: 9, expiry_tick: 2, gen: 3, sg: 0 }, { dir: e.dir }); };
   const r = await leaseExpire(A, "L", 3, opts(e, sys, locks));
   assert.equal(r.acted, true);
   assert.equal(r.proven, true);
@@ -482,4 +555,158 @@ test("cross-language fixture: lease.mjs reads the runtime files exactly as the f
     assert.equal(readRecord(A, { dir: e.dir }).state === "ok", r.js, r.text);
     assert.ok(!r.rust || r.js, `rust is never more lenient: ${r.text}`);
   }
+});
+
+// ---- the suspend gate (lease-on r1.5 §6.1-6.3) -------------------------------------------------------------------------
+
+const MAX = 2 ** 53 - 1;
+const sleepText = (gen, phase = "post", preOk = true, preAt = 0) => JSON.stringify({ gen, phase, pre_ok: preOk, pre_at: preAt });
+const reopenText = (gen) => JSON.stringify({ gen });
+/** Write the gate files (null removes one), root-style: this process's uid, 0644. */
+function gateFiles(dir, sleep, reopen) {
+  mkdirSync(dir, { recursive: true, mode: 0o755 });
+  for (const [name, text] of [[SLEEP_FILE, sleep], [REOPEN_FILE, reopen]]) {
+    const f = join(dir, name);
+    try { spawnSync("rm", ["-f", f]); } catch { /* none */ }
+    if (text !== null) { writeFileSync(f, text, { mode: 0o644 }); chmodSync(f, 0o644); }
+  }
+}
+
+test("the gate, cross-language: gateOf decides every fixture row exactly as its js column, and rust is pinned equal", () => {
+  const fx = JSON.parse(readFileSync(new URL("./fixtures/host/lease-files.json", import.meta.url), "utf8"));
+  assert.ok(fx.gate.length >= 20);
+  for (const row of fx.gate) {
+    const read = (t) => (t === null ? { state: "missing" } : { state: "ok", text: t });
+    const g = gateOf(read(row.sleep), read(row.reopen), row.now);
+    assert.equal(g.open ? g.g : null, row.js, row.name);
+    assert.equal(row.rust, row.js, `rust and js agree: ${row.name}`);
+    if (!g.open) assert.equal(typeof g.why, "string", row.name);
+  }
+  assert.equal(G_MAX, MAX - 1, "2^53 - 1 is the terminal generation, never opened");
+});
+
+test("the gate reads trusted files only: a group- or other-writable file, a link, an unreadable one, or an untrusted directory reads CLOSED", () => {
+  const e = env(), c = fakeClock();
+  gateFiles(e.dir, sleepText(3), reopenText(3));
+  assert.deepEqual(readGate({ dir: e.dir, clock: c }), { open: true, g: 3 });
+  chmodSync(join(e.dir, SLEEP_FILE), 0o666);
+  assert.equal(readGate({ dir: e.dir, clock: c }).open, false, "other-writable sleep");
+  chmodSync(join(e.dir, SLEEP_FILE), 0o644);
+  spawnSync("rm", ["-f", join(e.dir, REOPEN_FILE)]); symlinkSync(join(e.dir, SLEEP_FILE), join(e.dir, REOPEN_FILE));
+  assert.equal(readGate({ dir: e.dir, clock: c }).open, false, "a link");
+  gateFiles(e.dir, sleepText(3), reopenText(3));
+  chmodSync(e.dir, 0o775);
+  assert.equal(readGate({ dir: e.dir, clock: c }).why, "untrusted", "a group-writable lease directory");
+  chmodSync(e.dir, 0o755);
+  assert.equal(readGateFile(e.dir, SLEEP_FILE, { uid: process.getuid() + 1 }).state, "bad", "another owner");
+  // no lease directory at all: both absent, open at 0
+  assert.deepEqual(readGate({ dir: join(e.root, "nothing"), clock: c }), { open: true, g: 0 });
+  gateFiles(e.dir, sleepText(3), null);
+  assert.deepEqual(readGate({ dir: e.dir, clock: c }), { open: false, why: "one_sided" });
+});
+
+test("liveCheck refuses `suspended` unless the gate is open at exactly the record's sg, before any other check", async () => {
+  const e = env(), c = fakeClock(), sys = fakeSys(e);
+  const rec = { lease_id: "L1", lg: 2, expiry_tick: c.boot() + 600_000, gen: 3, sg: 4 };
+  await armWatchdog(A, rec, { sys, clock: c });
+  const o = { dir: e.dir, sys, clock: c };
+  gateFiles(e.dir, sleepText(4), reopenText(4));
+  assert.equal(await liveCheck(A, rec, o), null, "open at 4: live");
+  gateFiles(e.dir, sleepText(5, "pre"), reopenText(4));
+  assert.equal(await liveCheck(A, rec, o), "suspended", "closed (a PRE)");
+  gateFiles(e.dir, sleepText(5), reopenText(5));
+  assert.equal(await liveCheck(A, rec, o), "suspended", "open at a NEWER generation: the old lease never passes again");
+  gateFiles(e.dir, null, null);
+  assert.equal(await liveCheck(A, rec, o), "suspended", "open at 0, the record's sg is 4");
+  const calls = sys.calls.length;
+  gateFiles(e.dir, sleepText(5, "pre"), reopenText(4));
+  await liveCheck(A, rec, o);
+  assert.equal(sys.calls.length, calls, "the gate is checked first: no timer read on a closed gate");
+});
+
+test("T4, exhaustion: open at G_max with a live lease; the terminal generation closes it for good, in every reader", async () => {
+  const e = env(), c = fakeClock(), sys = fakeSys(e);
+  const rec = { lease_id: "L1", lg: 2, expiry_tick: c.boot() + 600_000, gen: 3, sg: G_MAX };
+  await armWatchdog(A, rec, { sys, clock: c });
+  gateFiles(e.dir, sleepText(G_MAX), reopenText(G_MAX));
+  assert.equal(await liveCheck(A, rec, { dir: e.dir, sys, clock: c }), null, "open at G_max, live");
+  gateFiles(e.dir, sleepText(MAX, "pre"), reopenText(G_MAX));
+  assert.equal(await liveCheck(A, rec, { dir: e.dir, sys, clock: c }), "suspended", "a PRE to 2^53 - 1");
+  gateFiles(e.dir, sleepText(MAX), reopenText(G_MAX));
+  assert.equal(readGate({ dir: e.dir, clock: c }).why, "unacknowledged");
+  gateFiles(e.dir, sleepText(MAX), reopenText(MAX));
+  assert.deepEqual(readGate({ dir: e.dir, clock: c }), { open: false, why: "exhausted" }, "even acknowledged, 2^53 - 1 never opens");
+  for (const sg of [G_MAX, MAX]) assert.equal(await liveCheck(A, { ...rec, sg }, { dir: e.dir, sys, clock: c }), "suspended", `sg ${sg}`);
+  // a late publication for the old generation, and one claiming the terminal generation: neither is published
+  for (const sg of [G_MAX, MAX]) {
+    assert.equal(await publish(A, { ...rec, lg: 9, sg }, { dir: e.dir, sys, clock: c }), false, `publish sg ${sg}`);
+  }
+});
+
+test("publish (§6.3): under the exclusive activation lock; the gate closing between its write and its re-read spends the lease", async () => {
+  const e = env(), c = fakeClock(), sys = fakeSys(e);
+  const rec = { lease_id: "L1", lg: 7, expiry_tick: c.boot() + 600_000, gen: 3, sg: 2 };
+  await armWatchdog(A, rec, { sys, clock: c });
+  gateFiles(e.dir, sleepText(2), reopenText(2));
+  // A PRE that closes the gate right after the record's rename (the crossing §6.3 linearizes).
+  const crossing = { ...realIo, rename: (a, b) => { realIo.rename(a, b); if (b === join(e.dir, A)) writeFileSync(join(e.dir, SLEEP_FILE), sleepText(3, "pre", false, 0)); } };
+  assert.equal(await publish(A, rec, { dir: e.dir, sys, clock: c, io: crossing }), false);
+  assert.ok(readTombstone(A, { dir: e.dir }) >= rec.lg, "spent by publish itself, under the lock");
+  assert.equal(readRecord(A, { dir: e.dir }).state, "ok", "the record was written");
+  assert.equal(await liveCheck(A, rec, { dir: e.dir, sys, clock: c }), "suspended", "and no reader passes it");
+  // gate already closed: nothing is written
+  const e2 = env(); await armWatchdog(A, rec, { sys: fakeSys(e2), clock: c });
+  gateFiles(e2.dir, sleepText(3, "pre"), reopenText(2));
+  assert.equal(await publish(A, rec, { dir: e2.dir, sys: fakeSys(e2), clock: c }), false);
+  assert.equal(readRecord(A, { dir: e2.dir }).state, "missing");
+  // a busy activation lock: not published, nothing written, never waiting unbounded
+  const e3 = env(), locks = fakeLocks(), sys3 = fakeSys(e3, { locks });
+  await armWatchdog(A, rec, { sys: sys3, clock: c });
+  gateFiles(e3.dir, sleepText(2), reopenText(2));
+  await locks.lock(join(e3.dir, `${A}.lock`), {});
+  assert.equal(await publish(A, rec, { dir: e3.dir, sys: sys3, clock: c, lock: locks.lock }), false);
+  assert.equal(readRecord(A, { dir: e3.dir }).state, "missing");
+  // the happy path holds the lock while it writes
+  const e4 = env(), l4 = fakeLocks(), s4 = fakeSys(e4, { locks: l4 });
+  await armWatchdog(A, rec, { sys: s4, clock: c });
+  gateFiles(e4.dir, sleepText(2), reopenText(2));
+  assert.equal(await publish(A, rec, { dir: e4.dir, sys: s4, clock: c, lock: l4.lock }), true);
+  assert.deepEqual(l4.takes.map((t) => t.shared), [false], "one exclusive take");
+  assert.equal(l4.count(join(e4.dir, `${A}.lock`)), 0, "released");
+});
+
+test("the helpers refuse a lease from another gate generation (`suspended`), lowering nothing", async () => {
+  const e = env(), c = fakeClock(), locks = fakeLocks(), sys = fakeSys(e, { locks });
+  const rec = { lease_id: "L", lg: 1, expiry_tick: c.boot() + 600_000, gen: 3, sg: 1 };
+  await armWatchdog(A, rec, { sys, clock: c });
+  gateFiles(e.dir, sleepText(1), reopenText(1));
+  assert.equal(await publish(A, rec, { dir: e.dir, sys, clock: c, lock: locks.lock }), true);
+  raiseFence("lease", A, { dir: join(e.fenceDir, "..") });
+  gateFiles(e.dir, sleepText(2), reopenText(2)); // a suspend and its reopen happened since
+  const r = await leaseActivate(A, "L", 1, { dir: e.dir, fenceDir: e.fenceDir, sys, clock: c, lock: locks.lock });
+  assert.deepEqual(r, { activated: false, reason: "suspended", lowered: false });
+  assert.ok(existsSync(e.fence), "lease stays raised");
+});
+
+test("readGateFile reads the SAME object it looked at, through a handle that never follows a link", () => {
+  const e = env();
+  gateFiles(e.dir, sleepText(3), reopenText(3));
+  const real = (k) => (...a) => (fsReal[k])(...a);
+  // lstat answers for another object (a swap between the look and the open): bad, so the gate reads closed.
+  const swapped = { ...fsReal, lstatSync: (p) => { const st = fsReal.lstatSync(p); return Object.assign(Object.create(Object.getPrototypeOf(st)), st, { ino: st.ino + 1 }); } };
+  assert.equal(readGateFile(e.dir, SLEEP_FILE, { fsx: swapped }).state, "bad");
+  assert.equal(readGateFile(e.dir, SLEEP_FILE, { fsx: { ...fsReal, openSync: real("openSync") } }).state, "ok");
+  // an open refused for the object's type (a link swapped in: ELOOP): bad
+  const eloop = { ...fsReal, openSync: () => { throw Object.assign(new Error("ELOOP"), { code: "ELOOP" }); } };
+  assert.equal(readGateFile(e.dir, SLEEP_FILE, { fsx: eloop }).state, "bad");
+});
+
+test("SEC on S1: the gate files are parsed strictly, as the launcher parses them; JSON.parse's leniency never opens the gate", () => {
+  const probe = '{"gen":2,"phase":"pre","phase":"post","pre_ok":true,"pre_at":0}';
+  assert.equal(parseSleep(probe), null, "a duplicate phase is malformed");
+  assert.deepEqual(gateOf({ state: "ok", text: probe }, { state: "ok", text: '{"gen":2}' }, 1000), { open: false, why: "malformed" });
+  for (const t of ['{"gen":2.0}', '{"gen":2e0}', '{"gen":02}', '{"gen":-2}', '{"gen":2,"gen":2}', '{"gen":2} x']) assert.equal(parseReopen(t), null, t);
+  assert.deepEqual(parseReopen(' { "\\u0067en" : 2 } '), { gen: 2 }, "escapes and whitespace decode as in Rust");
+  assert.equal(parseGateJson('{"a":1,"a":1}'), null);
+  assert.equal(parseGateJson('{"a":9007199254740992}').a, Infinity, "above the safe range: kept out of range");
 });

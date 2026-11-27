@@ -21,6 +21,17 @@ const regFile = (root) => join(root, "registry", "registry.json");
 /** Open the host store and return its registry view, with close() closing the store. */
 const Registry = { open: async (root, opts) => { const h = await HostStore.open(root, opts); const r = h.registry; r.close = () => h.close(); r.store = h; return r; } };
 
+test("fresh(): true only for a registry that has never recorded anything (no agent, no tag, both counters at their start)", async () => {
+  for (const add of ["agent", "tag"]) {
+    const r = await Registry.open(fresh());
+    try {
+      assert.equal(r.fresh(), true);
+      if (add === "agent") r.addAgent(newId(), 1); else r.addTag(newId());
+      assert.equal(r.fresh(), false, `after a ${add}`);
+    } finally { await r.close(); }
+  }
+});
+
 test("uids and gids come from their ranges, in order, and survive a reopen", async () => {
   const dir = fresh();
   const r = await Registry.open(dir);
@@ -402,4 +413,44 @@ test("the lock holder dies and the commit runs before Node sees the exit: the OS
   while (!pids.every(gone) && Date.now() - t0 < 5000) { /* spin: Node can't process the exit event here */ }
   refused(() => r.setState(a, "running"), "outcome_unknown");
   assert.equal(disk(dir).agents[a].state, "provisioned");
+});
+
+test("a grant generation of 0 is \"no grant applied on this host yet\": valid in every state; a grant never sets it", async () => {
+  const { checkRegistry } = await import("../lib/fleet/host/registry.mjs");
+  const reg = (state, gen) => ({ v: 1, next_uid: UID_RANGE[0] + 1, next_gid: GID_RANGE[0], agents: { [newId()]: { uid: UID_RANGE[0], state, life: 0, gen, tags: [], start_failed: null } }, tags: {} });
+  for (const s of ["provisioned", "running", "paused", "stopped", "revoked", "deleted"]) {
+    assert.equal(checkRegistry(reg(s, 0)), true, s);
+    assert.equal(checkRegistry(reg(s, 9)), true, s);
+    refused(() => checkRegistry(reg(s, -1)), "bad_form");
+  }
+  const r = await Registry.open(fresh());
+  const a = newId();
+  r.addAgent(a, 3);
+  refused(() => r.setGrant(a, 0, []), "bad_form");
+  refused(() => r.addAgent(newId(), 0), "bad_form");
+  r.close();
+});
+
+test("a restored agent at gen 0 can be revoked or deleted before any grant here: durable, life counted, its deprovision record bound to 0", async () => {
+  for (const [to, op] of [["revoked", "revoke-caps"], ["deleted", "delete"]]) {
+    const dir = fresh();
+    const a = newId(), b = newId();
+    const copy = { v: 1, next_uid: UID_RANGE[0] + 2, next_gid: GID_RANGE[0], tags: {}, agents: {
+      [a]: { uid: UID_RANGE[0], state: "running", life: 2, gen: 9, tags: [], start_failed: null },
+      [b]: { uid: UID_RANGE[0] + 1, state: "deleted", life: 4, gen: 6, tags: [], start_failed: null },
+    } };
+    let r = await Registry.open(dir);
+    r.importRestored(copy);
+    assert.equal(r.agent(a).gen, 0, "the live agent's generation is reset");
+    assert.equal(r.agent(b).gen, 6, "an agent already deleted keeps its own");
+    const after = r.setState(a, to, op);
+    assert.deepEqual([after.state, after.gen, after.life], [to, 0, 3], to);
+    if (to === "deleted") assert.equal(r.store.deprovision.ensure(a, r.agent(a)).gen, 0, "its deprovision record binds gen 0");
+    await r.close();
+    r = await Registry.open(dir);
+    assert.deepEqual([r.agent(a).state, r.agent(a).gen, r.agent(a).life, r.agent(b).gen], [to, 0, 3, 6], `${to}: after a reopen`);
+    if (to === "revoked") { const d = r.setState(a, "deleted", "delete"); assert.deepEqual([d.state, d.gen, d.life], ["deleted", 0, 4]); }
+    await r.close();
+    assert.equal(disk(dir).agents[a].gen, 0);
+  }
 });

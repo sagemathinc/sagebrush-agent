@@ -8,7 +8,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
-import { stop, raiseFence, lowerFence, fenced, countProcs, rootUnitsIn, realSystemd } from "../lib/fleet/host/fence.mjs";
+import { CAUSES, fenceCauses, stop, raiseFence, lowerFence, fenced, countProcs, rootUnitsIn, realSystemd } from "../lib/fleet/host/fence.mjs";
+import { agentSlice } from "../lib/fleet/host/names.mjs";
 import { lockDir, realIo } from "../lib/fleet/host/store.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
@@ -291,6 +292,38 @@ test("each fence is lowered only by its own cause; the agent's needs a known res
     await lowerFence("agent", a, "resume-agent", { dir, agentState });
     assert.equal(fenced(a, { dir }), false, agentState);
   }
+});
+
+test("transferred (execution lease §4): one agent's, a fence like any other, and lowered NEVER, by any authority", async () => {
+  const dir = fresh();
+  const a = newId(), b = newId();
+  assert.ok(CAUSES.includes("transferred"));
+  raiseFence("transferred", a, { dir });
+  assert.ok(existsSync(join(dir, "transferred", a)), "its own file, transferred/<id>");
+  assert.equal(fenced(a, { dir }), true);
+  assert.equal(fenced(b, { dir }), false, "only that agent");
+  assert.deepEqual(fenceCauses(a, { dir }), ["transferred"]);
+  for (const authority of ["resume-all", "resume-agent", "newer-grant", "backup-recovery", "resume-restored", "transferred", "person", undefined]) {
+    for (const agentState of [undefined, "stopped", "running"]) {
+      await rejects(lowerFence("transferred", a, authority, { dir, agentState, restoreState: "validated", cgroupOf: () => null }), "not_granted");
+    }
+  }
+  assert.equal(fenced(a, { dir }), true, "still up after every attempt");
+  refused(() => raiseFence("transferred", null, { dir }), "bad_form");
+});
+
+test("a transfer's stop: transferred raised first, then the agent's WHOLE slice (unit, turns, helpers) stopped and proven; one agent only", async () => {
+  const dir = fresh();
+  const a = newId(), b = newId();
+  const slice = agentSlice(a);
+  const sys = fakeSystemd(dir, { units: { [slice]: { active: true, procs: 3 }, [unitOf(b)]: { active: true, procs: 2 } } });
+  let fenceFirst = null;
+  const r = await stop({ agent: a }, "transferred", { sys, dir, barrier: async (n) => { if (n === "after_fence_write") fenceFirst = existsSync(join(dir, "transferred", a)) && sys.calls.length === 0; } });
+  assert.equal(fenceFirst, true, "the fence is durable before any stop");
+  assert.equal(r.status, "stopped and fenced");
+  assert.deepEqual(sys.calls.filter((c) => c[0] === "stop").map((c) => c[1]), [slice], "the agent's slice, not just its unit");
+  assert.equal(sys.units[unitOf(b)].active, true, "another agent untouched");
+  await rejects(stop({ all: true }, "transferred", { sys, dir }), "bad_form");
 });
 
 test("an agent is fenced by any one of its three fences, expiry included", () => {

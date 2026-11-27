@@ -4,17 +4,19 @@
 // the switch happens once after the compare-and-set, bounds, expiry and revocation. And one whole handshake through it.
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
-import { FleetError, b64, newId, keyFromSeed, seal, applyChainEntry as apply, hostFingerprint, verifyHostCert } from "../lib/fleet/index.mjs";
+import { FleetError, b64, enc, newId, keyFromSeed, seal, applyChainEntry as apply, hostFingerprint, verifyHostCert } from "../lib/fleet/index.mjs";
 import { parseSig, signRequest, verifyRequest } from "../lib/fleet/request.mjs";
+import { canon } from "../lib/canon.mjs";
 import { lockDir } from "../lib/fleet/host/store.mjs";
 import { acceptMessage1, openChannelStore, prologueBytes } from "../lib/fleet/channel/accept.mjs";
 import { initiator, x25519Generate } from "../lib/fleet/channel/noise.mjs";
 import {
-  FakeRelay, HEADERS_MAX, RECORD_HEADER_MAX, ROUTE, openTarget, parseOpenTarget, signCommit, verifyAppOpen, verifyCommit, verifyHostOpen,
+  APP_TOKEN, APP_TOKEN_MS, AppTokens, FakeRelay, appTokenKey, appTokenRequest, HEADERS_MAX, RECORD_HEADER_MAX, ROUTE, openTarget, parseOpenTarget, signCommit, verifyAppOpen, verifyCommit,
+  verifyHostOpen,
 } from "../lib/fleet/channel/relay.mjs";
 
 const AUD = "https://dev.sagebrush.space";
@@ -70,11 +72,22 @@ async function world(t) {
   const store = openChannelStore(dir, lock);
   const nonces = new Set(), requests = new Set();
   let clock = NOW;
+  const account = newId(), accountSession = newId(), tokens = new AppTokens({ now: () => clock });
+  let sessionLive = true;
   const w = {
     fleet, host, agent, chain, cert, encKey, store, H, relay: new FakeRelay({ now: () => clock }),
     advance(ms) { clock += ms; },
     sig: { aud: AUD, get now() { return clock; }, hostKey: (h) => { if (h !== host) refuse(); return H.raw; }, currentGen: () => 3, consumeNonce: (h, x) => (nonces.has(x) ? false : (nonces.add(x), true)), agentHasBrowser: (h, a) => a === agent },
-    app: { aud: AUD, get now() { return clock; }, accountFleets: () => [fleet], chainOf: () => chain, currentGen: () => 3, consumeRequest: (id) => (requests.has(id) ? false : (requests.add(id), true)) },
+    tokens, account, accountSession, logout() { sessionLive = false; tokens.logout(accountSession); },
+    app: { aud: AUD, get now() { return clock; }, consumeAppToken: (k) => tokens.consume(k), sessionLive: (a, s) => sessionLive && a === account && s === accountSession,
+      chainOf: () => chain, currentGen: () => 3, consumeRequest: (id) => (requests.has(id) ? false : (requests.add(id), true)) },
+    /** A token issued for an open's fields and request id, as the issuer would (synchronously: the row put in place). */
+    mint(f, request, row = {}) {
+      const token = `rt1.${b64(randomBytes(32))}`;
+      const { role, ...b } = f;
+      tokens.rows.set(createHash("sha256").update(token, "utf8").digest("base64url"), { account, account_session: accountSession, ...b, host, request, expires_ms: clock + APP_TOKEN_MS, ...row });
+      return token;
+    },
     session(extra = {}) {
       const app = x25519Generate();
       const body = { fleet, aud: AUD, at_ms: NOW - 1000, not_before_ms: NOW - 1000, not_after_ms: NOW + 3_600_000, session: newId(), host, agent,
@@ -88,8 +101,9 @@ async function world(t) {
       const target = openTarget(w.fields(sess, "host", resume_n));
       return { target, headers: { "sagebrush-sig": signRequest({ aud: AUD, method: "GET", target, host, key: H, fields: { gen: 3, ts: clock, nonce: nonce() } }), ...extra } };
     },
-    appOpen(sess, resume_n = 0, extra = {}) {
-      return { target: openTarget(w.fields(sess, "app", resume_n)), headers: { "sagebrush-browser-record": b64(sess.record), "sagebrush-request": nonce(), ...extra } };
+    appOpen(sess, resume_n = 0, extra = {}, row = {}) {
+      const f = w.fields(sess, "app", resume_n), request = nonce();
+      return { target: openTarget(f), headers: { "sagebrush-relay-token": w.mint(f, request, row), "sagebrush-browser-record": b64(sess.record), "sagebrush-request": request, ...extra } };
     },
   };
   function refuse() { throw new FleetError("unknown_host"); }
@@ -115,16 +129,19 @@ test("the host's open (§5.2): signed, its gen the open's host_gen, the agent gr
   assert.equal(await code(() => verifyHostOpen(other.hostOpen(other.session()), w.sig)), "unknown_host", "another host's key");
 });
 
-test("the app's open (§5.3): the account's fleet, the record verified and equal to the open, its window, the request id once, the H6 caps", async (t) => {
+test("the app's open (§5.3, A1): its token taken once, the record verified and equal to the open, its window, the request id once, the H6 caps", async (t) => {
   const w = await world(t);
   const sess = w.session();
   const v = await verifyAppOpen(w.appOpen(sess), w.app);
   assert.deepEqual([v.role, v.host, v.session], ["app", w.host, sess.body.session]);
   const o = w.appOpen(sess);
   await verifyAppOpen(o, w.app);
-  assert.equal(await code(() => verifyAppOpen(o, w.app)), "replay", "the same request id");
-  assert.equal(await code(() => verifyAppOpen(w.appOpen(sess), { ...w.app, accountFleets: () => [newId()] })), "not_granted", "another account");
-  assert.equal(await code(() => verifyAppOpen({ ...w.appOpen(sess), target: openTarget({ ...w.fields(sess, "app"), browser_gen: 9 }) }, w.app)), "bad_form", "the record isn't the open");
+  assert.equal(await code(() => verifyAppOpen(o, w.app)), "unauthenticated", "the same open again: its token was taken");
+  const again = { ...o, headers: { ...o.headers, "sagebrush-relay-token": w.mint(w.fields(sess, "app"), o.headers["sagebrush-request"]) } };
+  assert.equal(await code(() => verifyAppOpen(again, w.app)), "replay", "a fresh token, the same request id");
+  const g9 = { ...w.fields(sess, "app"), browser_gen: 9 }, r9 = nonce();
+  const o9 = { target: openTarget(g9), headers: { "sagebrush-relay-token": w.mint(g9, r9), "sagebrush-browser-record": b64(sess.record), "sagebrush-request": r9 } };
+  assert.equal(await code(() => verifyAppOpen(o9, w.app)), "bad_form", "the record isn't the open (the token is)");
   assert.equal(await code(() => verifyAppOpen(w.appOpen(w.session({ not_after_ms: NOW })), w.app)), "grant_expired");
   assert.equal(await code(() => verifyAppOpen(w.appOpen(sess), { ...w.app, currentGen: () => 4 })), "stale_generation");
   // H6: the record header at 87,252 characters is read (and refused as a record); one over, or not base64url, is refused first
@@ -134,6 +151,86 @@ test("the app's open (§5.3): the account's fleet, the record verified and equal
   const fill = HEADERS_MAX - 200;
   assert.equal(await code(() => verifyAppOpen(w.appOpen(sess, 0, { "x-filler": "a".repeat(fill) }), w.app)), "limit", "a header block filled by other headers");
   assert.equal(await code(() => verifyAppOpen(w.appOpen(sess, 0, { "sagebrush-request": "short" }), w.app)), "bad_form", "the request id's form");
+});
+
+test("the relay token (A1): issued for one open, taken once whatever the outcome, its expiry exact, the session read at use, never in a message", async (t) => {
+  const w = await world(t);
+  const sess = w.session();
+  const seen = [];
+  const codeOf = async (fn) => { try { await fn(); return "ok"; } catch (e) { if (!(e instanceof FleetError)) throw e; seen.push(String(e), e.message); return e.code; } };
+  const open = (f, request, token) => ({ target: openTarget(f), headers: { "sagebrush-relay-token": token, "sagebrush-browser-record": b64(sess.record), "sagebrush-request": request } });
+  const f0 = w.fields(sess, "app");
+  // (the body as the app sends it: canonical bytes of exactly what it holds; `extra` adds or changes fields)
+  const issue = async (f, request, extra = {}) => {
+    const { role, ...b } = f;
+    const body = Object.keys(extra).length ? enc(canon({ ...b, host: w.host, request, ...extra }).text) : appTokenRequest({ ...b, host: w.host, request });
+    return (await w.tokens.issue({ account: w.account, account_session: w.accountSession, body })).token;
+  };
+  const tokensUsed = [];
+  const fresh = async (f = f0) => { const r = nonce(); const tk = await issue(f, r); tokensUsed.push(tk); return { r, tk }; };
+
+  // the issuer: its form; the token's form and lifetime; only the hash kept
+  const a = await fresh();
+  assert.match(a.tk, APP_TOKEN);
+  const row = w.tokens.rows.get(await appTokenKey(a.tk));
+  assert.equal(row.expires_ms, NOW + APP_TOKEN_MS);
+  assert.ok(!JSON.stringify([...w.tokens.rows]).includes(a.tk.slice(4)), "the store keeps no token, only its hash");
+  const size = w.tokens.rows.size;
+  assert.equal(await codeOf(() => issue(f0, nonce(), { resume_n: 0 })), "ok", "the hand-built body, unchanged, is accepted (the control)");
+  for (const bad of [{ extra: 1 }, { request: "x" }, { browser_gen: 0 }, { resume_n: -1 }, { host: "x" }])
+    assert.equal(await codeOf(() => issue(f0, nonce(), bad)), "bad_form", JSON.stringify(bad));
+  assert.equal(await codeOf(() => w.tokens.issue({ account: w.account, account_session: w.accountSession, body: enc(JSON.stringify({ ...f0, host: w.host, request: nonce() }, null, 1)) })), "bad_form", "not canonical");
+  assert.equal(w.tokens.rows.size, size + 1, "nothing stored on a refusal (the control's one row)");
+
+  // taken once: the open, then the same token again
+  assert.equal(await codeOf(() => verifyAppOpen(open(f0, a.r, a.tk), w.app)), "ok");
+  assert.equal(await codeOf(() => verifyAppOpen(open(f0, nonce(), a.tk), w.app)), "unauthenticated", "used");
+  // a mismatch burns it: the right open after it finds nothing
+  const b = await fresh();
+  assert.equal(await codeOf(() => verifyAppOpen(open({ ...f0, resume_n: 1 }, b.r, b.tk), w.app)), "bad_form");
+  assert.equal(await codeOf(() => verifyAppOpen(open(f0, b.r, b.tk), w.app)), "unauthenticated", "burned by the mismatch");
+  // an invalid record burns it too (the record is checked independently, after the token)
+  const c = await fresh();
+  const tampered = open(f0, c.r, c.tk);
+  tampered.headers["sagebrush-browser-record"] = b64(Uint8Array.from(sess.record, (x, i) => (i === sess.record.length - 5 ? x ^ 1 : x)));
+  assert.notEqual(await codeOf(() => verifyAppOpen(tampered, w.app)), "ok");
+  assert.equal(await codeOf(() => verifyAppOpen(open(f0, c.r, c.tk), w.app)), "unauthenticated", "burned by the bad record");
+  // its expiry, exactly: now < expires_ms
+  const d = await fresh(), e = await fresh();
+  w.advance(APP_TOKEN_MS - 1);
+  assert.equal(await codeOf(() => verifyAppOpen(open(f0, d.r, d.tk), w.app)), "ok", "1 ms before");
+  w.advance(1);
+  assert.equal(await codeOf(() => verifyAppOpen(open(f0, e.r, e.tk), w.app)), "unauthenticated", "at expires_ms, the row still there");
+  const g = await fresh();
+  w.advance(APP_TOKEN_MS);
+  w.tokens.sweep();
+  assert.equal(w.tokens.rows.has(await appTokenKey(g.tk)), false, "swept");
+  assert.equal(await codeOf(() => verifyAppOpen(open(f0, g.r, g.tk), w.app)), "unauthenticated", "after its sweep: the same code");
+  // another endpoint never takes it: a host open carrying the header leaves the row in place
+  const h = await fresh();
+  const ho = w.hostOpen(sess);
+  ho.headers["sagebrush-relay-token"] = h.tk;
+  verifyHostOpen(ho, w.sig);
+  assert.equal(w.tokens.rows.has(await appTokenKey(h.tk)), true, "untouched by a host open");
+  // two presentations at once: exactly one admitted, one row taken, one request id used
+  const both = await Promise.all([codeOf(() => verifyAppOpen(open(f0, h.r, h.tk), w.app)), codeOf(() => verifyAppOpen(open(f0, h.r, h.tk), w.app))]);
+  assert.deepEqual(both.sort(), ["ok", "unauthenticated"]);
+  // an invalid first presenter burns it for the valid second one
+  const k = await fresh();
+  const pair = await Promise.all([codeOf(() => verifyAppOpen(open({ ...f0, resume_n: 1 }, k.r, k.tk), w.app)), codeOf(() => verifyAppOpen(open(f0, k.r, k.tk), w.app))]);
+  assert.deepEqual(pair, ["bad_form", "unauthenticated"]);
+  // the session, read at use: ended with the row still present, then with its rows deleted
+  const m = await fresh(), q = await fresh();
+  const live = w.app.sessionLive;
+  w.app.sessionLive = () => false;
+  assert.equal(w.tokens.rows.has(await appTokenKey(m.tk)), true);
+  assert.equal(await codeOf(() => verifyAppOpen(open(f0, m.r, m.tk), w.app)), "unauthenticated", "a session ended, its row present");
+  w.app.sessionLive = live;
+  w.logout();
+  assert.equal(w.tokens.rows.has(await appTokenKey(q.tk)), false, "logout deletes the session's rows");
+  assert.equal(await codeOf(() => verifyAppOpen(open(f0, q.r, q.tk), w.app)), "unauthenticated", "after logout");
+  // the canary: no refusal's text carries a token
+  for (const tk of tokensUsed) assert.ok(seen.every((m) => !m.includes(tk) && !m.includes(tk.slice(4))), "a token in a refusal's text");
 });
 
 /** One whole handshake through the relay: opens, message 1, the compare-and-set, the authorization, message 2. */
@@ -277,7 +374,10 @@ test("a switch closes only that host's and agent's other sockets: another agent'
     const target = openTarget(w2.fields(sess, "host", resume_n));
     return { target, headers: { "sagebrush-sig": signRequest({ aud: AUD, method: "GET", target, host: w.host, key: w.H, fields: { gen: 3, ts: NOW, nonce: nonce() } }) } };
   };
-  w2.appOpen = (sess, resume_n = 0) => ({ target: openTarget(w2.fields(sess, "app", resume_n)), headers: { "sagebrush-browser-record": b64(sess.record), "sagebrush-request": nonce() } });
+  w2.appOpen = (sess, resume_n = 0) => {
+    const f = w2.fields(sess, "app", resume_n), request = nonce();
+    return { target: openTarget(f), headers: { "sagebrush-relay-token": w.mint(f, request), "sagebrush-browser-record": b64(sess.record), "sagebrush-request": request } };
+  };
   const theirs = await connect(w2, w.session({ browser_gen: 2, agent: otherAgent }));
   const closed = [];
   theirs.appSock.onclose = (x) => closed.push(x);

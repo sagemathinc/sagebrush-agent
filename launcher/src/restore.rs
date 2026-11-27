@@ -24,6 +24,9 @@ use std::ffi::CString;
 use std::io;
 
 pub const RESTORE: &str = "/srv/sagebrush/.restore";
+/// The host store's reserved project (A2 r3.14 §1): clear of the agents', tags' and profiles' ids. Begin sets its quota
+/// (setquota -P) before staging, so the kernel bounds the stage during the walk.
+pub const HOSTSTORE_PROJID: u32 = 110000;
 pub const STATE: &str = "/var/lib/sagebrush/backup/state";
 pub const SECRETS: &str = "/var/lib/sagebrush/host-secrets";
 pub const CACHE: &str = "/var/cache/sagebrush-backup";
@@ -39,6 +42,10 @@ const MAX_LIST: usize = 1000;
 const MAX_MARKER: usize = 64;
 const MAX_UIDS: usize = 64;
 const MARKER: &str = ".complete";
+/// The digest list's fixed name beside the class (A2 r3.6 §4b), in the attempt's `data/`. A class leaf can't take it.
+pub const DIGESTS: &str = "digests.json";
+/// The longest listing (A2 r3.6 §4b): `digests.json`, and `tree-digest`'s output.
+pub const MAX_LISTING: u64 = 512 << 20;
 const MAX_ELF_PHNUM: usize = 64;
 /// resolv.conf (and only it) may be owned by a system service account below this uid: on a stock Ubuntu 24.04 host,
 /// /etc/resolv.conf resolves to systemd-resolved's stub file, owned by `systemd-resolve`. Agents (70000+) and people
@@ -55,6 +62,24 @@ pub enum Class {
     Sessions,
     Archive,
     Tag,
+    /// An agent's config tree (A2 r3.13): staged only, never filled (the supervisor's config import reads it).
+    Config,
+    /// A deleted agent's config archive (A2 r3.13): filled, root-owned, exact modes.
+    ArchiveConfig,
+    /// The backup's host-store snapshot (A2 r3.14): owner `host`, staged only (restore begin's import reads it in
+    /// place), root-owned, exact modes, project 110000.
+    HostStore,
+}
+
+impl Class {
+    /// The root-owned classes (A2 r3.13 §2): their only owner is root, and their modes are exact (0700, 0600).
+    pub fn root_owned(self) -> bool {
+        matches!(self, Class::Config | Class::ArchiveConfig | Class::HostStore)
+    }
+    /// The classes staged only, never filled or listed (A2 r3.13 `config`, r3.14 `hoststore`).
+    pub fn stage_only(self) -> bool {
+        matches!(self, Class::Config | Class::HostStore)
+    }
 }
 
 /// One attempt's name: `<run>/<owner>/<class>/<attempt>`, every part validated.
@@ -73,6 +98,16 @@ impl Name {
         if run.len() != 16 || !run.bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)) {
             return None;
         }
+        // The host's own owner name (A2 r3.14): the literal `host`, with exactly one class.
+        if owner == "host" {
+            if class != "hoststore" {
+                return None;
+            }
+            if attempt.is_empty() || attempt.len() > 6 || attempt.starts_with('0') || !attempt.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            return Some(Name { run: run.to_string(), owner: owner.to_string(), id: String::new(), class: Class::HostStore, attempt: attempt.parse().ok()? });
+        }
         let (agent, id) = match owner.split_at_checked(2)? {
             ("a-", id) if is_id(id) => (true, id),
             ("t-", id) if is_id(id) => (false, id),
@@ -83,6 +118,8 @@ impl Name {
             ("sessions", true) => Class::Sessions,
             ("archive", true) => Class::Archive,
             ("tag", false) => Class::Tag,
+            ("config", true) => Class::Config,
+            ("archive-config", true) => Class::ArchiveConfig,
             _ => return None,
         };
         if attempt.is_empty() || attempt.len() > 6 || attempt.starts_with('0') || !attempt.bytes().all(|b| b.is_ascii_digit()) {
@@ -96,6 +133,9 @@ impl Name {
             Class::Sessions => "sessions",
             Class::Archive => "archive",
             Class::Tag => "tag",
+            Class::Config => "config",
+            Class::ArchiveConfig => "archive-config",
+            Class::HostStore => "hoststore",
         }
     }
     /// The name beneath the anchor, and the marker's exact content.
@@ -105,9 +145,14 @@ impl Name {
     pub fn parts(&self) -> [String; 4] {
         [self.run.clone(), self.owner.clone(), self.class_str().to_string(), self.attempt.to_string()]
     }
-    /// The project id range for the owner (agents 70000-79999, tags 80000-89999).
+    /// The project id range for the owner (agents 70000-79999, tags 80000-89999); the host store's is exactly
+    /// HOSTSTORE_PROJID (A2 r3.14 §1).
     pub fn projid_ok(&self, projid: u32) -> bool {
-        if self.class == Class::Tag { (80000..=89999).contains(&projid) } else { (70000..=79999).contains(&projid) }
+        match self.class {
+            Class::Tag => (80000..=89999).contains(&projid),
+            Class::HostStore => projid == HOSTSTORE_PROJID,
+            _ => (70000..=79999).contains(&projid),
+        }
     }
 }
 
@@ -142,8 +187,19 @@ pub fn request(snapshot: &str, path: &str) -> Result<Vec<u8>> {
     if !snapshot_ok(snapshot) || !rel_ok(path) {
         return Err(err(Fail::Usage, "bad arguments"));
     }
+    // r3.6: the leaf `digests.json` is reserved for the digest list beside the class.
+    if leaf(path) == DIGESTS {
+        return Err(err(Fail::Usage, "bad arguments"));
+    }
     let dest = format!("/data/{}", leaf(path));
-    let r = format!("{{\"op\":\"restore\",\"snapshot\":{},\"path\":{},\"dest\":{}}}", json::quote(snapshot), json::quote(path), json::quote(&dest));
+    let digests = format!("/data/{DIGESTS}");
+    let r = format!(
+        "{{\"op\":\"restore\",\"snapshot\":{},\"path\":{},\"dest\":{},\"digests\":{}}}",
+        json::quote(snapshot),
+        json::quote(path),
+        json::quote(&dest),
+        json::quote(&digests)
+    );
     if r.len() > MAX_REQUEST {
         return Err(err(Fail::Usage, "the request is too large"));
     }
@@ -153,7 +209,7 @@ pub fn request(snapshot: &str, path: &str) -> Result<Vec<u8>> {
 // ---- the operations A2 adds to A1's
 
 pub trait RestoreOps: Ops {
-    fn mkdir(&mut self, dir: &Self::H, name: &str, mode: u16) -> io::Result<()>;
+    fn mkdir(&mut self, dir: &Self::H, name: impl AsRef<[u8]>, mode: u16) -> io::Result<()>;
     fn set_project(&mut self, h: &Self::H, projid: u32) -> io::Result<()>;
     fn chown(&mut self, h: &Self::H, uid: u32, gid: u32) -> io::Result<()>;
     /// Every extended attribute's name.
@@ -252,8 +308,9 @@ fn is_space_error(e: &io::Error) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
-    /// The snapshot the binary restored (its full id) and how many specials it skipped.
-    Ok(String, u64),
+    /// The snapshot the binary restored (its full id), how many specials it skipped, and the SHA-256 (64 lowercase hex)
+    /// of the digest list it wrote (A2 r3.6).
+    Ok(String, u64, String),
     Failed(String),
 }
 
@@ -264,13 +321,14 @@ pub fn reply(out: &[u8]) -> Option<Reply> {
         return None;
     }
     let v = json::parse_with(body, MAX_OUT)?;
-    if let Some(f) = v.exact(&["ok", "snapshot", "skipped_special"]) {
+    if let Some(f) = v.exact(&["ok", "snapshot", "skipped_special", "digests_sha256"]) {
         if f[0] != &Value::Bool(true) {
             return None;
         }
         let snap = f[1].str().filter(|s| snapshot_ok(s))?;
+        let digests = f[3].str().filter(|s| crate::sha256::is_hex64(s))?;
         // A non-negative integer: the reader refuses signs, fractions and exponents.
-        return Some(Reply::Ok(snap.to_string(), f[2].int()?));
+        return Some(Reply::Ok(snap.to_string(), f[2].int()?, digests.to_string()));
     }
     let f = v.exact(&["ok", "error"])?;
     if f[0] != &Value::Bool(false) {
@@ -323,7 +381,7 @@ fn done(r: Result<()>) -> Done {
 
 /// A staging parent (`<run>`, `<owner>`, `<class>`): opened, or made 0700 when absent; root:root 0700 on the anchor's
 /// mount, else 73.
-fn staging_dir<O: RestoreOps>(o: &mut O, parent: &O::H, name: &str, mnt: u64, projid: u32) -> Result<O::H> {
+pub(crate) fn staging_dir<O: RestoreOps>(o: &mut O, parent: &O::H, name: &str, mnt: u64, projid: u32) -> Result<O::H> {
     if tchild(o, parent, name, mnt)?.is_none() {
         match o.mkdir(parent, name, 0o700) {
             Ok(()) => {
@@ -533,16 +591,58 @@ fn stage_inner<O: RestoreOps, R: Runner<O::H>>(o: &mut O, r: &mut R, a: &StageAr
             let (q, s, now) = (o.quota(&att, a.projid), o.space(&att), o.now());
             Err(limit_error(classify(q, s, now)))
         }
+        // A2 r3.8.3: the binary's own §4b bounds (entries, a path, the listing) are permanent: 64 `limit`, no marker,
+        // never the retried 75. Its JSON is relayed as for any other failure.
+        Some(Reply::Failed(code)) if code == "limit" => Ok(Done { out: stdout, result: Err(err(Fail::Usage, "limit")) }),
         Some(Reply::Failed(_)) => Ok(Done { out: stdout, result: Err(err(Fail::Partial, "the restore failed")) }),
-        Some(Reply::Ok(snap, _)) if snap != a.snapshot => Err(err(Fail::Partial, "the restored snapshot isn't the requested one")),
-        Some(Reply::Ok(..)) => {
+        Some(Reply::Ok(snap, ..)) if snap != a.snapshot => Err(err(Fail::Partial, "the restored snapshot isn't the requested one")),
+        Some(Reply::Ok(_, _, digests)) => {
             // 11. The marker, written by the launcher only, once the data is durable (O1, O2).
             o.syncfs(&att).map_err(|_| err(Fail::Partial, "the staged data can't be made durable"))?;
+            // 11.1a (r3.6): the digest list is the one the binary reported, before any marker.
+            digests_bound(o, &data, mnt, &digests)?;
             o.create_marker(&att, MARKER, n.path().as_bytes()).map_err(|_| err(Fail::Partial, "the marker can't be written"))?;
             o.fsync(&att).map_err(|_| err(Fail::Partial, "the marker can't be made durable"))?;
             Ok(Done { out: stdout, result: Ok(()) })
         }
     }
+}
+
+/// A2 r3.6 §3 step 11.1a: `data/digests.json` beneath `data` (no symlink, no other mount), a regular root-owned file
+/// with one link and at most MAX_LISTING bytes, read through its own handle and hashed; the hash must be the binary's
+/// reported `digests_sha256`. Anything else is 75 `bad_result`, and no marker is written.
+fn digests_bound<O: RestoreOps>(o: &mut O, data: &O::H, mnt: u64, want: &str) -> Result<()> {
+    let bad = || err(Fail::Partial, "bad_result");
+    let ok = |id: &Ident| kind_of(id) == Some(Kind::File) && id.nlink == 1 && id.uid == 0 && id.size <= MAX_LISTING && id.mnt_id == mnt;
+    let id = match o.at(data, DIGESTS, At::Path) {
+        Ok(h) => o.ident(&h).map_err(|_| bad())?,
+        Err(_) => return Err(bad()),
+    };
+    if !ok(&id) {
+        return Err(bad());
+    }
+    let h = o.at(data, DIGESTS, At::File).map_err(|_| bad())?;
+    let again = o.ident(&h).map_err(|_| bad())?;
+    if (again.dev, again.ino) != (id.dev, id.ino) || !ok(&again) {
+        return Err(bad());
+    }
+    let mut sum = crate::sha256::Sha256::new();
+    let mut off = 0u64;
+    loop {
+        let chunk = o.pread(&h, 1 << 20, off).map_err(|_| bad())?;
+        if chunk.is_empty() {
+            break;
+        }
+        off += chunk.len() as u64;
+        if off > MAX_LISTING {
+            return Err(bad());
+        }
+        sum.update(&chunk);
+    }
+    if off != again.size || crate::sha256::hex(&sum.finish()) != want {
+        return Err(bad());
+    }
+    Ok(())
 }
 
 // ---- fill-home (A2 §4)
@@ -554,15 +654,28 @@ pub struct FillArgs<'a> {
     pub expect: &'a str,
 }
 
-fn dest_anchor(c: Class) -> &'static str {
+pub(crate) fn dest_anchor(c: Class) -> &'static str {
     match c {
         Class::Home | Class::Sessions => "/srv/sagebrush/agents",
         Class::Archive => "/srv/sagebrush/archive",
         Class::Tag => "/srv/sagebrush/tags",
+        Class::ArchiveConfig => "/srv/sagebrush/archive-config",
+        // (never a destination: fill-home and tree-digest refuse `config` before they look for one)
+        Class::Config => "/srv/sagebrush/agent-config",
+        // (never a destination either: the host store is staged only, A2 r3.14)
+        Class::HostStore => RESTORE,
     }
 }
 
+/// The expect's owners for the class (A2 r3.13 §2): a root-owned class's are exactly root ([0] and gid 0); every
+/// other class's never include root (uid 0 or gid 0), so no other class ever places a root-owned entry.
+pub(crate) fn owners_ok(c: Class, uids: &[u32], gid: u32) -> bool {
+    if c.root_owned() { uids == [0] && gid == 0 } else { !uids.contains(&0) && gid != 0 }
+}
+
 struct Fill {
+    /// A root-owned class (A2 r3.13): only 0700 directories and 0600 files are placed, no symlink.
+    root_owned: bool,
     uids: Vec<u32>,
     gid: u32,
     projid: u32,
@@ -573,8 +686,9 @@ struct Fill {
     dirs: u64,
     files: u64,
     symlinks: u64,
-    refused: Vec<(String, u32, u32, u64)>,
-    unexpected: Vec<(String, &'static str)>,
+    /// Raw relative paths (A2 r3.9): encoded with §4b's codec only in the report.
+    refused: Vec<(Vec<u8>, u32, u32, u64)>,
+    unexpected: Vec<(Vec<u8>, &'static str)>,
     truncated: bool,
 }
 
@@ -583,10 +697,10 @@ impl Fill {
     fn fail(&self, msg: &'static str) -> Error {
         if self.effects == 0 { identity(msg) } else { err(Fail::Partial, msg) }
     }
-    fn refuse(&mut self, path: String, uid: u32, gid: u32, entries: u64) {
+    fn refuse(&mut self, path: Vec<u8>, uid: u32, gid: u32, entries: u64) {
         if self.refused.len() < MAX_LIST { self.refused.push((path, uid, gid, entries)) } else { self.truncated = true }
     }
-    fn odd(&mut self, path: String, t: &'static str) {
+    fn odd(&mut self, path: Vec<u8>, t: &'static str) {
         if self.unexpected.len() < MAX_LIST { self.unexpected.push((path, t)) } else { self.truncated = true }
     }
 }
@@ -613,7 +727,7 @@ fn special_name(mode: u16) -> &'static str {
 
 /// An entry of a staging directory, identified without opening it for reading: (identity, its kind or None for a
 /// special). A symlink is identified by name.
-fn entry<O: RestoreOps>(o: &mut O, w: &Fill, dir: &O::H, name: &str) -> Result<(Ident, Option<Kind>)> {
+fn entry<O: RestoreOps>(o: &mut O, w: &Fill, dir: &O::H, name: &[u8]) -> Result<(Ident, Option<Kind>)> {
     let id = match o.at(dir, name, At::Path) {
         Ok(h) => o.ident(&h).map_err(|_| w.fail("an entry can't be identified"))?,
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
@@ -632,8 +746,10 @@ fn entry<O: RestoreOps>(o: &mut O, w: &Fill, dir: &O::H, name: &str) -> Result<(
     Ok((id, kind_of(&id)))
 }
 
-/// The dry pass (before any effect): bounds (2,000,000 objects, depth 256) and types only. Returns the count.
-fn scan<O: RestoreOps>(o: &mut O, w: &Fill, dir: &O::H, depth: usize, count: &mut usize) -> Result<()> {
+/// The dry pass (before any effect): bounds (2,000,000 objects, depth 256, and a relative path of at most 4096 raw
+/// bytes, A2 r3.9) and types only. `plen` is `dir`'s own relative path length in raw bytes (0 at the class root).
+/// Adds the entries it sees to `count`.
+fn scan<O: RestoreOps>(o: &mut O, w: &Fill, dir: &O::H, plen: usize, depth: usize, count: &mut usize) -> Result<()> {
     if depth > tree::MAX_DEPTH {
         return Err(w.fail("the staged class is too deep"));
     }
@@ -647,16 +763,27 @@ fn scan<O: RestoreOps>(o: &mut O, w: &Fill, dir: &O::H, depth: usize, count: &mu
             if *count > w.limit {
                 return Err(w.fail("the staged class is too large"));
             }
+            let len = if plen == 0 { name.len() } else { plen + 1 + name.len() };
+            if len > crate::digest::MAX_PATH {
+                return Err(w.fail("a staged path is too long"));
+            }
             if let (_, Some(Kind::Dir)) = entry(o, w, dir, &name)? {
                 let h = o.at(dir, &name, At::Dir).map_err(|_| w.fail("a staging directory can't be opened"))?;
-                scan(o, w, &h, depth + 1, count)?;
+                scan(o, w, &h, len, depth + 1, count)?;
             }
         }
     }
 }
 
-fn join(rel: &str, name: &str) -> String {
-    if rel.is_empty() { name.to_string() } else { format!("{rel}/{name}") }
+/// A relative path's raw bytes: `rel/name`, or `name` at the class root.
+fn join(rel: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(rel.len() + 1 + name.len());
+    if !rel.is_empty() {
+        p.extend_from_slice(rel);
+        p.push(b'/');
+    }
+    p.extend_from_slice(name);
+    p
 }
 
 /// The walk, top-down (A2 §4 step 5), for the staging directory `sname` beneath `sp` (identity `sid`) into `dst`.
@@ -664,7 +791,7 @@ fn join(rel: &str, name: &str) -> String {
 /// until a round finds nothing new (as A1's remove-tree pass 2): a listing may skip a name while names leave, never
 /// invent one. Only the names that stay in staging (refused, unexpected) are remembered between rounds.
 #[allow(clippy::too_many_arguments)]
-fn walk<O: RestoreOps>(o: &mut O, w: &mut Fill, sp: &O::H, sname: &str, sid: ((u32, u32), u64), dst: &O::H, rel: &str, depth: usize) -> Result<()> {
+fn walk<O: RestoreOps>(o: &mut O, w: &mut Fill, sp: &O::H, sname: &[u8], sid: ((u32, u32), u64), dst: &O::H, rel: &[u8], depth: usize) -> Result<()> {
     if depth > tree::MAX_DEPTH {
         return Err(w.fail("the staged class is too deep"));
     }
@@ -687,7 +814,7 @@ fn walk<O: RestoreOps>(o: &mut O, w: &mut Fill, sp: &O::H, sname: &str, sid: ((u
 }
 
 /// One round over a freshly opened staging directory: Ok(true) if it handled at least one new entry.
-fn walk_round<O: RestoreOps>(o: &mut O, w: &mut Fill, src: &O::H, dst: &O::H, rel: &str, depth: usize, kept: &mut std::collections::BTreeSet<String>) -> Result<bool> {
+fn walk_round<O: RestoreOps>(o: &mut O, w: &mut Fill, src: &O::H, dst: &O::H, rel: &[u8], depth: usize, kept: &mut std::collections::BTreeSet<Vec<u8>>) -> Result<bool> {
     let mut progress = false;
     loop {
         let names = o.batch(src).map_err(|_| w.fail("a staging directory can't be listed"))?;
@@ -706,12 +833,21 @@ fn walk_round<O: RestoreOps>(o: &mut O, w: &mut Fill, src: &O::H, dst: &O::H, re
                 kept.insert(name);
                 continue;
             };
-            if !(w.uids.contains(&id.uid) && id.gid == w.gid) {
-                // Not placed; a refused directory's whole subtree is neither walked nor placed, reported once.
-                let mut n = 0usize;
+            // A root-owned class: a directory exactly 0700, a file exactly 0600, no symlink; anything else is refused
+            // like another owner (A2 r3.13 §2: a root-owned writable entry from the snapshot never lands in a root tree).
+            let exact = !w.root_owned || match kind {
+                Kind::Dir => id.mode & 0o7777 == 0o700,
+                Kind::File => id.mode & 0o7777 == 0o600,
+                Kind::Symlink => false,
+            };
+            if !(w.uids.contains(&id.uid) && id.gid == w.gid) || !exact {
+                // Not placed; a refused directory's whole subtree is neither walked nor placed, reported once. Its
+                // `entries` counts the refused object itself plus, for a directory, everything beneath it (A2 r3.9):
+                // exactly the listing entries validation removes for it.
+                let mut n = 1usize;
                 if kind == Kind::Dir {
                     let h = o.at(src, &name, At::Dir).map_err(|_| w.fail("a staging directory can't be opened"))?;
-                    scan(o, w, &h, depth + 1, &mut n)?;
+                    scan(o, w, &h, p.len(), depth + 1, &mut n)?;
                 }
                 w.refuse(p, id.uid, id.gid, n as u64);
                 kept.insert(name);
@@ -775,12 +911,14 @@ fn walk_round<O: RestoreOps>(o: &mut O, w: &mut Fill, src: &O::H, dst: &O::H, re
 }
 
 fn fill_report(w: &Fill) -> String {
+    // Every path through §4b's codec, then its JSON form (A2 r3.9): one encoding for every path written.
+    let path = |p: &[u8]| json::quote(&crate::digest::encode(p));
     let refused: Vec<String> = w
         .refused
         .iter()
-        .map(|(p, u, g, n)| format!("{{\"path\":{},\"uid\":{u},\"gid\":{g},\"entries\":{n}}}", json::quote(p)))
+        .map(|(p, u, g, n)| format!("{{\"path\":{},\"uid\":{u},\"gid\":{g},\"entries\":{n}}}", path(p)))
         .collect();
-    let unexpected: Vec<String> = w.unexpected.iter().map(|(p, t)| format!("{{\"path\":{},\"type\":\"{t}\"}}", json::quote(p))).collect();
+    let unexpected: Vec<String> = w.unexpected.iter().map(|(p, t)| format!("{{\"path\":{},\"type\":\"{t}\"}}", path(p))).collect();
     format!(
         "{{\"placed\":{{\"dirs\":{},\"files\":{},\"symlinks\":{}}},\"refused\":[{}],\"unexpected\":[{}],\"truncated\":{}}}\n",
         w.dirs,
@@ -798,7 +936,9 @@ pub fn fill_home<O: RestoreOps>(o: &mut O, a: &FillArgs) -> Result<String> {
 
 fn fill_limited<O: RestoreOps>(o: &mut O, a: &FillArgs, limit: usize) -> Result<String> {
     let n = &a.name;
-    if !a.source.starts_with("data/") || !rel_ok(a.source) {
+    // `config` and `hoststore` are staged only (A2 r3.13 §4, r3.14 §1): never filled, refused before anything, the
+    // marker untouched.
+    if n.class.stage_only() || !a.source.starts_with("data/") || !rel_ok(a.source) {
         return Err(err(Fail::Usage, "bad arguments"));
     }
     let root = o.root().map_err(|_| pre("the root can't be opened"))?;
@@ -808,7 +948,7 @@ fn fill_limited<O: RestoreOps>(o: &mut O, a: &FillArgs, limit: usize) -> Result<
     let (e_epoch, e_fsid, e_dest) = (tree::epoch_of(f[0])?, tree::fsid_of(f[1])?, obj_of(f[2])?);
     let uids = f[3].arr().filter(|u| !u.is_empty() && u.len() <= MAX_UIDS).ok_or(tree::bad_expect())?.iter().map(tree::u32_of).collect::<Result<Vec<u32>>>()?;
     let (gid, projid) = (tree::u32_of(f[4])?, tree::u32_of(f[5])?);
-    if (n.class != Class::Tag && uids.len() != 1) || !n.projid_ok(projid) {
+    if (n.class != Class::Tag && uids.len() != 1) || !n.projid_ok(projid) || !owners_ok(n.class, &uids, gid) {
         return Err(tree::bad_expect());
     }
     let _ = tree::parse_mount(a.mount)?;
@@ -858,11 +998,11 @@ fn fill_limited<O: RestoreOps>(o: &mut O, a: &FillArgs, limit: usize) -> Result<
     let leaf: &str = match n.class {
         Class::Home => "home",
         Class::Sessions => "sessions",
-        Class::Archive | Class::Tag => &n.id,
+        Class::Archive | Class::Tag | Class::ArchiveConfig | Class::Config | Class::HostStore => &n.id,
     };
     let dest_parent = match n.class {
         Class::Home | Class::Sessions => tchild(o, &da, &n.id, mnt)?.and_then(|(_, h)| h).ok_or(identity("no agent directory"))?,
-        Class::Archive | Class::Tag => da,
+        Class::Archive | Class::Tag | Class::ArchiveConfig | Class::Config | Class::HostStore => da,
     };
     let (dx, probe) = tchild(o, &dest_parent, leaf, mnt)?.ok_or(identity("no destination"))?;
     if dx != e_dest {
@@ -883,7 +1023,7 @@ fn fill_limited<O: RestoreOps>(o: &mut O, a: &FillArgs, limit: usize) -> Result<
     }
 
     // The source: data/... beneath the attempt, every component a directory on the mount.
-    let mut w = Fill { uids, gid, projid, mnt, limit, effects: 0, dirs: 0, files: 0, symlinks: 0, refused: vec![], unexpected: vec![], truncated: false };
+    let mut w = Fill { root_owned: n.class.root_owned(), uids, gid, projid, mnt, limit, effects: 0, dirs: 0, files: 0, symlinks: 0, refused: vec![], unexpected: vec![], truncated: false };
     let mut src = None;
     for part in a.source.split('/') {
         let parent = src.as_ref().unwrap_or(&att);
@@ -893,7 +1033,7 @@ fn fill_limited<O: RestoreOps>(o: &mut O, a: &FillArgs, limit: usize) -> Result<
     let src = src.ok_or(identity("no such source"))?;
     // 5. The dry pass, then the walk on fresh handles.
     let mut count = 0usize;
-    scan(o, &w, &src, 1, &mut count)?;
+    scan(o, &w, &src, 0, 1, &mut count)?;
     let si = o.ident(&src).map_err(open_err)?;
     drop(src);
     let (parent_rel, leaf) = a.source.rsplit_once('/').ok_or(identity("no such source"))?;
@@ -903,7 +1043,7 @@ fn fill_limited<O: RestoreOps>(o: &mut O, a: &FillArgs, limit: usize) -> Result<
         sp = Some(tchild(o, parent, part, mnt)?.and_then(|(_, h)| h).ok_or(identity("no such source"))?);
     }
     let sp = sp.ok_or(identity("no such source"))?;
-    walk(o, &mut w, &sp, leaf, (si.dev, si.ino), &dst, "", 1)?;
+    walk(o, &mut w, &sp, leaf.as_bytes(), (si.dev, si.ino), &dst, b"", 1)?;
     // The durability barrier: every written directory was synced bottom-up in the walk; then the destination and its
     // parent. Exit 0 only after the whole barrier.
     o.fsync(&dst).map_err(|_| err(Fail::Partial, "the destination can't be synced"))?;
@@ -934,8 +1074,8 @@ fn cs(s: &str) -> io::Result<CString> {
 }
 
 impl RestoreOps for tree::RealOps {
-    fn mkdir(&mut self, dir: &OwnedFd, name: &str, mode: u16) -> io::Result<()> {
-        sys::mkdirat(dir, &cs(name)?, mode as libc::mode_t)
+    fn mkdir(&mut self, dir: &OwnedFd, name: impl AsRef<[u8]>, mode: u16) -> io::Result<()> {
+        sys::mkdirat(dir, &tree::cb(name.as_ref())?, mode as libc::mode_t)
     }
     fn set_project(&mut self, h: &OwnedFd, projid: u32) -> io::Result<()> {
         sys::set_project(h, projid, true)
@@ -1043,9 +1183,9 @@ mod tests {
     const BIN: &str = "opt/sagebrush/1/bin/sagebrush-agent-backup";
 
     impl RestoreOps for Fake {
-        fn mkdir(&mut self, dir: &FH, name: &str, mode: u16) -> io::Result<()> {
+        fn mkdir(&mut self, dir: &FH, name: impl AsRef<[u8]>, mode: u16) -> io::Result<()> {
             self.tick("mkdir")?;
-            let p = join(&dir.p, name);
+            let p = join(&dir.p, &crate::tree::tests::key(name.as_ref()));
             if self.nodes.contains_key(&p) {
                 return Err(e(libc::EEXIST));
             }
@@ -1128,6 +1268,8 @@ mod tests {
             Ok(self.exe.clone())
         }
         fn pread(&mut self, h: &FH, len: usize, off: u64) -> io::Result<Vec<u8>> {
+            self.tick("pread")?;
+            self.log.push(format!("pread {}", h.p));
             let b = self.files.get(&h.p).cloned().unwrap_or_default();
             let s = (off as usize).min(b.len());
             Ok(b[s..(s + len).min(b.len())].to_vec())
@@ -1168,7 +1310,30 @@ mod tests {
         f.file(BIN, 0, 0o755);
         f.files.insert(BIN.into(), elf(false));
         f.exe = "/opt/sagebrush/1/bin/sagebrush-agent-launch".into();
+        // The fake binary's digest list (A2 r3.6): planted in the attempt's data just before the launcher's syncfs.
+        f.hook = Some(("syncfs", 1, plant_digests));
         f
+    }
+
+    const DIG: &[u8] = b"{\"v\":1}\n{\"count\":0,\"total_bytes\":0}\n";
+    fn dig_hex(b: &[u8]) -> String {
+        let mut s = crate::sha256::Sha256::new();
+        s.update(b);
+        crate::sha256::hex(&s.finish())
+    }
+    /// The attempt's data directory: the last `mkdir .../data` the fake logged.
+    fn data_dir(f: &Fake) -> String {
+        f.log.iter().rev().find_map(|l| l.strip_prefix("mkdir ").filter(|p| p.ends_with("/data")).map(str::to_string)).expect("a data dir was made")
+    }
+    fn put_digests(f: &mut Fake, body: &[u8]) {
+        let p = format!("{}/{DIGESTS}", data_dir(f));
+        f.nodes.remove(&p);
+        f.add(&p, S_IFREG | 0o600, 0, 0);
+        f.node(&p).id.size = body.len() as u64;
+        f.files.insert(p, body.to_vec());
+    }
+    fn plant_digests(f: &mut Fake) {
+        put_digests(f, DIG);
     }
 
     fn owner() -> String {
@@ -1196,7 +1361,10 @@ mod tests {
         }
     }
     fn ok_reply() -> Vec<u8> {
-        format!("{{\"snapshot\":\"{SNAP}\",\"skipped_special\":0,\"ok\":true}}\n").into_bytes()
+        ok_reply_with(&dig_hex(DIG))
+    }
+    fn ok_reply_with(digests: &str) -> Vec<u8> {
+        format!("{{\"snapshot\":\"{SNAP}\",\"skipped_special\":0,\"ok\":true,\"digests_sha256\":\"{digests}\"}}\n").into_bytes()
     }
     fn failed(code: &str) -> Vec<u8> {
         format!("{{\"ok\":false,\"error\":{{\"code\":\"{code}\",\"message\":\"x\"}}}}\n").into_bytes()
@@ -1231,13 +1399,16 @@ mod tests {
         // A plain 1025-byte path that fits is accepted (the bound is the encoding, not the raw length).
         assert!(request(SNAP, &"b".repeat(1025)).is_ok());
         let r = String::from_utf8(request(SNAP, "srv/x").unwrap()).unwrap();
-        assert_eq!(r, format!("{{\"op\":\"restore\",\"snapshot\":\"{SNAP}\",\"path\":\"srv/x\",\"dest\":\"/data/x\"}}"));
+        assert_eq!(r, format!("{{\"op\":\"restore\",\"snapshot\":\"{SNAP}\",\"path\":\"srv/x\",\"dest\":\"/data/x\",\"digests\":\"/data/digests.json\"}}"));
+        // r3.6: the leaf `digests.json` is reserved beside the class.
+        assert_eq!(code(request(SNAP, "srv/sagebrush/agents/x/digests.json")), 64);
+        assert!(request(SNAP, "srv/sagebrush/agents/x/digests.json.d").is_ok());
         // R1: dest is exactly /data/<leaf> for each class's path, and the bound counts it: a path whose request is 4097
         // bytes only because of the leaf repeated in dest is usage.
         for (path, want) in [("srv/sagebrush/agents/x/home", "home"), ("srv/sagebrush/agents/x/sessions", "sessions"), ("srv/sagebrush/archive/x", "x"), ("srv/sagebrush/tags/t", "t"), ("solo", "solo")] {
             assert_eq!(leaf(path), want);
             let r = String::from_utf8(request(SNAP, path).unwrap()).unwrap();
-            assert!(r.ends_with(&format!(",\"dest\":\"/data/{want}\"}}")), "{r}");
+            assert!(r.ends_with(&format!(",\"dest\":\"/data/{want}\",\"digests\":\"/data/digests.json\"}}")), "{r}");
         }
         let p = |k: usize| format!("a/{}", "b".repeat(k));
         let k = (1..MAX_REQUEST).take_while(|k| request(SNAP, &p(*k)).is_ok()).last().unwrap();
@@ -1267,7 +1438,9 @@ mod tests {
             (RUN, A, "home", "1"),
             (RUN, a.as_str(), "tag", "1"),
             (RUN, t.as_str(), "home", "1"),
-            (RUN, a.as_str(), "config", "1"),
+            (RUN, t.as_str(), "config", "1"),
+            (RUN, t.as_str(), "archive-config", "1"),
+            (RUN, a.as_str(), "configs", "1"),
             (RUN, a.as_str(), "home", "0"),
             (RUN, a.as_str(), "home", "01"),
             (RUN, a.as_str(), "home", "1000000"),
@@ -1349,7 +1522,13 @@ mod tests {
 
     #[test]
     fn exactly_one_closed_json_object_on_one_line() {
-        assert_eq!(reply(&ok_reply()), Some(Reply::Ok(SNAP.into(), 0)));
+        assert_eq!(reply(&ok_reply()), Some(Reply::Ok(SNAP.into(), 0, dig_hex(DIG))));
+        // r3.6: digests_sha256 is required, exact (64 lowercase hex), and no other key is allowed.
+        let without = format!("{{\"snapshot\":\"{SNAP}\",\"skipped_special\":0,\"ok\":true}}\n");
+        let extra = format!("{{\"snapshot\":\"{SNAP}\",\"skipped_special\":0,\"ok\":true,\"digests_sha256\":\"{}\",\"x\":1}}\n", dig_hex(DIG));
+        for bad in [without, extra, String::from_utf8(ok_reply_with(&"A".repeat(64))).unwrap(), String::from_utf8(ok_reply_with(&"a".repeat(63))).unwrap(), String::from_utf8(ok_reply_with(&"g".repeat(64))).unwrap()] {
+            assert_eq!(reply(bad.as_bytes()), None, "{bad}");
+        }
         assert_eq!(reply(&failed("quota_exceeded")), Some(Reply::Failed("quota_exceeded".into())));
         let long = format!("{{\"ok\":false,\"error\":{{\"code\":\"no_space\",\"message\":\"{}\"}}}}\n", "m".repeat(10_000));
         assert_eq!(reply(long.as_bytes()), Some(Reply::Failed("no_space".into())), "a long message still classifies");
@@ -1427,6 +1606,9 @@ mod tests {
 
     // ---- restore-stage
 
+    // (This row is also the empty source's (restore empty-source d1): the child writes nothing into data/<leaf> and
+    // answers the empty digest list, DIG; the leaf stays the launcher's root 0700 directory, the list is bound, and the
+    // marker follows syncfs, exactly as for any class.)
     #[test]
     fn restore_stage_makes_the_attempt_runs_the_child_and_writes_the_marker_only_after_syncfs() {
         let mut f = host();
@@ -1658,6 +1840,114 @@ mod tests {
         }
     }
 
+    // ---- the digest list's binding (A2 r3.6 §3 step 11.1a)
+
+    fn plant_none(_f: &mut Fake) {}
+    fn plant_symlink(f: &mut Fake) {
+        let p = format!("{}/{DIGESTS}", data_dir(f));
+        f.add(&p, S_IFLNK | 0o777, 0, 0);
+    }
+    fn plant_dir(f: &mut Fake) {
+        let p = format!("{}/{DIGESTS}", data_dir(f));
+        f.dir(&p, 0, 0o700);
+    }
+    fn plant_two_links(f: &mut Fake) {
+        plant_digests(f);
+        let p = format!("{}/{DIGESTS}", data_dir(f));
+        f.node(&p).id.nlink = 2;
+    }
+    fn plant_foreign(f: &mut Fake) {
+        plant_digests(f);
+        let p = format!("{}/{DIGESTS}", data_dir(f));
+        f.node(&p).id.uid = UID;
+    }
+    fn plant_huge(f: &mut Fake) {
+        plant_digests(f);
+        let p = format!("{}/{DIGESTS}", data_dir(f));
+        f.node(&p).id.size = MAX_LISTING + 1;
+    }
+    fn plant_other(f: &mut Fake) {
+        put_digests(f, b"{\"v\":1}\n{\"count\":1,\"total_bytes\":0}\n");
+    }
+    fn plant_short(f: &mut Fake) {
+        plant_digests(f);
+        let p = format!("{}/{DIGESTS}", data_dir(f));
+        f.node(&p).id.size = DIG.len() as u64 + 1; // the bytes read don't reach the size statx reported
+    }
+
+    #[test]
+    fn the_digest_list_must_be_the_reported_one_before_any_marker() {
+        // The match: the marker is written, after the syncfs, and the printed line carries the hash.
+        let mut f = host();
+        let d = restore_stage(&mut f, &mut exited(ok_reply()), &stage_args("home"));
+        assert_eq!(rcode(&d), 0, "{:?}", d.result);
+        assert!(String::from_utf8(d.out.clone()).unwrap().contains(&dig_hex(DIG)));
+        let att = attempt_path("home");
+        assert!(f.nodes.contains_key(&format!("{att}/.complete")));
+        // Each other list (or none): 75 bad_result, and NO marker.
+        let rows: [(&str, Hook); 8] = [
+            ("missing", plant_none),
+            ("a symlink", plant_symlink),
+            ("a directory", plant_dir),
+            ("two links", plant_two_links),
+            ("not root's", plant_foreign),
+            ("over 512 MiB", plant_huge),
+            ("another list (a hash mismatch)", plant_other),
+            ("shorter than its size", plant_short),
+        ];
+        for (what, plant) in rows {
+            let mut f = host();
+            f.hook = Some(("syncfs", 1, plant));
+            let d = restore_stage(&mut f, &mut exited(ok_reply()), &stage_args("home"));
+            assert_eq!(rcode(&d), 75, "{what}");
+            assert!(!f.nodes.contains_key(&format!("{}/.complete", attempt_path("home"))), "{what}: no marker");
+            assert!(!f.log.iter().any(|l| l.starts_with("marker ")), "{what}");
+            // Refused before a single byte is read: the cap, the kind, the links and the owner are checked first.
+            if !what.starts_with("another list") && !what.starts_with("shorter") {
+                assert!(!f.log.iter().any(|l| l.starts_with("pread ") && l.ends_with(DIGESTS)), "{what}: nothing read");
+            }
+        }
+        // A reply naming another hash than the list's: 75, no marker.
+        let mut f = host();
+        let d = restore_stage(&mut f, &mut exited(ok_reply_with(&"0".repeat(64))), &stage_args("home"));
+        assert_eq!(rcode(&d), 75);
+        assert!(!f.log.iter().any(|l| l.starts_with("marker ")));
+        // A reply without the hash is bad_result before the syncfs.
+        let mut f = host();
+        let without = format!("{{\"snapshot\":\"{SNAP}\",\"skipped_special\":0,\"ok\":true}}\n").into_bytes();
+        assert_eq!(rcode(&restore_stage(&mut f, &mut exited(without), &stage_args("home"))), 75);
+        assert_eq!(f.count("syncfs"), 0);
+    }
+
+    #[test]
+    fn fill_home_never_moves_the_digest_list() {
+        let (mut f, _) = staged("home");
+        let p = format!("{}/data/{DIGESTS}", attempt_path("home"));
+        let before = (f.nodes[&p].id.ino, f.files[&p].clone());
+        let x = fill_expect(&mut f, "home");
+        fill_home(&mut f, &fill_args("home", x)).unwrap();
+        assert_eq!((f.nodes[&p].id.ino, f.files[&p].clone()), before, "the list stays, the same inode and bytes");
+    }
+
+    #[test]
+    fn the_binary_s_limit_is_a_permanent_64_and_other_failures_keep_their_codes() {
+        // A2 r3.8.3: `limit` is 64 with no syncfs and no marker; the binary's line is relayed.
+        let mut f = host();
+        let d = restore_stage(&mut f, &mut exited(failed("limit")), &stage_args("home"));
+        assert_eq!(rcode(&d), 64);
+        assert_eq!(d.result.unwrap_err().msg, "limit");
+        assert_eq!(d.out, failed("limit"), "the binary's JSON is relayed");
+        assert_eq!(f.count("syncfs"), 0);
+        assert!(!f.log.iter().any(|l| l.starts_with("marker ")));
+        // Another unknown code stays 75; no_space stays §3.1's (77 with the filesystem full and the project under).
+        let mut f = host();
+        assert_eq!(rcode(&restore_stage(&mut f, &mut exited(failed("other")), &stage_args("home"))), 75);
+        let mut f = host();
+        f.quota = Some(q(2 << 20, GIB_BLOCKS, 5, 100));
+        f.space = (0, 9);
+        assert_eq!(rcode(&restore_stage(&mut f, &mut exited(failed("no_space")), &stage_args("home"))), 77);
+    }
+
     #[test]
     fn a_syncfs_or_marker_failure_is_75_and_leaves_no_marker() {
         let mut f = host();
@@ -1726,7 +2016,11 @@ mod tests {
         // R3 (A2 r3.5): the class's contents land in data/<leaf>, the launcher's own root 0700 directory; nothing else
         // (no sibling class) is staged.
         let src = format!("{att}/data/{}", leaf(stage_args(class).path));
-        assert_eq!(f.nodes.keys().filter(|k| k.starts_with(&format!("{att}/data/"))).collect::<Vec<_>>(), vec![&src]);
+        // r3.6: beside it, only the binary's digest list.
+        let digests = format!("{att}/data/{DIGESTS}");
+        let mut want = vec![&digests, &src];
+        want.sort();
+        assert_eq!(f.nodes.keys().filter(|k| k.starts_with(&format!("{att}/data/"))).collect::<Vec<_>>(), want);
         let put = |f: &mut Fake, rel: &str, mode: u16, uid: u32| {
             let path = format!("{src}/{rel}");
             f.add(&path, mode, uid, uid);
@@ -1767,7 +2061,7 @@ mod tests {
         let out = fill_home(&mut f, &fill_args("home", x)).unwrap();
         assert_eq!(
             out,
-            "{\"placed\":{\"dirs\":1,\"files\":2,\"symlinks\":1},\"refused\":[{\"path\":\"other\",\"uid\":70002,\"gid\":70002,\"entries\":2},{\"path\":\"root.txt\",\"uid\":0,\"gid\":0,\"entries\":0}],\"unexpected\":[{\"path\":\"fifo\",\"type\":\"fifo\"}],\"truncated\":false}\n"
+            "{\"placed\":{\"dirs\":1,\"files\":2,\"symlinks\":1},\"refused\":[{\"path\":\"other\",\"uid\":70002,\"gid\":70002,\"entries\":3},{\"path\":\"root.txt\",\"uid\":0,\"gid\":0,\"entries\":1}],\"unexpected\":[{\"path\":\"fifo\",\"type\":\"fifo\"}],\"truncated\":false}\n"
         );
         let dest = format!("srv/sagebrush/agents/{A}/home");
         let a = &f.nodes[&format!("{dest}/a.txt")];
@@ -1958,6 +2252,144 @@ mod tests {
         assert!(!f.nodes.contains_key(&format!("{dest}/stranger")));
     }
 
+    // ---- names that aren't UTF-8 (A2 r3.9, A1 r2.5)
+
+    /// `staged`'s class plus names that aren't UTF-8 (the fake keys names encoded: `%FF` is the byte 0xFF), all the
+    /// agent's: a file named 0xFF, a directory named 0xE2 0x82 (a truncated sequence) holding a file, and a symlink
+    /// named 0xC0 0x80 (an overlong encoding) whose target is `t`. The FIFO is dropped so remove-tree can follow.
+    fn staged_odd() -> (Fake, String) {
+        let (mut f, src) = staged("home");
+        f.nodes.remove(&format!("{src}/fifo"));
+        for (rel, mode) in [("%FF", S_IFREG | 0o600), ("%E2%82", S_IFDIR | 0o700), ("%E2%82/in", S_IFREG | 0o600), ("%C0%80", S_IFLNK | 0o777)] {
+            let p = format!("{src}/{rel}");
+            f.add(&p, mode, UID, UID);
+            f.node(&p).proj = UID;
+            f.node(&p).inherit = true;
+        }
+        f.files.insert(format!("{src}/%C0%80"), b"t".to_vec());
+        f.node(&format!("{src}/%C0%80")).id.size = 1;
+        (f, src)
+    }
+
+    #[test]
+    fn names_that_are_not_utf8_are_placed_listed_by_the_codec_and_their_attempt_removed() {
+        let (mut f, src) = staged_odd();
+        let x = fill_expect(&mut f, "home");
+        let out = fill_home(&mut f, &fill_args("home", x.clone())).unwrap();
+        assert!(out.starts_with("{\"placed\":{\"dirs\":2,\"files\":4,\"symlinks\":2}"), "{out}");
+        let dest = format!("srv/sagebrush/agents/{A}/home");
+        // Placed under their exact bytes: the fake finds a node only by the encoding of the bytes it is given.
+        for l in [format!("mkdir {dest}/%E2%82"), format!("rename {src}/%FF {dest}/%FF"), format!("rename {src}/%E2%82/in {dest}/%E2%82/in"), format!("rename {src}/%C0%80 {dest}/%C0%80")] {
+            assert!(f.log.contains(&l), "{l}: {:?}", f.log);
+        }
+        // tree-digest lists them through §4b's codec, exactly as the expected lines.
+        let o: &'static str = Box::leak(owner().into_boxed_str());
+        let listing = crate::digest::tree_digest(&mut f, &crate::digest::DigestArgs { mount: "/srv/sagebrush", owner: o, class: "home", expect: Box::leak(x.into_boxed_str()), copy_run: None }).unwrap();
+        let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        for line in [
+            "{\"path\":\"%C0%80\",\"type\":\"symlink\",\"size\":1,\"mode\":511,\"target\":\"t\"}".to_string(),
+            "{\"path\":\"%E2%82\",\"type\":\"dir\",\"size\":0,\"mode\":448}".to_string(),
+            format!("{{\"path\":\"%E2%82/in\",\"type\":\"file\",\"size\":0,\"mode\":384,\"sha256\":\"{empty}\"}}"),
+            format!("{{\"path\":\"%FF\",\"type\":\"file\",\"size\":0,\"mode\":384,\"sha256\":\"{empty}\"}}"),
+        ] {
+            assert!(listing.contains(&format!("\n{line}\n")), "{line}\n{listing}");
+        }
+        // Sorted by raw bytes: 0xC0 < 0xE2 < 0xFF, all after the ASCII names.
+        let at = |p: &str| listing.find(&format!("\"path\":\"{p}\"")).unwrap();
+        assert!(at("sub/b.txt") < at("%C0%80") && at("%C0%80") < at("%E2%82") && at("%E2%82/in") < at("%FF"));
+        // The consumed attempt, refused entries included, is removed.
+        let root = f.root().unwrap();
+        let class = f.dir_from_root(&root, &format!("srv/sagebrush/.restore/{RUN}/{}/home", owner())).unwrap();
+        let (ax, _) = crate::tree::child(&mut f, &class, "1", MNT).unwrap().unwrap();
+        // A1 r2.9 §5b: beneath .restore, owners exactly [0], whatever the refused entries' owners.
+        let owners: Vec<String> = vec!["0".to_string()];
+        let ex = expect_file(&mut f, "rm.json", format!("{{\"epoch\":{{\"boot_id\":\"{BOOT}\",\"mnt_id\":{MNT}}},\"fsid\":\"0000abcd00001234\",\"root\":{},\"owners\":[{}]}}", obj_json(&ax), owners.join(",")));
+        assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 0);
+        assert!(!f.nodes.contains_key(&attempt_path("home")));
+    }
+
+    #[test]
+    fn a_refused_entry_counts_itself_and_its_path_is_encoded() {
+        let (mut f, src) = staged("home");
+        // The raw name `x%` then 0xFF, foreign, holding two files; a raw-name neighbour `x%` 0xFF `y`, the agent's.
+        for (rel, mode, uid) in [("x%25%FF", S_IFDIR | 0o700, 70002), ("x%25%FF/p", S_IFREG | 0o600, 70002), ("x%25%FF/q", S_IFREG | 0o600, 70002), ("x%25%FFy", S_IFREG | 0o600, UID), ("empty", S_IFDIR | 0o700, 70002), ("sub/%FEz", S_IFREG | 0o600, 0), ("sub/fifo", 0o010000 | 0o600, UID)] {
+            let p = format!("{src}/{rel}");
+            f.add(&p, mode, uid, uid);
+            f.node(&p).proj = UID;
+            f.node(&p).inherit = true;
+        }
+        let x = fill_expect(&mut f, "home");
+        let out = fill_home(&mut f, &fill_args("home", x)).unwrap();
+        for want in [
+            "{\"path\":\"x%25%FF\",\"uid\":70002,\"gid\":70002,\"entries\":3}",
+            "{\"path\":\"empty\",\"uid\":70002,\"gid\":70002,\"entries\":1}",
+            "{\"path\":\"root.txt\",\"uid\":0,\"gid\":0,\"entries\":1}",
+            "{\"path\":\"other\",\"uid\":70002,\"gid\":70002,\"entries\":3}",
+            // Below the class root: the relative path, joined at '/' and encoded.
+            "{\"path\":\"sub/%FEz\",\"uid\":0,\"gid\":0,\"entries\":1}",
+            "{\"path\":\"sub/fifo\",\"type\":\"fifo\"}",
+        ] {
+            assert!(out.contains(want), "{want}\n{out}");
+        }
+        assert!(!out.contains("x%25%FFy"), "the neighbour is placed, not refused: {out}");
+        // The codec commutes with joining at '/' (A2 r3.9 §4b): the refused files' encoded paths are the reported path
+        // plus '/', and the neighbour's is not, though it shares the encoded prefix.
+        let e = crate::digest::encode;
+        assert_eq!(e(b"x%\xff/p"), format!("{}/{}", e(b"x%\xff"), e(b"p")));
+        assert!(e(b"x%\xff/q").starts_with("x%25%FF/") && !e(b"x%\xffy").starts_with("x%25%FF/") && e(b"x%\xffy").starts_with("x%25%FF"));
+        for (a, b) in [(&b"\xe2\x82"[..], &b"in"[..]), (b"\xc3", b"\xa9"), (b"a\xf0\x9f", b"\x98\x80z"), (b"%", b"%25")] {
+            let mut j = a.to_vec();
+            j.push(b'/');
+            j.extend_from_slice(b);
+            assert_eq!(e(&j), format!("{}/{}", e(a), e(b)), "{a:?} / {b:?}");
+        }
+    }
+
+    #[test]
+    fn a_staged_path_over_4096_raw_bytes_is_73_in_the_dry_pass_and_4096_is_placed() {
+        for (last, want) in [(254usize, 0), (255, 73)] {
+            let (mut f, src) = staged("home");
+            // 15 directories of 255 bytes and one of `last`, each beneath the previous, then a file `x`: the file's
+            // relative path is 15 * 255 + last + 16 separators and `x`: 4096 bytes with last = 254, 4097 with 255.
+            let mut p = src.clone();
+            let mut len = 0usize;
+            for i in 0..16 {
+                let n = if i == 15 { "d".repeat(last) } else { "d".repeat(255) };
+                p = format!("{p}/{n}");
+                len += n.len() + usize::from(i > 0);
+                f.add(&p, S_IFDIR | 0o700, UID, UID);
+                f.node(&p).proj = UID;
+                f.node(&p).inherit = true;
+            }
+            f.add(&format!("{p}/x"), S_IFREG | 0o600, UID, UID);
+            f.node(&format!("{p}/x")).proj = UID;
+            assert_eq!(len + 2, if last == 254 { 4096 } else { 4097 });
+            let x = fill_expect(&mut f, "home");
+            let r = fill_home(&mut f, &fill_args("home", x));
+            assert_eq!(code(r), want, "last {last}");
+            if want != 0 {
+                assert!(!f.log.iter().any(|l| l.starts_with(&format!("mkdir srv/sagebrush/agents/{A}")) || l.starts_with("rename ")), "zero effects");
+            }
+        }
+    }
+
+    #[test]
+    fn the_report_lists_exactly_1000_and_truncates_at_1001() {
+        for (n, truncated) in [(999usize, false), (1000, true)] {
+            // root.txt is already one refused entry: n more makes 1000 or 1001.
+            let (mut f, src) = staged("home");
+            f.nodes.remove(&format!("{src}/other"));
+            f.nodes.retain(|k, _| !k.starts_with(&format!("{src}/other/")));
+            for i in 0..n {
+                f.add(&format!("{src}/r{i:04}"), S_IFREG | 0o600, 0, 0);
+            }
+            let x = fill_expect(&mut f, "home");
+            let out = fill_home(&mut f, &fill_args("home", x)).unwrap();
+            assert_eq!(out.matches("\"entries\":").count(), 1000, "{n}");
+            assert!(out.ends_with(&format!("\"truncated\":{truncated}}}\n")), "{n}: {}", &out[out.len() - 40..]);
+        }
+    }
+
     // ---- remove-tree beneath .restore (A2 §1)
 
     #[test]
@@ -1970,8 +2402,8 @@ mod tests {
         let root = f.root().unwrap();
         let class = f.dir_from_root(&root, &format!("srv/sagebrush/.restore/{RUN}/{}/home", owner())).unwrap();
         let (x, _) = crate::tree::child(&mut f, &class, "1", MNT).unwrap().unwrap();
-        let owners: Vec<String> = std::iter::once(0).chain(70001..70065).map(|u: u32| u.to_string()).collect();
-        assert_eq!(owners.len(), 65);
+        // A1 r2.9 §5b: owners exactly [0]; the refused entries (another agent's) are removed with the rest.
+        let owners: Vec<String> = vec!["0".to_string()];
         let ex = expect_file(&mut f, "rm.json", format!("{{\"epoch\":{{\"boot_id\":\"{BOOT}\",\"mnt_id\":{MNT}}},\"fsid\":\"0000abcd00001234\",\"root\":{},\"owners\":[{}]}}", obj_json(&x), owners.join(",")));
         // remove-tree refuses a FIFO (A1 §5): drop it from this staging.
         f.nodes.remove(&format!("{att}/data/home/fifo"));
@@ -1992,5 +2424,309 @@ mod tests {
             assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 73, "{uid} {mode:o}");
             assert!(f.nodes.contains_key(&att), "nothing removed");
         }
+    }
+
+    // ---- A1 r2.9 §5b: removing a staging attempt, whatever its restored entries' owners and its state
+
+    /// A staged home attempt, its FIFO dropped, and the expect for removing it (owners [0], built after `spoil`).
+    fn attempt_with(spoil: fn(&mut Fake, &str)) -> (Fake, String, String) {
+        let (mut f, src) = staged("home");
+        f.nodes.remove(&format!("{src}/fifo"));
+        let att = attempt_path("home");
+        spoil(&mut f, &att);
+        let root = f.root().unwrap();
+        let class = f.dir_from_root(&root, &format!("srv/sagebrush/.restore/{RUN}/{}/home", owner())).unwrap();
+        let (x, _) = crate::tree::child(&mut f, &class, "1", MNT).unwrap().unwrap();
+        let ex = expect_file(&mut f, "rm.json", format!("{{\"epoch\":{{\"boot_id\":\"{BOOT}\",\"mnt_id\":{MNT}}},\"fsid\":\"0000abcd00001234\",\"root\":{},\"owners\":[0]}}", obj_json(&x)));
+        (f, att, ex)
+    }
+
+    fn leaf_of(f: &Fake, att: &str) -> String {
+        f.nodes.keys().find(|k| k.starts_with(&format!("{att}/data/")) && f.nodes[*k].id.mode & crate::tree::S_IFMT == S_IFDIR && k[att.len() + 6..].find('/').is_none()).cloned().unwrap()
+    }
+
+    #[test]
+    fn a_staging_attempt_is_removed_whatever_its_entries_owners() {
+        let (mut f, att, ex) = attempt_with(|f, att| {
+            let leaf = f.nodes.keys().find(|k| k.starts_with(&format!("{att}/data/")) && !k.ends_with("digests.json") && k[att.len() + 6..].find('/').is_none()).cloned().unwrap();
+            // Another agent's, an unknown uid's and root's entries, at several depths below the class leaf.
+            f.add(&format!("{leaf}/u"), S_IFDIR | 0o755, 99999, 99999);
+            f.add(&format!("{leaf}/u/deep"), S_IFDIR | 0o700, 12345, 12345);
+            f.add(&format!("{leaf}/u/deep/x"), S_IFREG | 0o600, 70002, 70002);
+            f.add(&format!("{leaf}/r"), S_IFREG | 0o600, 0, 0);
+            f.node(&leaf).id.uid = 77777; // the leaf's own metadata isn't checked
+        });
+        assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 0);
+        assert!(!f.nodes.contains_key(&att));
+    }
+
+    #[test]
+    fn every_state_a_stage_or_a_removal_leaves_is_removed() {
+        let states: Vec<(&str, fn(&mut Fake, &str))> = vec![
+            ("staged and marked", |_, _| {}),
+            ("the marker only (a removal killed after data)", |f, att| { f.nodes.retain(|k, _| !k.starts_with(&format!("{att}/data"))); }),
+            ("empty (killed before data's mkdir)", |f, att| { f.nodes.retain(|k, _| !k.starts_with(&format!("{att}/"))); }),
+            ("data only (killed before the leaf)", |f, att| { f.nodes.retain(|k, _| !k.starts_with(&format!("{att}/data/")) && !k.ends_with(".complete")); }),
+            ("a list mid-write", |f, att| { f.nodes.remove(&format!("{att}/data/digests.json")); f.nodes.remove(&format!("{att}/.complete")); f.add(&format!("{att}/data/.digests.json.tmp-4242"), S_IFREG | 0o600, 0, 0); }),
+            ("a partial leaf, no list", |f, att| { f.nodes.remove(&format!("{att}/data/digests.json")); f.nodes.remove(&format!("{att}/.complete")); }),
+        ];
+        for (what, spoil) in states {
+            let (mut f, att, ex) = attempt_with(spoil);
+            assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 0, "{what}");
+            assert!(!f.nodes.contains_key(&att), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_staging_removal_fails_at_each_seam_and_converges_on_retry() {
+        let (f0, _, _) = attempt_with(|_, _| {});
+        let n = f0.nodes.keys().filter(|k| k.starts_with(&attempt_path("home"))).count();
+        for at in 1..=n {
+            let (mut f, att, ex) = attempt_with(|_, _| {});
+            f.errno_at = Some(("unlink", at, libc::EIO));
+            let want = if at == 1 { 73 } else { 75 };
+            assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), want, "unlink {at}");
+            assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 0, "retry after unlink {at}");
+            assert!(!f.nodes.contains_key(&att));
+        }
+        let (mut f, att, ex) = attempt_with(|_, _| {});
+        f.fail = Some("fsync");
+        assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 75);
+        f.fail = None;
+        assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 0);
+        assert!(!f.nodes.contains_key(&att));
+    }
+
+    #[test]
+    fn a_staging_attempt_outside_the_closed_shape_is_refused_with_zero_unlinks() {
+        let rows: Vec<(&str, fn(&mut Fake, &str))> = vec![
+            ("the attempt 0750", |f, att| f.node(att).id.mode = S_IFDIR | 0o750),
+            ("data not root's", |f, att| f.node(&format!("{att}/data")).id.uid = UID),
+            ("data 0755", |f, att| f.node(&format!("{att}/data")).id.mode = S_IFDIR | 0o755),
+            ("two directories in data", |f, att| f.add(&format!("{att}/data/second"), S_IFDIR | 0o700, 0, 0)),
+            ("digests.json not root's", |f, att| f.node(&format!("{att}/data/digests.json")).id.uid = UID),
+            ("digests.json group-readable", |f, att| f.node(&format!("{att}/data/digests.json")).id.mode = S_IFREG | 0o640),
+            ("digests.json setuid", |f, att| f.node(&format!("{att}/data/digests.json")).id.mode = S_IFREG | 0o4600),
+            ("digests.json with two links", |f, att| f.node(&format!("{att}/data/digests.json")).id.nlink = 2),
+            ("a marker of 65 bytes", |f, att| f.node(&format!("{att}/.complete")).id.size = 65),
+            ("a marker not root's", |f, att| f.node(&format!("{att}/.complete")).id.uid = UID),
+            ("a temporary list with another name", |f, att| f.add(&format!("{att}/data/.digests.json.tmp-x1"), S_IFREG | 0o600, 0, 0)),
+            ("a temporary list with no number", |f, att| f.add(&format!("{att}/data/.digests.json.tmp-"), S_IFREG | 0o600, 0, 0)),
+            ("two temporary lists", |f, att| { f.add(&format!("{att}/data/.digests.json.tmp-1"), S_IFREG | 0o600, 0, 0); f.add(&format!("{att}/data/.digests.json.tmp-2"), S_IFREG | 0o600, 0, 0); }),
+            ("an extra name in the attempt", |f, att| f.add(&format!("{att}/junk"), S_IFREG | 0o600, 0, 0)),
+            ("a symlink in the attempt", |f, att| f.add(&format!("{att}/data2"), crate::tree::S_IFLNK | 0o777, 0, 0)),
+            ("an extra file in data", |f, att| f.add(&format!("{att}/data/notes"), S_IFREG | 0o600, 0, 0)),
+            ("a FIFO in data", |f, att| f.add(&format!("{att}/data/p"), 0o010000 | 0o600, 0, 0)),
+            ("a FIFO below the leaf", |f, att| { let l = leaf_of(f, att); f.add(&format!("{l}/p"), 0o010000 | 0o600, UID, UID); }),
+            ("a bind below the leaf", |f, att| { let l = leaf_of(f, att); f.add(&format!("{l}/m"), S_IFDIR | 0o700, UID, UID); f.node(&format!("{l}/m")).id.mnt_id = MNT + 1; }),
+        ];
+        for (what, spoil) in rows {
+            let (mut f, att, ex) = attempt_with(spoil);
+            assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex)), 73, "{what}");
+            assert_eq!(f.count("unlink"), 0, "{what}");
+            assert!(f.nodes.contains_key(&att), "{what}");
+        }
+        // owners other than [0]: 65, nothing opened below the anchor.
+        let (mut f, _, ex) = attempt_with(|_, _| {});
+        let other = String::from_utf8(f.files[&ex[1..]].clone()).unwrap().replace("\"owners\":[0]", &format!("\"owners\":[0,{UID}]"));
+        let ex2 = expect_file(&mut f, "rm2.json", other);
+        assert_eq!(code(tree::remove_tree(&mut f, RESTORE, &name("home").path(), &ex2)), 65);
+        assert_eq!(f.count("unlink"), 0);
+    }
+
+    // ---- A2 r3.14: the host's stage-only `hoststore` class, project 110000
+
+    #[test]
+    fn r314_hoststore_parses_for_the_host_owner_only_with_project_110000() {
+        let n = Name::parse(RUN, "host", "hoststore", "1").expect("host/hoststore");
+        assert_eq!((n.class, n.owner.as_str(), n.id.as_str()), (Class::HostStore, "host", ""));
+        assert_eq!(n.path(), format!("{RUN}/host/hoststore/1"));
+        assert_eq!(name_of(&n.path()), Some(n.clone()), "round-trips (remove-tree's --name)");
+        assert!(n.projid_ok(HOSTSTORE_PROJID) && HOSTSTORE_PROJID == 110000);
+        for p in [0, 70000, 79999, 80000, 89999, 109999, 110001] {
+            assert!(!n.projid_ok(p), "{p}: only 110000");
+        }
+        // `host` takes no other class; no other owner takes `hoststore`; a bad attempt still refuses.
+        for class in ["home", "sessions", "archive", "tag", "config", "archive-config", "hoststores"] {
+            assert!(Name::parse(RUN, "host", class, "1").is_none(), "host/{class}");
+        }
+        for o in [owner(), format!("t-{TAG}"), "hosts".to_string(), "host-".to_string(), "h-host".to_string()] {
+            assert!(Name::parse(RUN, &o, "hoststore", "1").is_none(), "{o}/hoststore");
+        }
+        for att in ["0", "01", "", "1234567", "x"] {
+            assert!(Name::parse(RUN, "host", "hoststore", att).is_none(), "attempt {att:?}");
+        }
+        assert!(Class::HostStore.root_owned() && Class::HostStore.stage_only() && Class::Config.stage_only());
+        for c in [Class::Home, Class::Sessions, Class::Archive, Class::Tag, Class::ArchiveConfig] {
+            assert!(!c.stage_only(), "{c:?}");
+        }
+        assert!(owners_ok(Class::HostStore, &[0], 0) && !owners_ok(Class::HostStore, &[UID], UID));
+    }
+
+    #[test]
+    fn r314_a_hoststore_stage_is_charged_to_project_110000_with_its_marker_last() {
+        let mut f = host();
+        let mut r = exited(ok_reply());
+        let a = StageArgs { mount: "/srv/sagebrush", name: Name::parse(RUN, "host", "hoststore", "1").unwrap(), projid: HOSTSTORE_PROJID, snapshot: SNAP, path: "var/lib/sagebrush/backup/hoststore-staging/run" };
+        let d = restore_stage(&mut f, &mut r, &a);
+        assert_eq!(rcode(&d), 0, "{:?}", d.result);
+        let att = format!("srv/sagebrush/.restore/{RUN}/host/hoststore/1");
+        // The shared parents are root:root 0700 and carry no project of their own (A2 r3.14 r2 §1): only the attempt is
+        // charged, so a hoststore and an agent's stage in one run never block each other.
+        for p in [format!("srv/sagebrush/.restore/{RUN}"), format!("srv/sagebrush/.restore/{RUN}/host"), format!("srv/sagebrush/.restore/{RUN}/host/hoststore"), att.clone()] {
+            let n = &f.nodes[&p];
+            assert_eq!((n.id.uid, n.id.gid, n.id.mode & 0o7777), (0, 0, 0o700), "{p}");
+        }
+        let (at, dd, lf) = (f.nodes[&att].clone(), f.nodes[&format!("{att}/data")].clone(), f.nodes[&format!("{att}/data/run")].clone());
+        assert_eq!((at.proj, at.inherit, dd.proj, dd.inherit, lf.proj, lf.inherit), (HOSTSTORE_PROJID, true, HOSTSTORE_PROJID, true, HOSTSTORE_PROJID, true), "charged to 110000");
+        assert_eq!(f.files[&format!("{att}/.complete")], format!("{RUN}/host/hoststore/1").into_bytes());
+        let pos = |s: &str| f.log.iter().position(|l| l == s).unwrap_or_else(|| panic!("{s}: {:?}", f.log));
+        assert!(pos(&format!("syncfs {att}")) < pos(&format!("marker {att}/.complete")), "durable data before the marker");
+    }
+
+    #[test]
+    fn r314_fill_home_of_hoststore_is_usage_before_anything() {
+        let (mut f, _src) = staged("home");
+        let x = fill_expect(&mut f, "home");
+        let before = f.log.len();
+        let out = fill_home(&mut f, &FillArgs { mount: "/srv/sagebrush", name: Name::parse(RUN, "host", "hoststore", "1").unwrap(), source: "data/run", expect: Box::leak(x.into_boxed_str()) });
+        assert_eq!(out.map(|_| 0).unwrap_or_else(|e| e.fail.code()), 64);
+        assert_eq!(f.log.len(), before, "no effect, no read");
+    }
+
+    // ---- A2 r3.13: the stage-only `config` class and the root-owned `archive-config` fill class
+
+    #[test]
+    fn r313_the_two_classes_parse_for_an_agent_owner_only() {
+        let a = owner();
+        let t = format!("t-{TAG}");
+        for class in ["config", "archive-config"] {
+            let n = Name::parse(RUN, &a, class, "1").expect(class);
+            assert_eq!(name_of(&n.path()), Some(n.clone()), "{class} round-trips");
+            assert!(n.projid_ok(70000) && !n.projid_ok(80000), "{class}: the agent's project range");
+            assert!(Name::parse(RUN, &t, class, "1").is_none(), "{class} isn't a tag's");
+        }
+        assert!(Class::Config.root_owned() && Class::ArchiveConfig.root_owned());
+        for c in [Class::Home, Class::Sessions, Class::Archive, Class::Tag] {
+            assert!(!c.root_owned());
+        }
+    }
+
+    #[test]
+    fn r313_owners_root_only_in_the_root_classes_and_never_root_in_any_other() {
+        for c in [Class::Config, Class::ArchiveConfig] {
+            assert!(owners_ok(c, &[0], 0));
+            for (uids, gid) in [(vec![UID], UID), (vec![0], UID), (vec![UID], 0), (vec![0, UID], 0)] {
+                assert!(!owners_ok(c, &uids, gid), "{c:?} {uids:?} {gid}");
+            }
+        }
+        // Every other class keeps its owners, and never root: a uid 0 or a gid 0 in its expect refuses.
+        for c in [Class::Home, Class::Sessions, Class::Archive, Class::Tag] {
+            assert!(owners_ok(c, &[UID], UID), "{c:?}");
+            for (uids, gid) in [(vec![0], 0), (vec![0], UID), (vec![UID], 0), (vec![UID, 0], UID)] {
+                assert!(!owners_ok(c, &uids, gid), "{c:?} {uids:?} {gid}");
+            }
+        }
+    }
+
+    #[test]
+    fn r313_fill_home_of_config_is_usage_before_anything() {
+        let (mut f, _src) = staged("home");
+        // (a well-formed, readable expect, so only the class can refuse: not the expect's path or shape)
+        let x = fill_expect(&mut f, "home");
+        let before = f.log.len();
+        let out = fill_home(&mut f, &FillArgs { mount: "/srv/sagebrush", name: name("config"), source: "data/home", expect: Box::leak(x.into_boxed_str()) });
+        assert_eq!(out.map(|_| 0).unwrap_or_else(|e| e.fail.code()), 64);
+        assert_eq!(f.log.len(), before, "no effect, no read");
+    }
+
+    #[test]
+    fn r313_the_cleanup_table_gains_archive_config() {
+        assert!(tree::contents_ok("/srv/sagebrush/archive-config", A));
+        assert!(!tree::contents_ok("/srv/sagebrush/archive-config", &format!("{A}/x")));
+        assert!(!tree::contents_ok("/srv/sagebrush/agent-config", A), "a live config tree is never emptied by the restore");
+    }
+
+    /// A staged `archive-config` attempt with root-owned entries of every mode, and its destination.
+    fn staged_archive_config() -> (Fake, String) {
+        let mut f = host();
+        restore_stage(&mut f, &mut exited(ok_reply()), &StageArgs { projid: UID, ..stage_args("archive-config") });
+        let att = attempt_path("archive-config");
+        let src = format!("{att}/data/{}", leaf(stage_args("archive-config").path));
+        let put = |f: &mut Fake, rel: &str, mode: u16, uid: u32| {
+            let path = format!("{src}/{rel}");
+            f.add(&path, mode, uid, uid);
+            let n = f.node(&path);
+            n.proj = UID;
+            n.inherit = true;
+        };
+        put(&mut f, "manifest.json", S_IFREG | 0o600, 0);
+        put(&mut f, "gen", S_IFDIR | 0o700, 0);
+        put(&mut f, "gen/ok.md", S_IFREG | 0o600, 0);
+        put(&mut f, "gen/wide.md", S_IFREG | 0o666, 0); // nested: a 0666 file
+        put(&mut f, "gen/deep", S_IFDIR | 0o700, 0);
+        put(&mut f, "gen/deep/bad.md", S_IFREG | 0o644, 0); // nested twice: a 0644 file
+        put(&mut f, "open", S_IFDIR | 0o777, 0); // a root-owned 0777 directory, with its subtree
+        put(&mut f, "open/x", S_IFREG | 0o600, 0);
+        put(&mut f, "exec", S_IFREG | 0o700, 0);
+        put(&mut f, "link", S_IFLNK | 0o777, 0);
+        put(&mut f, "agent.txt", S_IFREG | 0o600, UID); // another owner than root
+        f.dir("srv/sagebrush/archive-config", 0, 0o755);
+        let d = format!("srv/sagebrush/archive-config/{A}");
+        f.dir(&d, 0, 0o700);
+        let x = f.node(&d);
+        x.proj = UID;
+        x.inherit = true;
+        (f, src)
+    }
+    fn archive_config_expect(f: &mut Fake, uids: &str, gid: u32) -> String {
+        let root = f.root().unwrap();
+        let ac = f.dir_from_root(&root, "srv/sagebrush/archive-config").unwrap();
+        let (x, _) = crate::tree::child(f, &ac, A, MNT).unwrap().unwrap();
+        expect_file(f, "fill.json", format!("{{\"epoch\":{{\"boot_id\":\"{BOOT}\",\"mnt_id\":{MNT}}},\"fsid\":\"0000abcd00001234\",\"dest\":{},\"uids\":[{uids}],\"gid\":{gid},\"projid\":{UID}}}", obj_json(&x)))
+    }
+
+    #[test]
+    fn r313_fill_of_archive_config_places_only_roots_exact_entries_and_refuses_the_rest_at_every_depth() {
+        let (mut f, _src) = staged_archive_config();
+        let x = archive_config_expect(&mut f, "0", 0);
+        let out = fill_home(&mut f, &FillArgs { mount: "/srv/sagebrush", name: name("archive-config"), source: "data/home", expect: Box::leak(x.into_boxed_str()) }).unwrap();
+        let dest = format!("srv/sagebrush/archive-config/{A}");
+        for placed in ["manifest.json", "gen", "gen/ok.md", "gen/deep"] {
+            assert!(f.nodes.contains_key(&format!("{dest}/{placed}")), "{placed} placed");
+        }
+        for refused in ["gen/wide.md", "gen/deep/bad.md", "open", "open/x", "exec", "link", "agent.txt"] {
+            assert!(!f.nodes.contains_key(&format!("{dest}/{refused}")), "{refused} not placed");
+        }
+        assert_eq!(f.nodes[&format!("{dest}/gen")].id.mode & 0o7777, 0o700);
+        assert_eq!(f.nodes[&format!("{dest}/manifest.json")].id.mode & 0o7777, 0o600);
+        // Each refusal reported like a refused owner; the open directory with its whole subtree (2 entries).
+        for want in ["{\"path\":\"gen/wide.md\",\"uid\":0,\"gid\":0,\"entries\":1}", "{\"path\":\"gen/deep/bad.md\",\"uid\":0,\"gid\":0,\"entries\":1}",
+            "{\"path\":\"open\",\"uid\":0,\"gid\":0,\"entries\":2}", "{\"path\":\"exec\",\"uid\":0,\"gid\":0,\"entries\":1}",
+            "{\"path\":\"link\",\"uid\":0,\"gid\":0,\"entries\":1}"] {
+            assert!(out.contains(want), "{want} in {out}");
+        }
+        assert!(out.contains(&format!("{{\"path\":\"agent.txt\",\"uid\":{UID},\"gid\":{UID},\"entries\":1}}")), "{out}");
+        assert!(out.starts_with("{\"placed\":{\"dirs\":2,\"files\":2,\"symlinks\":0}"), "{out}");
+    }
+
+    #[test]
+    fn r313_fill_of_archive_config_with_other_owners_in_its_expect_is_refused_before_anything() {
+        for (uids, gid) in [(UID.to_string(), UID), ("0".to_string(), UID), (UID.to_string(), 0)] {
+            let (mut f, _src) = staged_archive_config();
+            let x = archive_config_expect(&mut f, &uids, gid);
+            let marker = format!("{}/{MARKER}", attempt_path("archive-config"));
+            let r = fill_home(&mut f, &FillArgs { mount: "/srv/sagebrush", name: name("archive-config"), source: "data/home", expect: Box::leak(x.into_boxed_str()) });
+            assert_eq!(r.map(|_| 0).unwrap_or_else(|e| e.fail.code()), Fail::Contract.code(), "{uids} {gid}");
+            assert!(f.nodes.contains_key(&marker), "{uids} {gid}: the marker untouched");
+        }
+        // And root in an ordinary class's expect: refused before anything too (no other class places a root entry).
+        let (mut f, _src) = staged("home");
+        let root = f.root().unwrap();
+        let ag = f.dir_from_root(&root, &format!("srv/sagebrush/agents/{A}")).unwrap();
+        let (hx, _) = crate::tree::child(&mut f, &ag, "home", MNT).unwrap().unwrap();
+        let x = expect_file(&mut f, "fill.json", format!("{{\"epoch\":{{\"boot_id\":\"{BOOT}\",\"mnt_id\":{MNT}}},\"fsid\":\"0000abcd00001234\",\"dest\":{},\"uids\":[0],\"gid\":0,\"projid\":{UID}}}", obj_json(&hx)));
+        let r = fill_home(&mut f, &fill_args("home", x));
+        assert_eq!(r.map(|_| 0).unwrap_or_else(|e| e.fail.code()), Fail::Contract.code());
     }
 }

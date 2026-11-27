@@ -12,7 +12,7 @@ import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { buildManifest, canonical, sha256 } from "../lib/fleet/host/backup-manifest.mjs";
 import { PLAN, checkPlan, chooseManifest, createPlan, expectedOf, listManifests, newPlan, readPlan, replanSet, updatePlan, withRestoreLock } from "../lib/fleet/host/restore-plan.mjs";
 import { realIo } from "../lib/fleet/host/store.mjs";
-import { newRecord, newRestoreRun, restoreReady, retryRecord, runTime, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
+import { CLASSES, newRecord, newRestoreRun, restoreReady, retryRecord, runTime, step, writeRecord } from "../lib/fleet/host/restore-record.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const rejects = (p, code) => assert.rejects(p, (e) => e instanceof FleetError && e.code === code, code);
@@ -87,9 +87,20 @@ test("listing: every committed manifest of every host, newest first, with what e
     { snapshot: a.mid, host: "old-host", run: RUN, time: "2026-11-24T03:10:00.000Z", agents: 2, deleted: 1, tags: 1 },
   ]);
   assert.deepEqual(r.unusable, []);
+  assert.equal(r.skipped, 1, "the one snapshot with none of a backup's tags is counted, not read");
   // Only manifests are read: one readback and one dump each, nothing else.
   assert.deepEqual(s.calls.filter(([op]) => op !== "snapshots").map(([op, id]) => `${op}:${id}`).sort(),
     [a.mid, b.mid, c.mid].flatMap((id) => [`readback:${id}`, `dump:${id}`]).sort());
+});
+
+test("listing: a store of snapshots made by other means lists no manifest and counts them as skipped; a backup's set snapshots aren't counted", async () => {
+  const other = (n) => ({ id: hex(), time: "2026-11-25T00:00:00.000Z", tree: hex(), host: "old-host", paths: [`/x${n}`], tags: n ? ["mine"] : [], summary: null });
+  const only = await listManifests(store([], { edit: (l) => [...l, other(0), other(1)] }));
+  assert.deepEqual(only, { manifests: [], unusable: [], skipped: 2 });
+  const b = backup("old-host", RUN, "2026-11-24T03:10:00.000Z");
+  const r = await listManifests(store([b]));
+  assert.equal(r.manifests.length, 1);
+  assert.equal(r.skipped, 0, "a backup's own set and host-store snapshots are not skipped ones");
 });
 
 test("listing: a manifest that fails any check is unusable, with why, and the others are still offered", async () => {
@@ -153,7 +164,11 @@ test("the plan: every set of the chosen manifest bound to the restore's run, its
   const b = backup("old-host", RUN, "2026-11-24T03:10:00.000Z");
   const chosen = await chooseManifest(store([b]), b.mid);
   const p = newPlan(chosen, RRUN);
-  assert.deepEqual(Object.keys(p), ["v", "host", "manifest", "sha256", "hoststore", "sets"]);
+  assert.deepEqual(Object.keys(p), ["v", "host", "manifest", "sha256", "hoststore", "sets", "config"]);
+  // Each agent set's config hash, the manifest's; only the agents' (an archive's or a tag's has none).
+  const agents = b.m.sets.filter((s) => s.kind === "agent");
+  assert.ok(agents.length > 0);
+  assert.deepEqual(p.config, Object.fromEntries(agents.map((s) => [s.id, b.m.config[s.id]])));
   assert.deepEqual([p.host, p.manifest, p.sha256, p.hoststore], ["old-host", b.mid, b.sha, b.m.hoststore]);
   assert.deepEqual(p.sets, Object.fromEntries(b.m.sets.map((s) => [`${s.kind}-${s.id}`, { run: RRUN, snapshot: s.snapshot, tree: s.tree }])));
   assert.deepEqual(expectedOf(p), Object.fromEntries(b.m.sets.map((s) => [`${s.kind}-${s.id}`, { run: RRUN, snapshot: s.snapshot }])));
@@ -162,7 +177,8 @@ test("the plan: every set of the chosen manifest bound to the restore's run, its
   refused(() => checkPlan({ ...p, sets: Object.fromEntries(Object.entries(p.sets).map(([k, v]) => [k, { ...v, run: RUN }])) }), "bad_form");
   // A manifest with no sets still needs a valid run.
   const empty = { ...chosen, manifest: { ...chosen.manifest, sets: [] } };
-  assert.deepEqual(newPlan(empty, RRUN).sets, {});
+  assert.deepEqual([newPlan(empty, RRUN).sets, newPlan(empty, RRUN).config], [{}, {}]);
+  refused(() => newPlan({ ...chosen, manifest: { ...chosen.manifest, config: {} } }, RRUN), "bad_form"); // an agent with no hash
   refused(() => newPlan(empty, "x"), "bad_form");
   const k = Object.keys(p.sets)[0];
   for (const bad of [
@@ -170,6 +186,9 @@ test("the plan: every set of the chosen manifest bound to the restore's run, its
     { ...p, sets: [] }, { ...p, sets: null }, { ...p, sets: { ...p.sets, "host-x": p.sets[k] } }, { ...p, sets: { ...p.sets, [`agent-nope`]: p.sets[k] } },
     { ...p, sets: { ...p.sets, [k]: { ...p.sets[k], run: "x" } } }, { ...p, sets: { ...p.sets, [k]: { ...p.sets[k], snapshot: "x" } } },
     { ...p, sets: { ...p.sets, [k]: { ...p.sets[k], tree: undefined } } }, { ...p, sets: { ...p.sets, [k]: { ...p.sets[k], extra: 1 } } },
+    (({ config, ...rest }) => rest)(p), { ...p, config: null }, { ...p, config: [] }, { ...p, config: {} },
+    { ...p, config: { ...p.config, [newId()]: hex() } }, { ...p, config: Object.fromEntries(Object.keys(p.config).map((id) => [id, "A".repeat(64)])) },
+    { ...p, config: Object.fromEntries(Object.keys(p.config).map((id) => [id, null])) },
   ]) refused(() => checkPlan(bad), "bad_form");
 });
 
@@ -179,18 +198,22 @@ test("the plan is restoreReady's authority: records of the plan's run and snapsh
   const dir = fresh();
   const agent = b.ids[0], tag = b.t;
   const rec = (kind, id, run, dest) => {
-    let r = newRecord({ kind, id, run, snapshot: p.sets[`${kind}-${id}`].snapshot });
-    for (const s of ["staged", "filling", "published", "validated"]) r = step(r, s, { dest });
-    return r;
+    let r = step(newRecord({ kind, id, run, snapshot: p.sets[`${kind}-${id}`].snapshot }), "bind", { dest });
+    for (const cls of CLASSES[kind]) r = step(r, "digest", { cls, sha256: "d".repeat(64) });
+    for (const s of ["staged", "filling", "published", "files_validated"]) r = step(r, s, { dest });
+    // An agent's imports, each pending then done; an archive or a tag folder has none.
+    if (r.imports !== null) for (const which of ["config", "context"]) for (const phase of ["pending", "done"]) r = step(r, "import", { which, phase, sha256: "c".repeat(64) });
+    return step(r, "validated");
   };
-  const home = { home: { dev: "1", ino: "2" }, sessions: { dev: "1", ino: "3" } };
+  const ident = (ino) => ({ dev: "1", ino, uid: 70000, gid: 70000, mode: 0o700, projid: 70000 });
+  const home = { home: ident("2"), sessions: ident("3") };
   writeRecord(rec("agent", agent, RRUN, home), { dir });
-  writeRecord(rec("tag", tag, RRUN, { tag: { dev: "1", ino: "4" } }), { dir });
+  writeRecord(rec("tag", tag, RRUN, { tag: ident("4") }), { dir });
   assert.equal(restoreReady(agent, [tag], expectedOf(p), { dir }), "validated");
   // The person's new request for the tag folder: re-planned to RRUN2; the old record no longer resumes anything.
   const p2 = replanSet(p, "tag", tag, RRUN2);
   refused(() => restoreReady(agent, [tag], expectedOf(p2), { dir }), "not_granted");
-  writeRecord(rec("tag", tag, RRUN2, { tag: { dev: "1", ino: "4" } }), { dir });
+  writeRecord(rec("tag", tag, RRUN2, { tag: ident("4") }), { dir });
   assert.equal(restoreReady(agent, [tag], expectedOf(p2), { dir }), "validated");
   // The record for the new request starts from the stopped one (retryRecord) on the plan's new run.
   const stopped = step(newRecord({ kind: "agent", id: agent, run: RRUN, snapshot: p.sets[`agent-${agent}`].snapshot }), "not_fitting");
@@ -255,15 +278,18 @@ test("the plan on disk: created once (0600, exclusive; the same plan again is fi
     { ...step3, sets: { ...step3.sets, [k]: { ...step3.sets[k], snapshot: hex() } } },
     { ...step3, sets: { ...step3.sets, [k]: { ...step3.sets[k], tree: hex() } } },
     { ...step3, sets: { ...step3.sets, [k2]: { ...step3.sets[k2], tree: hex() } } },
+    { ...step3, config: Object.fromEntries(Object.keys(step3.config).map((id) => [id, hex()])) }, // (a config hash with it)
   ];
   // The same millisecond, or a run whose string sorts higher but whose time is older, is not newer.
+  const extra = newId();
   const sameMs = { ...p2, sets: { ...p2.sets, [k]: { ...p2.sets[k], run: rrun(3600000, () => Buffer.alloc(6, 5)) } } };
   for (const bad of [
     two, ...alsoChanged, sameMs,
     p, // backwards
     { ...p2, manifest: hex() }, { ...p2, sha256: hex() }, { ...p2, hoststore: hex() }, { ...p2, host: "elsewhere" },
     { ...p2, sets: { ...p2.sets, [k]: { ...p2.sets[k], snapshot: hex() } } }, { ...p2, sets: { ...p2.sets, [k]: { ...p2.sets[k], tree: hex() } } },
-    { ...p2, sets: Object.fromEntries(Object.entries(p2.sets).slice(1)) }, { ...p2, sets: { ...p2.sets, [`agent-${newId()}`]: p2.sets[k] } },
+    { ...p2, sets: Object.fromEntries(Object.entries(p2.sets).filter(([x]) => x !== k2)), config: Object.fromEntries(Object.entries(p2.config).filter(([id]) => `agent-${id}` !== k2)) }, { ...p2, sets: { ...p2.sets, [`agent-${extra}`]: p2.sets[k] }, config: { ...p2.config, [extra]: hex() } },
+    { ...p2, config: Object.fromEntries(Object.keys(p2.config).map((id) => [id, hex()])) },
   ]) refused(() => updatePlan(bad, { dir }), "not_granted");
   assert.deepEqual(readPlan({ dir }), p2);
   // The next single request is fine, including a later one whose string sorts lower.

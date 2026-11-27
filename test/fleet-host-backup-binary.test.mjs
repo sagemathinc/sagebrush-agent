@@ -42,7 +42,7 @@ process.stdout.write(JSON.stringify({ ok: true, snapshots: [] }) + "\\n");`);
   assert.deepEqual(r, { ok: true, value: { snapshots: [] }, stderr: "" });
   const seen = JSON.parse(readFileSync(join(dir, "seen.json"), "utf8"));
   assert.equal(seen.input, JSON.stringify({ op: "snapshots" }));
-  assert.deepEqual(seen.argv, ["--state", ctx.state, "--secrets", ctx.secrets, "--cache", ctx.cache]);
+  assert.deepEqual(seen.argv, ["--state", ctx.state, "--secrets", ctx.secrets, "--cache", ctx.cache, "--parent-pid", String(process.pid)]);
   assert.deepEqual(Object.keys(seen.env).filter((k) => !k.startsWith("NODE_") && k !== "PWD" && k !== "SHLVL" && k !== "_"), []);
 });
 
@@ -225,4 +225,43 @@ test("usage: the request's and the result's closed shapes", () => {
     assert.equal(ok(bad).code, "bad_result", JSON.stringify(bad));
   }
   assert.ok(CODES.includes("usage_failed"));
+});
+
+test("the console command's signals (init/run d3 §5.2): the first aborts the call in flight and kills its group; a second is ignored; later calls answer aborted unstarted", async () => {
+  const { EventEmitter } = await import("node:events");
+  const { installCommandSignals } = await import("../lib/fleet/host/backup-binary.mjs");
+  const { mkdtempSync, writeFileSync, chmodSync, readFileSync, existsSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const d = mkdtempSync(join(tmpdir(), "sb-sig-"));
+  const bin = join(d, "bin");
+  // A binary that records its pid, then a grandchild in its own group (as the real one may fork), and waits.
+  writeFileSync(bin, `#!/bin/sh\necho $$ > ${d}/pid\nsleep 60 &\necho $! > ${d}/child\nwait\n`);
+  chmodSync(bin, 0o755);
+  const ctx = { bin, state: d, secrets: d, cache: d };
+  const proc = new EventEmitter();
+  const controller = new AbortController();
+  const remove = installCommandSignals(controller, proc);
+  try {
+    assert.equal(proc.listenerCount("SIGTERM"), 1, "installed before any spawn");
+    const p = runBackupOp({ op: "snapshots" }, ctx, { ms: 30_000 });
+    const until = Date.now() + 5000;
+    while (!existsSync(join(d, "child")) && Date.now() < until) await new Promise((r) => { setTimeout(r, 20); });
+    const pids = ["pid", "child"].map((f) => Number(readFileSync(join(d, f), "utf8")));
+    proc.emit("SIGINT");
+    proc.emit("SIGTERM"); // (a second signal: ignored, no exit)
+    const r = await p;
+    assert.deepEqual([r.ok, r.code], [false, "aborted"]);
+    // Gone or a zombie (a killed grandchild waits for init to reap it), within a short bound.
+    const exited = (pid) => { try { return /\) [ZX] /.test(readFileSync(`/proc/${pid}/stat`, "utf8")); } catch { return true; } };
+    for (const pid of pids) {
+      const t0 = Date.now();
+      while (!exited(pid) && Date.now() - t0 < 3000) await new Promise((r) => { setTimeout(r, 20); });
+      assert.equal(exited(pid), true, `pid ${pid} gone with its group`);
+    }
+    // Every later call answers aborted without starting a process.
+    const later = await runBackupOp({ op: "snapshots" }, { ...ctx, bin: join(d, "never-run") }, { ms: 30_000 });
+    assert.deepEqual([later.ok, later.code], [false, "aborted"]);
+  } finally { remove(); }
+  assert.equal(proc.listenerCount("SIGTERM"), 0);
 });

@@ -1,0 +1,21 @@
+# The Sagebrush host supervisor (host daemon main r1.1 §1): the one process that owns the host's identity and runs its
+# agents. A refusal exits 3 and is not restarted (it waits for the person); a crash is restarted, and the next start
+# contains everything before anything else. Stopping it touches no agent. Before any release code runs as root, the
+# trust boundary (lease-on r1.12 §2.6), installed outside the release, proves the release tree root's; else no start.
+[Unit]
+Description=Sagebrush host supervisor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStartPre=/usr/lib/sagebrush/release-trust @RELEASE@
+ExecStart=/usr/bin/node @RELEASE@/bin/sagebrush-agent.mjs host run
+Restart=on-failure
+RestartSec=10s
+RestartPreventExitStatus=3
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target

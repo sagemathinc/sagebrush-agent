@@ -181,5 +181,9 @@ test("envelope: the type and signer are in the signed bytes; signer kinds per ty
   const withSig2 = swap({ ...JSON.parse(new TextDecoder().decode(addish)), sig2: env.sig });
   assert.equal(code(() => open(addish, ctx)), "ok");
   assert.equal(code(() => open(withSig2, ctx)), "bad_form");
-  assert.equal(Object.keys(TYPES).length, 18);
+  assert.equal(Object.keys(TYPES).length, 20);
+  // (agent messages, agent-messages r6 §2: a person's message is signed by a device only, a host's record by a host only)
+  assert.equal(code(() => seal("sb.agent-message.v1", { ...signer, kind: "host" }, body, host)), "bad_signature");
+  assert.equal(code(() => seal("sb.agent-reply.v1", signer, body, dev)), "bad_signature");
+  assert.equal(code(() => seal("sb.agent-reply.v1", { ...signer, kind: "service" }, body, dev)), "bad_signature");
 });

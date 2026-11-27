@@ -81,8 +81,9 @@ test("a widening intent is durable (fsynced) before it resolves; its terminal na
 test("the intent deadline: a hung fsync refuses the intent with audit_timeout within its bound, and the effect never starts; narrowing never waits", async () => {
   const dir = fresh();
   let hang = false;
+  const hung = []; // (released at the end, so the stream closes its handle)
   const io = { open: (p, f, m) => import("node:fs").then((fs) => fs.promises.open(p, f, m)), write: (fh, b) => fh.write(b, 0, b.length, null),
-    fsync: (fh) => (hang ? new Promise(() => {}) : fh.datasync()), close: (fh) => fh.close() };
+    fsync: (fh) => (hang ? new Promise((r) => hung.push(r)) : fh.datasync()), close: (fh) => fh.close() };
   const s = await open(dir, { trustGenesis: true, io });
   const a = auditAdapters(s);
   hang = true;
@@ -94,6 +95,9 @@ test("the intent deadline: a hung fsync refuses the intent with audit_timeout wi
   a.audit({ kind: "agent.stop", agent: newId(), phase: "succeeded" });
   await a.appendIntent({ kind: "agent.pause", agent: newId() }, 2000); // (a narrowing intent: never awaited, never thrown)
   assert.ok(Date.now() - t1 < 100, "narrowing returned within 100 ms against a hung fsync");
+  hang = false;
+  for (const r of hung.splice(0)) r();
+  await s.close();
 });
 
 test("open, torn vs corrupt: only the LAST epoch's unterminated final line is torn (truncated, its intent left open); a terminated corrupt record is fail_closed, its bytes kept", async () => {
@@ -122,6 +126,7 @@ test("open, torn vs corrupt: only the LAST epoch's unterminated final line is to
   assert.equal(s4.health().state, "fail_closed");
   assert.equal(readFileSync(p2, "utf8"), bad, "the corrupt bytes kept as evidence");
   await assert.rejects(s4.intent({ op: "grant.apply", op_id: b64(new Uint8Array(16)), phase: "authorized" }), (e) => e.code === "audit_unavailable");
+  await s4.close();
 });
 
 test("open: each break is fail_closed: an empty line, an over-size line, an earlier epoch's unterminated line, an epoch gap, a stream file without logs, logs without a stream file, another certificate", async () => {
@@ -129,7 +134,7 @@ test("open: each break is fail_closed: an empty line, an over-size line, an earl
   const cases = {
     "an empty line": (d) => appendFileSync(join(d, "epoch-0.log"), "\n"),
     "an over-size line": (d) => appendFileSync(join(d, "epoch-0.log"), `${"x".repeat(9000)}\n`),
-    "an earlier epoch's unterminated line": async (d) => { (await open(d)).close(); appendFileSync(join(d, "epoch-0.log"), "{"); },
+    "an earlier epoch's unterminated line": async (d) => { await (await open(d)).close(); appendFileSync(join(d, "epoch-0.log"), "{"); },
     "an epoch gap": async (d) => { await (await open(d)).close(); writeFileSync(join(d, "epoch-3.log"), readFileSync(join(d, "epoch-1.log"))); },
     "a stream file without logs": (d) => { rmSync(join(d, "epoch-0.log")); },
     "logs without a stream file": (d) => { rmSync(join(d, "stream")); },
@@ -144,6 +149,7 @@ test("open: each break is fail_closed: an empty line, an over-size line, an earl
   const d = await mk();
   const s = await open(d, { id: { keyFor: () => refuse("bad_signature", "revoked") } });
   assert.equal(s.health().state, "fail_closed", "a record whose certificate doesn't verify at its chain_seq");
+  await s.close();
 });
 
 test("open: prior_last must name the prior epoch's actual last record: its tail deleted after a later epoch exists is fail_closed", async () => {
@@ -156,7 +162,9 @@ test("open: prior_last must name the prior epoch's actual last record: its tail 
   const p = join(d, "epoch-0.log");
   const all = readFileSync(p, "utf8").split("\n").filter(Boolean);
   writeFileSync(p, all.slice(0, -1).join("\n") + "\n"); // (epoch 0's last record removed, the file still terminated)
-  assert.equal((await open(d)).health().state, "fail_closed");
+  const failed = await open(d);
+  assert.equal(failed.health().state, "fail_closed");
+  await failed.close();
 });
 
 test("checkpoints: each covers its predecessor (covers == prev, never itself); written to checkpoints/; they stop at the cap minus the reserve (counted), never eating the reserve", async () => {
@@ -191,7 +199,7 @@ test("the cap and the reserve: widening refused audit_full once the next record 
   const h = s.health();
   assert.ok(h.reserve_free_pct < before.reserve_free_pct, "narrowing used the reserve");
   assert.ok(h.counters.unrecorded >= 1 && h.held >= 1, "past the reserve, held and counted");
-  assert.equal(h.counters.unrecorded, h.held + h.counters.dropped, "counted exactly once per record");
+  assert.equal(h.counters.unrecorded, h.held + h.counters.dropped, "counted exactly once per record");  await s.close();
 });
 
 test("recovery: intents left open by an earlier epoch become unknown_effect, once; openIntents returns the grant.apply gens only (agent.start leftovers reported, not reconciled)", async () => {
@@ -252,7 +260,9 @@ test("open: a correctly signed checkpoint whose covers names another record is f
   const r = JSON.parse(all[i]);
   const forged = Buffer.from(await seal(r.type, r.signer, { ...r.body, covers: { ...r.body.covers, seq: r.body.seq - 2 } }, key)).toString();
   writeFileSync(p, [...all.slice(0, i), forged].join("\n") + "\n"); // (the forged checkpoint last, so only covers is wrong)
-  assert.equal((await open(d)).health().state, "fail_closed");
+  const failed = await open(d);
+  assert.equal(failed.health().state, "fail_closed");
+  await failed.close();
 });
 
 test("held narrowing records are bounded by heldMax: past it each is dropped and counted, never held", async () => {
@@ -264,7 +274,7 @@ test("held narrowing records are bounded by heldMax: past it each is dropped and
   const h = s.health();
   assert.equal(h.held, 2);
   assert.ok(h.counters.dropped >= 1);
-  assert.equal(h.counters.unrecorded, h.held + h.counters.dropped);
+  assert.equal(h.counters.unrecorded, h.held + h.counters.dropped);  await s.close();
 });
 
 test("health for the host's report: unanchored and failed closed are audit_unavailable; at the cap (widening refused) reserve_only with audit_full; host-state accepts each", async () => {

@@ -263,6 +263,72 @@ export async function build() {
     { name: "a host signing a grant", bytes: txt(enc(canonText({ ...JSON.parse(g1), signer: { kind: "host", id: host, alg: "ed25519", key: H.key } }))), expect: "bad_signature" },
   ];
 
+  // ---- 6b. agent messages (agent-messages r6 §2, with r7 to r10): a person->agent message signed by any enrolled
+  // device of the fleet (no tier), and the host's signed records answering it; checked by verifyAgentMessage (against
+  // the honest chain) and verifyAgentReply (against the certificate above). body_sha256 is over a ciphertext the
+  // service never opens: here a fixed stand-in.
+  const ct = sha256b64(enc("a sealed body"));
+  const msgBody = (extra = {}) => ({ fleet, aud: AUD, host, agent, thread: id(90), id: id(91), in_reply_to: null, at_ms: NOW, chain_seq: headAt.seq, body_sha256: ct, ...extra });
+  const msg = (k, sg, extra) => txt(seal("sb.agent-message.v1", sg, msgBody(extra), k));
+  const repBody = (extra = {}) => ({ fleet, aud: AUD, host, agent, thread: id(90), id: id(92), in_reply_to: id(91), covers: [id(91)], turn: id(93), kind: "reply", reason: null, answer: null, at_ms: NOW, chain_seq: headAt.seq, body_sha256: ct, ...extra });
+  const rep = (extra) => txt(seal("sb.agent-reply.v1", hostSigner, repBody(extra), H));
+  // (a signer of a kind the type doesn't allow: seal() refuses to make one, so it is signed by hand, as an attacker would)
+  const forge = async (type, sg, body, k) => txt(enc(canonText({ v: 1, type, signer: sg, body, sig: b64(await k.sign(signedBytes(type, sg, body))) })));
+  const m0 = msg(B, signer(B, bId));
+  const agent_messages = [
+    { name: "a message from a browser device", bytes: m0, expect: "ok" },
+    { name: "a message from a native device", bytes: msg(N, signer(N, nId)), expect: "ok" },
+    { name: "a message answering another", bytes: msg(B, signer(B, bId), { in_reply_to: id(92) }), expect: "ok" },
+    { name: "a message answering itself", bytes: msg(B, signer(B, bId), { in_reply_to: id(91) }), expect: "bad_form" },
+    { name: "a message to another audience", bytes: m0, ctx: { aud: "https://sagebrush.space", fleet }, expect: "bad_audience" },
+    { name: "a message with an extra field (a subject)", bytes: msg(B, signer(B, bId), { subject: "x" }), expect: "bad_form" },
+    { name: "a message id that isn't a fleet id (B22-shaped)", bytes: msg(B, signer(B, bId), { id: "A".repeat(21) + "A" }), expect: "bad_form" },
+    { name: "a message for another agent", bytes: msg(B, signer(B, bId), { agent: id(94) }), expect: "not_granted" },
+    { name: "a message for another host", bytes: msg(B, signer(B, bId), { host: id(94) }), expect: "not_granted" },
+    // (the device key's rules, on this type: enrolled at the record's chain_seq, not removed by then, and no chain_seq
+    // past the head; chain "removed" is the transfers' chain_removed, the browser device removed at the next seq)
+    { name: "a message from a device enrolled only after its chain_seq", bytes: msg(N2, signer(N2, n2Id), { chain_seq: 1 }), expect: "device_unknown" },
+    { name: "a message from a device removed at or before its chain_seq", bytes: msg(B, signer(B, bId), { chain_seq: headAt.seq + 1 }), chain: "removed", expect: "device_unknown" },
+    { name: "a message from a device enrolled at its chain_seq but removed by the head", bytes: msg(B, signer(B, bId)), chain: "removed", expect: "device_removed" },
+    { name: "a message whose chain_seq is past the head", bytes: msg(B, signer(B, bId), { chain_seq: headAt.seq + 5 }), expect: "device_unknown" },
+    { name: "a message signed by a host", bytes: await forge("sb.agent-message.v1", hostSigner, msgBody(), H), expect: "bad_signature" },
+    { name: "a message's signer swapped to another device (the signature no longer verifies)", bytes: txt(enc(canonText({ ...JSON.parse(m0), signer: signer(N, nId) }))), expect: "bad_signature" },
+  ];
+  const agent_replies = [
+    { name: "a reply", bytes: rep(), expect: "ok" },
+    { name: "a reply covering three, in_reply_to the last", bytes: rep({ covers: [id(95), id(96), id(91)] }), expect: "ok" },
+    { name: "a reply whose in_reply_to isn't the last of covers", bytes: rep({ covers: [id(91), id(95)] }), expect: "bad_form" },
+    { name: "covers with a repeat", bytes: rep({ covers: [id(91), id(91)] }), expect: "bad_form" },
+    { name: "covers of 64", bytes: rep({ covers: [...Array.from({ length: 63 }, (_, i) => id(100 + i)), id(91)] }), expect: "ok" },
+    { name: "covers of 65", bytes: rep({ covers: [...Array.from({ length: 64 }, (_, i) => id(100 + i)), id(91)] }), expect: "bad_form" },
+    { name: "a reply without a body", bytes: rep({ body_sha256: null }), expect: "bad_form" },
+    { name: "a reply with a reason", bytes: rep({ reason: "crashed" }), expect: "bad_form" },
+    { name: "a turn_failed: no body, a closed reason", bytes: rep({ kind: "turn_failed", reason: "crashed", body_sha256: null }), expect: "ok" },
+    { name: "a turn_failed for a lost answer (C1)", bytes: rep({ kind: "turn_failed", reason: "answer_lost", body_sha256: null }), expect: "ok" },
+    { name: "a turn_failed with a refused record's reason", bytes: rep({ kind: "turn_failed", reason: "replayed", body_sha256: null }), expect: "bad_form" },
+    { name: "a turn_failed with a body", bytes: rep({ kind: "turn_failed", reason: "stalled" }), expect: "bad_form" },
+    { name: "a refused record: no turn, no covers, no body", bytes: rep({ kind: "refused", reason: "not_granted", turn: null, covers: null, body_sha256: null }), expect: "ok" },
+    { name: "a refused record with covers", bytes: rep({ kind: "refused", reason: "replayed", turn: null, body_sha256: null }), expect: "bad_form" },
+    { name: "a refused record with a turn_failed's reason", bytes: rep({ kind: "refused", reason: "budget", turn: null, covers: null, body_sha256: null }), expect: "bad_form" },
+    { name: "a covered record", bytes: rep({ kind: "covered", body_sha256: null }), expect: "ok" },
+    { name: "a covered record naming the answer in another thread", bytes: rep({ kind: "covered", body_sha256: null, answer: { thread: id(97), id: id(98) } }), expect: "ok" },
+    { name: "a covered record with a body", bytes: rep({ kind: "covered" }), expect: "bad_form" },
+    { name: "an answer on a reply", bytes: rep({ answer: { thread: id(97), id: id(98) } }), expect: "bad_form" },
+    { name: "a reply of kind message", bytes: rep({ kind: "message" }), expect: "bad_form" },
+    { name: "a reason outside every closed set", bytes: rep({ kind: "turn_failed", reason: "because", body_sha256: null }), expect: "bad_form" },
+    { name: "a reply signed by a device", bytes: await forge("sb.agent-reply.v1", signer(N, nId), repBody(), N), expect: "bad_signature" },
+    { name: "a reply signed by a key other than the certified host's", bytes: txt(seal("sb.agent-reply.v1", hostSigner, repBody(), N2)), expect: "bad_signature" },
+    { name: "the certified host's signature under another key id", bytes: txt(seal("sb.agent-reply.v1", { ...hostSigner, key: N2.key }, repBody(), H)), expect: "bad_signature" },
+    { name: "the certified host's signature over a body naming another host", bytes: rep({ host: id(94) }), expect: "bad_signature" },
+    { name: "a refused record with a turn but no covers", bytes: rep({ kind: "refused", reason: "replayed", covers: null, body_sha256: null }), expect: "bad_form" },
+    { name: "a covered record without covers", bytes: rep({ kind: "covered", body_sha256: null, covers: null }), expect: "bad_form" },
+    { name: "a turn_failed without a turn", bytes: rep({ kind: "turn_failed", reason: "crashed", body_sha256: null, turn: null }), expect: "bad_form" },
+    { name: "answer_lost on a refused record (r11)", bytes: rep({ kind: "refused", reason: "answer_lost", turn: null, covers: null, body_sha256: null }), expect: "bad_form" },
+    { name: "not_granted on a turn_failed (r11)", bytes: rep({ kind: "turn_failed", reason: "not_granted", body_sha256: null }), expect: "bad_form" },
+    { name: "an answer on a turn_failed", bytes: rep({ kind: "turn_failed", reason: "crashed", body_sha256: null, answer: { thread: id(97), id: id(98) } }), expect: "bad_form" },
+    { name: "an answer on a refused record", bytes: rep({ kind: "refused", reason: "replayed", turn: null, covers: null, body_sha256: null, answer: { thread: id(97), id: id(98) } }), expect: "bad_form" },
+  ];
+
   // ---- 7. moving an agent (r2.4 §3.7): the receipt pair (checks 1-3), then the new host's own (checks 4-6)
   const tSigned = (type, sg, b) => sha256b64(signedBytes(type, sg, b));
   const g1Env = JSON.parse(g1);
@@ -414,7 +480,7 @@ export async function build() {
     lease_keys: { chain: leased, chain_cases: lease_chain, cases: lease_keys },
     fence_acks: { chain: honest, host_cert: cert, cases: fence_acks },
     leases: { chain: leased, host_cert: cert, host: host, host_key: certBody.fingerprint, requests: lease_requests, leases },
-    objects: { chain: honest, host_cert: cert, grants, grant_acks, host_ops, approvals, envelopes },
+    objects: { chain: honest, host_cert: cert, grants, grant_acks, host_ops, approvals, envelopes, agent_messages, agent_replies },
     transfers: { chain: honest, chain_removed: removedChain, receipts: transfer_receipts, hosts: transfer_hosts },
     fleet_fingerprints: fingerprints,
   };

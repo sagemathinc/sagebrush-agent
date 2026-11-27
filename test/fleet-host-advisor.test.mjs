@@ -253,3 +253,62 @@ test("clearLimited (SEC's hardening): a later success without a limit clears ano
   assert.equal(clearLimited({ limited: { until: new Date(now - 1).toISOString() } }, "a", now), null);
   assert.equal(clearLimited({}, "a", now), null);
 });
+
+// ---- rows for the TESTS review's survivors (ported behaviour of server/agents/claude-pool.ts and util/ai/claude-usage.ts)
+
+test("pickForTurn: this turn's own earlier reservation doesn't count against it", () => {
+  const usage = member("a", { five: 0.8, weekResetsIn: 50 * HOUR }).usage;
+  const st = { a: { usage, reservations: { ab: { amount: 0.15, expires: now + 60_000 } } } };
+  assert.deepEqual(pickForTurn(st, { turn: "ab" }, now).result, { profile: "a" }, "own stale 0.15 ignored: 0.8 + 0.1 heavy fits");
+  assert.deepEqual(pickForTurn(st, { turn: "cd" }, now).result.profile, undefined, "another turn's 0.15 does count");
+});
+
+test("pickForTurn: a fresh usage reading is written to the profile's history", () => {
+  const st = { a: { usage: member("a", { week: 0.3 }).usage } };
+  const h = pickForTurn(st, { turn: "ab" }, now).updates.find((u) => u.key === "history");
+  assert.ok(h, "a history update");
+  assert.equal(h.value.at(-1).week, 0.3);
+});
+
+test("pickForTurn: other running reservations on the picked profile are kept alongside this turn's", () => {
+  const st = { a: { usage: member("a").usage } };
+  const first = pickForTurn(st, { turn: "aa" }, now);
+  const st2 = { a: { ...st.a, reservations: first.updates.filter((u) => u.key === "reservations").at(-1).value } };
+  const second = pickForTurn(st2, { turn: "bb" }, now);
+  assert.deepEqual(Object.keys(second.updates.filter((u) => u.key === "reservations").at(-1).value).sort(), ["aa", "bb"]);
+});
+
+test("pickForTurn: a turn cost naming a profile outside the pool is skipped, never thrown on", () => {
+  const r = pickForTurn({ a: {} }, { turn: "ab", turn_costs: [{ profile: "zz", cost: 0.04 }, { profile: "a", cost: 0.03 }] }, now);
+  assert.deepEqual(r.updates.filter((u) => u.key === "turn_costs").map((u) => u.profile), ["a"]);
+});
+
+test("pickForTurn: an expired stored reservation is pruned in the store's update", () => {
+  const st = { a: { reservations: { aa: { amount: 0.02, expires: now - 1 }, bb: { amount: 0.02, expires: now + 60_000 } } }, b: {} };
+  const upd = pickForTurn(st, { turn: "cc", limited: { profile: "a", resets_at: sec(now + HOUR) } }, now).updates.filter((u) => u.profile === "a" && u.key === "reservations");
+  assert.deepEqual(Object.keys(upd[0].value), ["bb"], "the expired one is gone from the first rewrite");
+});
+
+test("snapshot: per-window readings win over the single limiter when both are given", () => {
+  const s = rateLimitSnapshot({ unifiedWindows: { five_hour: { utilization: 0.4, resetsAt: sec(now + HOUR) } }, rateLimitType: "seven_day", utilization: 0.9, resetsAt: sec(now + 50 * HOUR) }, now);
+  assert.deepEqual(Object.keys(s.windows), ["five_hour"]);
+});
+
+test("snapshot: a non-integer resets_at, a utilization over 10, and an over-long observed_at are refused", () => {
+  assert.equal(rateLimitSnapshot({ rateLimitType: "five_hour", utilization: 0.3, resetsAt: sec(now + HOUR) + 0.5 }, now), undefined);
+  assert.equal(rateLimitSnapshot({ rateLimitType: "five_hour", utilization: 10.01, resetsAt: sec(now + HOUR) }, now), undefined);
+  assert.ok(rateLimitSnapshot({ rateLimitType: "five_hour", utilization: 10, resetsAt: sec(now + HOUR) }, now), "10 itself is in range (capped to 1)");
+  const ok = { observed_at: new Date(now).toISOString(), windows: { five_hour: { utilization: 0.3, resets_at: sec(now + HOUR) } } };
+  assert.ok(parseRateLimitSnapshot(ok, now));
+  // (a date string that still parses, at exactly 40 characters: refused by the length guard alone)
+  const long = "2026-10-02T12:00:00.0000000000000000000Z";
+  assert.equal(long.length, 40);
+  assert.ok(Number.isFinite(Date.parse(long)));
+  assert.equal(parseRateLimitSnapshot({ ...ok, observed_at: long }, now), undefined, "40 characters or more");
+});
+
+test("usage history: a reading more than 60 s in the future isn't added; exactly 60 s is", () => {
+  const ahead = (ms) => ({ observed_at: new Date(now + ms).toISOString(), windows: { seven_day: { utilization: 0.2, resets_at: sec(now + 72 * HOUR) } } });
+  assert.equal(appendUsageHistory(undefined, ahead(60_001), now), undefined);
+  assert.equal(appendUsageHistory(undefined, ahead(60_000), now).length, 1);
+});

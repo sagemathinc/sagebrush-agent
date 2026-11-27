@@ -184,11 +184,15 @@ const RFC7748 = [
 const RFC7748_SHARED = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742";
 const hex = (h) => Uint8Array.from(Buffer.from(h, "hex"));
 const toHex = (b) => Buffer.from(b).toString("hex");
-// (WebCrypto watched: every buffer it was handed to import, every digest it returned, every export and its format)
+// (WebCrypto watched: every buffer it was handed to import, with the algorithm and the extractable flag asked for, every
+// digest it returned, every export and its format)
 function watched() {
   const s = globalThis.crypto.subtle, seen = { imports: [], digests: [], exports: [] };
   const subtle = {
-    importKey: (fmt, data, ...rest) => { seen.imports.push({ fmt, data }); return s.importKey(fmt, data, ...rest); },
+    importKey: (fmt, data, alg, extractable, ...rest) => {
+      seen.imports.push({ fmt, data, alg: typeof alg === "string" ? alg : alg.name, extractable });
+      return s.importKey(fmt, data, alg, extractable, ...rest);
+    },
     async digest(alg, data) { const ab = await s.digest(alg, data); seen.digests.push(ab); return ab; },
     exportKey: (fmt, key) => { seen.exports.push(fmt); return s.exportKey(fmt, key); },
     deriveBits: (...a) => s.deriveBits(...a), sign: (...a) => s.sign(...a), verify: (...a) => s.verify(...a),
@@ -243,6 +247,16 @@ test("ed25519FromSeed and x25519FromPrivate zero every copy of the secret they m
   const xs = x.seen.imports.filter((i) => i.fmt === "pkcs8");
   assert.ok(xs.length === 1 && xs[0].data.every((b) => b === 0), "the X25519 PKCS#8 copy zeroed");
   assert.equal(toHex(sk), keepSk, "the caller's private key is the caller's");
+});
+
+test("ed25519FromSeed and x25519FromPrivate import every private key non-extractable: no exportKey could ever take one out", async () => {
+  const e = watched();
+  await e.w.ed25519FromSeed(hex(RFC8032[0][0]));
+  const x = watched();
+  await x.w.x25519FromPrivate(hex(RFC7748[0][0]));
+  const secrets = [...e.seen.imports, ...x.seen.imports].filter((i) => i.fmt === "pkcs8");
+  assert.deepEqual(secrets.map((i) => i.alg), ["Ed25519", "X25519", "X25519"], "the signing key, the derived scalar's key, the X25519 key");
+  for (const i of secrets) assert.equal(i.extractable, false, `${i.alg} pkcs8 imported with extractable=${i.extractable}`);
 });
 
 // (a WebCrypto that fails at one named step and records every buffer it was handed and every digest it returned)

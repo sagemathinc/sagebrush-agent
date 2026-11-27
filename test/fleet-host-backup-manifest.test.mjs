@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
 import { FleetError, newId } from "../lib/fleet/index.mjs";
 import { buildManifest, canonical, checkManifest, commitManifest, parseManifest, referenced, sha256 } from "../lib/fleet/host/backup-manifest.mjs";
-import { checkDataPart, classify, forgetPlan, isoWeek, keepManifests, pruneDue, retentionPass, rootsOf } from "../lib/fleet/host/backup-retention.mjs";
+import { checkDataPart, classify, forgetPlan, isoWeek, keepManifests, pruneDue, retentionPass, rootsOf, snapshotTime } from "../lib/fleet/host/backup-retention.mjs";
 
 const refused = (fn, code) => assert.throws(fn, (e) => e instanceof FleetError && e.code === code, code);
 const hex = (n) => n.toString(16).padStart(64, "0");
@@ -243,7 +243,9 @@ function store(snapshots, manifests, { failDump = null, failReadback = null } = 
   fn.calls = calls;
   return fn;
 }
-const listed = (id, time, tags, { host = HOST, tree = hex(0) } = {}) => ({ id, time: new Date(time).toISOString(), tree, host, paths: ["/var/lib/sagebrush/backup/staging-x"], tags, summary: null });
+/** A time as the backup binary lists it (rustic's zoned timestamp: nanoseconds, an offset, a zone name). */
+const binaryTime = (ms) => `${new Date(ms).toISOString().slice(0, 23)}123456+00:00[Etc/UTC]`;
+const listed = (id, time, tags, { host = HOST, tree = hex(0) } = {}) => ({ id, time: binaryTime(time), tree, host, paths: ["/var/lib/sagebrush/backup/staging-x"], tags, summary: null });
 
 /** A store holding one committed manifest and exactly the snapshots it references, plus `extra` listings. */
 function committedStore(extra = [], { text = null, tag = null, edit = (x) => x } = {}) {
@@ -256,6 +258,61 @@ function committedStore(extra = [], { text = null, tag = null, edit = (x) => x }
   return { binary: store(snapshots, new Map([[mid, text ?? mtext]])), mid, m };
 }
 const pass = (binary) => retentionPass({ binary }, { now: T0, host: HOST, parse: parseManifest, sha256, batch: 1 });
+
+test("a snapshot's time as the binary prints it (RFC 9557: nanoseconds, an offset, a zone name), to ms; anything else NaN", () => {
+  const ms = Date.parse("2026-11-26T19:14:23.438Z");
+  assert.equal(snapshotTime("2026-11-26T19:14:23.438876374+00:00[Etc/UTC]"), ms, "the binary's own form (seen on a real store)");
+  assert.equal(snapshotTime("2026-11-26T19:14:23.438Z"), ms);
+  assert.equal(snapshotTime("2026-11-26T19:14:23.4388+00:00"), ms, "truncated, never rounded");
+  assert.equal(snapshotTime("2026-11-26T11:14:23.438-08:00[America/Los_Angeles]"), ms, "an offset and its zone");
+  assert.equal(snapshotTime("2026-11-26T19:14:23Z"), Date.parse("2026-11-26T19:14:23Z"), "no fraction");
+  for (const bad of ["", "2026-11-26", "2026-11-26T19:14:23", "2026-11-26T19:14:23.1234567890Z", "2026-11-26T19:14:23Z[", "2026-11-26T19:14:23Z[Etc/UTC] x", null, 5]) {
+    assert.ok(Number.isNaN(snapshotTime(bad)), JSON.stringify(bad));
+  }
+});
+
+test("a snapshot time's fields are each in range, never normalized: impossible ones are NaN, each beside its valid twin", () => {
+  for (const [bad, twin] of [
+    ["2026-02-30T19:14:23.438876374+00:00[Etc/UTC]", "2026-02-28T19:14:23.438876374+00:00[Etc/UTC]"], // (Feb 30 isn't Mar 2)
+    ["2026-02-29T00:00:00Z", "2028-02-29T00:00:00Z"], // (2026 isn't a leap year; 2028 is)
+    ["2026-04-31T00:00:00Z", "2026-04-30T00:00:00Z"],
+    ["2026-13-01T00:00:00Z", "2026-12-01T00:00:00Z"],
+    ["2026-00-10T00:00:00Z", "2026-01-10T00:00:00Z"],
+    ["2026-11-00T00:00:00Z", "2026-11-01T00:00:00Z"],
+    ["2026-11-26T24:00:00+00:00[Etc/UTC]", "2026-11-26T23:00:00+00:00[Etc/UTC]"], // (hour 24 isn't the next midnight)
+    ["2026-11-26T19:60:00Z", "2026-11-26T19:59:00Z"],
+    ["2026-11-26T19:14:60Z", "2026-11-26T19:14:59Z"],
+    ["2026-11-26T19:14:23+24:00", "2026-11-26T19:14:23+23:00"],
+    ["2026-11-26T19:14:23+05:60", "2026-11-26T19:14:23+05:59"],
+    ["0099-11-26T19:14:23Z", "2026-11-26T19:14:23Z"],
+  ]) {
+    assert.ok(Number.isNaN(snapshotTime(bad)), `${bad} refused`);
+    assert.ok(Number.isFinite(snapshotTime(twin)), `${twin} accepted`);
+  }
+  assert.equal(snapshotTime("2028-02-29T00:00:00Z"), Date.parse("2028-02-29T00:00:00Z"));
+  assert.equal(snapshotTime("2026-11-26T19:14:23.1+05:30[Asia/Kolkata]"), Date.parse("2026-11-26T13:44:23.100Z"));
+  assert.equal(snapshotTime("2026-11-26T19:14:23.12-03:30"), Date.parse("2026-11-26T22:44:23.120Z"));
+});
+
+for (const [time, twin] of [["2026-02-30T19:14:23.438876374+00:00[Etc/UTC]", "2026-02-28T19:14:23.438876374+00:00[Etc/UTC]"], ["2026-11-20T24:00:00+00:00[Etc/UTC]", "2026-11-20T23:00:00+00:00[Etc/UTC]"]]) {
+  test(`an impossible listing time stops the pass before any forget (${time}); its valid twin is forgotten as usual`, async () => {
+    const at = (x) => ({ ...listed(hex(6), T0 - 2 * DAY, T("agent", "good", "20261101T030000Z-dddddddd")), time: x });
+    const { binary } = committedStore([at(time)]);
+    const r = await pass(binary);
+    assert.equal(r.error, "bad_result");
+    assert.equal(binary.calls.filter((c) => c.op === "forget").length, 0);
+    const ok = committedStore([at(twin)]);
+    const r2 = await pass(ok.binary);
+    assert.deepEqual(r2.forgotten, [hex(6)], "the twin: an ordinary stale snapshot, forgotten");
+  });
+}
+
+test("a listing time the binary wouldn't print stops the pass (bad_result), nothing forgotten", async () => {
+  const { binary } = committedStore([{ ...listed(hex(6), T0 - 2 * DAY, T("agent", "good", "20261101T030000Z-dddddddd")), time: "yesterday" }]);
+  const r = await pass(binary);
+  assert.equal(r.error, "bad_result");
+  assert.equal(binary.calls.filter((c) => c.op === "forget").length, 0);
+});
 
 test("a retention pass: the manifest checked against its bound hash, its references against the listing; forget only outside, in batches", async () => {
   const extra = [listed(hex(6), T0 - 2 * DAY, T("agent", "good", "20261101T030000Z-dddddddd")), listed(hex(7), T0 - 2 * DAY, T("agent", "warm", "20261122T030000Z-aaaaaaaa"))];

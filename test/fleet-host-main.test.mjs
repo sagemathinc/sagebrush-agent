@@ -137,7 +137,12 @@ function harness(o = {}) {
     },
     host: { release: "/opt/sagebrush/release" },
     hostInfo: { ramMb: 8192, cpus: 4 },
-    inputs: ({ submit }) => { ev("inputs"); made.submit = submit; return () => ev("inputsStop"); },
+    inputs: (x) => {
+      ev("inputs"); made.submit = x.submit; made.inputsCtx = x;
+      const stop = () => ev("inputsStop");
+      if (o.inputsExtra) Object.assign(stop, o.inputsExtra(ev));
+      return stop;
+    },
     wall: () => NOW,
     sleep: o.sleep ?? ((ms) => { ev("sleep", ms); return Promise.resolve(); }),
     terminated,
@@ -825,12 +830,13 @@ test("the unit as shipped: the release's host run as root, refusals (status 3) n
 // ---- the host audit stream's three adapters (audit stream d1-d1r5)
 
 const BROKER_SIDE = ADAPTERS.filter((k) => !AUDIT_ADAPTERS.includes(k));
-const fakeAudit = (ev, made) => async (ident) => {
+const fakeAuditOf = (anchored) => (ev, made) => async (ident) => {
   ev("auditOpen");
   made.auditIdent = ident;
   made.auditAdapters = Object.fromEntries(AUDIT_ADAPTERS.map((k) => [k, () => {}]));
-  return { adapters: made.auditAdapters, health: () => ({ state: "ok", reasons: [] }), close: async () => ev("auditClose") };
+  return { adapters: made.auditAdapters, anchored, health: () => ({ state: "ok", reasons: [] }), close: async () => ev("auditClose") };
 };
+const fakeAudit = fakeAuditOf(true);
 
 test("PAIRED with the audit stream: opened only after every other adapter is present, under the certificate, its three adapters given to the effects; closed after the executor, before the store", async () => {
   const { id } = await paired();
@@ -869,6 +875,18 @@ test("certValidity: the certificate counts at each seq from its issue until its 
   assert.deepEqual([...w.entries()].filter(([, ok]) => ok).map(([s]) => s), [chain.seq]);
 });
 
+test("the hard readiness refusal (N12/N13): an unanchored stream, genesis included, refuses to serve PAIRED work with every adapter present: audit_unavailable, item unanchored, after the proven containment; no executor", async () => {
+  const { id } = await paired();
+  const others = Object.fromEntries(BROKER_SIDE.map((k) => [k, () => {}]));
+  const h = harness({ id, adapters: others, openAudit: fakeAuditOf(false) });
+  const out = await Promise.race([hostRun(h.d), new Promise((r) => setTimeout(() => r("served"), 2000))]);
+  if (out === "served") { h.term(); assert.fail("an unanchored stream served PAIRED work"); }
+  assert.equal(out.code, 3);
+  assert.deepEqual(h.lines.filter((l) => l.refused), [{ v: 1, refused: "audit_unavailable", item: "unanchored" }]);
+  assert.ok(h.log.includes("auditOpen") && h.log.includes("stopAll") && !h.log.includes("supervisor") && !h.log.includes("effects"));
+  assert.ok(h.log.indexOf("auditClose") > h.log.indexOf("auditOpen") && h.log.includes("storeClose"), "the stream and store closed");
+});
+
 test("PAIRED with the audit stream but no broker or ack adapters (the shipped wiring today): preflight_missing naming exactly those four; the stream is never opened", async () => {
   const { id } = await paired();
   const h = harness({ id, adapters: {}, openAudit: fakeAudit });
@@ -887,6 +905,7 @@ test("registry: every emitter's refusal is a host-owned registered name whose me
     [{ linux: false }, "preflight_missing", "platform"],
     [{ broker: null }, "preflight_missing", "account"],
     ...ADAPTERS.map((k) => [{ id, adapters: Object.fromEntries(ADAPTERS.filter((x) => x !== k).map((x) => [x, () => {}])) }, "preflight_missing", "adapter"]),
+    [{ id, adapters: Object.fromEntries(BROKER_SIDE.map((k) => [k, () => {}])), openAudit: fakeAuditOf(false) }, "audit_unavailable", "unavailable"],
     [{ lock: "bad" }, "identity_broken", "trusted parents"],
     [{ lock: "bad" }, "identity_broken", "ownership lock"],
     [{ state: "BROKEN" }, "identity_broken", "restore-root separation"],
@@ -1116,6 +1135,25 @@ test("lease on and QUALIFIED: asked once, before the unmask; a LeaseMachine from
   assert.ok(Object.isFrozen(h.made.supervisor.restoreResume));
   h.term();
   assert.equal((await run).code, 0);
+});
+
+test("slice B's wiring: the inputs get the daemon's context; an adoption that adopted nudges the grant reader (others don't); the restore resume's pairOf is the intake's", async () => {
+  const { id } = await paired();
+  const A = newId(), PAIR = { transfer: "T2", receipt: "R2" };
+  const h = harness({ id, config: { lease: "on" }, qualified: { ok: true },
+    supervisor: () => ({ submit: async (op) => ({ status: op.kind === "chain-adopt" ? (op.adopt === false ? "not_adopted" : "adopted") : "ok" }) }),
+    inputsExtra: (ev) => ({ nudge: () => ev("nudge"), pairOf: (a) => (a === A ? PAIR : null) }) });
+  const run = hostRun(h.d);
+  await until(() => h.lines.some((l) => l.serving));
+  for (const k of ["submit", "pin", "cert", "keys", "sync", "store", "verify", "audit"]) assert.ok(Object.hasOwn(h.made.inputsCtx, k), k);
+  await h.made.sync.submit({ kind: "chain-adopt", adopt: false });
+  assert.ok(!h.log.includes("nudge"), "not adopted: no nudge");
+  await h.made.sync.submit({ kind: "chain-adopt" });
+  assert.equal(h.log.filter((x) => x === "nudge").length, 1);
+  await h.made.supervisor.restoreResume.request(A, { liveLease: async () => null });
+  assert.equal(h.made.resumeCalls[0].opts.pairOf(A), PAIR);
+  h.term();
+  await run;
 });
 
 test("the restore resume through hostRun's wiring: exactly the base keys plus the per-call liveLease and verifyCtx; pairOf is null, so a real request refuses no_receipt and launches nothing", async () => {

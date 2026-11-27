@@ -168,28 +168,141 @@ test("the WebCrypto backend's verify is a boolean: false for bytes it can't use,
   assert.equal(await backend.ed25519Verify(k.raw, msg, sig), true);
 });
 
-test("ed25519FromSeed clears its PKCS#8 copy of the seed when an import or the export fails (and leaves the caller's seed)", async () => {
-  for (const failAt of ["first import", "export", "second import"]) {
-    let der = null, imports = 0;
-    const subtle = {
-      async importKey(fmt, data) {
-        imports++;
-        if (imports === 1) der = data;
-        if ((failAt === "first import" && imports === 1) || (failAt === "second import" && imports === 2)) throw new Error(failAt);
-        return {};
-      },
-      async exportKey() {
-        if (failAt === "export") throw new Error(failAt);
-        return { x: core.b64(new Uint8Array(32).fill(9)) };
-      },
-    };
-    const w = core.webCrypto({ subtle, getRandomValues: (b) => b });
+// (RFC 8032 §7.1's Ed25519 vectors, TEST 1, 2, 3 and SHA(abc): secret key, public key; SHA(abc)'s public key is the one
+//  whose x sign bit is 1, so the probe's first guess is wrong and both branches run)
+const RFC8032 = [
+  ["9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60", "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"],
+  ["4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb", "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"],
+  ["c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7", "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025"],
+  ["833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42", "ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf"],
+];
+// (RFC 7748 §6.1: Alice's and Bob's private keys, their public keys, and the shared secret)
+const RFC7748 = [
+  ["77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a", "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"],
+  ["5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb", "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"],
+];
+const RFC7748_SHARED = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742";
+const hex = (h) => Uint8Array.from(Buffer.from(h, "hex"));
+const toHex = (b) => Buffer.from(b).toString("hex");
+// (WebCrypto watched: every buffer it was handed to import, every digest it returned, every export and its format)
+function watched() {
+  const s = globalThis.crypto.subtle, seen = { imports: [], digests: [], exports: [] };
+  const subtle = {
+    importKey: (fmt, data, ...rest) => { seen.imports.push({ fmt, data }); return s.importKey(fmt, data, ...rest); },
+    async digest(alg, data) { const ab = await s.digest(alg, data); seen.digests.push(ab); return ab; },
+    exportKey: (fmt, key) => { seen.exports.push(fmt); return s.exportKey(fmt, key); },
+    deriveBits: (...a) => s.deriveBits(...a), sign: (...a) => s.sign(...a), verify: (...a) => s.verify(...a),
+    encrypt: (...a) => s.encrypt(...a), decrypt: (...a) => s.decrypt(...a), generateKey: (...a) => s.generateKey(...a),
+  };
+  return { w: core.webCrypto({ subtle, getRandomValues: (b) => globalThis.crypto.getRandomValues(b) }), seen };
+}
+
+test("ed25519FromSeed: RFC 8032's public keys, derived without exporting any key; the key signs RFC 8032 TEST 1", async () => {
+  for (const [sk, pk] of RFC8032) {
+    const { w, seen } = watched();
+    const k = await w.ed25519FromSeed(hex(sk));
+    assert.equal(toHex(k.raw), pk, sk);
+    assert.deepEqual(seen.exports, [], `${sk}: nothing exported, in any format`);
+  }
+  const k1 = await watched().w.ed25519FromSeed(hex(RFC8032[0][0]));
+  assert.equal(toHex(await k1.sign(new Uint8Array(0))), "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b");
+});
+
+test("ed25519FromSeed: the sign bit is chosen by verifying, both ways (a key with x's sign bit 1, and three with 0)", async () => {
+  const bits = RFC8032.map(([, pk]) => hex(pk)[31] >> 7);
+  assert.deepEqual(bits, [0, 0, 0, 1], "the vectors cover both signs");
+  for (const [sk, pk] of RFC8032) assert.equal(toHex((await core.webCrypto().ed25519FromSeed(hex(sk))).raw), pk);
+});
+
+test("x25519FromPrivate: RFC 7748's public keys, derived without exporting any key, and the shared secret", async () => {
+  const pairs = [];
+  for (const [sk, pk] of RFC7748) {
+    const { w, seen } = watched();
+    const p = await w.x25519FromPrivate(hex(sk));
+    assert.equal(toHex(p.raw), pk, sk);
+    assert.deepEqual(seen.exports, [], `${sk}: nothing exported, in any format`);
+    pairs.push(p);
+  }
+  assert.equal(toHex(await pairs[0].dh(pairs[1].raw)), RFC7748_SHARED);
+  assert.equal(toHex(await pairs[1].dh(pairs[0].raw)), RFC7748_SHARED);
+});
+
+test("ed25519FromSeed and x25519FromPrivate zero every copy of the secret they made, and leave the caller's", async () => {
+  const seed = hex(RFC8032[0][0]), keep = toHex(seed);
+  const e = watched();
+  await e.w.ed25519FromSeed(seed);
+  const secrets = e.seen.imports.filter((i) => i.fmt === "pkcs8");
+  assert.equal(secrets.length, 2, "the Ed25519 key and the X25519 scalar, each imported once");
+  assert.ok(secrets.every((i) => i.data.every((x) => x === 0)), "both PKCS#8 copies zeroed");
+  assert.equal(e.seen.digests.length, 1);
+  assert.ok(new Uint8Array(e.seen.digests[0]).every((x) => x === 0), "the SHA-512 of the seed zeroed");
+  assert.equal(toHex(seed), keep, "the caller's seed is the caller's");
+  const sk = hex(RFC7748[0][0]), keepSk = toHex(sk);
+  const x = watched();
+  await x.w.x25519FromPrivate(sk);
+  const xs = x.seen.imports.filter((i) => i.fmt === "pkcs8");
+  assert.ok(xs.length === 1 && xs[0].data.every((b) => b === 0), "the X25519 PKCS#8 copy zeroed");
+  assert.equal(toHex(sk), keepSk, "the caller's private key is the caller's");
+});
+
+// (a WebCrypto that fails at one named step and records every buffer it was handed and every digest it returned)
+function failing(failAt) {
+  const s = globalThis.crypto.subtle, imports = [], digests = [];
+  const subtle = {
+    async digest(alg, data) { if (failAt === "digest") throw new Error(failAt); const ab = await s.digest(alg, data); digests.push(ab); return ab; },
+    async importKey(fmt, data, alg, ...rest) {
+      imports.push({ fmt, data });
+      if (fmt === "pkcs8" && alg.name === "Ed25519" && failAt === "ed25519 import") throw new Error(failAt);
+      if (fmt === "pkcs8" && alg.name === "X25519" && failAt === "x25519 import") throw new Error(failAt);
+      if (fmt === "raw" && alg.name === "X25519" && failAt === "base point import") throw new Error(failAt);
+      return s.importKey(fmt, data, alg, ...rest);
+    },
+    async deriveBits(...a) { if (failAt === "deriveBits") throw new Error(failAt); return s.deriveBits(...a); },
+    sign: (...a) => s.sign(...a), verify: (...a) => s.verify(...a), exportKey: (...a) => s.exportKey(...a),
+  };
+  return { w: core.webCrypto({ subtle, getRandomValues: (b) => b }), imports, digests };
+}
+
+test("ed25519FromSeed clears every copy it made when any step fails (and leaves the caller's seed)", async () => {
+  for (const failAt of ["ed25519 import", "digest", "x25519 import", "base point import", "deriveBits"]) {
+    const { w, imports, digests } = failing(failAt);
     const seed = new Uint8Array(32).fill(7);
     await assert.rejects(w.ed25519FromSeed(seed), new RegExp(failAt));
-    assert.equal(der.length, 48, failAt);
-    assert.ok(der.every((x) => x === 0), `${failAt}: the PKCS#8 copy is cleared`);
+    const pk = imports.filter((i) => i.fmt === "pkcs8");
+    // (each secret copy made is handed to its import at once, so each one made is seen here)
+    assert.ok(pk.length >= 1 && pk.every((i) => i.data.length === 48 && i.data.every((x) => x === 0)), `${failAt}: every PKCS#8 copy is cleared`);
+    assert.ok(digests.every((ab) => new Uint8Array(ab).every((x) => x === 0)), `${failAt}: the seed's hash is cleared`);
     assert.ok(seed.every((x) => x === 7), `${failAt}: the caller's seed is the caller's`);
   }
+});
+
+test("x25519FromPrivate clears its copy when its import or the base-point multiplication fails (and leaves the caller's key)", async () => {
+  for (const failAt of ["x25519 import", "base point import", "deriveBits"]) {
+    const { w, imports } = failing(failAt);
+    const sk = new Uint8Array(32).fill(5);
+    await assert.rejects(w.x25519FromPrivate(sk), new RegExp(failAt));
+    const pk = imports.filter((i) => i.fmt === "pkcs8");
+    assert.ok(pk.length === 1 && pk[0].data.every((x) => x === 0), `${failAt}: the PKCS#8 copy is cleared`);
+    assert.ok(sk.every((x) => x === 5), `${failAt}: the caller's key is the caller's`);
+  }
+});
+
+test("ed25519FromSeed takes the key only from an encoding that verifies ALONE: both verifying goes to a second probe", async () => {
+  // (a WebCrypto whose verify says yes to both encodings for the first probe only: the second decides, and the key
+  //  is still RFC 8032's)
+  const s = globalThis.crypto.subtle, probe1 = new TextEncoder().encode("sagebrush.fleet.public-key-probe.v1");
+  const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+  let lied = 0;
+  const subtle = {
+    digest: (...a) => s.digest(...a), importKey: (...a) => s.importKey(...a), deriveBits: (...a) => s.deriveBits(...a), sign: (...a) => s.sign(...a), exportKey: (...a) => s.exportKey(...a),
+    async verify(alg, key, sig, msg) { if (same(new Uint8Array(msg), probe1)) { lied++; return true; } return s.verify(alg, key, sig, msg); },
+  };
+  const w = core.webCrypto({ subtle, getRandomValues: (b) => b });
+  for (const [sk, pk] of RFC8032) assert.equal(toHex((await w.ed25519FromSeed(hex(sk))).raw), pk, sk);
+  assert.ok(lied >= 8, "the first probe was ambiguous each time");
+  // (and one where no encoding ever verifies alone: refused, never a guess)
+  const never = core.webCrypto({ subtle: { ...subtle, verify: async () => true }, getRandomValues: (b) => b });
+  await assert.rejects(never.ed25519FromSeed(hex(RFC8032[0][0])), /no public key/);
 });
 
 test("recoveryKey clears the seed HKDF derived, when the key is made and when its import is refused", async () => {

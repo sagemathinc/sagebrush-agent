@@ -90,6 +90,7 @@
   "lib/fleet/host/lease.mjs",
   "lib/fleet/host/names.mjs",
   "lib/fleet/host/net.mjs",
+  "lib/fleet/host/pair.mjs",
   "lib/fleet/host/plan.mjs",
   "lib/fleet/host/pool.mjs",
   "lib/fleet/host/profiles.mjs",

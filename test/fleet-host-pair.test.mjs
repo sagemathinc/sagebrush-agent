@@ -4,7 +4,7 @@
 // (another key or host: not_found); the approved, expired and pending states; and the existing paged chain read. On a
 // temporary root with the shared fixtures' honest chain; certificates sealed by the fixtures' native device.
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync } from "node:fs";
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "./host-linux-only.mjs";
@@ -183,7 +183,7 @@ test("d3: a crash before the create, or after it with the reply lost, or during 
   }
 });
 
-test("d3: a resume with the pairing recorded polls it (no new request); approval while stopped, resumed after more than 10 minutes (within the horizon), completes", async () => {
+test("d3/d3r3: a resume with the pairing recorded re-POSTs it first (idempotent: the same pairing), then polls; approval while stopped, resumed after more than 10 minutes (within the horizon), completes", async () => {
   const h = setup();
   const ac = new AbortController();
   const first = await h.run(undefined, { signal: ac.signal, onSleep: () => ac.abort() });
@@ -195,8 +195,7 @@ test("d3: a resume with the pairing recorded polls it (no new request); approval
   h.svc.log.length = 0;
   const r = await h.run();
   assert.equal(r.code, 0);
-  assert.equal(h.svc.log[0], "result", "polled, not re-requested");
-  assert.ok(!h.svc.log.includes("pair"));
+  assert.deepEqual(h.svc.log.slice(0, 2), ["pair", "result"], "re-requested (the same pairing, approved), then polled");
   assert.equal(await h.state(), "PAIRED");
 });
 
@@ -261,7 +260,7 @@ test("d3r2: the resume horizon, exactly 7 days and 7 days + 1 ms, with and witho
         assert.equal(h.intentBytes(), null, what);
       } else {
         assert.ok(h.svc.log.length > 0, `${what}: resumed`);
-        assert.equal(h.svc.log[0], saved ? "result" : "pair", what);
+        assert.equal(h.svc.log[0], "pair", what); // (d3r3: a resume always re-POSTs first, saved pairing or not)
       }
     }
   }
@@ -277,7 +276,7 @@ test("the intent's fields are immutable: the rewrite that adds the pairing refus
     assert.throws(() => addPairing(h.p.identity, changed, newId(), { uid: UID }), (e) => e.code === "not_granted", k);
   }
   const { writeIntent } = await import("../lib/fleet/host/pair.mjs");
-  assert.throws(() => writeIntent(h.p.identity, { ...x, host: newId() }), (e) => e.code === "EEXIST");
+  assert.throws(() => writeIntent(h.p.identity, { ...x, host: newId() }), (e) => e.code === "in_progress");
   assert.deepEqual(h.intent(), x);
 });
 
@@ -345,4 +344,82 @@ test("usage: unknown or repeated flags", async () => {
     assert.equal(r.code, 2, JSON.stringify(argv));
   }
   assert.equal(POLL_MS, 5000);
+});
+
+// ---- review fixes: the supervisor's own classify inputs; a code never shown; a first write interrupted
+
+test("the real classify inputs: the broker account's uid and the machine-id file's exact text (with its newline): a normal first-booted host pairs, never BROKEN or CLONE", async () => {
+  const h = setup();
+  assert.equal(machine().endsWith("\n"), true, "(a real /etc/machine-id ends with a newline)");
+  // no classify seam: pair's own classify, from the brokerAccount and machineId seams
+  const r = await h.run(undefined, { classify: undefined, brokerAccount: () => ({ uid: UID, gid: UID }), machineId: machine, onSleep: approveSoon(h) });
+  assert.equal(r.code, 0, JSON.stringify(r));
+  assert.equal(await h.state(), "PAIRED");
+  // and the refusals: no broker account, a broker uid of 0
+  for (const broker of [() => null, () => ({ uid: 0, gid: 0 })]) {
+    const g = setup();
+    const r2 = await g.run(undefined, { classify: undefined, brokerAccount: broker, machineId: machine });
+    assert.deepEqual(r2.line, { v: 1, refused: "not_granted" });
+    assert.deepEqual(g.svc.log, [], "nothing sent");
+  }
+  // the uid classify checks the keys against is the broker's, not root's: another broker uid finds them not its own
+  const o = setup();
+  const r4 = await o.run(undefined, { classify: undefined, brokerAccount: () => ({ uid: UID + 1, gid: UID + 1 }), machineId: machine });
+  assert.deepEqual(r4.line, { v: 1, refused: "not_granted" });
+  assert.deepEqual(o.svc.log, [], "nothing sent");
+  // a trimmed machine-id is not this host's: not FRESH, so no request
+  const t = setup();
+  const r3 = await t.run(undefined, { classify: undefined, brokerAccount: () => ({ uid: UID, gid: UID }), machineId: () => machine().trim() });
+  assert.deepEqual(r3.line, { v: 1, refused: "not_granted" });
+  assert.deepEqual(t.svc.log, [], "nothing sent");
+});
+
+test("d3r3: a first attempt interrupted after its pairing id is saved but before its code is shown: the rerun re-POSTs and shows a FRESH code for the same pairing", async () => {
+  const h = setup();
+  // the first attempt saves the pairing id, then dies before the code reaches the terminal
+  let shown = false;
+  const tty = { write: (s) => { if (/Pairing code/.test(s)) throw Object.assign(new Error("killed"), { code: "killed" }); if (/Pairing code/.test(s)) shown = true; }, ask: async () => null, close: () => {} };
+  assert.deepEqual((await h.run(undefined, { tty })).line, { v: 1, refused: "outcome_unknown" });
+  const x = h.intent();
+  assert.ok(x?.pairing, "the pairing id was saved");
+  assert.equal(shown, false, "its code was never shown");
+  const firstCode = h.svc.byHost.get(x.host).code;
+  h.svc.log.length = 0;
+  const r = await h.run([], { onSleep: approveSoon(h) });
+  assert.equal(r.code, 0);
+  assert.equal(h.svc.log[0], "pair", "re-POSTed");
+  const codes = h.out.join("").match(/Pairing code: ([a-z2-7]{4})-([a-z2-7]{4})/g) ?? [];
+  assert.ok(codes.length >= 1, "a code was shown on the rerun");
+  assert.notEqual(h.svc.byHost.get(x.host).code, firstCode, "a fresh code, the old one dead");
+  assert.equal(h.intent()?.pairing ?? x.pairing, x.pairing, "the same pairing");
+});
+
+test("d3r3: the first intent is published whole: a crash after its temporary write leaves no pairing.json (the rerun starts fresh); a stale temporary is removed; it never replaces an attempt", async () => {
+  const { writeIntent, INTENT_TMP } = await import("../lib/fleet/host/pair.mjs");
+  const h = setup();
+  mkdirSync(h.p.identity, { recursive: true, mode: 0o700 });
+  const x = { v: 1, host: newId(), host_fp: b64(new Uint8Array(32).fill(4)), origin: AUD, fleet_fp: normalizeFleetFp(FP), created_ms: h.clock.now() };
+  const fsx = { ...fs, linkSync: () => { throw Object.assign(new Error("crash"), { code: "EIO" }); } };
+  assert.throws(() => writeIntent(h.p.identity, x, { fsx }), (e) => e.code === "EIO");
+  assert.equal(existsSync(join(h.p.identity, PAIRING)), false, "no pairing.json: nothing partial to refuse later");
+  writeFileSync(join(h.p.identity, INTENT_TMP), "{\"v\":1,", { mode: 0o600 }); // (a partial stale temporary)
+  writeIntent(h.p.identity, x);
+  assert.deepEqual(readIntent(h.p.identity, { uid: UID }), x, "written whole");
+  assert.equal(existsSync(join(h.p.identity, INTENT_TMP)), false, "the temporary removed");
+  assert.throws(() => writeIntent(h.p.identity, { ...x, host: newId() }), (e) => e.code === "in_progress");
+  assert.deepEqual(readIntent(h.p.identity, { uid: UID }), x, "never replaced");
+});
+
+test("d3r3: a resume whose re-POST answers with another pairing than the saved one refuses outcome_unknown and keeps the attempt", async () => {
+  const h = setup();
+  const tty = { write: (s) => { if (/Pairing code/.test(s)) throw new Error("killed"); }, ask: async () => null, close: () => {} };
+  await h.run(undefined, { tty });
+  const x = h.intent();
+  assert.ok(x?.pairing);
+  h.svc.byHost.get(x.host).pairing = newId(); // (the service's record now another pairing)
+  h.svc.log.length = 0;
+  const r = await h.run([]);
+  assert.deepEqual(r.line, { v: 1, refused: "outcome_unknown" });
+  assert.deepEqual(h.svc.log, ["pair"], "no poll of either pairing");
+  assert.deepEqual(h.intent(), x, "the attempt kept");
 });
